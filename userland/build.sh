@@ -362,7 +362,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		fi
 	fi
 	# (drawable_test is built in the same block as surf_test, so it is copied with it)
-	cp obj/hello_dyn obj/svc_test obj/surf_test obj/drawable_test obj/rwtouch obj/mg_test root/bin/
+	# (prebuilt/userland does not ship every program -- e.g. drawable_test -- so copy what is there)
+	for t in hello_dyn svc_test surf_test drawable_test rwtouch mg_test; do
+		if [ -f obj/$t ]; then cp obj/$t root/bin/; fi
+	done
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
