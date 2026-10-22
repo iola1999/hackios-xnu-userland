@@ -495,8 +495,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
 	# points back into /var); point them at the data that ships with the system, and use this machine's zone
 	zone=$( { timedatectl show -p Timezone --value 2>/dev/null || readlink /etc/localtime 2>/dev/null | sed -E 's|.*/zoneinfo/||'; } || true ); zone=${zone:-UTC}
-	sed -i -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
-		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel
+	tmp=$(mktemp) && sed -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
+		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel >"$tmp" && cat "$tmp" >root/etc/var.skel && rm -f "$tmp"
 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
 	cp -r var root/var
 	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do
