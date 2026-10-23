@@ -23,8 +23,11 @@
 #   libredwoodair.dylib  the same path as a library (tools/mesa/air/air_metal.h), install name
 #                        /redwood/lib/libredwoodair.dylib, which is what userland's Metal driver
 #                        links against to compile a function Metal hands it
-# Needs on this machine: meson, ninja, bison, flex, python3 with venv (Mako is installed into a
-# private environment), llvm-ar.
+# Needs on this machine: bison, flex, python3 with venv (Mako and a pinned Meson are installed into a
+# private environment), llvm-ar, and the iOS cross toolchain -- $THEOS/toolchain/linux/iphone (cctools'
+# ld64 and install_name_tool, x86_64 binaries that run under qemu-user or Rosetta on an arm64 host) plus
+# $THEOS/sdks/iPhoneOS16.5.sdk. All of it is baked into the hackios-dev image (docker/Dockerfile pins
+# the theos commit and hashes the tools), so `docker/dev.sh` is the supported way to run this.
 #
 # This build is NOT reproducible byte for byte, so do not compare one of its outputs with another
 # by hash. Measured on 20 October: two builds from the same source tree, the second with
@@ -57,6 +60,18 @@ source "$ROOT/xnu-env.sh"
 B=$ROOT/xnu-deps/build/mesa
 SDK=$THEOS/sdks/iPhoneOS16.5.sdk
 CC=$ROOT/xnu-deps/host/bin/xnu-clang
+# xnu-clang links through $ROOT/xnu-deps/host/bin/ld64 -- that exact path is where the kernel build
+# looks for the linker, and nothing but this script puts it there: an untracked symlink onto the
+# theos toolchain, which is why the container image, not the repository, is its source of truth.
+LD64=$ROOT/xnu-deps/host/bin/ld64
+[ -e "$LD64" ] || ln -sfn "$THEOS/toolchain/linux/iphone/bin/ld" "$LD64"
+# the C++ name of the same wrapper, which xnu-deps/setup.sh also makes (line: link xnu-clang
+# host/bin/xnu-clang++); Mesa needs the C++ compiler, and mesa does not run setup.sh
+[ -e "$ROOT/xnu-deps/host/bin/xnu-clang++" ] || ln -s xnu-clang "$ROOT/xnu-deps/host/bin/xnu-clang++"
+# the same toolchain holds install_name_tool; the bare name is only right on macOS, and it was
+# never on the PATH of the old containers, so resolve it rather than assume it
+INTOOL=$THEOS/toolchain/linux/iphone/bin/install_name_tool
+[ -x "$INTOOL" ] || INTOOL=install_name_tool
 mkdir -p "$B/out"
 cd "$B"
 
@@ -71,7 +86,10 @@ if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf mesa-$VERSION build-*
 	tar xJf mesa-$VERSION.tar.xz
-	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done
+	# On 26.x some hunks of the old patches fail or skip, which is expected: 0003-restore-* re-establishes
+	# what they carried (tools/mesa/rebase-26/README.md). Only there, so a 25.0.7 build still stops on a
+	# patch that no longer fits.
+	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p" || [ "$REBASE" = 26 ]; done
 	if [ "$REBASE" = 26 ]; then for p in "$ROOT"/tools/mesa/rebase-26/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done; fi
 	echo "$PATCHES" > mesa-$VERSION/.redwood-patches
 fi
@@ -85,7 +103,10 @@ rm -rf mesa-$VERSION/src/compiler/air
 cp -r "$ROOT/tools/mesa/air" mesa-$VERSION/src/compiler/air
 if [ ! -x venv/bin/python3 ]; then
 	python3 -m venv venv
-	venv/bin/pip -q install mako pyyaml packaging
+	# meson is pinned, not apt's: 26.x meson.build requires >= 1.4 and Ubuntu noble ships 1.3,
+	# and a pinned builder is what makes the cross build reproducible across machines
+	# (docs/analysis/mesa-rebase-2026-10.md section 9).
+	venv/bin/pip -q install mako pyyaml packaging "meson==1.12.1"
 fi
 export PATH=$B/venv/bin:$PATH
 
@@ -112,13 +133,20 @@ needs_exe_wrapper = true
 INI
 DRIVERS=${DRIVERS:-softpipe,freedreno}
 BUILD=build-${DRIVERS//,/-}
+# 26.x dropped the gallium state trackers vdpau and xa, so those options only exist up to 25.x;
+# meson hard-errors on an unknown -D, which means the flag list has to follow the version.
+LEGACY_TRACKERS="-Dgallium-vdpau=disabled -Dgallium-xa=disabled"
+case "$VERSION" in
+	1.*|2[0-5].*) ;;
+	*) LEGACY_TRACKERS="" ;;
+esac
 [ -f $BUILD/build.ninja ] || meson setup $BUILD mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
 	--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
 	-Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
 	-Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
 	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
-	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
-	-Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
+	-Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-va=disabled \
+	$LEGACY_TRACKERS -Dlmsensors=disabled -Dbuild-tests=false > meson-setup.log
 ninja -C $BUILD > ninja.log
 # air_run draws with a translated Metal shader and reads the pixels back; it is
 # the only way to find out whether the Adreno takes work that did not come from
@@ -134,18 +162,21 @@ if [ "${AIR:-}" = 1 ]; then
 	# because meson's own is @rpath.
 	ninja -C $BUILD src/gallium/drivers/freedreno/libredwoodair.dylib >> ninja.log
 	llvm-strip -x -o out/libredwoodair.dylib $BUILD/src/gallium/drivers/freedreno/libredwoodair.dylib
-	install_name_tool -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
+	"$INTOOL" -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
 	echo "mk-mesa.sh: $B/out/libredwoodair.dylib ($(stat -c %s out/libredwoodair.dylib) bytes," \
-		"$(nm -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions)"
+		"$(llvm-nm -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions)"
 	# what this library was built from, so userland/build.sh can tell that it is older than the
 	# sources and come back here instead of shipping it beside a driver that disagrees with it
 	cat "$ROOT"/tools/mesa/air/* | sha256sum > out/built-from-air
 fi
 
 llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
-install_name_tool -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
-nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
-cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml out/gl.xml
+"$INTOOL" -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
+llvm-nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
+# 26.x moved the Khronos registry inside the tree (src/mapi/glapi/registry, then src/mesa/glapi/glapi/registry)
+glxml=mesa-$VERSION/src/mapi/glapi/registry/gl.xml
+[ -f "$glxml" ] || glxml=mesa-$VERSION/src/mesa/glapi/glapi/registry/gl.xml
+cp "$glxml" out/gl.xml
 # (userland/build.sh comes here again when this no longer matches)
 cat "$ROOT"/tools/mesa/*.patch "$ROOT"/tools/mesa/redwood-drm/* | sha256sum > out/built-from
 echo "mk-mesa.sh: Mesa $VERSION ($DRIVERS): $B/out/libOSMesa.8.dylib, $(stat -c %s out/libOSMesa.8.dylib) bytes," \
