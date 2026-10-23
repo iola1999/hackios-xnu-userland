@@ -251,7 +251,7 @@ struct air_vertex_attribute {
 };
 
 struct air_shader_info {
-   gl_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
+   mesa_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
    const char *entry_point;
    unsigned num_resources;
    struct air_resource *resources;

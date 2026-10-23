@@ -14,6 +14,15 @@
 #include "nir.h"
 #include "nir_builder.h"
 
+/* 26.x dropped the builder's bool `exact` for the `fp_math_ctrl` bitmask;
+ * the nir_fp_exact bits (no_contract | no_reassoc | no_transform) are the same
+ * knob the old code meant: transformations must not touch the value. */
+static inline void
+air_builder_set_exact(nir_builder *b, bool exact)
+{
+   b->fp_math_ctrl = (b->fp_math_ctrl & ~nir_fp_exact) | (exact ? nir_fp_exact : 0);
+}
+
 /* Where a pointer points. AIR's address spaces say which kind of memory;
  * which buffer, and the byte offset into it, the translator tracks itself
  * (docs/air.md section 3): no pointer in the corpus is ever stored to
