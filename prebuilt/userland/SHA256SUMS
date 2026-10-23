@@ -18,3 +18,21 @@ a7bd8279e8e0effd4094ab8369556a51899401d8e32a9fd3aefc451db445e0b6  prebuilt/userl
 02629167d9126f59d8f7ac86b30617e175a321819d3cf9fa7a89414656579a57  prebuilt/userland/stage0
 143a06695cf54273b39a74a979c690715b7ba171dd408400084eac3ca78db3da  prebuilt/userland/surf_test
 879d6d554758905cdd17795e7049267bc516452cb6264c20ef11f680d25de5dd  prebuilt/userland/svc_test
+
+GL chain, added 2026-10-23 (docs/analysis/mesa-rebase-2026-10.md 9). These six are not prebuilts and
+are deliberately not in this directory: libOSMesa.8.dylib, libredwoodair.dylib and air_run are what
+tools/mk-mesa.sh writes to xnu-deps/build/mesa/out, and the GL branch of userland/build.sh copies
+them to userland/obj and links libredwood-gl.dylib, gl_test and u2f_test against the same out/ tree,
+so all six move together with the out/built-from and out/built-from-air stamps and no stamp mismatch
+can leave this table standing. The paths are the ones the last `GL=1 ./build.sh` left them at in the
+merged tree (common/setup.sh), and root/lib and root/bin -- what the apfs images are packed from --
+hold byte-identical copies of the same names. build.sh checks nothing here; to recheck from the
+merged tree root: (cd hackios-xnu-kernel && sha256sum -c <(grep -E '^[0-9a-f]{64}  userland/obj/' prebuilt/userland/SHA256SUMS)),
+where a mismatch means the tree has been built from different sources than the lines below.
+
+faab40828abe0209165bb3e17420ca4aa75e470d957bf28a29a59f8be4bc965b  userland/obj/libOSMesa.8.dylib
+2950f4d42904b155e1f047535d5ec0f615ec11de9b707a3b2bf032c9fda36aa0  userland/obj/libredwoodair.dylib
+15de976fbd8a796ec455710b6855c0290908a63ac9212077e0e6823fa4a59861  userland/obj/libredwood-gl.dylib
+46888554b78de97b86c826548f9b75ff2f792e5cd6378417b488cbf511941f83  userland/obj/gl_test
+322b49810a206223ba30ea710c8b8e7bf4e67d5012864e4602f40bedaac626e5  userland/obj/u2f_test
+04921bb7ffdd1cbd8820f3fb9d6720fa25b2685263b065caa4bc4c8ea7b42f10  userland/obj/air_run
