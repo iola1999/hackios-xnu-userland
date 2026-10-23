@@ -1,14 +1,16 @@
 # HackiOS — userland
 
-The user-space half of **HackiOS**: Apple's open-source XNU kernel on Android phone hardware (POCO X5 Pro 5G) and in
-QEMU, running the unmodified iOS 16.5 user space. The kernel, loader, UEFI and the `common/` scripts are in
-[hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel) — **start there**.
+> **REDMI K90 移植分支：`k90-port`。** 本仓库基于 [OOSEX GANG 的原用户态仓库](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史并维护本项目的用户态和构建修改。感谢原作者及贡献者开放 init、注入库、APFS 镜像工具和图形适配；本项目沿用这些实现开展 K90 移植。
 
-> **No Apple files are in this repository.** `ios165/fetch.sh` downloads the iOS 16.5 IPSW from Apple's CDN to your
-> machine and extracts what is needed there. HackiOS is an independent research project by OOSEX GANG and is not
-> affiliated with, authorised or endorsed by Apple Inc.
+[顶层工作区](https://github.com/iola1999/hackios-k90-port)保存计划、实测和子模块版本，[K90 内核仓库](https://github.com/iola1999/hackios-xnu-kernel/tree/k90-port)维护 XNU、loader 与固件相关修改，本仓库维护用户态及镜像工具。两个代码仓库使用 `k90-port` 分支，GitHub 的 fork 关联尚未建立。原许可证和版权声明保留；K90 的验证范围以顶层工作区文档为准。
 
-## Getting it
+K90 构建使用对应内核仓库的 `k90-port`，运行 `common/setup.sh` 时显式指定 `USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port`。userland 会作为 `.userland.git` 管理的 overlay 放入 kernel 工作树；下文的上游获取方式保留其原始来源。
+
+The user-space half of **HackiOS**: Apple's open-source XNU kernel on Android phone hardware (POCO X5 Pro 5G) and in QEMU, running the unmodified iOS 16.5 user space. The kernel, loader, UEFI and the `common/` scripts are in [hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel) — **start there**.
+
+> **No Apple files are in this repository.** `ios165/fetch.sh` downloads the iOS 16.5 IPSW from Apple's CDN to your machine and extracts what is needed there. HackiOS is an independent research project by OOSEX GANG and is not affiliated with, authorised or endorsed by Apple Inc.
+
+## 1. Getting it
 
 The two repositories are built as one tree. Clone the kernel repository and let it bring this one in:
 
@@ -19,7 +21,7 @@ common/setup.sh        # checks this repository out into the same directory (git
 common/ugit status     # git for this repository inside that tree
 ```
 
-## What is here
+## 2. What is here
 
 | Path | What |
 |---|---|
@@ -37,7 +39,7 @@ common/ugit status     # git for this repository inside that tree
 | `tools/font_trim.py` | trims two oversized iOS fonts so the image fits |
 | `prebuilt/userland/` | our programs and libraries, built — used when there is no cross toolchain |
 
-## Building the images
+## 3. Building the images
 
 ```sh
 ios165/fetch.sh               # once
@@ -45,16 +47,12 @@ REST=1 userland/build.sh      # -> userland/root.apfs, userland/system.apfs
 GL=1 REST=1 userland/build.sh # with OpenGL ES (Mesa) for the window server; on the phone with gpu=1
 ```
 
-Without the cross toolchain (theos + iPhoneOS16.5.sdk, see the kernel repository) the build takes our programs from
-`prebuilt/userland`; with it, it compiles `userland/src`.
+Without the cross toolchain (theos + iPhoneOS16.5.sdk, see the kernel repository) the build takes our programs from `prebuilt/userland`; with it, it compiles `userland/src`.
 
-A job list (`RC_JOBS=file`) is run by our `init`, not by a shell: iOS 16.5's root has no shell, lines are split on
-blanks, there is no quoting and no variable assignment; only `>> FILE` and a trailing `&` are understood.
+A job list (`RC_JOBS=file`) is run by our `init`, not by a shell: iOS 16.5's root has no shell, lines are split on blanks, there is no quoting and no variable assignment; only `>> FILE` and a trailing `&` are understood.
 
-## Licenses
+## 4. Licenses
 
-Our code in this repository is released under the [MIT License](LICENSE). Mesa (MIT) is not in the
-repository: `tools/mk-mesa.sh` fetches release 25.0.7, `tools/mesa/*.patch` are our changes to it. apfsprogs
-(GPL-2.0) is not in the repository either: `tools/apfs/check-image.sh` fetches and builds only `apfsck`.
+Our code in this repository is released under the [MIT License](LICENSE). Mesa (MIT) is not in the repository: `tools/mk-mesa.sh` fetches release 25.0.7, `tools/mesa/*.patch` are our changes to it. apfsprogs (GPL-2.0) is not in the repository either: `tools/apfs/check-image.sh` fetches and builds only `apfsck`.
 
 OOSEX GANG — [t.me/oosexgangdevs](https://t.me/oosexgangdevs)
