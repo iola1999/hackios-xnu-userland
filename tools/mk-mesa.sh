@@ -166,8 +166,9 @@ if [ "${AIR:-}" = 1 ]; then
 	echo "mk-mesa.sh: $B/out/libredwoodair.dylib ($(stat -c %s out/libredwoodair.dylib) bytes," \
 		"$(llvm-nm -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions)"
 	# what this library was built from, so userland/build.sh can tell that it is older than the
-	# sources and come back here instead of shipping it beside a driver that disagrees with it
-	cat "$ROOT"/tools/mesa/air/* | sha256sum > out/built-from-air
+	# sources and come back here instead of shipping it beside a driver that disagrees with it;
+	# byte order (LC_ALL=C), no locale collation -- see the note on built-from below
+	find "$ROOT"/tools/mesa/air -maxdepth 1 -type f -print | LC_ALL=C sort | xargs cat | sha256sum > out/built-from-air
 fi
 
 llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
@@ -177,7 +178,17 @@ llvm-nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > 
 glxml=mesa-$VERSION/src/mapi/glapi/registry/gl.xml
 [ -f "$glxml" ] || glxml=mesa-$VERSION/src/mesa/glapi/glapi/registry/gl.xml
 cp "$glxml" out/gl.xml
-# (userland/build.sh comes here again when this no longer matches)
-cat "$ROOT"/tools/mesa/*.patch "$ROOT"/tools/mesa/redwood-drm/* | sha256sum > out/built-from
+# what this library was built from, so userland/build.sh can tell that it is older than the
+# sources and come back here instead of shipping it beside a driver that disagrees with it.
+# Hashed in byte order (LC_ALL=C) and NOT by a glob: the locale collation of the shell that runs
+# this decided the old hash, so the same tree gave different stamps on a macOS host and in the
+# container, and 23 October lost a build to that. The list also covers the rebase layer and names
+# the baseline, so a rebuild of another VERSION cannot leave the previous stamp standing.
+# userland/build.sh computes the same expression -- both sides here and there, or not at all.
+{ { find "$ROOT"/tools/mesa -maxdepth 1 -type f -name '*.patch' -print
+	[ "$REBASE" = 26 ] && find "$ROOT"/tools/mesa/rebase-26 -maxdepth 1 -type f -name '*.patch' -print
+	find "$ROOT"/tools/mesa/redwood-drm -maxdepth 1 -type f -print; } |
+	LC_ALL=C sort | xargs cat
+	echo "mesa-$VERSION REBASE=$REBASE"; } | sha256sum > out/built-from
 echo "mk-mesa.sh: Mesa $VERSION ($DRIVERS): $B/out/libOSMesa.8.dylib, $(stat -c %s out/libOSMesa.8.dylib) bytes," \
 	"$(wc -l < out/exported-gl.txt) gl* functions"
