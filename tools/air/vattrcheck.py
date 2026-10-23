@@ -46,6 +46,13 @@ machine that draws with a translated vertex shader, and the contract the Metal
 driver uses carries no vertex layout at all yet (docs/air.md, docs/metal.md
 10.18). What a fetched attribute is worth is a question for the phone.
 
+On 26.x the fetch table itself prints SKIPPED, the same downgrade as in
+discardcheck.py: upstream deleted the standalone `ir3_cmdline` (986530d231,
+25.3+) and the compiler is libgallium-internal now, so there is no offline
+tool left to read the input table. Everything above except the table is still
+checked, and the table is what the phone prints
+(docs/analysis/mesa-rebase-2026-10.md 10.3).
+
 usage: vattrcheck.py [-v]
 """
 import argparse
@@ -429,6 +436,10 @@ def check(ll, want, work, n, verbose):
                            "is what would feed it" % (a["index"], dl, want_dl))
         want_dl += 1
 
+    if not os.path.exists(IR3):
+        return True, ("interface, driver_location and read masks are as expected; the VFD "
+                      "fetch table is SKIPPED (26.x has no offline compiler; the phone "
+                      "would show ir3's input table)")
     ir3, err = ir3_inputs(bc, verbose)
     if err:
         return False, err
@@ -563,10 +574,13 @@ def main():
                     help="print the NIR and the Adreno instructions of each case")
     args = ap.parse_args()
 
-    for prog in (AIR2NIR, IR3):
+    for prog in (AIR2NIR,):
         if not os.path.exists(prog):
             print("vattrcheck: run tools/air/mk-host.sh first (%s)" % prog, file=sys.stderr)
             return 2
+    if not os.path.exists(IR3):
+        print("vattrcheck: no offline ir3 compiler at %s: 26.x deleted ir3_cmdline, so "
+              "the fetch-table half of each case will read SKIPPED" % IR3, file=sys.stderr)
 
     ok = 0
     with tempfile.TemporaryDirectory(prefix="vattrcheck") as work:
