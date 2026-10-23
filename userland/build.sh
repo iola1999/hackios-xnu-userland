@@ -332,17 +332,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# and the stamp below says so: pinning VERSION/REBASE into it is what stops a rebuild this
 			# branch starts from coming out as a 25.x library beside a 26.x air frontend.
 			MESA_BUILD="REBASE=26 VERSION=26.2.5 SHA256=794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5"
-			# LC_ALL=C: the file list is hashed in byte order, not in the locale's collation -- a
-			# 23 October check on macOS (en_US.UTF-8) read this contract as changed when it was not
-			# (bash sorts `air2nir.c` before `air_bitcode.c`, GNU sort puts the underscore first),
-			# and a false positive here means a 9-minute Mesa build nobody asked for.
-			# The list covers tools/mesa/rebase-26/ too and names the baseline, because those patches
-			# and that VERSION do change the library while the old list could not see either.
-			MESA_FROM=$({ { find ../tools/mesa -maxdepth 1 -type f -name '*.patch' -print
-					find ../tools/mesa/rebase-26 -maxdepth 1 -type f -name '*.patch' -print
-					find ../tools/mesa/redwood-drm -maxdepth 1 -type f -print; } |
-					LC_ALL=C sort | xargs cat
-				echo "mesa-26.2.5 REBASE=26"; } | sha256sum)
+			# both stamps are computed by tools/mesa-stamp.sh, the same file mk-mesa.sh writes them
+			# with -- one text on both sides, so a drift is not possible. Why the list covers the
+			# rebase layer, names the baseline and sorts in byte order is written down there.
+			. ../tools/mesa-stamp.sh
+			MESA_FROM=$(mesa_from_stamp .. 26.2.5 26)
 			[ "$(cat $M/built-from 2>/dev/null)" = "$MESA_FROM" ] || env $MESA_BUILD ../tools/mk-mesa.sh
 			# ... and the compiler library separately, because the hash above covers the PATCHES
 			# and the library is built from tools/mesa/air/, which they do not mention. Two boots
@@ -351,7 +345,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# contract warns about, and nothing in it said so. Silence is what made it expensive:
 			# the library is stripped, so the driver found the symbols it wanted and read a stride
 			# where a pixel format was.
-			[ "$(cat $M/built-from-air 2>/dev/null)" = "$(find ../tools/mesa/air -maxdepth 1 -type f | LC_ALL=C sort | xargs cat | sha256sum)" ] || {
+			[ "$(cat $M/built-from-air 2>/dev/null)" = "$(mesa_air_stamp ..)" ] || {
 				echo "build.sh: tools/mesa/air/ has changed since libredwoodair.dylib was built"
 				env AIR=1 $MESA_BUILD ../tools/mk-mesa.sh
 			}

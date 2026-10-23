@@ -48,6 +48,23 @@ for command in ET.parse(xml_path).getroot().iter('command'):
 exported = set(open(exported_path).read().split())
 by_hand = set(re.findall(r'^my_(gl\w+)\(', open(source_path).read(), re.M))
 
+# The guard. A function written by hand that the scan does not find does not fail the build: it
+# silently becomes a generated pass-on or a missing-entry stub, which is what a split of eagl.c
+# that forgets to extend this scan list (argv[4], ONE file) produces. Both floors were measured
+# on 25 October against the tree as it stood -- 30 hand-written functions in src/eagl.c, 409
+# slot entries in src/eagl_slots.txt -- and a legitimate change moves a floor in the same commit
+# that changes the file, deliberately, never as a surprise at build time.
+BY_HAND_MIN = 30
+SLOTS_MIN = 409
+if len(slots) < SLOTS_MIN:
+    sys.exit('mkeagl.py: %d slot entries in %s, below the floor of %d -- truncated file?'
+             % (len(slots), slots_path, SLOTS_MIN))
+if len(by_hand) < BY_HAND_MIN:
+    sys.exit('mkeagl.py: only %d of the %d functions written by hand were found in %s -- the rest '
+             'would become generated pass-ons; extend the scan list (docs/analysis/'
+             'linecount-audit-userland-2026-10.md) if the file was split'
+             % (len(by_hand), BY_HAND_MIN, source_path))
+
 def trace_format(ctype):
     if '*' in ctype or ctype in ('GLsync', 'GLeglImageOES', 'GLDEBUGPROC', 'GLDEBUGPROCKHR'):
         return '%p'

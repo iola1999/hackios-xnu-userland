@@ -57,6 +57,9 @@ SHA256=${SHA256:-592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a
 REBASE=${REBASE:-}
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 source "$ROOT/xnu-env.sh"
+# the stamp expressions in the one text build.sh sources too: what is written here is read there,
+# so the pair cannot drift into "a rebuild every build" or "a stale library shipped quietly"
+source "$ROOT/tools/mesa-stamp.sh"
 B=$ROOT/xnu-deps/build/mesa
 SDK=$THEOS/sdks/iPhoneOS16.5.sdk
 CC=$ROOT/xnu-deps/host/bin/xnu-clang
@@ -72,6 +75,16 @@ LD64=$ROOT/xnu-deps/host/bin/ld64
 # never on the PATH of the old containers, so resolve it rather than assume it
 INTOOL=$THEOS/toolchain/linux/iphone/bin/install_name_tool
 [ -x "$INTOOL" ] || INTOOL=install_name_tool
+# the install name a dylib actually carries, read back out of it: install_name_tool can exit 0 on
+# a file it did not fix the way the device needs, and the id is only checked by dyld on the
+# device -- which is the most expensive place. llvm-objdump is the container's, otool macOS'.
+dylib_id() {
+	if command -v llvm-objdump >/dev/null 2>&1; then
+		llvm-objdump --macho --private-headers "$1" | awk '/LC_ID_DYLIB/{id=1} id && $1=="name"{print $2; exit}'
+	else
+		otool -D "$1" | sed -n 2p
+	fi
+}
 mkdir -p "$B/out"
 cd "$B"
 
@@ -80,7 +93,10 @@ cd "$B"
 # the rest): the sources are taken from the archive again and everything is built anew, about a minute.
 REBASE_PATCHES=""
 if [ "$REBASE" = 26 ]; then REBASE_PATCHES="$ROOT"/tools/mesa/rebase-26/*.patch; fi
-PATCHES=$(cat "$ROOT"/tools/mesa/*.patch $REBASE_PATCHES | sha256sum | cut -d' ' -f1)
+# LC_ALL=C inside the substitution, before the globs expand: a shell sorts a glob in the locale's
+# collation, the same 23 October trap the stamp hashed around -- only here it decides
+# .redwood-patches, and a host/container disagreement costs an unpack and re-patch of the tree.
+PATCHES=$(LC_ALL=C; export LC_ALL; cat "$ROOT"/tools/mesa/*.patch $REBASE_PATCHES | sha256sum | cut -d' ' -f1)
 if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
@@ -163,32 +179,54 @@ if [ "${AIR:-}" = 1 ]; then
 	ninja -C $BUILD src/gallium/drivers/freedreno/libredwoodair.dylib >> ninja.log
 	llvm-strip -x -o out/libredwoodair.dylib $BUILD/src/gallium/drivers/freedreno/libredwoodair.dylib
 	"$INTOOL" -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
+	# the interface the driver calls, kept as a manifest beside the library: the count printed
+	# here used to be allowed to be 0 (a strip that took rwa_* with it, or a meson that stopped
+	# building the sources, left a green build and a driver that dlopens a library it cannot
+	# call), and the 31 of docs/analysis/mesa-rebase-2026-10.md 9 is a ledger, not an assertion --
+	# so the list itself lands in out/exports-rwa.txt, its hash beside the size in the echo.
+	llvm-nm -gU out/libredwoodair.dylib | awk '{ print $NF }' | LC_ALL=C sort > out/exports-rwa.txt
+	RWA=$(grep -c '^_rwa_' out/exports-rwa.txt)
+	[ "$RWA" -gt 0 ] || { echo "mk-mesa.sh: libredwoodair.dylib exports no rwa_* at all: the interface of tools/mesa/air/air_metal.h is not in the library"; exit 1; }
+	[ "$(dylib_id out/libredwoodair.dylib)" = /redwood/lib/libredwoodair.dylib ] || {
+		echo "mk-mesa.sh: libredwoodair.dylib does not carry the install name /redwood/lib/libredwoodair.dylib"; exit 1; }
 	echo "mk-mesa.sh: $B/out/libredwoodair.dylib ($(stat -c %s out/libredwoodair.dylib) bytes," \
-		"$(llvm-nm -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions)"
+		"$RWA rwa_* functions, interface $(sha256sum < out/exports-rwa.txt | cut -d' ' -f1))"
 	# what this library was built from, so userland/build.sh can tell that it is older than the
 	# sources and come back here instead of shipping it beside a driver that disagrees with it;
-	# byte order (LC_ALL=C), no locale collation -- see the note on built-from below
-	find "$ROOT"/tools/mesa/air -maxdepth 1 -type f -print | LC_ALL=C sort | xargs cat | sha256sum > out/built-from-air
+	# the expression and the byte-order sort are in tools/mesa-stamp.sh, the one text build.sh
+	# computes the comparison value from. Written after the two assertions: a failed check leaves
+	# the old stamp, and a build.sh that comes back here does not find a green pair.
+	mesa_air_stamp "$ROOT" > out/built-from-air
 fi
 
 llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
 "$INTOOL" -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
+[ "$(dylib_id out/libOSMesa.8.dylib)" = /redwood/lib/libOSMesa.8.dylib ] || {
+	echo "mk-mesa.sh: libOSMesa.8.dylib does not carry the install name /redwood/lib/libOSMesa.8.dylib"; exit 1; }
 llvm-nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
+# mkeagl.py consumes this list next and the whole table of eagl_gen.h is only as good as it is:
+# an empty one is a library exporting no gl* at all, and one without glDrawArrays is a build of
+# the wrong target -- either way, stop here rather than in front of CoreAnimation on the device.
+[ -s out/exported-gl.txt ] || { echo "mk-mesa.sh: exported-gl.txt is empty: the library exports no gl* at all"; exit 1; }
+grep -qx glDrawArrays out/exported-gl.txt || { echo "mk-mesa.sh: exported-gl.txt has no glDrawArrays: this is not an OpenGL ES 2 library"; exit 1; }
 # 26.x moved the Khronos registry inside the tree (src/mapi/glapi/registry, then src/mesa/glapi/glapi/registry)
 glxml=mesa-$VERSION/src/mapi/glapi/registry/gl.xml
 [ -f "$glxml" ] || glxml=mesa-$VERSION/src/mesa/glapi/glapi/registry/gl.xml
 cp "$glxml" out/gl.xml
+# what fell off the tolerant 26.x patching: `|| [ "$REBASE" = 26 ]` above lets a hunk fail or skip,
+# and the only trace is a .rej in the unpacked tree, which the next rm -rf buries. Collected here
+# so the drift is a file read beside the library instead of an argument nobody kept -- recorded,
+# never fatal, because 26.x is expected to carry some (tools/mesa/rebase-26/README.md). Only the
+# suffixes GNU patch itself writes: an earlier form also collected *.frag and caught two of
+# Mesa's own shader files (src/tool/gamma, src/vulkan/overlay-layer) for it.
+{ echo "# mesa-$VERSION, patches $PATCHES"
+	find mesa-$VERSION \( -name '*.rej' -o -name '*.orig' \) -type f -print | LC_ALL=C sort
+} > out/patch-survey.txt
 # what this library was built from, so userland/build.sh can tell that it is older than the
-# sources and come back here instead of shipping it beside a driver that disagrees with it.
-# Hashed in byte order (LC_ALL=C) and NOT by a glob: the locale collation of the shell that runs
-# this decided the old hash, so the same tree gave different stamps on a macOS host and in the
-# container, and 23 October lost a build to that. The list also covers the rebase layer and names
-# the baseline, so a rebuild of another VERSION cannot leave the previous stamp standing.
-# userland/build.sh computes the same expression -- both sides here and there, or not at all.
-{ { find "$ROOT"/tools/mesa -maxdepth 1 -type f -name '*.patch' -print
-	[ "$REBASE" = 26 ] && find "$ROOT"/tools/mesa/rebase-26 -maxdepth 1 -type f -name '*.patch' -print
-	find "$ROOT"/tools/mesa/redwood-drm -maxdepth 1 -type f -print; } |
-	LC_ALL=C sort | xargs cat
-	echo "mesa-$VERSION REBASE=$REBASE"; } | sha256sum > out/built-from
+# sources and come back here instead of shipping it beside a driver that disagrees with it. The
+# expression, the byte-order sort and why they are that way are in tools/mesa-stamp.sh, which
+# build.sh sources to compute the value this file is compared against. Written last, as always:
+# the stamp is what says a successful build happened.
+mesa_from_stamp "$ROOT" "$VERSION" "$REBASE" > out/built-from
 echo "mk-mesa.sh: Mesa $VERSION ($DRIVERS): $B/out/libOSMesa.8.dylib, $(stat -c %s out/libOSMesa.8.dylib) bytes," \
 	"$(wc -l < out/exported-gl.txt) gl* functions"
