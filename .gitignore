@@ -12,6 +12,7 @@
 !/docs/
 
 __pycache__/
+.DS_Store
 *~
 *.orig
 *.rej
@@ -46,3 +47,14 @@ __pycache__/
 !/ios165/fetch.sh
 !/ios165/*.py
 !/firmware-gen8/
+/firmware-gen8/*
+!/firmware-gen8/README.md
+!/firmware-gen8/SHA256SUMS
+!/firmware-gen8/LICENSE.qcom.txt
+!/firmware-gen8/NOTICE.qcom.txt
+!/firmware-gen8/gen80000-manifest.json
+!/firmware-gen8/gen80000_*.fw
+!/firmware-gen8/gen80000_gmu.bin
+!/firmware-gen8/gen80000_zap.mbn
+!/firmware-gen8/gen80200_*.fw
+!/firmware-gen8/gen80200_gmu.bin
