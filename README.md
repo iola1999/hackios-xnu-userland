@@ -2,7 +2,7 @@
 
 > **REDMI K90 移植分支：`k90-port`。** 本仓库基于 [OOSEX GANG 的原用户态仓库](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史并维护本项目的用户态和构建修改。感谢原作者及贡献者开放 init、注入库、APFS 镜像工具和图形适配；本项目沿用这些实现开展 K90 移植。
 
-[顶层工作区](https://github.com/iola1999/hackios-k90-port)保存计划、实测和子模块版本，[K90 内核仓库](https://github.com/iola1999/hackios-xnu-kernel/tree/k90-port)维护 XNU、loader 与固件相关修改，本仓库维护用户态及镜像工具。两个代码仓库使用 `k90-port` 分支，GitHub 的 fork 关联尚未建立。原许可证和版权声明保留；K90 的验证范围以顶层工作区文档为准。
+[顶层工作区](https://github.com/iola1999/hackios-k90-port)保存计划、实测和子模块版本，[K90 内核仓库](https://github.com/iola1999/hackios-xnu-kernel/tree/k90-port)维护 XNU、loader 与固件相关修改，本仓库维护用户态及镜像工具。两个代码仓库均已建立与对应上游的 GitHub fork 关系，默认分支均为 `k90-port`。原许可证和版权声明保留；K90 的验证范围以顶层工作区文档为准。
 
 K90 构建使用对应内核仓库的 `k90-port`，运行 `common/setup.sh` 时显式指定 `USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port`。userland 会作为 `.userland.git` 管理的 overlay 放入 kernel 工作树；下文的上游获取方式保留其原始来源。
 
