@@ -44,8 +44,14 @@
 # the build without it. To tell whether a patch is in a build, read the source in
 # xnu-deps/build/mesa/mesa-$VERSION, which is where this script unpacks and patches it.
 set -e
-VERSION=25.0.7
-SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
+VERSION=${VERSION:-25.0.7}
+SHA256=${SHA256:-592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6}
+# The 26.x experiment baseline (docs/analysis/mesa-rebase-2026-10.md section 6): the fork's patches survive
+# 26.2.5 with an adaptation layer, so the trial runs as
+#   VERSION=26.2.5 SHA256=794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5 REBASE=26 tools/mk-mesa.sh
+# REBASE=26 lays tools/mesa/rebase-26/*.patch over the rest -- a subdirectory, so the glob below misses it
+# on purpose: the layer only belongs on 26.x, never on 25.0.7.
+REBASE=${REBASE:-}
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 source "$ROOT/xnu-env.sh"
 B=$ROOT/xnu-deps/build/mesa
@@ -57,13 +63,16 @@ cd "$B"
 # The sources are the archive's with tools/mesa/*.patch on top. When the patches change, a tree that was
 # patched with the earlier ones is of no use (and builds without a word into a library that does not match
 # the rest): the sources are taken from the archive again and everything is built anew, about a minute.
-PATCHES=$(cat "$ROOT"/tools/mesa/*.patch | sha256sum | cut -d' ' -f1)
+REBASE_PATCHES=""
+if [ "$REBASE" = 26 ]; then REBASE_PATCHES="$ROOT"/tools/mesa/rebase-26/*.patch; fi
+PATCHES=$(cat "$ROOT"/tools/mesa/*.patch $REBASE_PATCHES | sha256sum | cut -d' ' -f1)
 if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf mesa-$VERSION build-*
 	tar xJf mesa-$VERSION.tar.xz
 	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done
+	if [ "$REBASE" = 26 ]; then for p in "$ROOT"/tools/mesa/rebase-26/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done; fi
 	echo "$PATCHES" > mesa-$VERSION/.redwood-patches
 fi
 # ours, kept in the repository: always the current ones
