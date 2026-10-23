@@ -44,3 +44,4 @@ __pycache__/
 /ios165/*
 !/ios165/fetch.sh
 !/ios165/*.py
+!/firmware-gen8/
