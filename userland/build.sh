@@ -42,7 +42,8 @@
 #                                   air_run grew --buffer.
 #                      GL=1         with an OpenGL ES implementation for the window server: Mesa
 #                                   (tools/mk-mesa.sh fetches and builds it) behind src/eagl.c, as
-#                                   lib/libOSMesa.8.dylib (15 MB) and lib/libredwood-gl.dylib. Where the
+#                                   lib/libOSMesa.8.dylib (19 MB, Mesa 26.2.5 + rebase layer; see
+#                                   docs/analysis/mesa-rebase-2026-10.md 9) and lib/libredwood-gl.dylib. Where the
 #                                   kernel has started the phone's GPU, CoreAnimation then draws with its
 #                                   OpenGL ES renderer, by that GPU (boot-arg gpu=1); anywhere else -- QEMU,
 #                                   no boot-arg, no firmware in ../fw-gpu -- the library is not even loaded
@@ -327,8 +328,16 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
 			M=../xnu-deps/build/mesa/out
-			[ "$(cat $M/built-from 2>/dev/null)" = "$(cat ../tools/mesa/*.patch ../tools/mesa/redwood-drm/* | sha256sum)" ] ||
-				../tools/mk-mesa.sh
+			# The baseline is 26.2.5 with the rebase layer (docs/analysis/mesa-rebase-2026-10.md 6 and 9),
+			# and the stamp below says so: pinning VERSION/REBASE into it is what stops a rebuild this
+			# branch starts from coming out as a 25.x library beside a 26.x air frontend.
+			MESA_BUILD="REBASE=26 VERSION=26.2.5 SHA256=794b3d1729075dae7ebd47c7283b7ca0cdb5dec668f7f11cc0a5d82f6138a0a5"
+			# both stamps are computed by tools/mesa-stamp.sh, the same file mk-mesa.sh writes them
+			# with -- one text on both sides, so a drift is not possible. Why the list covers the
+			# rebase layer, names the baseline and sorts in byte order is written down there.
+			. ../tools/mesa-stamp.sh
+			MESA_FROM=$(mesa_from_stamp .. 26.2.5 26)
+			[ "$(cat $M/built-from 2>/dev/null)" = "$MESA_FROM" ] || env $MESA_BUILD ../tools/mk-mesa.sh
 			# ... and the compiler library separately, because the hash above covers the PATCHES
 			# and the library is built from tools/mesa/air/, which they do not mention. Two boots
 			# of 22 October carried a libredwoodair.dylib three hours older than the driver beside
@@ -336,9 +345,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			# contract warns about, and nothing in it said so. Silence is what made it expensive:
 			# the library is stripped, so the driver found the symbols it wanted and read a stride
 			# where a pixel format was.
-			[ "$(cat $M/built-from-air 2>/dev/null)" = "$(cat ../tools/mesa/air/* | sha256sum)" ] || {
+			[ "$(cat $M/built-from-air 2>/dev/null)" = "$(mesa_air_stamp ..)" ] || {
 				echo "build.sh: tools/mesa/air/ has changed since libredwoodair.dylib was built"
-				AIR=1 ../tools/mk-mesa.sh
+				env AIR=1 $MESA_BUILD ../tools/mk-mesa.sh
 			}
 			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
@@ -362,7 +371,10 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		fi
 	fi
 	# (drawable_test is built in the same block as surf_test, so it is copied with it)
-	cp obj/hello_dyn obj/svc_test obj/surf_test obj/drawable_test obj/rwtouch obj/mg_test root/bin/
+	# (prebuilt/userland does not ship every program -- e.g. drawable_test -- so copy what is there)
+	for t in hello_dyn svc_test surf_test drawable_test rwtouch mg_test; do
+		if [ -f obj/$t ]; then cp obj/$t root/bin/; fi
+	done
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cow_test ] && cp obj/cow_test root/bin/
 	[ -f obj/cg_test ] && cp obj/cg_test root/bin/
@@ -491,9 +503,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
 	# points back into /var); point them at the data that ships with the system, and use this machine's zone
-	zone=$(timedatectl show -p Timezone --value 2>/dev/null); zone=${zone:-UTC}
-	sed -i -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
-		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel
+	zone=$( { timedatectl show -p Timezone --value 2>/dev/null || readlink /etc/localtime 2>/dev/null | sed -E 's|.*/zoneinfo/||'; } || true ); zone=${zone:-UTC}
+	tmp=$(mktemp) && sed -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \
+		-e "s|^l\t/var/db/timezone/zoneinfo/[^\t]*\t/private/var/db/timezone/localtime\$|l\t/var/db/timezone/zoneinfo/$zone\t/private/var/db/timezone/localtime|" root/etc/var.skel >"$tmp" && cat "$tmp" >root/etc/var.skel && rm -f "$tmp"
 	# ... and the files of ours it puts there (var/): those under mobile/ belong to the user mobile
 	cp -r var root/var
 	(cd var && find . -type f | sed 's|^\./||' | sort) | while read -r f; do

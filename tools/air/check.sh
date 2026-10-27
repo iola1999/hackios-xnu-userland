@@ -90,6 +90,11 @@ grep -a -E '^(WRONG|REFUSED|NOCASE|ASIDE|refused|approx|unread) ' "$WORK/intrin.
 grep -a '^intrincheck:' "$WORK/intrin.log" || :
 
 echo
+echo "== fast, strict and contract-only FMA lowering"
+ffma_rc=0
+python3 "$ROOT/tools/air/ffma_contractcheck.py" || ffma_rc=$?
+
+echo
 echo "== the same operations run, not folded"
 # A different check and not a slower one: folding asks NIR's constant
 # expression, this builds the arguments into a buffer so nothing can be folded
@@ -326,6 +331,6 @@ echo "== the kernels the driver ran on the phone, against softpipe here"
 IOS="$IOS" python3 "$ROOT/tools/air/metalcheck.py" --newest 2>&1 | tail -28
 metal_rc=${PIPESTATUS[0]}
 
-exit $((reader_rc | cpu_rc | intrin_rc | run_rc | atomic_rc | texop_rc | samp_rc \
+exit $((reader_rc | cpu_rc | intrin_rc | ffma_rc | run_rc | atomic_rc | texop_rc | samp_rc \
 	| pixfmt_rc | blend_rc | lowering_rc | fbfetch_rc | vattr_rc | argbuf_rc \
 	| argbufrun_rc | lib_rc | metal_rc))

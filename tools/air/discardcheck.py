@@ -13,18 +13,28 @@ What is decidable on this machine, and is checked below:
 
   - the module translates, and the NIR carries `demote` -- not `terminate`,
     which is the whole of the judgement, and not nothing, which is what a
-    dropped intrinsic would leave;
+    dropped intrinsic would leave. air2nir prints the NIR it produced when
+    run with no mode flag, which is what this reads now; before the rebase
+    to 26.x the reading came from ir3_cmdline, which printed the NIR it was
+    given on the way, and was the only other NIR printer in the build;
   - nir_shader_info.fs.uses_discard is set. The frontend sets it by hand
     because nir_shader_gather_info does not run on this path, and it is not
     bookkeeping: nir_to_tgsi_info turns it into `uses_kill`, which is what a
     Gallium driver reads before it allows an early depth test. It is checked
     here THROUGH air_run, which refuses a discarding shader by name and can
     only do so if the flag arrived;
-  - ir3 compiles it, and what the Adreno instruction is. It is `kill`, for
-    both kinds: the a6xx encoder maps DEMOTE onto KILL
-    (src/freedreno/isa/encode.c) and the ISA description has no demote bitset
-    at all, so the distinction this frontend makes in NIR does not survive
-    into the machine code on this GPU.
+  - ir3 compiles it, and what the Adreno instruction is -- but only on a
+    host that still has an offline compiler. 25.0.7 had one, ir3_cmdline,
+    and on it this was a third checkable fact: the a6xx encoder maps DEMOTE
+    onto KILL and the a6xx ISA has no demote bitset at all, so the
+    distinction this frontend makes in NIR did not survive into the machine
+    code. Upstream deleted ir3_cmdline (986530d231, 25.3+) and 26.x left no
+    equivalent entry -- the compiler is libgallium-internal now, behind a
+    screen -- so on a 26.x host this line reads SKIPPED and the instruction
+    shape joins the phone side below. Nor was it ever settled text: 26.x's
+    a8xx compiler emits `ir3_DEMOTE` as its own instruction
+    (ir3_compiler_nir.c), so "kill for both kinds" was an a6xx answer, and
+    what the 7c+ Gen 3 emits is a question for the phone either way.
 
 What is NOT decidable here, and is emitted for the phone instead:
 
@@ -206,11 +216,12 @@ def shape(verbose):
             bad += 1
             continue
 
-        # 2. the NIR carries demote and not terminate. ir3_compiler prints the
-        #    NIR it was given, which is the only NIR printer in this build.
-        ir3 = subprocess.run([IR3, "--chip-id", CHIP_ID, "-v", bc, case["id"]],
-                             capture_output=True, text=True)
-        nir = ir3.stdout + ir3.stderr
+        # 2. the NIR carries demote and not terminate. air2nir prints the NIR
+        #    it produced when run with no mode flag; before the rebase to 26.x
+        #    this reading came from ir3_cmdline, which printed the same NIR.
+        printed = subprocess.run([AIR2NIR, bc, case["id"]],
+                                 capture_output=True, text=True)
+        nir = printed.stdout + printed.stderr
         has_demote = re.search(r"@demote\b", nir) is not None
         has_terminate = re.search(r"@terminate\b", nir) is not None
         if not has_demote or has_terminate:
@@ -219,14 +230,25 @@ def shape(verbose):
             bad += 1
             continue
 
-        # 3. ir3 compiled it, and what the instruction is
-        if ir3.returncode != 0:
-            print("WRONG   %-14s ir3 refused it: %s"
-                  % (case["id"], (ir3.stderr or ir3.stdout).strip()[-120:]))
-            bad += 1
-            continue
-        kills = len(re.findall(r"^\s*kill ", nir, re.M))
-        demotes = len(re.findall(r"^\s*demote ", nir, re.M))
+        # 3. ir3 compiled it, and what the instruction is -- on the host that
+        #    still has ir3_cmdline. 26.x has no offline compiler to ask (see
+        #    the header), so without one this line is SKIPPED and the
+        #    instruction shape is left to the phone run at the bottom.
+        if os.path.exists(IR3):
+            ir3 = subprocess.run([IR3, "--chip-id", CHIP_ID, "-v", bc, case["id"]],
+                                 capture_output=True, text=True)
+            if ir3.returncode != 0:
+                print("WRONG   %-14s ir3 refused it: %s"
+                      % (case["id"], (ir3.stderr or ir3.stdout).strip()[-120:]))
+                bad += 1
+                continue
+            code = ir3.stdout + ir3.stderr
+            kills = len(re.findall(r"^\s*kill ", code, re.M))
+            demotes = len(re.findall(r"^\s*demote ", code, re.M))
+            here = "ir3 ok (%d kill, %d demote in the Adreno code)" % (kills, demotes)
+        else:
+            code = ""
+            here = "ir3 SKIPPED (no offline compiler in 26.x; the phone prints the instruction)"
 
         # 4. air_run refuses it by name, which is also how uses_discard is
         #    checked: the refusal reads that flag and nothing else.
@@ -240,11 +262,10 @@ def shape(verbose):
             bad += 1
             continue
 
-        print("shape   %-14s translates, NIR demote, ir3 ok (%d kill, %d demote in the "
-              "Adreno code), air_run refuses it by name"
-              % (case["id"], kills, demotes))
+        print("shape   %-14s translates, NIR demote, %s, air_run refuses it by name"
+              % (case["id"], here))
         if verbose:
-            for line in nir.splitlines():
+            for line in (nir + "\n" + code).splitlines():
                 if re.match(r"^\s*(kill|demote) ", line):
                     print("          %s" % line.strip())
 
@@ -254,11 +275,11 @@ def shape(verbose):
           "DEMOTE case at all (tgsi_exec.c), so what a discarded fragment leaves in the "
           "framebuffer cannot be measured on this machine; `--emit` writes the two "
           "modules and a job list for the phone, which can")
-    print("discardcheck: and the Adreno instruction is `kill` for a demote as for a "
-          "terminate -- src/freedreno/isa/encode.c maps OPC_DEMOTE to OPC_KILL and "
-          "ir3-cat0.xml has no demote bitset -- so the distinction this frontend makes "
-          "in NIR is not in the machine code on this GPU, and whether that costs "
-          "anything is exactly what the phone is being asked")
+    print("discardcheck: and the Adreno instruction is only settled on the phone: a6xx maps "
+          "a demote onto KILL (src/freedreno/isa/encode.c, ir3-cat0.xml has no demote bitset) "
+          "while 26.x's a8xx compiler emits its own ir3_DEMOTE (ir3_compiler_nir.c), so which "
+          "of the two the 7c+ Gen 3 reaches for -- and whether the distinction this frontend "
+          "makes in NIR costs anything there -- is exactly what the phone is being asked")
     return 1 if bad else 0
 
 
@@ -395,11 +416,15 @@ def main(argv):
     if "--check" in argv:
         i = argv.index("--check")
         return check(argv[i + 1], argv[i + 2])
-    for p, what in ((AIR2NIR, "air2nir"), (AIR_RUN, "air_run"), (IR3, "ir3_compiler")):
+    for p, what in ((AIR2NIR, "air2nir"), (AIR_RUN, "air_run")):
         if not os.path.exists(p):
             print("discardcheck: no %s at %s (run tools/air/mk-host.sh)" % (what, p),
                   file=sys.stderr)
             return 1
+    if not os.path.exists(IR3):
+        print("discardcheck: no offline ir3 compiler at %s: 26.x has none, so the "
+              "instruction line reads SKIPPED and --emit is the judge of it" % IR3,
+              file=sys.stderr)
     return shape(verbose)
 
 

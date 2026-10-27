@@ -32,6 +32,11 @@ must be REFUSED rather than silently converted, and an argument marked
 `air.arg_unused`, which must not turn the shader into a framebuffer-fetch
 shader at all.
 
+On 26.x the second item prints SKIPPED: upstream deleted the standalone
+`ir3_cmdline` (986530d231, 25.3+) and left no equivalent -- the compiler is
+libgallium-internal now, behind a screen -- so on that tree the isamm line is
+the phone's (docs/analysis/mesa-rebase-2026-10.md 10.3).
+
 The modules are generated here rather than taken from the corpus, for the
 reason the rest of this directory generates them: a corpus module mixes the
 case with everything else it does, and `path_blit_frag` reads target 2 while
@@ -255,6 +260,10 @@ def check(ll, want, work, n, verbose):
         return False, "the half target is not narrowed with f2f16"
 
     if want.get("isamm"):
+        if not os.path.exists(IR3):
+            return True, ("the NIR fetch, flag and slot are as expected; the isamm "
+                          "instruction is SKIPPED (26.x has no offline compiler; the "
+                          "phone reads the framebuffer and prints the instruction)")
         q = subprocess.run([IR3, "-c", CHIP_ID, bc], capture_output=True)
         asm = q.stdout.decode()
         if verbose:
@@ -276,11 +285,14 @@ def main():
                     help="print the NIR and the Adreno instructions of each case")
     args = ap.parse_args()
 
-    for prog in (AIR2NIR, IR3):
+    for prog in (AIR2NIR,):
         if not os.path.exists(prog):
             print("fbfetchcheck: run tools/air/mk-host.sh first (%s)" % prog,
                   file=sys.stderr)
             return 2
+    if not os.path.exists(IR3):
+        print("fbfetchcheck: no offline ir3 compiler at %s: 26.x deleted ir3_cmdline, "
+              "so the isamm line will read SKIPPED" % IR3, file=sys.stderr)
 
     ok = 0
     with tempfile.TemporaryDirectory(prefix="fbfetchcheck") as work:

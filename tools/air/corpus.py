@@ -10,6 +10,12 @@ through stages, and each module is counted under the first one it fails:
   translate   air_to_nir produced a shader and nir_validate passed
   ir3         ir3 compiled it for the Adreno without error
 
+With --ir3 on a 26.x host the last column is dropped: upstream deleted the
+standalone `ir3_cmdline` (986530d231, 25.3+) and left no equivalent, so the
+table stops at translate and stderr says why -- the same downgrade as the
+SKIPPED line in discardcheck.py, accounted for in
+docs/analysis/mesa-rebase-2026-10.md 10.3.
+
 Nothing here says a shader is correct: that needs the CPU reference and a run
 on the GPU. A module that reaches ir3 has compiled, which is not the same
 thing, and the report never claims otherwise.
@@ -172,8 +178,18 @@ def main():
     if not rows:
         sys.exit("corpus.py: no modules; is %s built?" % AIR2NIR)
     if args.ir3:
-        refuse_if_stale(IR3, "ir3_compiler")
-        run_ir3(rows)
+        if os.path.exists(IR3):
+            refuse_if_stale(IR3, "ir3_compiler")
+            run_ir3(rows)
+        else:
+            # 26.x has no offline compiler: upstream deleted ir3_cmdline (986530d231)
+            # and left no replacement, so the table drops the column instead of
+            # aborting -- the reader and translate columns are still worth reading.
+            # The same shape as the SKIPPED line in discardcheck.py; the phone prints
+            # the instructions (docs/analysis/mesa-rebase-2026-10.md 10.3).
+            print("corpus.py: no offline ir3 compiler at %s: the ir3 column is dropped "
+                  "and the table stops at translate" % IR3, file=sys.stderr)
+            args.ir3 = False
 
     total = len(rows)
     stages = collections.OrderedDict()

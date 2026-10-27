@@ -391,7 +391,7 @@ quad_vertex_shader(const nir_shader_compiler_options *options, unsigned num_vary
  * variables. The same three passes are in tools/mesa/air-ir3.patch; when a
  * fourth place needs them they should become one function of the frontend.
  */
-static int
+static unsigned
 type_size_vec4(const struct glsl_type *type, bool bindless)
 {
    return glsl_count_attribute_slots(type, false);
@@ -976,7 +976,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
          struct pipe_resource *b = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
                                                       PIPE_USAGE_DEFAULT, bytes);
          pipe_buffer_write(pipe, b, 0, bytes, bits);
-         pipe->set_constant_buffer(pipe, PIPE_SHADER_COMPUTE, r->index, false,
+         pipe->set_constant_buffer(pipe, MESA_SHADER_COMPUTE, r->index,
                                    &(struct pipe_constant_buffer){
                                       .buffer = b, .buffer_size = bytes });
       } else if (r->kind == AIR_RESOURCE_DEVICE_BUFFER) {
@@ -1029,7 +1029,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
       if (writable[i])
          mask |= 1u << i;
    }
-   pipe->set_shader_buffers(pipe, PIPE_SHADER_COMPUTE, 0, num_ssbo, sb, mask);
+   pipe->set_shader_buffers(pipe, MESA_SHADER_COMPUTE, 0, num_ssbo, sb, mask);
 
    /* The images, one resource each, with the format the kernel's own intrinsics
     * declare. A readable one is filled with the same texel pattern the draw
@@ -1098,7 +1098,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
       };
    }
    if (num_img)
-      pipe->set_shader_images(pipe, PIPE_SHADER_COMPUTE, 0, num_img, 0, ivs);
+      pipe->set_shader_images(pipe, MESA_SHADER_COMPUTE, 0, num_img, 0, ivs);
 
    /* and the read-only textures, as sampler views with the same texel pattern */
    enum pipe_format tfmt[MAX_IMG];
@@ -1181,8 +1181,8 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
          if (own)
             print_own_sampler(i, own, compare_slot[i]);
       }
-      pipe->bind_sampler_states(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, csamplers);
-      pipe->set_sampler_views(pipe, PIPE_SHADER_COMPUTE, 0, num_tex, 0, false, views);
+      pipe->bind_sampler_states(pipe, MESA_SHADER_COMPUTE, 0, num_tex, csamplers);
+      pipe->set_sampler_views(pipe, MESA_SHADER_COMPUTE, 0, num_tex, 0, views);
    }
 
    void *cso = pipe->create_compute_state(pipe, &(struct pipe_compute_state){
@@ -1458,8 +1458,12 @@ main(int argc, char **argv)
          static driOptionCache info, cache;
          static struct pipe_screen_config config;
 
+         const driConfigFileParseParams params = {
+            .screenNum = 0,
+            .driverName = "msm",
+         };
          driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
-         driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+         driParseConfigFiles(&cache, &info, &params);
          config.options = &cache;
          config.options_info = &info;
 
@@ -1479,8 +1483,10 @@ main(int argc, char **argv)
    }
    printf("air_run: %s on %s (%s)\n", name, screen->get_name(screen), how);
 
-   const void *options =
-      screen->get_compiler_options(screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_FRAGMENT);
+   /* 26.x filled these into a table on the screen at its creation instead of
+    * answering a call, with a null entry for a stage it has no NIR for -- which is
+    * exactly what the check below reads as "no NIR here". */
+   const void *options = screen->nir_options[MESA_SHADER_FRAGMENT];
    if (!options) {
       fprintf(stderr, "air_run: this screen takes no NIR\n");
       return 1;
@@ -1503,7 +1509,7 @@ main(int argc, char **argv)
       return dispatch_kernel(screen, &info, fs, name, how);
    if (info.stage != MESA_SHADER_FRAGMENT) {
       fprintf(stderr, "air_run: %s is a %s shader; only fragment shaders are drawn here\n",
-              name, gl_shader_stage_name(info.stage));
+              name, _mesa_shader_stage_to_string(info.stage));
       return 1;
    }
    /* The render target's format follows the shader's own output type. A Metal
@@ -1715,8 +1721,12 @@ main(int argc, char **argv)
    };
    for (unsigned i = 0; i < num_rt; i++) {
       struct pipe_resource *res = screen->resource_create(screen, &templ);
-      fb.cbufs[i] = pipe->create_surface(pipe, res,
-         &(struct pipe_surface){ .format = templ.format });
+      /* A surface is data the caller owns now: it is filled here, handed to the
+       * context by value below, and its one reference -- the texture -- is this
+       * loop's to keep, which is why the resource is never released either: the
+       * framebuffer is dropped when the process ends. */
+      pipe_surface_init(pipe, &fb.cbufs[i], res, 0, 0);
+      fb.cbufs[i].format = templ.format;
       if (i == read_rt)
          target = res;
    }
@@ -1763,7 +1773,7 @@ main(int argc, char **argv)
       struct pipe_resource *buf = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
                                                      PIPE_USAGE_DEFAULT, bytes);
       pipe_buffer_write(pipe, buf, 0, bytes, bits);
-      pipe->set_constant_buffer(pipe, PIPE_SHADER_FRAGMENT, r->index, false,
+      pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, r->index,
                                 &(struct pipe_constant_buffer){
                                    .buffer = buf, .buffer_size = bytes,
                                 });
@@ -1959,8 +1969,8 @@ main(int argc, char **argv)
          if (own)
             print_own_sampler(i, own, compare_slot[i]);
       }
-      pipe->set_sampler_views(pipe, PIPE_SHADER_FRAGMENT, 0, num_tex, 0, false, views);
-      pipe->bind_sampler_states(pipe, PIPE_SHADER_FRAGMENT, 0, num_tex, samplers);
+      pipe->set_sampler_views(pipe, MESA_SHADER_FRAGMENT, 0, num_tex, 0, views);
+      pipe->bind_sampler_states(pipe, MESA_SHADER_FRAGMENT, 0, num_tex, samplers);
 
       float want[4];
       texel_value(0, TEX_X, TEX_Y, tex_z, want);
@@ -2024,7 +2034,12 @@ main(int argc, char **argv)
    pipe->bind_fs_state(pipe, fs_cso);
 
    union pipe_color_union clear = { .ui = { 0, 0, 0, 0 } };
-   pipe->clear(pipe, PIPE_CLEAR_COLOR, NULL, &clear, 0.0, 0);
+   /* 26.x names the channels and stencil bits to write instead of taking a surface to
+    * write them through (p_context.h). 0xf is all four channels and 0xff all stencil
+    * bits, which is the whole-surface clearing the surface-carrying form did; the
+    * buffers mask still decides which attachments are touched at all.
+    */
+   pipe->clear(pipe, PIPE_CLEAR_COLOR, 0xf, 0xff, NULL, &clear, 0.0, 0);
 
    struct pipe_draw_info draw = {
       .mode = MESA_PRIM_TRIANGLE_STRIP, .index_bounds_valid = true,

@@ -59,6 +59,7 @@
 #include "util/u_inlines.h"
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
+#include "util/macros.h" /* UNREACHABLE(), renamed from the unreachable() that used to arrive with the other headers */
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
  * waited for is not a result, and on this GPU one timeout wedges the core for the rest
@@ -314,37 +315,12 @@ say(char *why, size_t why_size, const char *fmt, ...)
    va_end(ap);
 }
 
-/* What the screen answers about compute, as one number. Returns false when it declines,
- * which softpipe does for most of them.
- *
- * The scratch is four words wide and not one: get_compute_param writes before it
- * returns the width, and some of these caps are a vector of three (the maximum block
- * size), so a one-word buffer would be written past by a cap nobody here asks for yet.
+/* What the screen answers about compute. 26.x filled a struct once at screen creation
+ * rather than answering a query per call, so there is nothing left to call and a screen
+ * that declines a cap simply leaves its field zero -- which softpipe, the host build's
+ * screen, does for the whole of it. What used to be the "returns false" branch is the
+ * default written beside each read below.
  */
-static bool
-compute_cap(struct pipe_screen *screen, enum pipe_compute_cap cap, uint64_t *out)
-{
-   uint64_t v[4] = { 0 };
-
-   if (!screen->get_compute_param)
-      return false;
-
-   int bytes = screen->get_compute_param(screen, PIPE_SHADER_IR_NIR, cap, v);
-   if (bytes == sizeof(uint64_t)) {
-      *out = v[0];
-   } else if (bytes == sizeof(uint32_t)) {
-      /* memcpy and not a cast: some of these caps are 32 bits wide and some 64, and
-       * reading a word of one through a pointer to the other is what the compiler is
-       * allowed to assume never happens.
-       */
-      uint32_t narrow;
-      memcpy(&narrow, v, sizeof(narrow));
-      *out = narrow;
-   } else {
-      return false;
-   }
-   return true;
-}
 
 /* What a Gallium driver expects of a shader it is handed: NIR's own system values
  * lowered to the hardware's, and I/O as intrinsics rather than variables. This is
@@ -352,7 +328,7 @@ compute_cap(struct pipe_screen *screen, enum pipe_compute_cap cap, uint64_t *out
  * tools/mesa/air-ir3.patch; a fourth copy would be the point at which they should
  * become one function of the frontend.
  */
-static int
+static unsigned
 type_size_vec4(const struct glsl_type *type, bool bindless)
 {
    return glsl_count_attribute_slots(type, false);
@@ -474,8 +450,17 @@ rwa_device_open(char *why, size_t why_size)
       static bool options_parsed = false;
 
       if (!options_parsed) {
+         /* 26.x gathered the seven trailing arguments into a struct of their own.
+          * The four names this used to pass as NULL stay unset for the same reason
+          * they were NULL: there is no application or engine here to match a
+          * section of mesa.conf against, only the driver.
+          */
+         const driConfigFileParseParams params = {
+            .screenNum = 0,
+            .driverName = "msm",
+         };
          driParseOptionInfo(&info, freedreno_options, ARRAY_SIZE(freedreno_options));
-         driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
+         driParseConfigFiles(&cache, &info, &params);
          config.options = &cache;
          config.options_info = &info;
          options_parsed = true;
@@ -503,9 +488,11 @@ rwa_device_open(char *why, size_t why_size)
       goto fail;
    }
 
-   device->nir_options =
-      device->screen->get_compiler_options(device->screen, PIPE_SHADER_IR_NIR,
-                                           PIPE_SHADER_COMPUTE);
+   /* The screen no longer answers a call for these: it fills one table per stage at
+    * creation, and a screen with no NIR leaves the entry null, which is the same
+    * "no NIR here" the null check below has always meant.
+    */
+   device->nir_options = device->screen->nir_options[MESA_SHADER_COMPUTE];
    if (!device->nir_options) {
       say(why, why_size, "%s takes no NIR, so no Metal shader can be given to it",
           device->screen->get_name(device->screen));
@@ -540,11 +527,17 @@ rwa_device_open(char *why, size_t why_size)
     * threadgroup size, and the dispatch below checks the size it is actually given
     * against the compiled variant, where the number is the hardware's.
     */
-   uint64_t v;
-   device->max_threads_per_group =
-      compute_cap(device->screen, PIPE_COMPUTE_CAP_MAX_THREADS_PER_BLOCK, &v) ? v : 0;
-   device->thread_execution_width =
-      compute_cap(device->screen, PIPE_COMPUTE_CAP_SUBGROUP_SIZES, &v) ? v : 1;
+   device->max_threads_per_group = device->screen->compute_caps.max_threads_per_block;
+
+   /* compute_caps.subgroup_sizes is a bitmask of the supported widths (rusticl
+    * reads the set bit indices and shifts them back), where the query this replaces
+    * answered the one width itself. freedreno sets base and, when the chip can do
+    * double-wide, base | 2 * base; the width a threadgroup is measured in is the
+    * narrowest, hence the lowest bit. Zero means unreported, and one lane is what
+    * the old decline fell back to.
+    */
+   uint32_t widths = device->screen->compute_caps.subgroup_sizes;
+   device->thread_execution_width = widths ? (widths & (~(widths - 1))) : 1;
 
    /* And what a bound buffer's offset has to be a multiple of, which an argument
     * buffer's member is the only thing here to have one. Taken from the screen and not
@@ -1168,7 +1161,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
                          "frontend refuses on the shader side too", type_name);
       return NULL;
    default:
-      unreachable("texture_type_name admitted a type this switch does not");
+      UNREACHABLE("texture_type_name admitted a type this switch does not");
    }
 
    if (width == 0) {
@@ -3549,7 +3542,7 @@ struct rwa_bound {
  * sampler's two state objects is bound.
  */
 static int
-bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
+bind_stage(struct rwa_device *device, mesa_shader_stage stage,
            const struct air_shader_info *info, void **own_sampler,
            const bool *compare_sampler,
            const struct rwa_bindings *bindings, const struct rwa_buffer_bind *table,
@@ -3678,7 +3671,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
             cb.buffer_offset = 0;
             cb.buffer_size = (unsigned)want;
          }
-         pipe->set_constant_buffer(pipe, stage, r->index, false, &cb);
+         pipe->set_constant_buffer(pipe, stage, r->index, &cb);
          break;
       }
 
@@ -3799,7 +3792,7 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
    if (num_ssbo)
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
    if (num_views)
-      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, false, views);
+      pipe->set_sampler_views(pipe, stage, 0, num_views, 0, views);
    if (num_images)
       pipe->set_shader_images(pipe, stage, 0, num_images, 0, images);
    if (num_samplers)
@@ -3819,12 +3812,12 @@ bind_stage(struct rwa_device *device, enum pipe_shader_type stage,
  * buffers are left bound (see struct rwa_bound).
  */
 static void
-unbind_stage(struct rwa_device *device, enum pipe_shader_type stage,
+unbind_stage(struct rwa_device *device, mesa_shader_stage stage,
              const struct rwa_bound *bound)
 {
    struct pipe_context *pipe = device->pipe;
    if (bound->num_views)
-      pipe->set_sampler_views(pipe, stage, 0, 0, bound->num_views, false, NULL);
+      pipe->set_sampler_views(pipe, stage, 0, 0, bound->num_views, NULL);
    if (bound->num_images)
       pipe->set_shader_images(pipe, stage, 0, 0, bound->num_images, NULL);
    if (bound->num_samplers) {
@@ -3912,7 +3905,7 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * the next dispatch or dropped at delete, as before.
     */
    struct rwa_bound bound = { 0 };
-   if (bind_stage(device, PIPE_SHADER_COMPUTE, &compute->info, compute->own_sampler,
+   if (bind_stage(device, MESA_SHADER_COMPUTE, &compute->info, compute->own_sampler,
                   compute->compare_sampler,
                   bindings, table, table_count, name, &bound, why, why_size) != 0)
       return -1;
@@ -3931,7 +3924,7 @@ rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bin
     * wait for work dispatched through another pipeline of the same device.
     */
    int rc = finish_or_say_why(device, true, "dispatch", why, why_size);
-   unbind_stage(device, PIPE_SHADER_COMPUTE, &bound);
+   unbind_stage(device, MESA_SHADER_COMPUTE, &bound);
    return rc;
 }
 
@@ -6731,12 +6724,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          return -1;
    }
 
-   /* The framebuffer, from the caller's own textures. create_surface wants a context,
-    * so it is a draw-time cost and not a pipeline one, and it is released again below
-    * before the caller may destroy the textures under it.
+   /* The framebuffer, from the caller's own textures. A surface is plain value data
+    * in 26.x -- the framebuffer state embeds the structs instead of pointing at ones
+    * the driver allocated -- so filling one in cannot fail and the only cost is the
+    * texture reference each takes, released again below before the caller may destroy
+    * the textures under it.
     */
-   struct pipe_surface *surf[PIPE_MAX_COLOR_BUFS] = { 0 };
-   struct pipe_surface *zsurf = NULL;
+   struct pipe_surface surf[PIPE_MAX_COLOR_BUFS] = { 0 };
+   struct pipe_surface zsurf = { 0 };
    /* pipe_framebuffer_state.samples is filled in although nothing here reads it: both
     * drivers take the pass's sample count off the attachments instead
     * (util_framebuffer_get_num_samples ignores this field whenever there is one), and a
@@ -6747,27 +6742,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                                         .nr_cbufs = draw->color_count,
                                         .samples = samples };
    for (unsigned i = 0; i < draw->color_count; i++) {
-      surf[i] = pipe->create_surface(pipe, draw->color[i]->res,
-         &(struct pipe_surface){ .format = draw->color[i]->res->format });
-      if (!surf[i]) {
-         say(why, why_size, "%s would not make a render surface of colour attachment %u",
-             rwa_device_name(device), i);
-         for (unsigned j = 0; j < i; j++)
-            pipe->surface_destroy(pipe, surf[j]);
-         return -1;
-      }
+      pipe_surface_init(pipe, &surf[i], draw->color[i]->res, 0, 0);
+      surf[i].format = draw->color[i]->res->format;
       fb.cbufs[i] = surf[i];
    }
    if (draw->depth) {
-      zsurf = pipe->create_surface(pipe, draw->depth->res,
-         &(struct pipe_surface){ .format = draw->depth->res->format });
-      if (!zsurf) {
-         say(why, why_size, "%s would not make a render surface of the depth attachment",
-             rwa_device_name(device));
-         for (unsigned j = 0; j < draw->color_count; j++)
-            pipe->surface_destroy(pipe, surf[j]);
-         return -1;
-      }
+      pipe_surface_init(pipe, &zsurf, draw->depth->res, 0, 0);
+      zsurf.format = draw->depth->res->format;
       fb.zsbuf = zsurf;
    }
    pipe->set_framebuffer_state(pipe, &fb);
@@ -6888,13 +6869,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 
    struct rwa_bound fbound = { 0 }, vbound = { 0 };
    int rc = -1;
-   if (bind_stage(device, PIPE_SHADER_FRAGMENT, &render->finfo, render->frag_own_sampler,
+   if (bind_stage(device, MESA_SHADER_FRAGMENT, &render->finfo, render->frag_own_sampler,
                   render->frag_compare_sampler,
                   &draw->fragment, draw->fragment_buffer_table, draw->fragment_buffer_table_count,
                   fname, &fbound, why, why_size) != 0)
       goto unbind;
    if (!render->generated_vertex &&
-       bind_stage(device, PIPE_SHADER_VERTEX, &render->vinfo, render->vert_own_sampler,
+       bind_stage(device, MESA_SHADER_VERTEX, &render->vinfo, render->vert_own_sampler,
                   render->vert_compare_sampler,
                   &draw->vertex, draw->vertex_buffer_table, draw->vertex_buffer_table_count, vname,
                   &vbound, why, why_size) != 0)
@@ -6929,7 +6910,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
           format_has_stencil(draw->depth->res->format))
          mask |= PIPE_CLEAR_STENCIL;
       if (mask)
-         pipe->clear(pipe, mask, NULL, &clear,
+         /* 26.x names the channels and stencil bits to write instead of taking a
+          * surface to write them through (p_context.h); 0xf and 0xff are the whole
+          * surface the old form cleared, and the buffers mask above still decides
+          * which attachments are touched at all.
+          */
+         pipe->clear(pipe, mask, 0xf, 0xff, NULL, &clear,
                      draw->clear_depth ? (double)*draw->clear_depth : 0.0,
                      draw->clear_stencil ? *draw->clear_stencil & 0xff : 0);
    }
@@ -6974,19 +6960,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    rc = finish_or_say_why(device, true, "draw", why, why_size);
 
 unbind:
-   unbind_stage(device, PIPE_SHADER_FRAGMENT, &fbound);
+   unbind_stage(device, MESA_SHADER_FRAGMENT, &fbound);
    if (!render->generated_vertex)
-      unbind_stage(device, PIPE_SHADER_VERTEX, &vbound);
-   /* The framebuffer is released before the surfaces are destroyed, and both before the
+      unbind_stage(device, MESA_SHADER_VERTEX, &vbound);
+   /* The framebuffer is released before the surfaces are, and both before the
     * caller's next call, which may be rwa_texture_destroy on one of these attachments:
     * a context still holding a surface of a freed resource is the same trap as a bound
-    * sampler state (rwa_sampler_destroy).
+    * sampler state (rwa_sampler_destroy). Destroying a value surface is nothing but
+    * dropping the texture reference it holds, and dropping it from the attachments
+    * that were never made is the no-op it looks like.
     */
    pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
-   for (unsigned i = 0; i < draw->color_count; i++)
-      if (surf[i])
-         pipe->surface_destroy(pipe, surf[i]);
-   if (zsurf)
-      pipe->surface_destroy(pipe, zsurf);
+   for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
+      pipe_resource_reference(&surf[i].texture, NULL);
+   pipe_resource_reference(&zsurf.texture, NULL);
    return rc;
 }

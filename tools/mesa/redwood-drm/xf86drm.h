@@ -15,6 +15,10 @@
 
 #include "drm-uapi/drm.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define DRM_NODE_PRIMARY        0
 #define DRM_NODE_RENDER         2
 #define DRM_CLOEXEC             O_CLOEXEC
@@ -31,6 +35,30 @@ typedef struct _drmVersion {
 } drmVersion, *drmVersionPtr;
 
 int drmOpenWithType(const char *name, const char *busid, int type);
+
+/*
+ * Turnip finds its GPU among libdrm's devices: here there is one, a platform device whose
+ * render node is /dev/null (the descriptor means nothing, as with drmOpenWithType()).
+ */
+#define DRM_NODE_MAX            3
+#define DRM_BUS_PCI             0
+#define DRM_BUS_PLATFORM        2
+
+typedef struct _drmPciBusInfo { uint16_t domain; uint8_t bus, dev, func; } drmPciBusInfo, *drmPciBusInfoPtr;
+typedef struct _drmPlatformBusInfo { char fullname[512]; } drmPlatformBusInfo, *drmPlatformBusInfoPtr;
+typedef struct _drmDevice {
+	char **nodes;
+	int available_nodes;
+	int bustype;
+	union { drmPciBusInfoPtr pci; drmPlatformBusInfoPtr platform; } businfo;
+	union { void *platform; } deviceinfo;
+} drmDevice, *drmDevicePtr;
+
+int drmGetDevices2(uint32_t flags, drmDevicePtr devices[], int max_devices);
+void drmFreeDevices(drmDevicePtr devices[], int count);
+int drmGetDevice2(int fd, uint32_t flags, drmDevicePtr *device);
+void drmFreeDevice(drmDevicePtr *device);
+int drmDevicesEqual(drmDevicePtr a, drmDevicePtr b);
 int drmIoctl(int fd, unsigned long request, void *arg);
 int drmCommandWrite(int fd, unsigned long index, const void *data, unsigned long size);
 int drmCommandWriteRead(int fd, unsigned long index, void *data, unsigned long size);
@@ -52,6 +80,16 @@ int drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle);
 int drmSyncobjHandleToFD(int fd, uint32_t handle, int *obj_fd);
 int drmSyncobjImportSyncFile(int fd, uint32_t handle, int sync_file_fd);
 int drmSyncobjExportSyncFile(int fd, uint32_t handle, int *sync_file_fd);
+int drmSyncobjWait(int fd, uint32_t *handles, unsigned num_handles, int64_t timeout_nsec, unsigned flags,
+    uint32_t *first_signaled);
+int drmSyncobjSignal(int fd, const uint32_t *handles, uint32_t handle_count);
+int drmSyncobjTimelineSignal(int fd, const uint32_t *handles, uint64_t *points, uint32_t handle_count);
+int drmSyncobjTimelineWait(int fd, uint32_t *handles, uint64_t *points, unsigned num_handles, int64_t timeout_nsec,
+    unsigned flags, uint32_t *first_signaled);
+int drmSyncobjQuery(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count);
+int drmSyncobjQuery2(int fd, uint32_t *handles, uint64_t *points, uint32_t handle_count, uint32_t flags);
+int drmSyncobjTransfer(int fd, uint32_t dst_handle, uint64_t dst_point, uint32_t src_handle, uint64_t src_point,
+    uint32_t flags);
 
 /* Not libdrm's: a buffer's memory in this process, in place of mmap() on the device (freedreno_bo.c is patched to call these). */
 void *redwood_drm_map(int fd, uint32_t handle, uint64_t size);
@@ -72,5 +110,9 @@ struct redwood_drm_surface {
 	uint32_t width, height, pixel_format, planes;   /* and what they are */
 };
 int redwood_drm_surface(int fd, struct redwood_drm_surface *surface);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

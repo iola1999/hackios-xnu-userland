@@ -1,0 +1,38 @@
+[
+  {
+    "file": "qcom/gen80000_gmu.bin",
+    "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/qcom/gen80000_gmu.bin",
+    "bytes": 88896,
+    "sha256": "1ad8175e6cd01ea76c64d20b83600038c52dd29844b48d57b11b769b038863a5"
+  },
+  {
+    "file": "qcom/gen80000_sqe.fw",
+    "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/qcom/gen80000_sqe.fw",
+    "bytes": 111476,
+    "sha256": "30ee3301534f95799d4afaf73864f3c369baa5a5dea8481e7f0cb8cc941f396c"
+  },
+  {
+    "file": "qcom/gen80000_aqe.fw",
+    "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/qcom/gen80000_aqe.fw",
+    "bytes": 25044,
+    "sha256": "67562ad5baae3a133c92a6e48a9d1b1a9a867fe2f85b49324e244e963f3b89c5"
+  },
+  {
+    "file": "LICENSES/LICENSE.qcom",
+    "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/LICENSES/LICENSE.qcom",
+    "bytes": 13962,
+    "sha256": "be904cd28cb292b80cdb6cf412ab0d9159d431671e987ad433c1f62e0988a9bc"
+  },
+  {
+    "file": "LICENSES/NOTICE.qcom",
+    "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/LICENSES/NOTICE.qcom",
+    "bytes": 23966,
+    "sha256": "fa43e1b9a13b341a07adca9dbe73d0f9072d7966fdfe811c01f0dd2872d7309a"
+  },
+  {
+    "file": "qcom/sm8750/gen80000_zap.mbn",
+    "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/qcom/sm8750/gen80000_zap.mbn",
+    "bytes": 12088,
+    "sha256": "0e3ae03f7dd3170621e7b231802639535410bbc2a1c3ba0829c15ab4cf3996cf"
+  }
+]

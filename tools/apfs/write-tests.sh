@@ -31,7 +31,7 @@ fi
 TOOL=$ROOT/apfs-work/apfs-tool
 stale=""
 [ -x "$TOOL" ] || stale=1
-for f in "$HERE/apfs-tool.c" "$HERE/build-tool.sh" \
+for f in "$HERE"/*.c "$HERE"/apfs_tool.h "$HERE"/build-tool.sh \
 	"$ROOT"/xnu-src/xnu-8796.121.2/bsd/miscfs/apfs/*.[ch] \
 	"$ROOT"/xnu/files/bsd/miscfs/apfs/*.[ch]; do
 	[ -n "$stale" ] && break
