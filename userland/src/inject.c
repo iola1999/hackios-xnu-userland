@@ -31,6 +31,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <notify.h>
@@ -1121,6 +1122,55 @@ input_start(void)
 	}
 }
 
+/* ---- the window server's main run loop ------------------------------------------------------------ */
+
+/*
+ * Boot-arg touch_lat=1: the three times of the window server's main run loop that libredwood-sb
+ * writes for SpringBoard's, under a name of its own so that the two read side by side in one log:
+ *   tl: b WOKE COMMIT DONE
+ * WOKE is when the turn came round, COMMIT when CoreAnimation's commit of what it changed began and
+ * DONE when that commit returned. The observers at COMMIT_ORDER - 1 and COMMIT_ORDER + 1 run just
+ * before and just after CoreAnimation's own, so the two bracket it. In a round where SpringBoard's
+ * turns go on and these stop, the frames stopped being taken here rather than asked for there; a
+ * DONE far from its COMMIT says the commit itself is what held the turn.
+ */
+#define COMMIT_ORDER 2000000
+static uint64_t ws_woke, ws_began;
+
+static void
+window_server_turn(__unused CFRunLoopObserverRef observer, CFRunLoopActivity activity, void *info)
+{
+	if (activity == kCFRunLoopAfterWaiting) {
+		ws_woke = micros(mach_absolute_time());
+	} else if (activity == kCFRunLoopBeforeWaiting && info == NULL) {
+		ws_began = micros(mach_absolute_time());
+	} else if (activity == kCFRunLoopBeforeWaiting && ws_woke != 0) {
+		say("tl: b %llu %llu %llu\n", ws_woke, ws_began, micros(mach_absolute_time()));
+		ws_woke = 0;
+	}
+}
+
+static void
+watch_window_server_loop(void)
+{
+	char args[1024] = "";
+	size_t size = sizeof(args) - 1;
+	const char *arg;
+	CFRunLoopObserverContext after = { .info = (void *) 1 };
+
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0 || (arg = strstr(args, "touch_lat=1")) == NULL ||
+	    (arg != args && arg[-1] != ' ')) {
+		return;
+	}
+	mach_timebase_info(&timebase);
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopAfterWaiting, true, LONG_MIN,
+	    window_server_turn, NULL), kCFRunLoopCommonModes);
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true, COMMIT_ORDER - 1,
+	    window_server_turn, NULL), kCFRunLoopCommonModes);
+	CFRunLoopAddObserver(CFRunLoopGetMain(), CFRunLoopObserverCreate(NULL, kCFRunLoopBeforeWaiting, true,
+	    COMMIT_ORDER + 1, window_server_turn, &after), kCFRunLoopCommonModes);
+}
+
 /* ---- containermanagerd ---------------------------------------------------------------------------- */
 
 static BOOL
@@ -1260,6 +1310,7 @@ redwood_init(void)
 		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 */
 		input_start();
+		watch_window_server_loop();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();
 	}
