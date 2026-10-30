@@ -144,6 +144,45 @@ dump(const char *filter)
     fprintf(stderr, "sb26 layers end lines=%u%s\n", lines, lines >= LAYER_LINES ? " (cut)" : "");
 }
 
+/*
+ * `notify com.redwood.battery.nofx` takes the compositing filters off every layer under the battery
+ * view. A probe: the GPU path loses the whole battery while the processor path draws it, and the
+ * view's one unusual layer is the percentage label that cuts through the fill with destOut. If
+ * the battery comes back without the cut, the group the filter makes CoreAnimation render is what
+ * the GPU path loses.
+ */
+static void
+clear_filters(id layer, int inside)
+{
+    if (!layer) return;
+    inside = inside || strstr(name_of(send(layer, "delegate")), "Battery") != NULL;
+    if (inside && send(layer, "compositingFilter")) {
+        fprintf(stderr, "sb26 nofx %s view=%s\n", name_of(layer), name_of(send(layer, "delegate")));
+        ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setCompositingFilter:"), nil);
+    }
+    id sublayers = send(layer, "sublayers");
+    unsigned long count = sublayers ? ((unsigned long (*)(id, SEL))objc_msgSend)(sublayers,
+        sel_registerName("count")) : 0;
+    for (unsigned long i = 0; i < count; i++)
+        clear_filters(((id (*)(id, SEL, unsigned long))objc_msgSend)(sublayers,
+            sel_registerName("objectAtIndex:"), i), inside);
+}
+
+static void
+clear_battery_filters(void)
+{
+    Class window_class = objc_getClass("UIWindow");
+    SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+    id windows = window_class && class_respondsToSelector(object_getClass((id)window_class), all)
+        ? ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)window_class, all, YES, NO) : nil;
+    unsigned long count = windows ? ((unsigned long (*)(id, SEL))objc_msgSend)(windows,
+        sel_registerName("count")) : 0;
+    for (unsigned long i = 0; i < count; i++)
+        clear_filters(send(((id (*)(id, SEL, unsigned long))objc_msgSend)(windows,
+            sel_registerName("objectAtIndex:"), i), "layer"), 0);
+    fprintf(stderr, "sb26 nofx done windows=%lu\n", count);
+}
+
 /* Looked up when the first dump is asked for, by which time SpringBoard has both frameworks. */
 static void
 resolve(void *context)
@@ -183,4 +222,9 @@ sb26_install_layer_dump(void)
             dump(filter);
         });
     }
+    int token;
+    notify_register_dispatch("com.redwood.battery.nofx", &token, dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        clear_battery_filters();
+    });
 }

@@ -24,6 +24,8 @@ from_big(const uint8_t *p)
 	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
+static int acl_restored;        /* the entry being unpacked had a list in the store */
+
 /* 1 when ATTRIBUTE is the ACL one, whether or not the list could be put back; 0 for any other */
 static int
 restore_acl(const char *file, const char *attribute, const uint8_t *value, uint32_t vlen)
@@ -34,6 +36,7 @@ restore_acl(const char *file, const char *attribute, const uint8_t *value, uint3
 	if (strcmp(attribute, ACL_ATTRIBUTE) != 0) {
 		return 0;
 	}
+	acl_restored = 1;
 	count = vlen >= FILESEC_HEAD ? from_big(value + 36) : 0;
 	entries = count == ACL_NONE ? 0 : count;
 	if (vlen < FILESEC_HEAD || from_big(value) != FILESEC_MAGIC || entries > ACL_MAX_ENTRIES ||
@@ -56,4 +59,21 @@ restore_acl(const char *file, const char *attribute, const uint8_t *value, uint3
 		printf("var_store: %s: the access list could not be put back\n", file);
 	}
 	return 1;
+}
+
+/*
+ * The list a new file inherits from its directory, taken off again when the store had none for it.
+ * iconservicesagent removes the inherited list from its cache directory and throws the whole cache
+ * away whenever it finds one there (-[ISMutableIconCache initWithURL:]), so a restore that left the
+ * inherited list in place cost every boot the icon cache (kernel-12377-cmd31-warm5).
+ */
+#define FILESEC_REMOVE_ACL      1       /* _FILESEC_REMOVE_ACL: chmod_extended deletes the list */
+
+static void
+drop_inherited_acl(const char *file)
+{
+	if (file == NULL || acl_restored) {
+		return;
+	}
+	mini_syscall(SYS_chmod_extended, (long)file, OWNER_UNCHANGED, OWNER_UNCHANGED, -1, FILESEC_REMOVE_ACL, 0);
 }

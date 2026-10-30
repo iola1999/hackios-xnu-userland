@@ -990,6 +990,7 @@ unpack_one(int make)
 		}
 	}
 	/* the attributes, before the contents, as they were packed */
+	acl_restored = 0;
 	for (uint32_t i = 0; i < e.nxattr; i++) {
 		uint32_t namelen, vlen;
 
@@ -1011,6 +1012,7 @@ unpack_one(int make)
 			setxattr(path, name, value, vlen, 0, XATTR_NOFOLLOW);
 		}
 	}
+	drop_inherited_acl(make && ok && (e.kind == ENT_DIR || e.kind == ENT_FILE) ? path : NULL);
 	if (!ok) {
 		if (out_fd >= 0) {
 			close(out_fd);
@@ -1104,10 +1106,8 @@ unpack_one(int make)
 	if (!make) {
 		return 1;
 	}
-	/*
-	 * Owner, then permissions, then the times (writing moved them), and the flags last of all:
-	 * one of them may be what keeps the file from being changed again.
-	 */
+	/* Owner, then permissions, then the times (writing moved them), and the flags last of all: one
+	 * of them may be what keeps the file from being changed again. */
 	switch (e.kind) {
 	case ENT_DIR:
 		/* its flags wait for ENT_DIRTIME: one of them may be what stops anything being made in it */
