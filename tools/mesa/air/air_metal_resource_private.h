@@ -1,6 +1,20 @@
 #ifndef AIR_METAL_RESOURCE_PRIVATE_H
 #define AIR_METAL_RESOURCE_PRIVATE_H
 
+/* What the draws left bound in the context (air_metal_state.inc). Index 0 of the per-stage
+ * arrays is the fragment stage, 1 the vertex stage. */
+struct rwa_bound_state {
+   struct pipe_framebuffer_state fb;
+   bool fb_set, viewport_set, stencil_set, scissor_set;
+   struct pipe_viewport_state viewport;
+   struct pipe_stencil_ref stencil;
+   struct pipe_scissor_state scissor;
+   void *blend, *dsa, *rast, *vs, *fs, *velem;
+   struct pipe_sampler_view *views[2][RWA_MAX_TEXTURES];
+   void *samplers[2][RWA_MAX_TEXTURES];
+   unsigned num_views[2], num_samplers[2];
+};
+
 struct rwa_device {
    struct pipe_screen *screen;
    struct pipe_context *pipe;
@@ -56,6 +70,8 @@ struct rwa_device {
     * has to happen again before every batch of work that reads them.
     */
    struct rwa_buffer_texture *buffer_textures;
+
+   struct rwa_bound_state bound;
 };
 
 /* One texture laid over a buffer, as -newTextureWithDescriptor:offset:bytesPerRow: asks for.

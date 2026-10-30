@@ -157,6 +157,49 @@ buffer_texture_download(struct rwa_buffer_texture *backing, char *why, size_t wh
  * reads the result there: IconRendering renders an icon into such a texture, waits for the
  * command buffer and reads the buffer's bytes.
  */
+/*
+ * The texture laid over the buffer's own memory: an import of the buffer's buffer object at the
+ * offset and row length the caller gave, so the GPU reads and writes the bytes the caller
+ * reads and writes, and nothing is copied either way. The A8XX reads a linear texture at a row
+ * pitch rounded up to 64 bytes and from a 64-byte aligned start, which is also what
+ * minimumLinearTextureAlignmentForPixelFormat: tells callers; anything else, and a buffer
+ * whose memory is the caller's (a mirror), keeps the copy below. NULL: no alias, and why
+ * does not matter to the caller, which copies instead.
+ */
+static struct rwa_texture *
+buffer_texture_alias(struct rwa_device *device, const struct rwa_texture_shape *shape,
+                     struct rwa_buffer *source, size_t offset, unsigned row_bytes)
+{
+   static unsigned said;
+   char why[256] = { 0 };
+   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_KMS };
+   struct rwa_texture *texture = NULL;
+
+   if (getenv("RWA_BUFFER_TEXTURE_COPY"))
+      say(why, sizeof(why), "RWA_BUFFER_TEXTURE_COPY is set");
+   else if (source->mirror)
+      say(why, sizeof(why), "the buffer's memory is the caller's (a no-copy buffer)");
+   else if (offset % 64 != 0 || row_bytes % 64 != 0 || offset > UINT_MAX)
+      say(why, sizeof(why), "offset or row length is not a multiple of 64 bytes");
+   else if (device->software || !source->res || !device->screen->resource_get_handle ||
+            !device->screen->resource_get_handle(device->screen, device->pipe, source->res,
+                                                 &handle, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE))
+      say(why, sizeof(why), "the buffer object has no handle to import");
+   else {
+      const struct rwa_surface_import import = {
+         .offset = (unsigned)offset, .row_bytes = row_bytes, .kms_handle = handle.handle };
+      texture = texture_of_shape(device, shape, &import, why, sizeof(why));
+   }
+
+   if (said < 16) {
+      said++;
+      printf("rwa alias: %ux%u format %u, %u bytes a row at offset %zu of buffer %p: %s\n",
+             shape->width, shape->height, shape->pixel_format, row_bytes, offset,
+             (void *)source, texture ? "laid over the buffer" : why);
+   }
+   return texture;
+}
+
 struct rwa_texture *
 rwa_texture_from_buffer(struct rwa_device *device, const struct rwa_texture_shape *shape,
                         struct rwa_buffer *source, size_t offset, unsigned row_bytes,
@@ -176,7 +219,10 @@ rwa_texture_from_buffer(struct rwa_device *device, const struct rwa_texture_shap
           shape ? shape->type : 0);
       return NULL;
    }
-   struct rwa_texture *texture = texture_of_shape(device, shape, NULL, why, why_size);
+   struct rwa_texture *texture = buffer_texture_alias(device, shape, source, offset, row_bytes);
+   if (texture)
+      return texture;
+   texture = texture_of_shape(device, shape, NULL, why, why_size);
    if (!texture)
       return NULL;
 

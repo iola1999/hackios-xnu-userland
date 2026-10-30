@@ -104,6 +104,7 @@ rwa_unlock_scope(int *unused)
 #define RWA_MAX_TEXTURES 16
 
 #include "air_metal_resource_private.h"
+#include "air_metal_state.inc"
 
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
  * not kept: a refusal about a sampler happens while it is being created, where the
@@ -890,6 +891,7 @@ rwa_device_close(struct rwa_device *device)
    RWA_LOCKED;
    if (!device)
       return;
+   state_release(device);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    /* Before the pipe goes: a fence outlives the context that made it, and one nobody
@@ -943,13 +945,13 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
     * resource that does not declare what it is used for is a resource the next driver
     * is entitled to put somewhere a draw cannot read.
     *
-    * PIPE_USAGE_STAGING: this is memory the processor reads and writes as much as the
-    * GPU does, which is what a Metal buffer is, and it is what air_run asks for the
-    * buffers it fills and reads back.
+    * PIPE_USAGE_STAGING: memory the processor uses as much as the GPU, as a Metal buffer is.
+    * PIPE_BIND_SHARED from a page up: a buffer object of its own, not a slice of freedreno's
+    * heap, so a texture can be laid over it by its handle (buffer_texture_alias).
     */
    buffer->res = pipe_buffer_create(device->screen,
                                     PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER |
-                                    PIPE_BIND_INDEX_BUFFER,
+                                    PIPE_BIND_INDEX_BUFFER | (size >= 4096 ? PIPE_BIND_SHARED : 0),
                                     PIPE_USAGE_STAGING, size);
    if (!buffer->res) {
       say(why, why_size, "the GPU driver would not allocate %zu bytes. After a few dozen "
@@ -1379,13 +1381,11 @@ pixel_format_refusal(unsigned f)
           "iOS 16.5 SDK's or none at all";
 }
 
-/* Where an imported texture's memory comes from: an IOSurface by its ID, with the offset
- * and the row length the kernel reported about it. NULL everywhere below means "allocate",
- * which is rwa_texture_create's whole difference from rwa_texture_from_surface.
- */
+/* Where an imported texture's memory comes from: an IOSurface by its ID, or (kms_handle) a buffer
+ * object of this device, at an offset and row length. NULL below means "allocate". */
 struct rwa_surface_import {
    int id;
-   unsigned offset, row_bytes;
+   unsigned offset, row_bytes, kms_handle;
 };
 
 static struct rwa_texture *
@@ -1739,8 +1739,8 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
        * 64-byte row alignment can be smaller than freedreno's format-specific pitch.
        */
       struct winsys_handle whandle = {
-         .type = WINSYS_HANDLE_TYPE_FD,
-         .handle = (unsigned) import->id,
+         .type = import->kms_handle ? WINSYS_HANDLE_TYPE_KMS : WINSYS_HANDLE_TYPE_FD,
+         .handle = import->kms_handle ? import->kms_handle : (unsigned) import->id,
          .stride = import->row_bytes,
          .offset = import->offset,
          .modifier = DRM_FORMAT_MOD_LINEAR,
@@ -1855,6 +1855,7 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
 }
 
 #include "air_metal_texture.inc"
+#include "air_metal_fence.inc"
 
 void
 rwa_texture_destroy(struct rwa_texture *texture)
@@ -1874,14 +1875,10 @@ rwa_texture_destroy(struct rwa_texture *texture)
       texture->backing = NULL;
    }
    argbuf_scrub(texture->device, NULL, texture, NULL);
-   /* The view first: it holds a reference of its own on the resource. Nothing has to
-    * be unbound here, because rwa_dispatch unbinds every texture it bound once its
-    * fence has come back -- a context left holding this would be holding freed memory
-    * the moment the last reference went, which is the same trap delete_compute_state
-    * below is about.
-    */
-   if (texture->view)
-      texture->device->pipe->sampler_view_destroy(texture->device->pipe, texture->view);
+   state_texture_gone(texture->device, texture->res);
+   /* Released, not destroyed: a draw may have left the view bound (air_metal_state.inc),
+    * and the context's reference then keeps it until it is unbound. */
+   pipe_sampler_view_release_ptr(&texture->view);
    pipe_resource_reference(&texture->res, NULL);
    free(texture);
 }
@@ -2267,12 +2264,10 @@ rwa_sampler_destroy(struct rwa_sampler *sampler)
    RWA_LOCKED;
    if (!sampler)
       return;
-   /* Nothing is unbound here: rwa_dispatch binds the samplers it needs and unbinds
-    * them once its fence has come back, so nothing of this is in the context now. It
-    * matters that it is not -- softpipe's delete_sampler_state is a plain FREE
-    * (sp_state_sampler.c), so a state deleted while bound leaves the context holding
-    * freed memory until something else is bound over it.
+   /* Unbound first: draws leave their samplers bound (state_forget), and a deleted
+    * sampler state left in the context is freed memory the next texture emit reads.
     */
+   state_forget(sampler->device);
    argbuf_scrub(sampler->device, NULL, NULL, sampler);
    sampler->device->pipe->delete_sampler_state(sampler->device->pipe, sampler->cso);
    sampler->device->pipe->delete_sampler_state(sampler->device->pipe,
@@ -3723,7 +3718,9 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
       pipe->set_shader_buffers(pipe, stage, 0, num_ssbo, sb, writable);
    bind_phase_add(BIND_PHASE_SSBO, mark);
    mark = draw_mark();
-   if (num_views)
+   if (stage != MESA_SHADER_COMPUTE)
+      state_views(device, stage, num_views, views);
+   else if (num_views)
       pipe->set_sampler_views(pipe, stage, 0, num_views, 0, views);
    bind_phase_add(BIND_PHASE_VIEWS, mark);
    mark = draw_mark();
@@ -3731,7 +3728,9 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
       pipe->set_shader_images(pipe, stage, 0, num_images, 0, images);
    bind_phase_add(BIND_PHASE_IMAGES, mark);
    mark = draw_mark();
-   if (num_samplers)
+   if (stage != MESA_SHADER_COMPUTE)
+      state_samplers(device, stage, num_samplers, samplers);
+   else if (num_samplers)
       pipe->bind_sampler_states(pipe, stage, 0, num_samplers, samplers);
    bind_phase_add(BIND_PHASE_SAMPLERS, mark);
    bind_phase_done(entry);
@@ -4634,6 +4633,7 @@ rwa_depth_stencil_destroy(struct rwa_depth_stencil *state)
     * -- the same trap delete_compute_state is about.
     */
    state->device->pipe->bind_depth_stencil_alpha_state(state->device->pipe, NULL);
+   state_forget(state->device);
    state->device->pipe->delete_depth_stencil_alpha_state(state->device->pipe, state->cso);
    free(state);
 }
@@ -6423,6 +6423,7 @@ rwa_render_destroy(struct rwa_render *render)
       return;
    struct pipe_context *pipe = render->device->pipe;
 
+   state_forget(render->device);
    /* Unbound before deleted, each of them, for the reason delete_compute_state and
     * rwa_sampler_destroy give: a Gallium context holds a pointer to the state bound in
     * it, and softpipe's delete is a plain FREE, so a state deleted while bound leaves
@@ -6931,7 +6932,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       zsurf.format = draw->depth->res->format;
       fb.zsbuf = zsurf;
    }
-   pipe->set_framebuffer_state(pipe, &fb);
+   state_framebuffer(device, &fb);
 
    /* The viewport, and now its z as well. Gallium's window depth is
     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
@@ -6955,7 +6956,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       vw = CLAMP(x1, 0.0f, (float)w) - vx;
       vh = CLAMP(y1, 0.0f, (float)h) - vy;
    }
-   pipe->set_viewport_states(pipe, 0, 1, &(struct pipe_viewport_state){
+   state_viewport(device, &(struct pipe_viewport_state){
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked
        * here. Metal's render-target origin is the top left and its NDC y points up, so clip
        * y = +1 belongs in memory row 0; a positive y scale puts clip y = -1 there, which is
@@ -6973,17 +6974,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       .scale = { vw / 2.0f, -(vh / 2.0f), zfar - znear },
       .translate = { vx + vw / 2.0f, vy + vh / 2.0f, znear } });
 
-   pipe->bind_blend_state(pipe, render->blend);
-   /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
-    * behaviour with no MTLDepthStencilState set: no test and no write.
-    */
-   pipe->bind_depth_stencil_alpha_state(pipe, draw->depth_stencil ? draw->depth_stencil->cso
-                                                                  : render->dsa);
    /* Metal keeps the reference value on the encoder and not in the state object, so it
     * is set per draw. Gallium's is one byte per face, which is the stencil buffer's
     * width; Metal's is a uint32 and only those bits can match anything.
     */
-   pipe->set_stencil_ref(pipe, (struct pipe_stencil_ref){
+   state_stencil_ref(device, (struct pipe_stencil_ref){
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
                      (uint8_t)(draw->stencil_reference[1] & 0xff) } });
    /* The clip rectangle, in the same pixels and from the same corner as Metal's: Gallium's
@@ -6992,15 +6987,19 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * rectangle and off without one -- the render's own rasterizer state does not clip.
     */
    if (draw->scissor != NULL) {
-      pipe->set_scissor_states(pipe, 0, 1, &(struct pipe_scissor_state){
+      state_scissor(device, &(struct pipe_scissor_state){
          .minx = (unsigned)CLAMP((float)draw->scissor[0], 0.0f, (float)w),
          .miny = (unsigned)CLAMP((float)draw->scissor[1], 0.0f, (float)h),
          .maxx = (unsigned)CLAMP((float)(draw->scissor[0] + draw->scissor[2]), 0.0f, (float)w),
          .maxy = (unsigned)CLAMP((float)(draw->scissor[1] + draw->scissor[3]), 0.0f, (float)h) });
    }
-   pipe->bind_rasterizer_state(pipe, draw->scissor != NULL ? render->rast_scissor : render->rast);
-   pipe->bind_vs_state(pipe, render->vs_cso);
-   pipe->bind_fs_state(pipe, render->fs_cso);
+   /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
+    * behaviour with no MTLDepthStencilState set: no test and no write.
+    */
+   state_objects(device, render->blend,
+                 draw->depth_stencil ? draw->depth_stencil->cso : render->dsa,
+                 draw->scissor != NULL ? render->rast_scissor : render->rast,
+                 render->vs_cso, render->fs_cso);
 
    /*
     * The vertex state, bound on BOTH paths and never NULL.
@@ -7071,7 +7070,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * set_vertex_buffers rather than in draw_vbo. Neither driver here does, so the
     * other order worked; it worked by permission and not by contract.
     */
-   pipe->bind_vertex_elements_state(pipe, render->velem);
+   state_vertex_elements(device, render->velem);
    pipe->set_vertex_buffers(pipe, nvb, vbs);
    draw_phase_add(1, mark);
    mark = draw_mark();
@@ -7268,24 +7267,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    rc = 0;
 
 unbind:
-   unbind_stage(device, MESA_SHADER_FRAGMENT, &fbound);
-   if (!render->generated_vertex)
-      unbind_stage(device, MESA_SHADER_VERTEX, &vbound);
-   /* The framebuffer is released before the surfaces are, and both before the
-    * caller's next call, which may be rwa_texture_destroy on one of these attachments:
-    * a context still holding a surface of a freed resource is the same trap as a bound
-    * sampler state (rwa_sampler_destroy). Destroying a value surface is nothing but
-    * dropping the texture reference it holds, and dropping it from the attachments
-    * that were never made is the no-op it looks like.
+   /* The framebuffer, views and samplers stay bound for the next draw (air_metal_state.inc,
+    * which holds references of its own); these are this call's references.
     */
-   /* The framebuffer goes back to nothing here, and keeping it bound across draws was
-    * measured and dropped: on the device the per-draw processor time was 654 us with this
-    * reset and 630 us without it, and setting the state itself costs 0.6 us a draw
-    * (docs/progress/2026-10-27-ios26-k90.md 43). The reset stays because the caller's
-    * next call may be rwa_texture_destroy on one of these attachments, and a context left
-    * holding a surface of that resource is a trap for whoever writes the next caller.
-    */
-   pipe->set_framebuffer_state(pipe, &(struct pipe_framebuffer_state){ 0 });
    for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++)
       pipe_resource_reference(&surf[i].texture, NULL);
    pipe_resource_reference(&zsurf.texture, NULL);

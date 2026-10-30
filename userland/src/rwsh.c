@@ -20,12 +20,15 @@
  *   kill SIGNAL PID            kill(2)
  *   notify NAME                notify_post(3)
  *   sysctl NAME                the value as a string, or as integers when it is not printable
+ *   sysctl NAME=NUMBER         set an integer sysctl
  *   setenv WORD...             kern.redwood.env becomes the words, each PROCESS:NAME=VALUE or
  *                              PROCESS:-NAME; libredwoodmetal applies its process's words when the
  *                              process loads it
  *   addenv WORD...             the words are added to kern.redwood.env (a command is at most 119
  *                              characters, so a long setting is sent in pieces)
  *   restart NAME...            SIGKILL to every process of that name, for launchd to start again
+ *   pull PATH                  kern.redwood.inbox, the last file the host pushed ("oem push"),
+ *                              written to PATH (mode 755) through a temporary file and a rename
  * Anything else is a program: posix_spawnp with stdout and stderr read back, killed after
  * RWSH_LIMIT_SECONDS.
  */
@@ -171,12 +174,24 @@ do_threads(int pid)
 }
 
 static int
-do_sysctl(const char *name)
+do_sysctl(char *name)
 {
-	unsigned char value[1024];
+	static unsigned char value[9000];
 	size_t size = sizeof(value) - 1;
 	size_t printable = 0;
+	char *equals = strchr(name, '=');
 
+	if (equals != NULL) {
+		int number = atoi(equals + 1);
+
+		*equals = '\0';
+		if (sysctlbyname(name, NULL, NULL, &number, sizeof(number)) != 0) {
+			out("sysctl %s=%d: %s", name, number, strerror(errno));
+			return 1;
+		}
+		out("%s = %d", name, number);
+		return 0;
+	}
 	if (sysctlbyname(name, value, &size, NULL, 0) != 0) {
 		out("sysctl %s: %s", name, strerror(errno));
 		return 1;
@@ -184,8 +199,13 @@ do_sysctl(const char *name)
 	while (printable < size && (value[printable] >= 0x20 || value[printable] == '\n' || value[printable] == '\t'))
 		printable++;
 	if (size > 0 && (printable == size || (printable == size - 1 && value[printable] == 0))) {
+		char *line, *rest = NULL;
+
 		value[printable] = 0;
-		out("%s = %s", name, (const char *)value);
+		line = strtok_r((char *)value, "\n", &rest);
+		out("%s = %s", name, line ? line : "");
+		while ((line = strtok_r(NULL, "\n", &rest)) != NULL)
+			out("%s", line);
 	} else if (size == sizeof(int32_t)) {
 		out("%s = %d", name, *(int32_t *)value);
 	} else if (size == sizeof(int64_t)) {
@@ -323,6 +343,39 @@ do_restart(int argc, char **argv)
 }
 
 static int
+do_pull(const char *path)
+{
+	size_t size = 0;
+	char *data, temporary[1024];
+	uint64_t seq;
+	int fd, ok;
+
+	if (sysctlbyname("kern.redwood.inbox", NULL, &size, NULL, 0) != 0 || size < sizeof(seq) ||
+	    (data = malloc(size)) == NULL || sysctlbyname("kern.redwood.inbox", data, &size, NULL, 0) != 0) {
+		out("pull: kern.redwood.inbox: %s", strerror(errno));
+		return 1;
+	}
+	memcpy(&seq, data, sizeof(seq));
+	if (seq == 0 || size == sizeof(seq)) {
+		out("pull: nothing has been pushed");
+		free(data);
+		return 1;
+	}
+	snprintf(temporary, sizeof(temporary), "%s.pull", path);
+	fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+	ok = fd >= 0 && write(fd, data + sizeof(seq), size - sizeof(seq)) == (ssize_t)(size - sizeof(seq));
+	ok = (fd < 0 || close(fd) == 0) && ok && rename(temporary, path) == 0;
+	if (!ok) {
+		out("pull: %s: %s", path, strerror(errno));
+		free(data);
+		return 1;
+	}
+	out("pull: push %llu, %zu bytes to %s", (unsigned long long)seq, size - sizeof(seq), path);
+	free(data);
+	return 0;
+}
+
+static int
 run(char *text)
 {
 	char *argv[32];
@@ -362,6 +415,8 @@ run(char *text)
 		return do_env(argc, argv, argv[0][0] == 'a');
 	if (strcmp(argv[0], "restart") == 0 && argc >= 2)
 		return do_restart(argc, argv);
+	if (strcmp(argv[0], "pull") == 0 && argc == 2)
+		return do_pull(argv[1]);
 	return do_spawn(argv);
 }
 

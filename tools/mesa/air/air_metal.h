@@ -594,6 +594,13 @@ int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
  * fence is kept on the device, and the next rwa_finish waits for it. 0, or -1. */
 int rwa_flush(struct rwa_device *device, char *why, size_t why_size);
 
+/* The fence of the last rwa_flush, referenced (NULL: nothing handed over yet); rwa_fence_wait
+ * waits for it without the library's lock, 0 or -1 after the timeout, from any thread. */
+struct rwa_fence;
+struct rwa_fence *rwa_fence_take(struct rwa_device *device);
+int rwa_fence_wait(struct rwa_device *device, struct rwa_fence *fence);
+void rwa_fence_release(struct rwa_device *device, struct rwa_fence *fence);
+
 /*
  * ---------------------------------------------------------------------------------------
  * Drawing.

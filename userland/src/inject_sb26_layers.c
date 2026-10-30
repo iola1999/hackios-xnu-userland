@@ -7,9 +7,8 @@
  * own class or whose view's class contains <filter> (case sensitive), at any depth, with the layers
  * below it up to LAYER_BELOW levels. `com.redwood.layers.all` prints the whole tree. Each line is the depth,
  * the layer class, the view class, the bounds size and position in points (in the superlayer),
- * hidden/opacity, and the contents:
- * CGImage and IOSurface with their size (and the surface's ID and FourCC), any other object by its
- * CF type or class. The total is capped at LAYER_LINES, because the console ring is 1.3 MB.
+ * hidden/opacity, the contents (CGImage and IOSurface with their size, and the surface's ID and
+ * FourCC; any other object by its CF type or class) and the effects (describe_effects). The total is capped at LAYER_LINES, because the console ring is 1.3 MB.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
@@ -73,6 +72,22 @@ describe_contents(id contents, char *out, size_t size)
     }
 }
 
+/* What changes how a layer is drawn beyond its contents, as "fx=COMPOSITING/FILTERS/MASK": the
+ * compositing filter's name, how many filters and background filters, and the mask's class. */
+static void
+describe_effects(id layer, char *out, size_t size)
+{
+    id compositing = send(layer, "compositingFilter"), name = send(compositing, "name");
+    id filters = send(layer, "filters"), backdrop = send(layer, "backgroundFilters");
+    SEL count = sel_registerName("count");
+    const char *text = name ? ((const char *(*)(id, SEL))objc_msgSend)(name, sel_registerName("UTF8String"))
+        : compositing ? name_of(compositing) : "-";
+    snprintf(out, size, "%s/%lu+%lu/%s", text,
+        filters ? ((unsigned long (*)(id, SEL))objc_msgSend)(filters, count) : 0,
+        backdrop ? ((unsigned long (*)(id, SEL))objc_msgSend)(backdrop, count) : 0,
+        name_of(send(layer, "mask")));
+}
+
 static int
 matches(id layer, const char *filter)
 {
@@ -90,11 +105,12 @@ walk(id layer, unsigned depth, const char *filter, int below)
         BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(layer, sel_registerName("isHidden"));
         float opacity = ((float (*)(id, SEL))objc_msgSend)(layer, sel_registerName("opacity"));
         struct point at = ((struct point (*)(id, SEL))objc_msgSend)(layer, sel_registerName("position"));
-        char contents[96];
+        char contents[96], effects[96];
         describe_contents(send(layer, "contents"), contents, sizeof(contents));
-        fprintf(stderr, "sb26 layer %2u %s view=%s %.0fx%.0f at %.0f,%.0f%s a=%.2f contents=%s\n",
+        describe_effects(layer, effects, sizeof(effects));
+        fprintf(stderr, "sb26 layer %2u %s view=%s %.0fx%.0f at %.0f,%.0f%s a=%.2f contents=%s fx=%s\n",
             depth, name_of(layer), name_of(send(layer, "delegate")), bounds.w, bounds.h, at.x, at.y,
-            hidden ? " hidden" : "", opacity, contents);
+            hidden ? " hidden" : "", opacity, contents, effects);
         lines++;
     }
     id sublayers = send(layer, "sublayers");
