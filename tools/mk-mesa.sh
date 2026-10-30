@@ -109,12 +109,38 @@ if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf mesa-$VERSION build-*
 	tar xJf mesa-$VERSION.tar.xz
+	# No reject may survive from an earlier application: with one in the tree, "did this run add a
+	# reject" has no answer, and an old one reads as a capability that went missing (28 October).
+	find mesa-$VERSION \( -name '*.rej' -o -name '*.orig' \) -delete
 	# On 26.x some hunks of the old patches fail or skip, which is expected: 0003-restore-* re-establishes
 	# what they carried (tools/mesa/rebase-26/README.md). Only there, so a 25.0.7 build still stops on a
 	# patch that no longer fits.
-	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p" || [ "$REBASE" = 26 ]; done
-	if [ "$REBASE" = 26 ]; then for p in "$ROOT"/tools/mesa/rebase-26/*.patch; do patch -s --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p"; done; fi
+	# --batch, and the output kept: without it patch asks "File to patch:" and reads the closed stdin as
+	# "skip the hunk", so a patch that no longer fits leaves neither a nonzero status nor a line anyone
+	# reads; the prompt and "malformed patch" in this log are its only trace.
+	PATCHLOG=patch.log
+	: > "$PATCHLOG"
+	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --batch --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p" >> "$PATCHLOG" 2>&1 || [ "$REBASE" = 26 ]; done
+	if [ "$REBASE" = 26 ]; then for p in "$ROOT"/tools/mesa/rebase-26/*.patch; do patch -s --batch --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p" >> "$PATCHLOG" 2>&1; done; fi
+	# What the loop above dropped, said out loud once: 26.x is allowed to drop the old hunks, every other
+	# version is not, and a build that dropped one on those is the case this check exists for.
+	REJECTS=$(find mesa-$VERSION -name '*.rej' | LC_ALL=C sort)
+	DROPPED=$(grep -cE 'File to patch:|malformed patch' "$PATCHLOG" || true)
+	if [ -n "$REJECTS" ] || [ "$DROPPED" != 0 ]; then
+		echo "mk-mesa.sh: $(printf '%s\n' "$REJECTS" | grep -c . || true) reject file(s), $DROPPED skip(s):" >&2
+		printf '%s\n' "$REJECTS" | grep . >&2 || true
+		grep -nE 'File to patch:|malformed patch' "$PATCHLOG" >&2 || true
+		[ "$REBASE" = 26 ] || exit 1
+	fi
 	echo "$PATCHES" > mesa-$VERSION/.redwood-patches
+	# The log goes next to the artifacts: what a round's manifest records has to be readable from
+	# the same place as the library it describes, or "which patch dropped what" is answered from a
+	# file only the build machine's build directory holds.
+	cp "$PATCHLOG" out/patch.log
+	# The rejects as a list of paths: a reject decides which hunk did not reach the build, and that
+	# fact appears in no digest, so the manifest carries it as its own field. Written as an empty file
+	# rather than skipped, so "no rejects this time" and "this build recorded none" read the same.
+	if [ -n "$REJECTS" ]; then printf '%s\n' "$REJECTS" > out/patch-rejects.txt; else : > out/patch-rejects.txt; fi
 fi
 # ours, kept in the repository: always the current ones
 rm -rf mesa-$VERSION/src/redwood-drm

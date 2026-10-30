@@ -1,0 +1,64 @@
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -8,6 +8,7 @@
+ 
+ #include "util/os_mman.h"
+ #include "util/os_time.h"
++#include <unistd.h>
+ #include <mach/mach.h>
+ #include <pthread.h>
+ 
+@@ -640,6 +641,35 @@
+ #endif
+ }
+ 
++/* The kernel maps a buffer on the first touch of each page, and on this device that fault costs
++ * milliseconds: 196 of them against 824 ms of wall clock in one draw's state emission, with 128 us of
++ * CPU, is the measurement this exists for. Touching one byte per page once, at the first map, moves
++ * that cost to a place where it is one line instead of a stall inside a draw. */
++static void
++fd_bo_prefault(struct fd_bo *bo)
++{
++   uint64_t began, took;
++   unsigned long page = (unsigned long)sysconf(_SC_PAGESIZE);
++   volatile uint8_t *bytes = bo->map;
++
++   if (bo->prefaulted || bo->map == NULL || bo->size == 0)
++      return;
++   bo->prefaulted = true;
++   if (page == 0)
++      page = 4096;
++
++   began = os_time_get_nano() / 1000;
++   for (unsigned off = 0; off < bo->size; off += page)
++      bytes[off] = bytes[off];   /* read then write the same byte: the write is what faults it in */
++   took = os_time_get_nano() / 1000 - began;
++
++   if (took >= 5000) {
++      printf("fd bo prefault slow: %p %u bytes %llu us\n", (void *)bo, bo->size,
++             (unsigned long long)took);
++      fflush(stdout);
++   }
++}
++
+ /* For internal use only, does not check FD_BO_NOMAP: */
+ void *
+ __fd_bo_map(struct fd_bo *bo)
+@@ -652,6 +682,7 @@
+       }
+    }
+ 
++   fd_bo_prefault(bo);
+    return bo->map;
+ }
+ 
+--- a/src/freedreno/drm/freedreno_drmif.h
++++ b/src/freedreno/drm/freedreno_drmif.h
+@@ -214,6 +214,7 @@
+    int32_t refcnt;
+    uint32_t reloc_flags; /* flags like FD_RELOC_DUMP to use for relocs to this BO */
+    uint32_t alloc_flags; /* flags that control allocation/mapping, ie. FD_BO_x */
++   bool prefaulted;      /* the pages were touched once at first map (see __fd_bo_map) */
+    uint64_t iova;
+    void *map;
+    const struct fd_bo_funcs *funcs;

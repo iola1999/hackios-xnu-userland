@@ -1,0 +1,51 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -382,8 +382,22 @@
+           unsigned index_offset)
+    assert_dt
+ {
++   static uint64_t fd_draw_vbos_calls;
++
+    struct fd6_context *fd6_ctx = fd6_context(ctx);
+    struct fd6_emit emit;
++
++   /* The state emission between here and the first draw_emit is where the sleeps measured so far
++    * have to be: the three segments after the emit printed nothing while this function's own span
++    * printed on every slow draw. The counter says the probe ran at all, which a threshold alone
++    * cannot. */
++   struct fd_draw_stamp entry = fd_draw_stamp_take();
++   bool state_said = false;
++
++   if (++fd_draw_vbos_calls % 1000 == 0) {
++      printf("fd draw vbos calls %llu\n", (unsigned long long) fd_draw_vbos_calls);
++      fflush(stdout);
++   }
+ 
+    emit.ctx = ctx;
+    emit.info = info;
+@@ -593,6 +607,12 @@
+          draw_emit_indirect<DRAW>(cs, &draw0, info, indirect, index_offset, dst_offset_dp);
+       }
+    } else {
++      if (!state_said) {
++         struct fd_draw_stamp now = fd_draw_stamp_take();
++
++         fd_draw_seg_say("state", &entry, &now);
++         state_said = true;
++      }
+       {
+          struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
+ 
+@@ -638,6 +658,12 @@
+ 
+             assert(!index_offset); /* handled by util_draw_multi() */
+ 
++            if (!state_said) {
++               struct fd_draw_stamp now = fd_draw_stamp_take();
++
++               fd_draw_seg_say("state", &entry, &now);
++               state_said = true;
++            }
+             {
+                struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
+ 

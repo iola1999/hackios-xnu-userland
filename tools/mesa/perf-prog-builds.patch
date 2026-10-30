@@ -1,0 +1,92 @@
+--- a/src/gallium/auxiliary/util/perf_draw.h
++++ b/src/gallium/auxiliary/util/perf_draw.h
+@@ -71,7 +71,8 @@
+    uint64_t sync, max_sync;                  /* tc_sync_msg: waiting for the driver thread */
+    uint64_t pass, max_pass;                  /* the rest of tc_flush before fd_context_flush */
+    uint64_t calls, calls_cond, calls_multi;  /* calls reaching fd_draw_vbo and the early returns */
+-   uint64_t prog_calls, prog_variants;       /* get_program_state calls and variant creations */
++   uint64_t prog_calls, prog_variants;       /* get_program_state calls and cache lookups */
++   uint64_t prog_builds;                     /* ir3_cache_lookup's misses: the ones it built */
+    uint64_t client, max_client;              /* the client's tc_draw_vbo, summed */
+ };
+ 
+@@ -79,6 +80,9 @@
+ extern struct fd_perf_draw fd_perf_current;   /* the driver thread's draw in flight */
+ extern struct fd_perf_window fd_perf_win;
+ extern unsigned fd_perf_progs, fd_perf_variants;   /* get_program_state calls and cache lookups */
++/* ir3_cache_lookup's miss path. Lookups minus misses is how often the cache answered, which is
++ * the reuse question; the number of lookups alone answers nothing. */
++extern unsigned fd_perf_cache_misses;
+ 
+ /* The slow-frame threshold, settable with FD_PERF_SLOW_US. A value past any frame silences the
+  * per-frame lines and keeps the window summary, which is what a round wants when the summary is
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c
+@@ -449,6 +449,7 @@
+ struct fd_perf_draw fd_perf_current;
+ struct fd_perf_window fd_perf_win;
+ unsigned fd_perf_progs, fd_perf_variants;
++unsigned fd_perf_cache_misses;
+ unsigned fd_perf_slow_us = FD_PERF_SLOW_US;
+ uint64_t fd_perf_checks_sum, fd_perf_checks_seen, fd_perf_checks_worst;
+ 
+@@ -475,7 +476,7 @@
+    {
+       static unsigned seen_in, seen_cond, seen_multi;
+ 
+-      static unsigned seen_progs, seen_variants;
++      static unsigned seen_progs, seen_variants, seen_misses;
+ 
+       w->calls += fd_perf_entry_calls - seen_in;
+       w->calls_cond += fd_perf_entry_cond - seen_cond;
+@@ -487,8 +488,10 @@
+        * cache never answers twice, far fewer means it does and the cost is the lookup. */
+       w->prog_calls += fd_perf_progs - seen_progs;
+       w->prog_variants += fd_perf_variants - seen_variants;
++      w->prog_builds += fd_perf_cache_misses - seen_misses;
+       seen_progs = fd_perf_progs;
+       seen_variants = fd_perf_variants;
++      seen_misses = fd_perf_cache_misses;
+    }
+    w->frames++;
+    w->draws += f->draws;
+@@ -535,7 +538,7 @@
+           "driver %llu max %llu; "
+           "own %llu (track %llu prog %llu emit %llu draw %llu); submit %llu max %llu; "
+           "client %llu max %llu; sync %llu max %llu, pass %llu max %llu; calls %llu in "
+-          "(condition %llu, multi %llu); prog_calls %llu prog_variants %llu us\n",
++          "(condition %llu, multi %llu); prog_calls %llu prog_variants %llu prog_builds %llu us\n",
+           w->frames, (unsigned long long) (w->interval / w->frames),
+           (unsigned long long) w->max_interval,
+           (unsigned long long) (w->draws / w->frames),
+@@ -553,7 +556,8 @@
+           (unsigned long long) (w->calls_cond / w->frames),
+           (unsigned long long) (w->calls_multi / w->frames),
+           (unsigned long long) (w->prog_calls / w->frames),
+-          (unsigned long long) (w->prog_variants / w->frames));
++          (unsigned long long) (w->prog_variants / w->frames),
++          (unsigned long long) (w->prog_builds / w->frames));
+    fflush(stdout);
+    memset(w, 0, sizeof(*w));
+    /* The window resets its counters; the time of the last close has to survive, or the first gap
+--- a/src/gallium/drivers/freedreno/ir3/ir3_cache.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_cache.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include "util/hash_table.h"
++#include "util/perf_draw.h"
+ #include "util/ralloc.h"
+ #define XXH_INLINE_ALL
+ #include "util/xxhash.h"
+@@ -79,6 +80,10 @@
+       return entry->data;
+    }
+ 
++   /* Past this point the cache has not answered and a program is built for the key. */
++   if (fd_perf_on())
++      fd_perf_cache_misses++;
++
+    MESA_TRACE_FUNC();
+ 
+    if (key->hs)

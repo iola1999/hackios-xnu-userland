@@ -23,10 +23,12 @@
  * Example, "swipe up from the bottom edge two minutes after boot":
  *   rwtouch wait 120 swipe 0.5 0.99 0.5 0.4 250
  */
+#include <errno.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <sys/qos.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,15 +39,52 @@
 
 static int device;
 
+/* Every line goes out at once: a replayed gesture runs for seconds and the run may end before a
+ * buffered line would have been written. */
+static void
+say(const char *format, ...)
+{
+	va_list ap;
+
+	va_start(ap, format);
+	vprintf(format, ap);
+	va_end(ap);
+	fflush(stdout);
+}
+
+/* What the kernel accepted. Kept here because it is the only number that tells "the replay sent
+ * nothing" from "the replay sent samples and the display did not draw". */
+static unsigned long long posted;
+
+/* One record to the queue. A failure is said once and the rest of the gesture still goes: the
+ * point of a failed write is to see it in the log, not to lose the other events with it. */
+static void
+send_record(const struct redwood_touch *record)
+{
+	if (write(device, record, sizeof(*record)) == (ssize_t)sizeof(*record)) {
+		posted++;
+		return;
+	}
+	/* One line per run, at the first failure: a failing write repeated at 8 ms would bury
+	 * everything else, and the first one is the one that says where it started. */
+	{
+		static int said;
+		int error = errno;
+
+		if (!said) {
+			said = 1;
+			say("rwtouch: post failed at event %llu errno %d (%s)\n", posted, error,
+			    strerror(error));
+		}
+	}
+}
+
 static void
 post(uint32_t type, double x, double y)
 {
 	struct redwood_touch t = { .type = type, .finger = 0, .x = (uint32_t)(x * 65535.0 + 0.5), .y = (uint32_t)(y * 65535.0 + 0.5) };
 
-	if (write(device, &t, sizeof(t)) != (ssize_t)sizeof(t)) {
-		perror("rwtouch: write");
-		exit(1);
-	}
+	send_record(&t);
 }
 
 static void
@@ -53,13 +92,10 @@ button(uint32_t which, int ms)
 {
 	struct redwood_touch t = { .type = REDWOOD_BUTTON_DOWN, .finger = which };
 
-	if (write(device, &t, sizeof(t)) != (ssize_t)sizeof(t)) {
-		perror("rwtouch: write");
-		exit(1);
-	}
+	send_record(&t);
 	usleep((useconds_t)ms * 1000);
 	t.type = REDWOOD_BUTTON_UP;
-	write(device, &t, sizeof(t));
+	send_record(&t);
 }
 
 #define SAMPLE_MS       8               /* a sample every so many milliseconds: what the touch screen gives */
@@ -86,9 +122,12 @@ sleep_until(uint64_t start, uint64_t at)
  * 60 frames, and an application that is moved by the samples drew no more frames than that.)
  */
 static void
-drag(double x0, double y0, double x1, double y1, int ms, int hold, int grab)
+drag(double x0, double y0, double x1, double y1, int ms, int hold, int grab, int step_ms)
 {
 	uint64_t start, total_us = (uint64_t)(ms > 0 ? ms : 1) * 1000;
+	/* step_ms overrides the touch screen's 8 ms sample rate, to tell whether the frame stream
+	 * stops because of how often the events arrive rather than what they carry. */
+	int step = step_ms > 0 ? step_ms : SAMPLE_MS;
 
 	post(REDWOOD_TOUCH_DOWN, x0, y0);
 	/*
@@ -101,7 +140,7 @@ drag(double x0, double y0, double x1, double y1, int ms, int hold, int grab)
 		post(REDWOOD_TOUCH_MOVE, x0, y0);
 	}
 	start = mach_absolute_time();
-	for (uint64_t at = SAMPLE_MS * 1000;; at += SAMPLE_MS * 1000) {
+	for (uint64_t at = (uint64_t)step * 1000;; at += (uint64_t)step * 1000) {
 		double part;
 
 		if (at > total_us) {
@@ -159,9 +198,20 @@ main(int argc, char **argv)
 		perror("rwtouch: " REDWOOD_TOUCH_DEVICE);
 		return 1;
 	}
+	say("rwtouch: opened %s fd %d after %.3f s of boot\n", REDWOOD_TOUCH_DEVICE, device,
+	    (double)(mach_absolute_time() * timebase.numer / timebase.denom / 1000000) / 1e6);
+	unsigned actions = 0;
+
 	for (int i = 1; i < argc; i++) {
 		const char *step = argv[i];
 		int left = argc - i - 1;
+		unsigned long long before = posted;
+		unsigned action = ++actions;
+
+		/* An action names itself before it starts and counts what it sent after it ends: a
+		 * replay that stops in the middle leaves a start without an end, and one that sent
+		 * nothing says zero. Both read without cross-checking any other line. */
+		say("rwtouch: action %u %s start\n", action, step);
 
 		if (strcmp(step, "wait") == 0 && left >= 1) {
 			usleep((useconds_t)(atof(argv[i + 1]) * 1e6));
@@ -201,14 +251,16 @@ main(int argc, char **argv)
 		} else if (strcmp(step, "swipe") == 0 && left >= 4) {
 			int ms = left >= 5 && argv[i + 5][0] >= '0' && argv[i + 5][0] <= '9' ? atoi(argv[i + 5]) : 0;
 
-			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300, 0, 0);
+			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300, 0, 0, 0);
 			i += ms ? 5 : 4;
 		} else if (strcmp(step, "drag") == 0 && left >= 6) {
 			int grab = left >= 7 && argv[i + 7][0] >= '0' && argv[i + 7][0] <= '9' ? atoi(argv[i + 7]) : 0;
 
+			int step_ms = left >= 8 && argv[i + 8][0] >= '0' && argv[i + 8][0] <= '9' ? atoi(argv[i + 8]) : 0;
+
 			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), atoi(argv[i + 5]),
-			    atoi(argv[i + 6]), grab);
-			i += grab ? 7 : 6;
+			    atoi(argv[i + 6]), grab, step_ms);
+			i += step_ms ? 8 : (grab ? 7 : 6);
 		} else if (strcmp(step, "notify") == 0 && left >= 1) {
 			uint32_t status = notify_post(argv[i + 1]);
 
@@ -249,7 +301,9 @@ main(int argc, char **argv)
 			fprintf(stderr, "rwtouch: bad step \"%s\"\n", step);
 			return 2;
 		}
+		say("rwtouch: action %u %s end %llu events\n", action, step, posted - before);
 		usleep(50000);
 	}
+	say("rwtouch: all %u actions done, %llu events sent\n", actions, posted);
 	return 0;
 }

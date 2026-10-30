@@ -75,6 +75,9 @@
 #   CHECK=1          check every image (every container) as it is made: apfsck has to find it clean and
 #                    the kernel's apfs_lib has to read every volume back as the directory it was made of
 #                    (../tools/apfs/check-image.sh; the system image takes a few minutes more)
+#   COMPILE_ONLY=1   compile into obj/ and stage into root/, then stop before any image is made, so
+#                    root$V.apfs and system$V.apfs keep whatever they are. For proving the toolchain
+#                    works in a container without replacing the image a payload is packed from
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
 source ../xnu-env.sh
@@ -82,8 +85,27 @@ source ../xnu-env.sh
 CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
 DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1"
-IOS=../ios165
-CACHE=$IOS/20F66__iPhone10,3_6
+# ldid signs a program with its entitlements. The build container has it in theos's toolchain but not
+# on PATH, and the iOS 26 branch below calls it three times without a guard, so name it here when PATH
+# has none. The entitlement check further down reads LDID out of the environment, hence the export;
+# when neither has one, LDID stays unset and every call fails as "ldid: not found", which the guarded
+# ones report and the 26 ones stop the build on.
+if [ -z "$LDID" ] && ! command -v ldid >/dev/null 2>&1; then
+	_ldid="${THEOS:-$HOME/theos}/toolchain/linux/iphone/bin/ldid"
+	if [ -x "$_ldid" ]; then
+		LDID=$_ldid
+		export LDID
+	fi
+	unset _ldid
+fi
+# the iOS release the images are made of: ../ios165 (16.5, 20F66, iPhone X), or IOS=../ios26 for 26.6.2
+# (23G90, iPhone 17), which ../ios26/fetch.sh lays out the same way; DSC is the cache's file name, and
+# the images of 26 are root26.apfs and system26.apfs, beside those of 16.5
+IOS=${IOS:-../ios165}
+case $IOS in
+*ios26) CACHE=$IOS/23G90__iPhone18,3 DSC=dyld_shared_cache_arm64e V=26 ;;
+*) CACHE=$IOS/20F66__iPhone10,3_6 DSC=dyld_shared_cache_arm64 V= ;;
+esac
 # ios165/rootfs and ios165/cryptex must be this copy's own directories of hard links, the way
 # tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
 # cp -a does not follow one, and then every rm -rf and mv below edits the shared extraction in place. That
@@ -106,6 +128,10 @@ IOS_JOBS=${JOBS-"
 	com.apple.iconservices.iconservicesagent com.apple.pluginkit.pkd
 	com.apple.SpringBoard
 "}
+if [ "$V" = 26 ] && [ "${JOBS+x}" != x ]; then
+	# iOS 26 publishes SystemStatus through its separate daemon.
+	IOS_JOBS="$IOS_JOBS com.apple.systemstatusd"
+fi
 # iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
 # networks the radio hears. NOT FINISHED: a network cannot be joined from Settings yet.
@@ -126,6 +152,10 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # (libredwood-tweaks is the tweak loader of the package manager's prefix, src/inject_tweaks.c: in
 # SpringBoard the library above opens it, here it is named for the programs that have no library of
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
+if [ "$V" = 26 ]; then
+	# The default injection libraries use 20F66 private layouts.
+	INJECT=${INJECT-"/redwood/lib/libredwood-sb26.dylib SpringBoard"}
+fi
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
 /redwood/lib/libredwood-media.dylib mediaserverd
@@ -145,8 +175,10 @@ if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
 if [ -n "$PREBUILT" ]; then
 	echo "build.sh: not compiling, using the programs in prebuilt/userland"
 	for f in ../prebuilt/userland/*; do
-		# keep a file that did not change (and its time stamp): system.apfs depends on stage0
-		cmp -s "$f" "obj/$(basename "$f")" || cp "$f" obj/
+		# keep a file that did not change (and its time stamp): system.apfs depends on stage0;
+		# and one built here after the prebuilt copy was made (cp -p keeps that copy's time stamp)
+		o=obj/$(basename "$f")
+		cmp -s "$f" "$o" || [ "$o" -nt "$f" ] || cp -p "$f" obj/
 	done
 	cp obj/hello hello
 else
@@ -160,6 +192,68 @@ else
 	done
 fi
 
+# The iOS 26 input process uses the checked 23G90 HID callback ABI.
+if [ "$V" = 26 ]; then
+	if [ -z "$PREBUILT" ]; then
+		if [ "$(uname -s)" = Darwin ]; then
+			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
+				-Os -Wall -Wextra -Werror -framework CoreFoundation -framework IOKit \
+				src/input26_service.c -o obj/input26-service
+			/usr/bin/codesign --force --sign - --entitlements src/input26_service.entitlements obj/input26-service
+			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
+				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os -Wall -Wextra -Werror \
+				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c -o obj/libredwood-sb26.dylib
+			/usr/bin/codesign --force --sign - obj/libredwood-sb26.dylib
+			# Metal device registration in SpringBoard and backboardd, and the compression
+			# preference the driver needs set before QuartzCore picks a format: it imports
+			# linear IOSurfaces only.
+			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
+				-dynamiclib -install_name /redwood/lib/libredwood-sbmetal-experiment.dylib \
+				-Os -fno-objc-arc -Wall -Wextra -Werror \
+				-framework Foundation -framework Metal -framework UIKit -framework IOKit -lobjc \
+				src/sb_metal_experiment.m -o obj/libredwood-sbmetal-experiment.dylib
+			/usr/bin/codesign --force --sign - obj/libredwood-sbmetal-experiment.dylib
+		else
+			# The iOS 26 SDK is a symlink farm into the build host's Xcode SDK, so a container
+			# that does not carry that same absolute path sees no frameworks at all and clang
+			# answers "CoreFoundation/CoreFoundation.h not found", which reads like a broken SDK
+			# instead of a missing mount. Say which of the two it is before a compile is spent.
+			[ -f ../xnu-deps/26/sdk/iPhoneOS.sdk/System/Library/Frameworks/CoreFoundation.framework/Headers/CoreFoundation.h ] || {
+				echo "build.sh: the iOS 26 SDK has no frameworks in this environment" >&2
+				echo "build.sh: its System is $(readlink ../xnu-deps/26/sdk/iPhoneOS.sdk/System 2>/dev/null || echo 'not a symlink')" >&2
+				echo "build.sh: that is a path of the build host; mount it into the container at the same absolute path, read only" >&2
+				exit 1
+			}
+			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk -miphoneos-version-min=26.0 \
+				-Os -framework CoreFoundation -framework IOKit src/input26_service.c -o obj/input26-service
+			${LDID:-ldid} -Ssrc/input26_service.entitlements obj/input26-service
+			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
+				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os \
+				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c -o obj/libredwood-sb26.dylib
+			${LDID:-ldid} -S obj/libredwood-sb26.dylib
+			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
+				-dynamiclib -install_name /redwood/lib/libredwood-sbmetal-experiment.dylib \
+				-Os -fno-objc-arc -framework Foundation -framework Metal -framework UIKit -framework IOKit -lobjc \
+				src/sb_metal_experiment.m -o obj/libredwood-sbmetal-experiment.dylib
+			${LDID:-ldid} -S obj/libredwood-sbmetal-experiment.dylib
+		fi
+	fi
+	[ -f obj/input26-service ] || { echo "build.sh: iOS 26 requires obj/input26-service" >&2; exit 1; }
+	[ -f obj/libredwood-sb26.dylib ] || { echo "build.sh: iOS 26 requires obj/libredwood-sb26.dylib" >&2; exit 1; }
+	python3 - <<'PYHID'
+import plistlib, subprocess, sys
+if sys.platform == 'darwin':
+    subprocess.run(['/usr/bin/codesign', '--verify', '--strict', 'obj/input26-service'], check=True)
+    command = ['/usr/bin/codesign', '-d', '--entitlements', ':-', 'obj/input26-service']
+else:
+    import os
+    command = [os.environ.get('LDID', 'ldid'), '-e', 'obj/input26-service']
+result = subprocess.run(command, check=True, stdout=subprocess.PIPE)
+if plistlib.loads(result.stdout).get('com.apple.private.hid.client.event-dispatch') is not True:
+    raise SystemExit('build.sh: input26-service requires the HID event-dispatch entitlement')
+PYHID
+fi
+
 # --- the small image ------------------------------------------------------------------------------
 rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
@@ -170,6 +264,10 @@ cp obj/child root/bin/child
 # copies are editing at once.
 [ -f obj/var_store ] && cp obj/var_store root/bin/
 cp com.redwood.varstore.plist root/LaunchDaemons/
+if [ "$V" = 26 ]; then
+	cp obj/input26-service root/bin/
+	cp com.redwood.input26.plist root/LaunchDaemons/
+fi
 echo "Darwin on redwood: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 # 300000 bytes, byte i = (i*31 + (i>>8)) & 0xff; init verifies it through read() and mmap()
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
@@ -196,6 +294,16 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface \
 			-framework IOKit -o obj/drawable_test src/drawable_test.c src/redwooddrawable.m
 		$DYN -o obj/rwtouch src/rwtouch.c
+		# stop and continue named daemons, so that one round carries both halves of an
+		# experiment without rebuilding the image (src/rwsig.m)
+		$DYN -o obj/rwsig src/rwsig.m
+		# wait for the compositor to stop putting frames on the panel and ask for a thread
+		# dump at that instant (src/framewatch.m). rwsig freezes a process and asks where it
+		# sits; framewatch waits for the system to stop by itself, which is what the round
+		# with 17 frames did.
+		$DYN -o obj/framewatch src/framewatch.m
+		# what LaunchServices and pluginkit answer on this boot (src/lsprobe.m)
+		$DYN -framework Foundation -o obj/lsprobe src/lsprobe.m
 		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
 		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
@@ -372,7 +480,19 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	fi
 	# (drawable_test is built in the same block as surf_test, so it is copied with it)
 	# (prebuilt/userland does not ship every program -- e.g. drawable_test -- so copy what is there)
-	for t in hello_dyn svc_test surf_test drawable_test rwtouch mg_test; do
+	# lsprobe is in the list below and the list copies what is there, so a probe whose source changed
+	# after the last compile packs the old one without a word and the round then reports numbers the
+	# current source does not produce: the shape of every "changed but not in the image" case in
+	# docs/plan/k90auto-run-protocol.md. Required only where its compile above runs, because
+	# prebuilt/userland ships no lsprobe and PREBUILT=1 promises nothing it does not carry.
+	if [ -z "$PREBUILT" ]; then
+		[ -f obj/lsprobe ] || { echo "build.sh: obj/lsprobe missing" >&2; exit 1; }
+		[ obj/lsprobe -nt src/lsprobe.m ] || {
+			echo "build.sh: obj/lsprobe is older than src/lsprobe.m; build it (IOS=$IOS) before staging" >&2
+			exit 1
+		}
+	fi
+	for t in hello_dyn svc_test surf_test drawable_test rwtouch rwsig framewatch lsprobe mg_test; do
 		if [ -f obj/$t ]; then cp obj/$t root/bin/; fi
 	done
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
@@ -406,7 +526,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# process whose output is certainly in the log, because the job list runs it. An
 	# application launched by SpringBoard is a process this file cannot promise that about.
 	[ -f obj/RedwoodTriangle ] && cp obj/RedwoodTriangle root/bin/triangle_app
-	for f in $EXTRA; do cp "$f" root/bin/; done
+	for f in $EXTRA; do
+		if [ "$V" = 26 ] && [ "$(basename "$f")" = input26-service ]; then
+			echo "build.sh: EXTRA cannot replace the validated input26-service" >&2
+			exit 1
+		fi
+		cp "$f" root/bin/
+	done
 	#
 	# ... and the application bundle itself, staged in obj/ and copied into
 	# sysroot/Applications by the system image below.
@@ -456,13 +582,46 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	mkdir -p root/dev root/private/var
 	mkdir -p root/lib
 	cp obj/libredwood.dylib obj/libredwood-sb.dylib root/lib/
+	if [ "$V" = 26 ]; then
+		cp obj/libredwood-sb26.dylib root/lib/
+		# A prebuilt tree may not ship it; the inject.conf loop below drops an entry whose library
+		# is absent, so an image that names it has to be built here.
+		if [ -f obj/libredwood-sbmetal-experiment.dylib ]; then cp obj/libredwood-sbmetal-experiment.dylib root/lib/; fi
+	fi
 	[ -f obj/libredwood-media.dylib ] && cp obj/libredwood-media.dylib root/lib/     # (as with cpu_test)
 	[ -f obj/libredwood-store.dylib ] && cp obj/libredwood-store.dylib root/lib/
 	[ -f obj/libredwood-fairplay.dylib ] && cp obj/libredwood-fairplay.dylib root/lib/
 	[ -f obj/libredwood-app.dylib ] && cp obj/libredwood-app.dylib root/lib/
 	[ -f obj/libredwood-tweaks.dylib ] && cp obj/libredwood-tweaks.dylib root/lib/
-	[ -f obj/libredwoodmetal.dylib ] && cp obj/libredwoodmetal.dylib root/lib/
-	[ -f obj/libredwoodair.dylib ] && cp obj/libredwoodair.dylib root/lib/
+	# The build above sits behind `-d $IOS/rootfs/usr/lib` and `-z $PREBUILT`, this copy does
+	# not: with IOS at its default of ../ios165, which has no rootfs here, the compile is
+	# skipped and the image gets whatever object was left from an earlier run. That is how a
+	# driver built on 23 October reached a 28 October image (docs/plan/k90auto-run-protocol.md).
+	[ -f obj/libredwoodmetal.dylib ] || { echo "build.sh: obj/libredwoodmetal.dylib missing"; exit 1; }
+	[ obj/libredwoodmetal.dylib -nt src/redwoodmetal.m ] || {
+		echo "build.sh: obj/libredwoodmetal.dylib is older than src/redwoodmetal.m; build it (IOS=../ios26) before staging"
+		exit 1
+	}
+	cp obj/libredwoodmetal.dylib root/lib/
+	# The AIR library comes from the Mesa build rather than from this script, so its architecture is
+	# not decided here -- and dyld refuses an arm64 slice in an arm64e process outright, which leaves
+	# src/redwoodmetal.m without a compiler: no shader is ever translated, the GPU takes no
+	# submission, and the desktop ran at 9-11 frames a second where the same image with an arm64e
+	# library reached 60. Only the kernel log says any of that, so the build stops here instead.
+	# AIR_DYLIB names another library to install.
+	air_lib=${AIR_DYLIB:-obj/libredwoodair.dylib}
+	if [ -f "$air_lib" ]; then
+		air_want=arm64; [ "$V" = 26 ] && air_want=arm64e
+		case " $(lipo -archs "$air_lib" 2>/dev/null) " in
+		*" $air_want "*) ;;
+		*)
+			echo "build.sh: $air_lib is '$(lipo -archs "$air_lib" 2>/dev/null)', and this image's processes load $air_want" >&2
+			echo "build.sh: point AIR_DYLIB at a $air_want build of tools/mesa/air/" >&2
+			exit 1
+			;;
+		esac
+		cp "$air_lib" root/lib/libredwoodair.dylib
+	fi
 	if [ -f obj/RedwoodAudio ]; then
 		mkdir -p root/lib/RedwoodAudio.driver
 		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
@@ -500,6 +659,16 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		*) echo "$library $names" ;;
 		esac
 	done > root/etc/inject.conf
+	if [ "$V" = 26 ]; then
+		# The kernel input queue has one reader; the older backboardd library also reads it.
+		python3 - <<'PYINPUT'
+from pathlib import Path
+for line in Path('root/etc/inject.conf').read_text().splitlines():
+    fields = line.split()
+    if fields and Path(fields[0]).name == 'libredwood.dylib' and 'backboardd' in fields[1:]:
+        raise SystemExit('build.sh: input26-service conflicts with libredwood.dylib in backboardd')
+PYINPUT
+	fi
 	cp $IOS/var.skel root/etc/var.skel              # the directories init creates in /private/var
 	# time zones: the template's links go in a circle until the time zone daemon has run (/usr/share/zoneinfo
 	# points back into /var); point them at the data that ships with the system, and use this machine's zone
@@ -517,6 +686,36 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# the prefix with the root on the flash, downloads every package and index there, and without it each
 	# download ended in "No such file or directory"
 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
+	# installd runs (the biomed round logged it being demoted as a stuck process) and has nowhere to
+	# put what it builds: the install records live under mobile/Library/MobileInstallation and the
+	# home screen layout under mobile/Library/SpringBoard, and the data volume template carries
+	# neither directory. Without them there is nothing to write into and no records are ever created.
+	cat var.skel.extra >> root/etc/var.skel
+	# iOS 26's usermanagerd aborts ("Daemon failed to load persona manifest.") when there is no
+	# /private/var/keybags/persona.kb; a manifest of the current format (version 1) with no users
+	# lets it start, with no personas
+	if [ "$V" = 26 ]; then
+		# This template initializes a new RAM data volume; restore_var overlays saved data afterward.
+		python3 - "$IOS/rootfs/System/Library/CoreServices/SystemVersion.plist" <<'PY'
+import pathlib, plistlib, sys
+build = plistlib.loads(pathlib.Path(sys.argv[1]).read_bytes())["ProductBuildVersion"]
+path = pathlib.Path("root/var/mobile/Library/Preferences/com.apple.migration.plist")
+record = plistlib.loads(path.read_bytes())
+record["LastSystemVersion"] = build
+record["DMLastMigrationResults"]["buildVersion"] = build
+path.write_bytes(plistlib.dumps(record, fmt=plistlib.FMT_BINARY))
+PY
+		mkdir -p root/var/keybags
+		python3 -c 'import plistlib, sys; sys.stdout.buffer.write(plistlib.dumps({"UsePersonaManifestVersion": 1,
+			"UsePersonaGenerationID": 1, "UserPersonaDictionary": {}}, fmt=plistlib.FMT_BINARY))' > root/var/keybags/persona.kb
+		printf 'd\t700\t0\t0\t/private/var/keybags\n' >> root/etc/var.skel
+		printf 'f\t600\t0\t0\t/private/var/keybags/persona.kb\t/var/keybags/persona.kb\n' >> root/etc/var.skel
+		# The current platform has no ExclaveOS SILManager service. Use QuartzCore's non-Medina path.
+		mkdir -p root/var/mobile/Library/Preferences
+		python3 -c 'import plistlib, sys; sys.stdout.buffer.write(plistlib.dumps({"CAEnableMedina": False},
+			fmt=plistlib.FMT_BINARY))' > root/var/mobile/Library/Preferences/com.apple.coreanimation.plist
+		printf 'f\t644\t501\t501\t/private/var/mobile/Library/Preferences/com.apple.coreanimation.plist\t/var/mobile/Library/Preferences/com.apple.coreanimation.plist\n' >> root/etc/var.skel
+	fi
 	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
 	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
 	# Wi-Fi, which saves rebuilding an image for every question one wants to ask a running iOS. It
@@ -636,11 +835,105 @@ mkdir -p root/empty root/xpc root/hal
 for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
+# iOS 26 outside the restore environment: launchd's jobs come from the cache in xpc, made of ours
+# (mkcache.py); stage0 binds root/xpc onto /System/Library/xpc
+if [ "$V" = 26 ]; then
+	cp $IOS/rootfs/System/Library/xpc/foreground_user_endpoints.plist root/xpc/
+	./mkcache.py $IOS/rootfs/System/Library/xpc/launchd.plist root/LaunchDaemons root/xpc/launchd.plist
+	# and it panics on a job whose program is not a platform binary; the kernel takes an ad hoc
+	# signed program for one (xnu/files/bsd/kern/kern_minimac.c). macOS's own codesign: the one of
+	# the kernel build's host tools (xnu-deps/host/bin) does nothing.
+	for f in root/sbin/* root/bin/*; do
+		if file -b "$f" | grep -q Mach-O && /usr/bin/codesign -dv "$f" 2>&1 | grep -q 'not signed at all'; then
+			/usr/bin/codesign -s - "$f"
+		fi
+	done
+fi
 [ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
+# The 26 image runs where the dyld shared cache has an arm64e slice and no other (ios26/23G90__iPhone18,3
+# holds dyld_shared_cache_arm64e alone), so every program in it that reaches dyld has to be an arm64e
+# slice, and one Apple's clang made: a slice whose cpusubtype lacks the LIB64 bit comes from a compiler
+# whose __has_feature(ptrauth) is 0, where ptrauth_strip() is the identity, so src/inject_sb26.c would
+# take a signed pointer for an address. The programs of our own that never reach dyld (init, child,
+# stage0: -static -nostdlib) are left alone, and so is everything that is not a Mach-O.
+# Checked here, after every copy into root/ and before any image is made, because a program that
+# cannot load looks exactly like one that can in the image and in the log a round reads.
+# The refusal states only what this gate measured: each file's cputype and cpusubtype, and the
+# requirement the gate applies. That a rejected program cannot load in the 26 image follows from
+# the image carrying an arm64e-only shared cache; that consequence has not been measured on the
+# device, and one log line showing a rejected program produce output would falsify it. Both the
+# consequence and its falsifier are written up in the doc the refusal names.
+if [ "$V" = 26 ]; then
+	python3 - <<'PYARCH'
+import os, struct, sys
+MH_MAGIC_64, FAT_MAGIC, FAT_CIGAM = 0xfeedfacf, 0xcafebabe, 0xbebafeca
+CPU_TYPE_ARM64, ARM64E, LIB64 = 0x0100000c, 2, 0x80000000
+MH_EXECUTE, MH_DYLIB, MH_BUNDLE, LC_LOAD_DYLINKER = 2, 6, 8, 0xe
+WANT = ARM64E | LIB64
+bad = []
+for dirpath, dirnames, filenames in os.walk('root'):
+    for name in sorted(filenames):
+        path = os.path.join(dirpath, name)
+        if os.path.islink(path):
+            continue
+        with open(path, 'rb') as f:
+            head = f.read(32)
+        if len(head) < 4:
+            continue
+        magic, = struct.unpack('<I', head[:4])
+        if magic in (FAT_MAGIC, FAT_CIGAM):
+            bad.append((path, None, 'is a fat binary, and this gate requires one thin arm64e slice'))
+            continue
+        if magic != MH_MAGIC_64 or len(head) < 32:
+            continue
+        cputype, cpusubtype, filetype, ncmds = struct.unpack('<IIII', head[4:20])
+        if filetype in (MH_DYLIB, MH_BUNDLE):
+            dynamic = True
+        elif filetype == MH_EXECUTE and cputype == CPU_TYPE_ARM64:
+            dynamic = False
+            with open(path, 'rb') as f:
+                f.seek(32)
+                for _ in range(ncmds):
+                    command = f.read(8)
+                    if len(command) < 8:
+                        break
+                    cmd, size = struct.unpack('<II', command)
+                    if cmd == LC_LOAD_DYLINKER:
+                        dynamic = True
+                        break
+                    f.seek(size - 8, 1)
+        else:
+            continue
+        if not dynamic:
+            continue
+        if cputype != CPU_TYPE_ARM64:
+            bad.append((path, cpusubtype, 'is cputype %#x, and this gate requires %#x (arm64e)'
+                        % (cputype, CPU_TYPE_ARM64)))
+        elif cpusubtype != WANT:
+            what = 'is arm64e without the LIB64 bit' if cpusubtype & ~LIB64 == ARM64E else 'is an arm64 slice'
+            bad.append((path, cpusubtype, '%s (cpusubtype %#x), and this gate requires %#x'
+                        % (what, cpusubtype, WANT)))
+for path, _, why in bad:
+    print('build.sh: %s %s' % (path, why), file=sys.stderr)
+if bad:
+    print('build.sh: %d of the programs staged for this image are not arm64e with the LIB64 bit'
+          % len(bad), file=sys.stderr)
+    print('build.sh: the 26 line has to be built on a host with Apple clang; a container clang has no ptrauth', file=sys.stderr)
+    print('build.sh: why this image needs arm64e, and what would falsify it: docs/progress/2026-10-28-userland-container-build-fix.md', file=sys.stderr)
+    raise SystemExit(1)
+PYARCH
+fi
+# COMPILE_ONLY=1 stops here: obj/ holds this run's programs and root/ is staged from them, and no
+# image is written. root$V.apfs is what a payload gets packed from, so a run whose only job is to
+# prove the toolchain works has to leave it alone; the system image below is the same risk at 4.9 GB.
+if [ -n "$COMPILE_ONLY" ]; then
+	echo "build.sh: COMPILE_ONLY=1, stopping before the images: obj/ is built, root/ is staged, no apfs was written"
+	exit 0
+fi
 # the image: zlib where it saves room (a small file whole in its attribute, as Apple keeps them); fw/
 # as it is, which the kernel's drivers use where it lies in memory (bsd/dev/redwood_image.c)
-python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -1
-[ -z "$CHECK" ] || ../tools/apfs/check-image.sh root.apfs redwood=root
+python3 ../tools/apfs/mkapfs.py -z --plain fw -o root$V.apfs redwood=root | tail -1
+[ -z "$CHECK" ] || ../tools/apfs/check-image.sh root$V.apfs redwood=root
 
 # --- the RAM part of a boot off the flash: FLASHBOOT=1 -> flashboot.apfs --------------------------------
 # With the iOS volume on the phone's flash as the root, all that has to come from RAM is what is not
@@ -658,7 +951,7 @@ python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -
 # CRYPTEXES=flash: the boot volume alone (20 MB) -- the cryptexes are Apple's images as they are on the
 # flash, in darwin right after the iOS volume (../tools/darwin-write.py put them there), and init mounts
 # them from there, the same containers 1 and 2 of the root's own device.
-if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
+if [ -n "$FLASHBOOT" ] && [ -f $CACHE/$DSC ]; then
 	rm -rf flashboot flashboot.os
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd
@@ -720,9 +1013,9 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 fi
 
 # --- the system image -----------------------------------------------------------------------------
-if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
-	{ [ ! -f system.apfs ] || [ obj/stage0 -nt system.apfs ] || [ $IOS/system.manifest -nt system.apfs ] ||
-	  [ $IOS/cryptex -nt system.apfs ] || [ $IOS/cryptex-app -nt system.apfs ] || [ -n "$SYSTEM" ]; }; then
+if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
+	{ [ ! -f system$V.apfs ] || [ obj/stage0 -nt system$V.apfs ] || [ $IOS/system.manifest -nt system$V.apfs ] ||
+	  [ $IOS/cryptex -nt system$V.apfs ] || [ $IOS/cryptex-app -nt system$V.apfs ] || [ -n "$SYSTEM" ]; }; then
 	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
 	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
 	# speaker and played nothing, though our device was there and the kernel's side worked)
@@ -735,7 +1028,11 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# launchd must load our choice of jobs, not all 500 that iOS has
 	rm -rf sysroot/System/Library/LaunchDaemons sysroot/System/Library/NanoLaunchDaemons \
 		sysroot/System/Library/LaunchAngels sysroot/System/Library/xpc/launchd.plist
-	ln -s /redwood/LaunchDaemons sysroot/System/Library/LaunchDaemons
+	if [ "$V" = 26 ]; then
+		mkdir sysroot/System/Library/LaunchDaemons    # stage0 binds /redwood/LaunchDaemons onto it (src/stage0.c)
+	else
+		ln -s /redwood/LaunchDaemons sysroot/System/Library/LaunchDaemons
+	fi
 	mkdir -p sysroot/redwood sysroot/sbin
 	# where the kernel mounts the iOS root container off the phone's flash (boot-arg apfs_volume=):
 	# iOS has no /System/Volumes, and nothing can make a directory in this image once it is built
@@ -835,7 +1132,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	done
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
-	python3 ../tools/apfs/mkapfs.py -z -o system.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
-	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system.apfs System=sysroot,manifest=$IOS/system.manifest
+	python3 ../tools/apfs/mkapfs.py -z -o system$V.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1
+	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh system$V.apfs System=sysroot,manifest=$IOS/system.manifest
 	rm -rf sysroot
 fi

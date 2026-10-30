@@ -1,0 +1,132 @@
+--- a/src/gallium/auxiliary/util/perf_draw.h
++++ b/src/gallium/auxiliary/util/perf_draw.h
+@@ -71,6 +71,7 @@
+    uint64_t sync, max_sync;                  /* tc_sync_msg: waiting for the driver thread */
+    uint64_t pass, max_pass;                  /* the rest of tc_flush before fd_context_flush */
+    uint64_t calls, calls_cond, calls_multi;  /* calls reaching fd_draw_vbo and the early returns */
++   uint64_t prog_calls, prog_lookups, prog_misses;   /* get_program_state, cache lookups, builds */
+    uint64_t client, max_client;              /* the client's tc_draw_vbo, summed */
+ };
+ 
+@@ -78,7 +79,15 @@
+ extern struct fd_perf_draw fd_perf_current;   /* the driver thread's draw in flight */
+ extern struct fd_perf_window fd_perf_win;
+ extern unsigned fd_perf_progs, fd_perf_variants;   /* get_program_state calls and cache lookups */
++/* ir3_cache_lookup's miss path: the variants it had to build. Lookups minus misses is how often
++ * the cache answered, which is the reuse question; a lookup counter alone answers nothing. */
++extern unsigned fd_perf_cache_misses;
+ 
++/* The slow-frame threshold, settable with FD_PERF_SLOW_US. A value past any frame silences the
++ * per-frame lines and keeps the window summary, which is what a round wants when the summary is
++ * the reading and the per-frame lines would crowd it out. */
++extern unsigned fd_perf_slow_us;
++
+ void fd_perf_window_add(uint64_t now, const struct fd_perf_frame *f);
+ void fd_perf_window_submit(uint64_t began);
+ void fd_perf_window_sync(uint64_t began);
+@@ -93,9 +102,15 @@
+       const char *off = getenv("FD_PERF_DRAW");
+ 
+       on = !(off && off[0] == '0');
++      {
++         const char *slow = getenv("FD_PERF_SLOW_US");
++         int value = slow ? atoi(slow) : 0;
++
++         fd_perf_slow_us = value > 0 ? (unsigned)value : FD_PERF_SLOW_US;
++      }
+       if (on) {
+-         printf("perf draw: timing on, frames over %d us are printed, %d frames per summary\n",
+-                FD_PERF_SLOW_US, FD_PERF_WINDOW);
++         printf("perf draw: timing on, frames over %u us are printed, %d frames per summary\n",
++                fd_perf_slow_us, FD_PERF_WINDOW);
+          fflush(stdout);
+       }
+    }
+@@ -168,7 +183,7 @@
+       f->first = 0;
+       return;
+    }
+-   if (now - f->first >= FD_PERF_SLOW_US) {
++   if (now - f->first >= fd_perf_slow_us) {
+       if (f == &fd_perf_driver) {
+          printf("perf driver %llu us: %u draws in %llu us, tracking %llu prog %llu emit %llu "
+                 "draw %llu us, max %llu us, program calls %u cache lookups %u\n",
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c
+@@ -449,6 +449,8 @@
+ struct fd_perf_draw fd_perf_current;
+ struct fd_perf_window fd_perf_win;
+ unsigned fd_perf_progs, fd_perf_variants;
++unsigned fd_perf_cache_misses;
++unsigned fd_perf_slow_us = FD_PERF_SLOW_US;
+ uint64_t fd_perf_checks_sum, fd_perf_checks_seen, fd_perf_checks_worst;
+ 
+ /* How many calls arrive at the driver's entry, and how many of those return before anything is
+@@ -474,12 +476,23 @@
+    {
+       static unsigned seen_in, seen_cond, seen_multi;
+ 
++      static unsigned seen_progs, seen_lookups, seen_misses;
++
+       w->calls += fd_perf_entry_calls - seen_in;
+       w->calls_cond += fd_perf_entry_cond - seen_cond;
+       w->calls_multi += fd_perf_entry_multi - seen_multi;
+       seen_in = fd_perf_entry_calls;
+       seen_cond = fd_perf_entry_cond;
+       seen_multi = fd_perf_entry_multi;
++      /* Calls, lookups and the builds the cache had to do. Lookups close to calls means every call
++       * reaches the cache; builds far below lookups means it answered, and the cost sits in the
++       * key and the search rather than in building a variant. */
++      w->prog_calls += fd_perf_progs - seen_progs;
++      w->prog_lookups += fd_perf_variants - seen_lookups;
++      w->prog_misses += fd_perf_cache_misses - seen_misses;
++      seen_progs = fd_perf_progs;
++      seen_lookups = fd_perf_variants;
++      seen_misses = fd_perf_cache_misses;
+    }
+    w->frames++;
+    w->draws += f->draws;
+@@ -526,7 +539,8 @@
+           "driver %llu max %llu; "
+           "own %llu (track %llu prog %llu emit %llu draw %llu); submit %llu max %llu; "
+           "client %llu max %llu; sync %llu max %llu, pass %llu max %llu; calls %llu in "
+-          "(condition %llu, multi %llu) us\n",
++          "(condition %llu, multi %llu); prog_calls %llu prog_lookups %llu prog_builds "
++          "%llu us\n",
+           w->frames, (unsigned long long) (w->interval / w->frames),
+           (unsigned long long) w->max_interval,
+           (unsigned long long) (w->draws / w->frames),
+@@ -542,7 +556,10 @@
+           (unsigned long long) (w->pass / w->frames), (unsigned long long) w->max_pass,
+           (unsigned long long) (w->calls / w->frames),
+           (unsigned long long) (w->calls_cond / w->frames),
+-          (unsigned long long) (w->calls_multi / w->frames));
++          (unsigned long long) (w->calls_multi / w->frames),
++          (unsigned long long) (w->prog_calls / w->frames),
++          (unsigned long long) (w->prog_lookups / w->frames),
++          (unsigned long long) (w->prog_misses / w->frames));
+    fflush(stdout);
+    memset(w, 0, sizeof(*w));
+    /* The window resets its counters; the time of the last close has to survive, or the first gap
+--- a/src/gallium/drivers/freedreno/ir3/ir3_cache.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_cache.c
+@@ -12,6 +12,7 @@
+ 
+ #include "ir3_cache.h"
+ #include "ir3_gallium.h"
++#include "util/perf_draw.h"
+ 
+ static uint32_t
+ key_hash(const void *_key)
+@@ -79,6 +80,11 @@
+       return entry->data;
+    }
+ 
++   /* Past this point a variant is built. Counted here rather than at the caller, because the
++    * caller's counter runs on hits too and would read as "no reuse" whatever the cache does. */
++   if (fd_perf_on())
++      fd_perf_cache_misses++;
++
+    MESA_TRACE_FUNC();
+ 
+    if (key->hs)

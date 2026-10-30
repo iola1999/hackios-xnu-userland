@@ -115,6 +115,23 @@ same_ptr(const struct air_ptr *a, const struct air_ptr *b)
           nir_src_as_uint(nir_src_for_ssa(b->offset));
 }
 
+static bool
+same_resource(const struct air_ptr *a, const struct air_ptr *b)
+{
+   return a->class == b->class && a->binding == b->binding && a->is_image == b->is_image;
+}
+
+/* A class whose pointers into one resource differ only by a byte offset that can be a
+ * run-time value. Not a texture or a sampler (no offset), and not an argument buffer,
+ * whose offset names a member and has to be known while translating.
+ */
+static bool
+offset_is_value(enum air_ptr_class class)
+{
+   return class == AIR_PTR_UBO || class == AIR_PTR_SSBO || class == AIR_PTR_SHARED ||
+          class == AIR_PTR_SCRATCH || class == AIR_PTR_CONSTANT_DATA;
+}
+
 static struct air_val *
 air_val_agg(struct air_ctx *c, unsigned n)
 {
@@ -155,8 +172,7 @@ air_nir_bit_size(struct air_ctx *c, const struct air_type *t)
        * no answer for an aggregate, and this used to return it unexamined, so
        * `[4 x float]` became a one-component float output and four clip planes
        * became one with nothing in any log. A width NIR cannot hold and a type
-       * that has no single width are both refusals, and they are not the same
-       * refusal.
+       * that has no single width are both refusals, and they are not the same refusal.
        */
       if (!bits)
          air_error(c, "instruction: %s where a number belongs, which has no single "
@@ -1655,9 +1671,9 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       case 3:
          p.class = AIR_PTR_SHARED;
          rk = AIR_RESOURCE_THREADGROUP_BUFFER;
-         /* a threadgroup argument is sized at dispatch; its base is where the
-          * previous ones end, which only the runtime knows. One is all the
-          * corpus uses, so its base is zero and anything else is refused.
+         /* a threadgroup argument is sized at dispatch. One is all the corpus
+          * uses, and anything else is refused; its base is set after
+          * plan_globals, past the static threadgroup arrays.
           */
          if (index != 0)
             return air_error(c, "interface: a second threadgroup buffer (index %u)",
@@ -1668,6 +1684,8 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       }
       add_resource(c, rk, index, size, read, write, param, node);
       c->params[param] = air_val_ptr(c, p);
+      if (p.class == AIR_PTR_SHARED)
+         c->dynamic_threadgroup = c->params[param];
       return true;
    }
 
@@ -1688,8 +1706,13 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          .binding = index,
          .is_image = write,
       };
-      add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
-                   sample || read, write, param, node);
+      /* An argument marked air.arg_unused is one Metal reports as inactive, and an
+       * application need not bind it: QuartzCore leaves [[texture(1)]] of some of its
+       * fill shaders empty. Listing it would make check_bindings refuse the draw.
+       */
+      if (md_key(node, "air.arg_unused") < 0)
+         add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
+                      sample || read, write, param, node);
       c->params[param] = air_val_ptr(c, p);
       return true;
    }
@@ -1698,7 +1721,9 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       uint64_t index = 0;
       md_key_int(node, "air.location_index", &index);
       struct air_ptr p = { .class = AIR_PTR_SAMPLER, .binding = index };
-      add_resource(c, AIR_RESOURCE_SAMPLER, index, 0, true, false, param, node);
+      /* inactive as an unused texture is, see there */
+      if (md_key(node, "air.arg_unused") < 0)
+         add_resource(c, AIR_RESOURCE_SAMPLER, index, 0, true, false, param, node);
       c->params[param] = air_val_ptr(c, p);
       return true;
    }
@@ -2468,6 +2493,19 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             return false;
          if (pc->num_components != 1)
             return air_error(c, "instruction: a vector select between pointers");
+         /* Two places in ONE memory differ only in their byte offset, and an offset is
+          * a value: the choice is a bcsel of the offsets and the result an ordinary
+          * pointer, which a phi can carry round a loop. CoreAnimation's path vertex
+          * shaders binary-search their segment buffer this way. A choice between two
+          * buffers still loads both sides.
+          */
+         if (pa->kind == AIR_VAL_PTR && pb->kind == AIR_VAL_PTR &&
+             same_resource(&pa->ptr, &pb->ptr) && offset_is_value(pa->ptr.class)) {
+            struct air_ptr p = pa->ptr;
+            p.offset = nir_bcsel(&c->b, pc, ptr_offset(c, pa->ptr), ptr_offset(c, pb->ptr));
+            air_set(c, &in->base, air_val_ptr(c, p));
+            return true;
+         }
          air_set(c, &in->base, air_val_ptr_select(c, pc, pa, pb));
          return true;
       }
@@ -2495,11 +2533,13 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       nir_def *i = air_get_ssa(c, in->operands[2]);
       if (!v || !x || !i)
          return false;
-      if (!nir_src_is_const(nir_src_for_ssa(i)))
-         return air_error(c, "instruction: insertelement at a run-time index");
+      /* A constant index still becomes nir_vector_insert_imm inside the helper; a run-time index
+       * becomes one bcsel per component, which is what this port's fragment shaders need: Metal's
+       * PBGRA-to-RGBA swizzle reaches here with an index computed in the shader, and refusing it
+       * failed the whole pipeline (kernel-12377-attr26-driver-revert, s005.log: "instruction:
+       * insertelement at a run-time index (block 6, instruction 1, opcode 10)"). */
       air_set(c, &in->base,
-              air_val_ssa(c, nir_vector_insert_imm(&c->b, v, x,
-                                                   nir_src_as_uint(nir_src_for_ssa(i)))));
+              air_val_ssa(c, nir_vector_insert(&c->b, v, x, nir_u2u32(&c->b, i))));
       return true;
    }
    case AIR_OP_SHUFFLEVEC: {
@@ -2817,328 +2857,16 @@ reverse_post_order(struct air_ctx *c, const struct air_function *f, unsigned *or
 }
 
 static bool translate_body(struct air_ctx *c);
+static bool inline_return(struct air_ctx *c, const struct air_inst *in);
+struct air_linked_function;
+static const char *visible_reference_name(struct air_ctx *c, const struct air_function *f);
+static const struct air_linked_function *linked_function(struct air_ctx *c, const char *name);
+static bool call_linked_function(struct air_ctx *c, const struct air_inst *in,
+                                 const struct air_function *decl,
+                                 const struct air_linked_function *lf);
 static void materialise_globals(struct air_ctx *c);
 
-/* Does this value hold a pointer anywhere inside it? */
-static bool
-val_holds_ptr(const struct air_val *v)
-{
-   if (!v)
-      return false;
-   if (val_is_pointerish(v))
-      return true;
-   if (v->kind != AIR_VAL_AGG)
-      return false;
-   for (unsigned i = 0; i < v->num_elems; i++)
-      if (val_holds_ptr(v->elems[i]))
-         return true;
-   return false;
-}
-
-/* A function of the module, translated as a nir_function so that
- * nir_inline_functions can fold it into its callers afterwards.
- *
- * Translating it in place at the call site was the other option and is worse:
- * the callees here are not straight-line code -- FilmGrainLuma has 17 blocks
- * and 24 branches -- so inlining by hand would mean reproducing a CFG inside
- * another one, with its own block map and phis. NIR already has that pass.
- *
- * The return goes through an out-parameter at index 0, with is_return set,
- * because a NIR call has no destination; this is the convention spirv_to_nir
- * uses (vtn_cfg.c) and the one nir_inline_functions expects.
- *
- * The per-function tables are swapped rather than shared: values, blocks and
- * phis are all keyed on this function's own objects, and leaving the caller's
- * entries in place would let a callee resolve a value it cannot see.
- */
-static nir_function *
-translate_callee(struct air_ctx *c, const struct air_function *f,
-                 struct air_val **argv, bool *is_param)
-{
-   /* A texture, sampler or buffer argument is not a value in this frontend: it
-    * is resolved at translation time into a binding, and tex_handle wants an
-    * AIR_VAL_PTR rather than an SSA def. Such an argument is bound from the
-    * caller's own resolution and takes no NIR parameter, which specialises the
-    * callee to its call site -- so it is not cached. Each of the four modules
-    * that needs this has exactly one call site, counted beforehand.
-    *
-    * A pointer carrying a byte offset is refused instead: that offset is an
-    * nir_def of the CALLER's impl, and using it here would be the same
-    * cross-function def/use that the globals used to cause.
-    */
-   bool specialised = false;
-   for (unsigned i = 0; i < f->num_args; i++) {
-      /* A struct holding a pointer counts as one too: CoreImage passes a
-       * texture and a sampler as metal::texture2d and metal::sampler, which
-       * are one-field structs wrapping the address-space-1 and -2 pointers.
-       * Passing such a struct as a NIR value would hand the callee something
-       * it then takes extractvalue of, and extractvalue of a value that is not
-       * an aggregate here is exactly the error this used to produce.
-       */
-      bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
-                                     val_holds_ptr(argv[i]));
-      if (ptr && argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset) {
-         air_error(c, "intrinsic: a call passing a pointer at a computed offset as "
-                      "argument %u, which would use the caller's own value here", i);
-         return NULL;
-      }
-      /* The same reason, for the two pointers that are values: a chosen
-       * pointer's condition is a def of the CALLER's impl, and a slot's
-       * soundness rests on every use being in one block of one function.
-       */
-      if (argv && argv[i] && argv[i]->kind == AIR_VAL_PTR_SELECT) {
-         air_error(c, "intrinsic: a call passing a pointer chosen at run time as "
-                      "argument %u", i);
-         return NULL;
-      }
-      is_param[i] = !ptr;
-      specialised |= ptr;
-   }
-
-   struct hash_entry *e = specialised ? NULL : _mesa_hash_table_search(c->fns, f);
-   if (e)
-      return e->data;
-
-   if (f->is_declaration || !f->num_blocks) {
-      air_error(c, "intrinsic: a call of %s, which the module only declares",
-                f->base.name ? f->base.name : "a function");
-      return NULL;
-   }
-
-   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
-   bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
-   /* A struct return takes one out-parameter per member rather than one for the
-    * whole value. Four of QuartzCore's vertex shaders are nothing but a wrapper
-    * around such a function -- `tail call fastcc`, then extractvalue of each
-    * field -- and before this they stopped at the call with "an aggregate where
-    * a number belongs", which was emit_return inside the callee asking for the
-    * returned struct as a register.
-    */
-   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
-   unsigned nret = 0;
-   if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++)
-         nret += ret_member_is_number(rt->members[i]);
-   } else if (has_ret) {
-      nret = 1;
-   }
-   unsigned nparams = f->num_args + nret;
-   nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
-   fn->num_params = nparams;
-   fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
-   fn->should_inline = true;
-
-   unsigned idx = 0;
-   const struct glsl_type *ret_glsl = NULL;
-   if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
-            continue;
-         fn->params[idx++] = (nir_parameter){
-            .num_components = 1, .bit_size = 32,
-            .is_return = true,
-            .mode = nir_var_function_temp,
-            .type = param_glsl_type(c, rt->members[i]),
-         };
-      }
-   } else if (has_ret) {
-      ret_glsl = param_glsl_type(c, rt);
-      fn->params[idx++] = (nir_parameter){
-         .num_components = 1, .bit_size = 32,
-         .is_return = true,
-         .mode = nir_var_function_temp,
-         .type = ret_glsl,
-      };
-   }
-   for (unsigned i = 0; i < f->num_args; i++) {
-      if (!is_param[i])
-         continue;
-      const struct air_type *at = f->args[i].type;
-      fn->params[idx++] = (nir_parameter){
-         .num_components = (uint8_t)air_nir_components(at),
-         .bit_size = (uint8_t)air_nir_bit_size(c, at),
-      };
-   }
-   fn->num_params = idx;   /* the pointers took no parameter */
-
-   /* cached before the body is translated, so that a callee which calls itself
-    * meets its own declaration rather than being translated for ever */
-   if (!specialised)
-      _mesa_hash_table_insert(c->fns, f, fn);
-   else
-      _mesa_hash_table_insert(c->fns, fn, fn);
-
-   nir_builder saved_b = c->b;
-   const struct air_function *saved_fn = c->fn;
-   struct hash_table *sv = c->values, *sb = c->blocks,
-                     *sp = c->phi_cursors, *sr = c->phi_regs;
-   nir_deref_instr *saved_ret = c->ret_deref;
-   nir_deref_instr **saved_ret_fields = c->ret_fields;
-   unsigned saved_num_ret_fields = c->num_ret_fields;
-   /* a constant of the caller is a def of the caller's impl, so the place
-    * constants are built belongs to the function being translated, like the
-    * values table above */
-   nir_cursor saved_consts = c->const_cursor;
-
-   c->fn = f;
-   c->values = _mesa_pointer_hash_table_create(c->mem_ctx);
-   c->blocks = _mesa_pointer_hash_table_create(c->mem_ctx);
-   c->phi_cursors = _mesa_pointer_hash_table_create(c->mem_ctx);
-   c->phi_regs = _mesa_pointer_hash_table_create(c->mem_ctx);
-   c->b = nir_builder_at(nir_before_impl(nir_function_impl_create(fn)));
-   /* as for the entry point: this translator emits an unstructured CFG with
-    * nir_goto, and nir_goto_if asserts on a structured impl. A new impl is
-    * structured by default, so a callee crashed on its first branch -- which
-    * is what the corpus's reader count caught, 456 falling to 454. */
-   c->b.impl->structured = false;
-   c->const_cursor = nir_before_impl(c->b.impl);
-   c->ret_deref = NULL;
-   c->ret_fields = NULL;
-   c->num_ret_fields = 0;
-
-   /* this function's own globals, built in its own builder */
-   materialise_globals(c);
-
-   bool ok = true;
-   /* The caller passes each deref's own def and the callee casts it back, which
-    * is the convention nir_functions.c documents: load_param is replaced by the
-    * call's source at inline time and nir_opt_deref removes the cast afterwards.
-    */
-   if (ret_struct) {
-      c->ret_fields = rzalloc_array(c->mem_ctx, nir_deref_instr *,
-                                    MAX2(rt->num_members, 1));
-      c->num_ret_fields = rt->num_members;
-      unsigned p = 0;
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
-            continue;
-         c->ret_fields[i] =
-            nir_build_deref_cast(&c->b, nir_load_param(&c->b, p++),
-                                 nir_var_function_temp,
-                                 param_glsl_type(c, rt->members[i]), 0);
-      }
-   } else if (has_ret) {
-      c->ret_deref = nir_build_deref_cast(&c->b, nir_load_param(&c->b, 0),
-                                          nir_var_function_temp, ret_glsl, 0);
-   }
-   unsigned pidx = nret;
-   for (unsigned i = 0; i < f->num_args && ok; i++) {
-      if (!is_param[i]) {
-         air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
-         continue;
-      }
-      air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));
-   }
-   if (ok)
-      ok = translate_body(c);
-
-   c->b = saved_b;
-   c->fn = saved_fn;
-   c->values = sv;
-   c->blocks = sb;
-   c->phi_cursors = sp;
-   c->phi_regs = sr;
-   c->const_cursor = saved_consts;
-   c->ret_deref = saved_ret;
-   c->ret_fields = saved_ret_fields;
-   c->num_ret_fields = saved_num_ret_fields;
-   return ok ? fn : NULL;
-}
-
-/* A call of a function this module defines. The callee is translated as a
- * nir_function (above) and the call becomes a nir_call, which
- * nir_inline_functions folds in after the whole shader is translated.
- *
- * This used to be refused outright, with a comment saying no system shader
- * needed it because Apple's own inliner had already flattened every one. That
- * was not true: six entry points of the corpus call a function in their module
- * and five of them are compute kernels, which is how the claim went unnoticed
- * -- nothing dispatched a kernel until there was something to dispatch it with.
- */
-bool
-air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name)
-{
-   const struct air_function *f = NULL;
-   for (unsigned i = 0; i < c->m->num_functions; i++) {
-      const char *fname = c->m->functions[i]->base.name;
-      if (fname && !strcmp(fname, name)) {
-         f = c->m->functions[i];
-         break;
-      }
-   }
-   if (!f)
-      return air_error(c, "intrinsic: a call of %s, which is not a function of this "
-                          "module", name);
-
-   if (in->num_operands - 1 != f->num_args)
-      return air_error(c, "intrinsic: a call of %s with %u arguments, wanting %u", name,
-                       in->num_operands - 1, f->num_args);
-
-   /* resolved in the CALLER's value map, which is the live one here */
-   struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *,
-                                         MAX2(f->num_args, 1));
-   bool *is_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
-   for (unsigned i = 0; i < f->num_args; i++) {
-      argv[i] = air_get(c, in->operands[i + 1]);
-      if (!argv[i])
-         return false;
-   }
-
-   nir_function *fn = translate_callee(c, f, argv, is_param);
-   if (!fn)
-      return false;   /* translate_callee has said why */
-
-   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
-   bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
-   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
-
-   nir_variable *tmp = NULL;
-   /* One local per member for a struct return, in the member order
-    * translate_callee made its parameters from; the ones with no parameter stay
-    * NULL and the aggregate's element for them stays NULL too, which is the
-    * same thing an extractvalue of an undef field already reads.
-    */
-   nir_variable **fields = ret_struct ?
-      rzalloc_array(c->mem_ctx, nir_variable *, MAX2(rt->num_members, 1)) : NULL;
-   nir_call_instr *call = nir_call_instr_create(c->nir, fn);
-   unsigned idx = 0;
-   if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
-            continue;
-         fields[i] = nir_local_variable_create(c->b.impl,
-                                               param_glsl_type(c, rt->members[i]),
-                                               "callret");
-         call->params[idx++] =
-            nir_src_for_ssa(&nir_build_deref_var(&c->b, fields[i])->def);
-      }
-   } else if (has_ret) {
-      tmp = nir_local_variable_create(c->b.impl, param_glsl_type(c, rt), "callret");
-      call->params[idx++] = nir_src_for_ssa(&nir_build_deref_var(&c->b, tmp)->def);
-   }
-   /* operand 0 is the callee; the arguments follow it */
-   for (unsigned i = 0; i < f->num_args; i++) {
-      if (!is_param[i])
-         continue;
-      nir_def *a = air_get_ssa(c, in->operands[i + 1]);
-      if (!a)
-         return air_error(c, "intrinsic: argument %u of %s is not a value this can pass",
-                          i, name);
-      call->params[idx++] = nir_src_for_ssa(a);
-   }
-   nir_builder_instr_insert(&c->b, &call->instr);
-
-   if (ret_struct) {
-      struct air_val *agg = air_val_agg(c, rt->num_members);
-      for (unsigned i = 0; i < rt->num_members; i++)
-         if (fields[i])
-            agg->elems[i] = air_val_ssa(c, nir_load_var(&c->b, fields[i]));
-      air_set(c, &in->base, agg);
-   } else if (has_ret) {
-      air_set(c, &in->base, air_val_ssa(c, nir_load_var(&c->b, tmp)));
-   }
-   return true;
-}
+#include "air_call.inc"
 
 /* The air.visible_input node for argument i, or NULL. The nodes carry a
  * parameter number as their first operand rather than being in order, so they
@@ -3197,7 +2925,8 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
 
    struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *,
                                          MAX2(f->num_args, 1));
-   bool *is_param = rzalloc_array(c->mem_ctx, bool, MAX2(f->num_args, 1));
+   unsigned char *kind = rzalloc_array(c->mem_ctx, unsigned char,
+                                       MAX2(f->num_args, 1));
 
    /* Eleven of the corpus's library functions are CoreImage's sampling helpers,
     * and they take what CoreImage hands a stitched function: a texture, a
@@ -3240,7 +2969,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
          struct air_val *agg = air_val_agg(c, 1);
          agg->elems[0] = air_val_ptr(c, p);
          argv[i] = agg;
-         is_param[i] = false;
+         kind[i] = CALL_PARAM_NONE;
          continue;
       }
 
@@ -3256,7 +2985,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
          add_resource(c, AIR_RESOURCE_CONSTANT_BUFFER, next_ubo++, 256, true, false,
                       i, arg_md(in_md, i));
          argv[i] = air_val_ptr(c, p);
-         is_param[i] = false;
+         kind[i] = CALL_PARAM_NONE;
          continue;
       }
 
@@ -3277,7 +3006,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
       if (!v)
          return false;
       argv[i] = air_val_ssa(c, v);
-      is_param[i] = true;
+      kind[i] = CALL_PARAM_VALUE;
    }
 
    const struct air_type *rt = f->fn_type->elem;
@@ -3289,7 +3018,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
                re->kind != AIR_TYPE_INT))
       return air_error(c, "library: the return value is neither a scalar nor a vector");
 
-   nir_function *fn = translate_callee(c, f, argv, is_param);
+   nir_function *fn = translate_callee(c, f, argv, kind);
    if (!fn)
       return false;   /* translate_callee has said why */
 
@@ -3310,7 +3039,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
        * has no value, which NIR dereferences while adding uses -- a segfault
        * inside nir_instr_insert rather than a message.
        */
-      if (!is_param[i])
+      if (kind[i] != CALL_PARAM_VALUE)
          continue;
       nir_def *a = argv[i] ? argv[i]->def : NULL;
       if (!a)
@@ -3339,30 +3068,33 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
  * name the same member -- 207 of the pointer phis in Resident Evil 4's library
  * are exactly that, and not one names two different members.
  *
- * Refused when they differ. This COULD go through the AIR_VAL_PTR_SELECT
- * machinery that already loads both sides and selects the values, but nothing
- * in reach needs it, a texture or a sampler is not a value that path can load,
- * and an untested path is worse than a refusal.
+ * Operands in one buffer at different offsets get a register for the offset, the
+ * way a loop-carried pointer does (CoreAnimation's path vertex shaders leave a
+ * binary search over their segment buffer with such a phi). Operands in different
+ * resources are refused. That COULD go through the AIR_VAL_PTR_SELECT machinery
+ * that already loads both sides and selects the values, but nothing in reach
+ * needs it, a texture or a sampler is not a value that path can load, and an
+ * untested path is worse than a refusal.
  *
- * `reachable` is why this is sound rather than optimistic: the blocks are
- * walked in reverse post order, so an operand coming in over a BACK edge has
- * not been translated yet. Skipping an operand merely because it is missing
- * would accept a loop-carried pointer by ignoring the edge that changes it, so
- * a missing operand from a reachable block is a refusal and only an edge the
- * entry cannot reach at all is passed over.
+ * `reachable` decides which edges count: the blocks are walked in reverse post
+ * order, so an operand coming in over a BACK edge has not been translated yet.
+ * Such a pointer is carried round the loop: its offset gets a register, and the
+ * pointer that comes back over the edge has to name the same resource. An edge
+ * the entry cannot reach at all is passed over.
  */
 static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
 {
    struct air_val *first = NULL;
+   bool loop_carried = false, offsets_differ = false;
    for (unsigned k = 0; k < in->num_operands; k++) {
       if (!in->targets[k] || !reachable[in->targets[k]->index])
          continue;
       struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
-      if (!e)
-         return air_error(c, "instruction: a phi of pointers whose operand comes in over "
-                             "a loop edge, so which resource it is depends on the "
-                             "iteration");
+      if (!e) {
+         loop_carried = true;
+         continue;
+      }
       struct air_val *v = e->data;
       if (!v || v->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a phi of pointers one of whose operands is "
@@ -3371,13 +3103,31 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
                                       : "not a resolved pointer");
       if (!first)
          first = v;
-      else if (!same_ptr(&first->ptr, &v->ptr))
+      else if (!same_resource(&first->ptr, &v->ptr) ||
+               (!same_ptr(&first->ptr, &v->ptr) && !offset_is_value(v->ptr.class) &&
+                !loop_carried))
          return air_error(c, "instruction: a phi between pointers that name different "
                              "places, which would have to be chosen at run time");
+      else
+         offsets_differ |= !same_ptr(&first->ptr, &v->ptr);
    }
    if (!first)
       return air_error(c, "instruction: a phi of pointers with no reachable operand");
-   air_set(c, &in->base, first);
+   if (!loop_carried && !offsets_differ) {
+      air_set(c, &in->base, first);
+      return true;
+   }
+   /* A pointer carried round a loop, or one buffer at two offsets: the resource is
+    * fixed and only the byte offset changes, so the offset gets a register like any
+    * other phi, and the store pass at the end of translate_body checks that every
+    * incoming pointer names the same resource before it stores that pointer's offset.
+    */
+   nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
+   nir_def *reg = nir_decl_reg(&entry, 1, 32, 0);
+   struct air_ptr p = first->ptr;
+   p.offset = nir_load_reg(&c->b, reg);
+   _mesa_hash_table_insert(c->phi_regs, in, reg);
+   air_set(c, &in->base, air_val_ptr(c, p));
    return true;
 }
 
@@ -3423,7 +3173,8 @@ translate_body(struct air_ctx *c)
    /* NIR's first block is the function's first; the rest are made as they
     * are reached, and nir_lower_goto_ifs puts them in order afterwards
     */
-   _mesa_hash_table_insert(c->blocks, &f->blocks[0], nir_start_block(c->b.impl));
+   _mesa_hash_table_insert(c->blocks, &f->blocks[0],
+                           c->inline_entry ? c->inline_entry : nir_start_block(c->b.impl));
 
    unsigned *order = rzalloc_array(c->mem_ctx, unsigned, MAX2(f->num_blocks, 1));
    unsigned num_order = reverse_post_order(c, f, order);
@@ -3486,6 +3237,12 @@ translate_body(struct air_ctx *c)
       const struct air_inst *term = blk->insts[blk->num_insts - 1];
       switch (term->op) {
       case AIR_OP_RET:
+         if (c->inline_exit) {
+            if (!inline_return(c, term))
+               return false;
+            nir_goto(&c->b, c->inline_exit);
+            break;
+         }
          if (!emit_return(c, term))
             return false;
          nir_goto(&c->b, c->b.impl->end_block);
@@ -3567,13 +3324,26 @@ translate_body(struct air_ctx *c)
             continue;
          struct hash_entry *re = _mesa_hash_table_search(c->phi_regs, in);
          if (!re)
-            continue; /* a phi in an unreachable block, or one of pointers */
+            continue; /* a phi in an unreachable block, or a pointer phi resolved in place */
          for (unsigned k = 0; k < in->num_operands; k++) {
             struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, in->targets[k]);
             if (!ce)
                continue; /* an edge from a block the entry cannot reach */
             c->b.cursor = *(nir_cursor *)ce->data;
-            nir_def *val = air_get_ssa(c, in->operands[k]);
+            nir_def *val;
+            if (in->base.type->kind == AIR_TYPE_POINTER) {
+               /* a loop-carried pointer (resolve_pointer_phi): store its offset */
+               struct hash_entry *pe = _mesa_hash_table_search(c->values, &in->base);
+               struct hash_entry *oe = _mesa_hash_table_search(c->values, in->operands[k]);
+               struct air_val *phi = pe ? pe->data : NULL, *from = oe ? oe->data : NULL;
+               if (!phi || !from || from->kind != AIR_VAL_PTR ||
+                   !same_resource(&phi->ptr, &from->ptr))
+                  return air_error(c, "instruction: a pointer carried round a loop that "
+                                      "names a different resource on the way back");
+               val = from->ptr.offset ? from->ptr.offset : nir_imm_int(&c->b, 0);
+            } else {
+               val = air_get_ssa(c, in->operands[k]);
+            }
             if (!val)
                return false;
             nir_store_reg(&c->b, val, re->data);
@@ -3615,32 +3385,7 @@ function_constant_index(struct air_ctx *c, const struct air_global *g)
  * records rather than builds -- making the value needs a builder, and which
  * function's builder matters (see materialise_globals).
  */
-/* The 64-bit `constexpr sampler` word, field by field (nir_air.h has where the
- * layout comes from and why it took three sources). Bit 63 marks the one-word
- * form; the two-word form of AIR 2.6 carries a LOD bias in the second word's
- * low 16 bits and no module of this corpus uses it, so it is reported rather
- * than decoded.
- */
-struct air_sampler_state
-air_decode_sampler_state(uint64_t w)
-{
-#define FIELD(lo, n) ((unsigned)((w >> (lo)) & ((1ull << (n)) - 1)))
-   struct air_sampler_state s = {
-      .address = { FIELD(0, 3), FIELD(3, 3), FIELD(6, 3) },
-      .mag_filter = FIELD(9, 2),
-      .min_filter = FIELD(11, 2),
-      .mip_filter = FIELD(13, 2),
-      .pixel_coord = FIELD(15, 1) != 0,
-      .compare_func = FIELD(16, 4),
-      .max_anisotropy = FIELD(20, 4) + 1,
-      .lod_min = FIELD(24, 16),
-      .lod_max = FIELD(40, 16),
-      .border_color = FIELD(56, 2),
-      .reduction = FIELD(58, 2),
-   };
-#undef FIELD
-   return s;
-}
+#include "air_sampler.inc"
 
 static void
 plan_globals(struct air_ctx *c)
@@ -3684,10 +3429,8 @@ plan_globals(struct air_ctx *c)
          pl->binding = next;
 
          uint64_t word = 0;
-         if (g->init && !air_const_uint(g->init, &word)) {
-            air_error(c, "interface: an inline sampler whose state is not a constant");
+         if (!inline_sampler_word(c, g, &word))
             return;
-         }
          struct air_shader_info *info = c->info;
          info->resources = reralloc(c->mem_ctx, info->resources, struct air_resource,
                                     info->num_resources + 1);
@@ -3747,6 +3490,8 @@ materialise_globals(struct air_ctx *c)
       air_set(c, &g->base, air_val_ptr(c, p));
    }
 }
+
+#include "air_link.inc"
 
 /* The functions of @llvm.global_ctors, inlined at the top of the entry point:
  * this is where a function constant turns into the program-scope variable the
@@ -3944,6 +3689,14 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
 
    if (!c.error[0])
       plan_globals(&c);
+   /* Gallium adds the dispatch's variable_shared_mem after static_shared_mem, so the
+    * threadgroup buffer the dispatch sizes starts where the static arrays end. The
+    * pointer value is the one air_set stored, and the body is translated after this.
+    */
+   if (!c.error[0] && c.dynamic_threadgroup && c.shared_size) {
+      c.shared_size = ALIGN_POT(c.shared_size, 16);
+      c.dynamic_threadgroup->ptr.offset = nir_imm_int(&c.b, c.shared_size);
+   }
    if (!c.error[0])
       materialise_globals(&c);
    if (!c.error[0])
@@ -4079,6 +3832,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       }
       info->entry_point = ralloc_strdup(mem_ctx, info->entry_point);
    }
+   air_gather_quad_helpers(c.nir);
    ralloc_free(ctx);
    if (error)
       *error = NULL;

@@ -65,17 +65,7 @@ void rwa_device_close(struct rwa_device *device);
 /* What the driver should call the GPU, as Mesa knows it ("Adreno 7c+ Gen 3"). Never NULL. */
 const char *rwa_device_name(struct rwa_device *device);
 
-/* Memory a shader can read and write, and the processor can too. The mapping is write
- * combined, as the kernel makes it, so a driver has nothing to flush.
- *
- * It is also what an index buffer is (rwa_draw.index_buffer): Metal has one buffer
- * object and the application decides at the draw what the bytes in it are, so this makes
- * memory that can be any of them rather than asking what it will be used for. */
-struct rwa_buffer *rwa_buffer_create(struct rwa_device *device, size_t size,
-				     char *why, size_t why_size);
-void *rwa_buffer_map(struct rwa_buffer *buffer);
-size_t rwa_buffer_size(struct rwa_buffer *buffer);
-void rwa_buffer_destroy(struct rwa_buffer *buffer);
+#include "air_metal_copy.h"
 
 /*
  * AIR in, a compiled pipeline out.
@@ -176,6 +166,17 @@ struct rwa_texture *rwa_texture_from_surface(struct rwa_device *device,
 					     const struct rwa_texture_shape *shape,
 					     int surface_id, unsigned offset,
 					     unsigned row_bytes, char *why, size_t why_size);
+
+/*
+ * -generateMipmapsForTexture: downsamples levels 1..last_level from level 0, with the
+ * library's own blit shaders. Level 0 has to have been written by the time this runs, which
+ * is why the Metal side records it as a work item in the command buffer rather than calling
+ * it while the blit encoder is open.
+ *
+ * 0, or -1 and a sentence. A texture of one level is a no-op, not an error: Metal allows the
+ * call and the texture has nothing above level 0 to fill.
+ */
+int rwa_texture_generate_mipmaps(struct rwa_texture *texture, char *why, size_t why_size);
 
 /*
  * Pixels in and out, which is -replaceRegion:... and -getBytes:... on the Metal side. The
@@ -575,8 +576,23 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
 			 const unsigned groups[3], const unsigned group_size[3],
 			 char *why, size_t why_size);
 
+/*
+ * rwa_dispatch_buffers with the length Metal's -setThreadgroupMemoryLength:atIndex: gave
+ * for threadgroup buffer 0, in bytes. A kernel that declares such a buffer is refused when
+ * the length is 0; for any other kernel the length is ignored. A new symbol for the reason
+ * rwa_dispatch_buffers gives.
+ */
+int rwa_dispatch_threadgroup(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+			     const struct rwa_buffer_bind *table, unsigned table_count,
+			     const unsigned groups[3], const unsigned group_size[3],
+			     unsigned threadgroup_bytes, char *why, size_t why_size);
+
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
+
+/* Hand over everything recorded so far, without waiting: what a Metal -commit does. The
+ * fence is kept on the device, and the next rwa_finish waits for it. 0, or -1. */
+int rwa_flush(struct rwa_device *device, char *why, size_t why_size);
 
 /*
  * ---------------------------------------------------------------------------------------
@@ -1085,6 +1101,44 @@ struct rwa_render *rwa_render_create(struct rwa_device *device,
 				     const char *fragment_entry,
 				     const struct rwa_render_shape *shape,
 				     struct rwa_render_info *info, char *why, size_t why_size);
+
+/*
+ * A function linked into a stage at pipeline time (MTLLinkedFunctions): a call of a function
+ * the stage's module only declares, under the name its air.visible_function_reference gives,
+ * runs `nodes` in dependency order and takes node `output`'s result. Each node is a call of
+ * `function` in the module `bitcode`; argument i is the linked call's argument args[i] when
+ * args[i] >= 0, and the result of node -1 - args[i] otherwise; with args NULL, argument i is
+ * the call's argument i. A stitching graph
+ * (MTLFunctionStitchingGraph) maps onto this node for node; a visible function linked as it is,
+ * is one node taking the call's own arguments. The modules are read during the call and not
+ * kept.
+ */
+struct rwa_stitch_node {
+	const void *bitcode;
+	size_t size;
+	const char *function;
+	unsigned num_args;
+	const int *args;
+	unsigned num_after;     /* controlDependencies: nodes that run first */
+	const unsigned *after;
+};
+struct rwa_linked_function {
+	const char *name;
+	unsigned num_nodes;
+	const struct rwa_stitch_node *nodes;
+	unsigned output;
+};
+
+/* rwa_render_create with functions linked into the fragment stage. */
+struct rwa_render *rwa_render_create_linked(struct rwa_device *device,
+					    const void *vertex_bitcode, size_t vertex_size,
+					    const char *vertex_entry,
+					    const void *fragment_bitcode, size_t fragment_size,
+					    const char *fragment_entry,
+					    const struct rwa_linked_function *fragment_linked,
+					    unsigned num_fragment_linked,
+					    const struct rwa_render_shape *shape,
+					    struct rwa_render_info *info, char *why, size_t why_size);
 void rwa_render_destroy(struct rwa_render *render);
 
 /*
@@ -1301,10 +1355,61 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+
+	/* { originX, originY, width, height } in pixels, or NULL for the whole attachment,
+	 * which is Metal's default and what every draw did before the rectangle was served.
+	 * CoreAnimation renders a layer into an attachment larger than the layer and places
+	 * it with this rectangle: with the rectangle ignored, the layer's quad covered the
+	 * whole attachment and the content arrived at the wrong size and position.
+	 * APPENDED for the reason the fields above are. */
+	const float *viewport;
+
+	/* { x, y, width, height } in pixels from the attachment's top left, or NULL for no
+	 * clip. Metal's default is the whole attachment and CoreAnimation sets it to a layer's
+	 * bounds; a draw that ignores it paints outside the layer the caller is filling.
+	 * APPENDED for the reason above. */
+	const unsigned *scissor;
+
+	/* The resolveTexture of each colour attachment, or NULL where the attachment has
+	 * none. Metal's MSAA resolve is not a draw: the pass renders into a multisample
+	 * texture and the resolved one-sample result is written when the pass ends. There
+	 * is no end-of-pass call here -- a Metal pass is a sequence of rwa_render_draw
+	 * calls carrying the same attachments -- so the resolve happens at the end of
+	 * every draw that names one. The multisample attachment keeps its contents, so a
+	 * second resolve after the next draw leaves the same result, at the cost of
+	 * resolving once per draw rather than once per pass.
+	 *
+	 * An entry must be a one-sample texture whose size and format match its colour
+	 * attachment; a mismatch is refused by name at the draw. APPENDED for the reason
+	 * `viewport` is.
+	 */
+	struct rwa_texture *const *resolve;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
+
+/* A texture over a buffer the caller holds (-newTextureWithDescriptor:offset:bytesPerRow:), 2D with
+ * one level and one sample. Its bytes are copied from the buffer when it is made and at every
+ * rwa_buffer_textures_refresh; once it is drawn into, written as an image, copied into or written by
+ * the processor, they go back at the next refresh or at rwa_buffer_textures_writeback. */
+struct rwa_texture *rwa_texture_from_buffer(struct rwa_device *device,
+					    const struct rwa_texture_shape *shape,
+					    struct rwa_buffer *source, size_t offset,
+					    unsigned row_bytes, char *why, size_t why_size);
+void rwa_buffer_textures_refresh(struct rwa_device *device);
+void rwa_buffer_textures_writeback(struct rwa_device *device);
+
+/* A second texture over the same resource: Metal's -newTextureViewWithPixelFormat: and the
+ * level range of -newTextureViewWithPixelFormat:textureType:levels:slices:. The view covers
+ * num_levels levels from first_level, every slice, and reads and renders the memory as
+ * mtl_format, whose texels must have the size of the texture's own. Level L of the view is
+ * level first_level + L of the texture. Destroyed with rwa_texture_destroy, independently of
+ * the texture it was made from.
+ */
+struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format,
+				     unsigned first_level, unsigned num_levels,
+				     char *why, size_t why_size);
 
 #ifdef __cplusplus
 }

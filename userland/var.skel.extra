@@ -1,0 +1,6 @@
+# Lines added to the data volume template on top of the image's own (etc/var.skel), read by build.sh
+# when it writes the skeleton and by tools/k90auto/package.py when it checks the packaged copy. One
+# file, two readers: the two directories below are what installd needs before it can write install
+# records (MobileInstallation) and what SpringBoard reads its layout from (SpringBoard).
+d	755	501	501	/private/var/mobile/Library/MobileInstallation
+d	755	501	501	/private/var/mobile/Library/SpringBoard

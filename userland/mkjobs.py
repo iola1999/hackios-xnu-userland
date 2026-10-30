@@ -10,6 +10,8 @@ is no log viewer or crash reporter yet). For the jobs named in the environment v
 everything the daemon has to say -- SpringBoard alone says a megabyte in half a minute, which
 costs time and pushes everybody else out of the log that comes back from the phone.
 The program itself must be there at run time; a warning is printed if it will not be.
+If the label has no LaunchDaemons entry, its LaunchAngels entry is used with the same
+on-demand startup rules as --rest.
 
 What "there at run time" means is the recipe, not what happens to be unpacked on this machine, and the
 two recipes differ. With the system image as the root, it is what select-system.py chose, and a daemon it
@@ -263,10 +265,19 @@ def present(program):
 
 
 angels = f'{src_root}/System/Library/LaunchAngels'
+startup_triggers = ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
+                    'QueueDirectories', 'StartOnMount', 'LaunchEvents')
 os.makedirs(dest, exist_ok=True)
 for label in labels:
-    with open(f'{src}/{label}.plist', 'rb') as f:
+    path = f'{src}/{label}.plist'
+    is_angel = not os.path.isfile(path)
+    if is_angel:
+        path = f'{angels}/{label}.plist'
+    with open(path, 'rb') as f:
         job = plistlib.load(f)
+    if is_angel:
+        for key in startup_triggers:
+            job.pop(key, None)
     job['StandardErrorPath'] = '/dev/console'
     # ... and the standard output with it, which launchd otherwise sends to /dev/null. That
     # default cost two nights of reading: the Metal driver says every one of its refusals with
@@ -310,8 +321,7 @@ if rest:
         program = job.get('Program') or (job.get('ProgramArguments') or [''])[0]
         if not job.get('MachServices') or not present(program):
             continue
-        for key in ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
-                    'QueueDirectories', 'StartOnMount', 'LaunchEvents'):
+        for key in startup_triggers:
             job.pop(key, None)
         job['StandardErrorPath'] = '/dev/console'
         job['StandardOutPath'] = '/dev/console'

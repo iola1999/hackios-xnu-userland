@@ -1,0 +1,119 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -262,12 +262,24 @@
+ {
+    uint64_t now = fd_perf_us();
+ 
+-   if (rec->count && *rec->count < 12) {
++   if (rec->count && *rec->count < 20) {
+       rec->segs[*rec->count].name = name;
+       rec->segs[*rec->count].us = now - *rec->cursor;
+       (*rec->count)++;
+    }
+    *rec->cursor = now;
++}
++
++/* ir3_cache_lookup, which the program-state segment spends its time in, takes no recorder: it is
++ * shared with other drivers. This hook and the pointer let it add marks to the active draw's cursor
++ * and cost one test on every other draw. */
++static struct fd_draw_seg_recorder *fd_active_rec;
++
++extern "C" void
++fd6_seg_mark_hook(const char *name)
++{
++   if (fd_active_rec)
++      fd_seg_mark(fd_active_rec, name);
+ }
+ 
+ template <fd6_pipeline_type PIPELINE>
+@@ -431,7 +443,7 @@
+     * those are follows the code rather than a list written here, so a branch that changes the count
+     * changes the line and not the probe. Wall clock only: cpu and flt already ride on the state
+     * line, and eight of each would bury the number that matters. */
+-   struct fd_draw_state_seg segs[12];
++   struct fd_draw_state_seg segs[20];
+    unsigned seg_count = 0;
+    uint64_t cursor = entry.wall;
+    struct fd_draw_seg_recorder rec = { segs, &seg_count, &cursor };
+@@ -439,7 +451,7 @@
+    auto mark = [&](const char *name) {
+       uint64_t now = fd_perf_us();
+ 
+-      if (seg_count < 12) {
++      if (seg_count < 20) {
+          segs[seg_count].name = name;
+          segs[seg_count].us = now - cursor;
+          seg_count++;
+@@ -497,7 +509,9 @@
+     * Otherwise we can just use the previous prog state.
+     */
+    if (unlikely(ctx->gen_dirty & BIT(FD6_GROUP_PROG_KEY))) {
++      fd_active_rec = &rec;
+       emit.prog = get_program_state<PIPELINE>(ctx, info, &rec);
++      fd_active_rec = NULL;
+    } else {
+       emit.prog = fd6_ctx->prog;
+    }
+--- a/src/gallium/drivers/freedreno/ir3/ir3_cache.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_cache.c
+@@ -15,6 +15,10 @@
+ #include "ir3_cache.h"
+ #include "ir3_gallium.h"
+ 
++/* Defined in fd6_draw.cc: marks the draw's state cursor when a recorder is active, and does
++ * nothing on every other draw. */
++void fd6_seg_mark_hook(const char *name);
++
+ static uint32_t
+ key_hash(const void *_key)
+ {
+@@ -73,10 +77,13 @@
+                  struct util_debug_callback *debug)
+ {
+    uint32_t hash = key_hash(key);
++   fd6_seg_mark_hook("prog_hash");
+    struct hash_entry *entry =
+       _mesa_hash_table_search_pre_hashed(cache->ht, hash, key);
++   fd6_seg_mark_hook("prog_search");
+ 
+    if (entry) {
++      fd6_seg_mark_hook("prog_hit");
+       return entry->data;
+    }
+ 
+@@ -96,6 +103,7 @@
+       [MESA_SHADER_GEOMETRY] = ir3_get_shader(key->gs),
+       [MESA_SHADER_FRAGMENT] = ir3_get_shader(key->fs),
+    };
++   fd6_seg_mark_hook("prog_shaders");
+ 
+    if (shaders[MESA_SHADER_TESS_EVAL] && !shaders[MESA_SHADER_TESS_CTRL]) {
+       struct ir3_shader *vs = shaders[MESA_SHADER_VERTEX];
+@@ -118,9 +126,11 @@
+          variants[stage] = NULL;
+       }
+    }
++   fd6_seg_mark_hook("prog_build");
+ 
+    struct ir3_compiler *compiler = shaders[MESA_SHADER_VERTEX]->compiler;
+    uint32_t safe_constlens = ir3_trim_constlen(variants, compiler);
++   fd6_seg_mark_hook("prog_constlen");
+    shader_key.safe_constlen = true;
+ 
+    for (mesa_shader_stage stage = MESA_SHADER_VERTEX; stage < MESA_SHADER_STAGES;
+@@ -132,6 +142,7 @@
+             return NULL;
+       }
+    }
++   fd6_seg_mark_hook("prog_rebuild");
+ 
+    const struct ir3_shader_variant *bs;
+ 
+@@ -148,6 +159,7 @@
+    } else {
+       bs = variants[MESA_SHADER_VERTEX];
+    }
++   fd6_seg_mark_hook("prog_binning");
+ 
+    struct ir3_program_state *state = cache->funcs->create_state(
+       cache->data, bs, variants[MESA_SHADER_VERTEX],

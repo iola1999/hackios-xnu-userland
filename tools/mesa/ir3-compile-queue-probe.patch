@@ -1,0 +1,177 @@
+--- a/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
+@@ -27,6 +27,10 @@
+ #include "ir3/ir3_gallium.h"
+ #include "ir3/ir3_nir.h"
+ #include "ir3/ir3_shader.h"
++#include "util/os_time.h"
++#include <mach/mach.h>
++#include <pthread.h>
++#include <sys/resource.h>
+ 
+ /**
+  * The hardware cso for shader state
+@@ -39,8 +43,80 @@
+ 
+    /* Fence signalled when async compile is completed: */
+    struct util_queue_fence ready;
++
++   /* Probe: when the initial-variant job went on the queue, and how many jobs were ahead of it. */
++   uint64_t queued_us;
++   int queued_ahead;
+ };
++
++/* The first draw of a new pipeline waits in ir3_get_shader() for this queue's initial-variant job,
++ * and with cpus=2 the queue has one thread. These lines split that wait: time queued behind other
++ * jobs, time the job ran, and how much of the run was the compile thread's own CPU. flt is the
++ * whole process's minor faults over the job (no per-thread count exists on XNU). Microseconds
++ * from os_time_get_nano. */
++static uint64_t
++ir3_probe_us(void)
++{
++   return os_time_get_nano() / 1000;
++}
++
++static uint64_t
++ir3_probe_tid(void)
++{
++   uint64_t tid = 0;
++
++   pthread_threadid_np(NULL, &tid);
++   return tid;
++}
++
++static uint64_t
++ir3_probe_cpu_us(void)
++{
++   mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++   struct thread_basic_info info;
++   mach_port_t self = pthread_mach_thread_np(pthread_self());
++
++   if (thread_info(self, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS)
++      return 0;
++   return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000 +
++          (uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds;
++}
++
++static long
++ir3_probe_flt(void)
++{
++   struct rusage usage;
++
++   return getrusage(RUSAGE_SELF, &usage) == 0 ? usage.ru_minflt : -1;
++}
+ 
++static void
++ir3_probe_queue(struct ir3_shader_state *hwcso, struct util_queue *queue)
++{
++   hwcso->queued_us = ir3_probe_us();
++   hwcso->queued_ahead = p_atomic_read(&queue->num_queued);   /* unlocked: a reading, not a decision */
++}
++
++static const char *
++ir3_probe_name(const struct ir3_shader *shader)
++{
++   return shader->nir && shader->nir->info.name ? shader->nir->info.name : "(none)";
++}
++
++static void
++ir3_probe_job(const struct ir3_shader_state *hwcso, uint64_t began, uint64_t cpu, long flt)
++{
++   const struct ir3_shader *shader = hwcso->shader;
++   uint64_t ended = ir3_probe_us();
++
++   printf("ir3q job: %s %s tid %llu ahead %d queued %llu run %llu cpu %llu flt %ld us\n",
++          _mesa_shader_stage_to_abbrev(shader->type), ir3_probe_name(shader),
++          (unsigned long long)ir3_probe_tid(), hwcso->queued_ahead,
++          (unsigned long long)(began - hwcso->queued_us), (unsigned long long)(ended - began),
++          (unsigned long long)(ir3_probe_cpu_us() - cpu), ir3_probe_flt() - flt);
++   fflush(stdout);
++}
++
+ /**
+  * Should initial variants be compiled synchronously?
+  *
+@@ -201,10 +277,13 @@
+ {
+    struct ir3_shader_state *hwcso = job;
+    struct util_debug_callback debug = {};
++   uint64_t began = ir3_probe_us(), cpu = ir3_probe_cpu_us();
++   long flt = ir3_probe_flt();
+ 
+    MESA_TRACE_FUNC();
+ 
+    create_initial_variants(hwcso, &debug);
++   ir3_probe_job(hwcso, began, cpu, flt);
+ }
+ 
+ static void
+@@ -214,11 +293,14 @@
+    struct ir3_shader *shader = hwcso->shader;
+    struct util_debug_callback debug = {};
+    static struct ir3_shader_key key; /* static is implicitly zeroed */
++   uint64_t began = ir3_probe_us(), cpu = ir3_probe_cpu_us();
++   long flt = ir3_probe_flt();
+ 
+    MESA_TRACE_FUNC();
+ 
+    ir3_shader_variant(shader, key, false, &debug);
+    shader->initial_variants_done = true;
++   ir3_probe_job(hwcso, began, cpu, flt);
+ }
+ 
+ /* a bit annoying that compute-shader and normal shader state objects
+@@ -283,6 +365,7 @@
+       shader->initial_variants_done = true;
+    } else {
+       struct fd_screen *screen = ctx->screen;
++      ir3_probe_queue(hwcso, &screen->compile_queue);
+       util_queue_add_job(&screen->compile_queue, hwcso, &hwcso->ready,
+                          create_initial_compute_variants_async, NULL, 0);
+    }
+@@ -351,6 +434,7 @@
+    if (initial_variants_synchronous(ctx)) {
+       create_initial_variants(hwcso, &ctx->debug);
+    } else {
++      ir3_probe_queue(hwcso, &ctx->screen->compile_queue);
+       util_queue_add_job(&ctx->screen->compile_queue, hwcso, &hwcso->ready,
+                          create_initial_variants_async, NULL, 0);
+    }
+@@ -408,7 +492,15 @@
+               shader->nir->info.name,
+               shader->nir->info.label) {
+       /* wait for initial variants to compile: */
++      uint64_t began = ir3_probe_us();
+       util_queue_fence_wait(&hwcso->ready);
++      uint64_t waited = ir3_probe_us() - began;
++      if (waited >= 1000) {
++         printf("ir3 wait: %s %s %llu us tid %llu\n", _mesa_shader_stage_to_abbrev(shader->type),
++                ir3_probe_name(shader), (unsigned long long)waited,
++                (unsigned long long)ir3_probe_tid());
++         fflush(stdout);
++      }
+    }
+ 
+    return shader;
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -145,7 +145,19 @@
+    if (bo)
+       return bo;
+ 
++   /* Probe: a new buffer from the kernel driver taking 5 ms or more, which is where a program's
++    * shader binaries land when ir3_cache_lookup builds state on a miss. */
++   uint64_t began = os_time_get_nano() / 1000;
+    bo = dev->funcs->bo_new(dev, size, flags);
++   uint64_t took = os_time_get_nano() / 1000 - began;
++   if (took >= 5000) {
++      uint64_t tid = 0;
++
++      pthread_threadid_np(NULL, &tid);
++      printf("fd bo new slow: %u bytes flags 0x%x %llu us tid %llu\n", size, flags,
++             (unsigned long long)took, (unsigned long long)tid);
++      fflush(stdout);
++   }
+    if (!bo)
+       return NULL;
+ 

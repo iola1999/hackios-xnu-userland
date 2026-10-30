@@ -1,0 +1,37 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -607,6 +607,15 @@
+               unsigned index_offset)
+    assert_dt
+ {
++   /* The segment from fd_draw_vbo's entry to this function measured under 20 ms on every draw of a
++    * round whose caller reported 667, 469 and 417 ms, so the time is in here: the dispatch below,
++    * and then draw_vbos<> itself. Three points, taken only while the window is on. No binding count
++    * is reachable at this level -- the groups are bound inside draw_vbos<> -- hence the 0. */
++   uint64_t began = fd_perf_on() ? fd_perf_us() : 0;
++   /* Taken one statement later: the dispatch is a branch on indirect and a template call, so `pre`
++    * reads as 0 and its only job is to say so. */
++   uint64_t dispatched = began != 0 ? fd_perf_us() : 0;
++
+    /* Non-indirect case is where we are more likely to see a high draw rate: */
+    if (likely(!indirect)) {
+       if (info->index_size) {
+@@ -632,6 +641,18 @@
+       draw_vbos<CHIP, PIPELINE, DRAW_INDIRECT_OP_NORMAL>(
+             ctx, info, drawid_offset, indirect, draws, num_draws, index_offset);
+    }
++
++   if (began != 0) {
++      uint64_t ended = fd_perf_us();
++      uint64_t pre = dispatched - began;
++      uint64_t post = ended - dispatched;
++
++      /* 50 ms of real microseconds, the same threshold as the lines around it. */
++      if (pre > 50000 || post > 50000)
++         printf("fd6 inner slow: pre %llu post %llu total %llu us (binds %u)\n",
++                (unsigned long long)pre, (unsigned long long)post, (unsigned long long)(ended - began),
++                0u);
++   }
+ }
+ 
+ template <chip CHIP>

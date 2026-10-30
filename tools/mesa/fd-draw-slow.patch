@@ -1,0 +1,131 @@
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c
+@@ -301,6 +301,23 @@
+          ctx->stats.prims_emitted +=
+             u_reduced_prims_for_vertices(tf_prim, verts_written);
+       }
++   }
++}
++
++/* A call that returns before the batch dispatch has none of the three points below in it, and one
++ * the layer in front measured at half a second has to leave a trace somewhere: five such returns sit
++ * before the dispatch, and the time they spend in util_draw_indirect, in the condition check or in
++ * the user index upload is exactly what no window records. Same fields as the tail's line, with
++ * `call` and `tail` at 0 because neither happened. */
++static void
++fd_draw_early(const char *branch, uint64_t began)
++{
++   uint64_t total = fd_perf_us() - began;
++
++   if (total > 50000) {
++      printf("fd draw early: %s prologue %llu call 0 tail 0 total %llu us\n", branch,
++             (unsigned long long) total, (unsigned long long) total);
++      fflush(stdout);
+    }
+ }
+ 
+@@ -312,6 +329,22 @@
+ {
+    struct fd_context *ctx = fd_context(pctx);
+ 
++   /* Three points across the call, because the perf window's entry and exit cover only the middle
++    * one: a draw the layer in front reported as 1,374,219 us while this function's own figures were
++    * in the tens of milliseconds leaves the prologue (condition check, index upload, a flush the
++    * batch size forces) and the tail as the only places left. */
++   static uint64_t fd_draw_call_count;
++
++   uint64_t fd_draw_began = fd_perf_us();
++   uint64_t fd_draw_called = 0, fd_draw_returned = 0;
++
++   /* Every 1000th call, so that a round with no slow line can tell "the probe never ran" from "it
++    * ran and every call was quick". */
++   if (++fd_draw_call_count % 1000 == 0) {
++      printf("fd draw calls %llu\n", (unsigned long long) fd_draw_call_count);
++      fflush(stdout);
++   }
++
+    /* Counted, not timed: a call that returns before anything is emitted still costs the layer in
+     * front, and telling those apart settles why the call site reports far more time than this
+     * function does. */
+@@ -328,12 +361,14 @@
+    if (indirect && indirect->buffer && FD_DBG(NOINDR)) {
+       /* num_draws is only applicable for direct draws: */
+       assert(num_draws == 1);
++      fd_draw_early("indirect", fd_draw_began);
+       util_draw_indirect(pctx, info, drawid_offset, indirect);
+       return;
+    }
+ 
+    /* TODO: push down the region versions into the tiles */
+    if (!fd_render_condition_check(pctx)) {
++      fd_draw_early("cond", fd_draw_began);
+       fd_perf_entry_cond++;
+       return;
+    }
+@@ -345,11 +380,13 @@
+    if (info->index_size) {
+       if (info->has_user_indices) {
+          if (num_draws > 1) {
++            fd_draw_early("multi", fd_draw_began);
+             util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
+             return;
+          }
+          if (!util_upload_index_buffer(pctx, info, &draws[0], &indexbuf,
+                                        &index_offset, 4))
++            fd_draw_early("indexbuf", fd_draw_began);
+             return;
+          new_info = *info;
+          new_info.index.resource = indexbuf;
+@@ -361,6 +398,7 @@
+    }
+ 
+    if ((ctx->streamout.num_targets > 0) && (num_draws > 1)) {
++      fd_draw_early("streamout", fd_draw_began);
+       fd_perf_entry_multi++;
+       util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
+       return;
+@@ -402,7 +440,9 @@
+ 
+    batch->cost += ctx->draw_cost;
+ 
++   fd_draw_called = fd_perf_us();
+    ctx->draw_vbos(ctx, info, drawid_offset, indirect, draws, num_draws, index_offset);
++   fd_draw_returned = fd_perf_us();
+    if (fd_perf_on()) {
+       fd_perf_current.exit = fd_perf_us();
+       fd_perf_note_driver(&fd_perf_current);
+@@ -431,6 +471,14 @@
+       check_sum += took;
+       if (took > check_worst)
+          check_worst = took;
++      /* One line the moment a check itself is the slow part: the window's figure divides the sum by
++       * its frames and keeps the worst across the run, so a single 1.37 s wait among hundreds of
++       * draws cannot be read back out of it without the batch it happened in. */
++      if (fd_perf_on() && took > 50000) {
++         printf("fd batch check slow: %llu us (cost %u, size %u)\n", (unsigned long long) took,
++                batch->cost, batch->num_draws);
++         fflush(stdout);
++      }
+       fd_perf_checks_sum += check_sum - fd_perf_checks_seen;
+       fd_perf_checks_seen = check_sum;
+       if (check_worst > fd_perf_checks_worst)
+@@ -440,6 +488,19 @@
+ 
+    if (info == &new_info)
+       pipe_resource_reference(&indexbuf, NULL);
++
++   {
++      uint64_t ended = fd_perf_us();
++      uint64_t total = ended - fd_draw_began;
++
++      if (total > 50000) {
++         printf("fd draw slow: prologue %llu call %llu tail %llu total %llu us\n",
++                (unsigned long long)(fd_draw_called - fd_draw_began),
++                (unsigned long long)(fd_draw_returned - fd_draw_called),
++                (unsigned long long)(ended - fd_draw_returned), (unsigned long long)total);
++         fflush(stdout);
++      }
++   }
+ }
+ 
+ /* Nothing here reads the frame's state off this thread: the driver thread writes it and the flush on

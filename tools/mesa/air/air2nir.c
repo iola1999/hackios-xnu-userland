@@ -42,6 +42,12 @@
  */
 static bool library_wrapper = false;
 
+/* --link NAME=NODE|NODE|..., where NODE is PATH@FUNCTION@ARG,ARG,... and ARG is iN (the
+ * linked call's argument N) or nN (the result of node N); the last node is the output. The
+ * graph form of struct air_linked_function, for running a stitched call on the host. */
+static struct air_linked_function links[8];
+static unsigned num_links;
+
 static const nir_shader_compiler_options default_options = {
    .lower_fdiv = false,
 };
@@ -396,7 +402,8 @@ interface_module(const struct module_ref *mod)
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
-                                        .library_wrapper = library_wrapper };
+                                        .library_wrapper = library_wrapper,
+                                        .linked = links, .num_linked = num_links };
    struct air_shader_info info;
    nir_shader *nir = air_to_nir(ctx, mod->bitcode, mod->size, NULL, &options,
                                 &default_options, &info, &err);
@@ -518,13 +525,66 @@ report_one(const struct module_ref *mod)
    ralloc_free(ctx);
 }
 
+static bool
+parse_link(void *ctx, char *spec)
+{
+   char *eq = strchr(spec, '=');
+   if (!eq || num_links >= ARRAY_SIZE(links))
+      return false;
+   *eq = 0;
+   struct air_linked_function *lf = &links[num_links++];
+   lf->name = spec;
+   struct air_stitch_node *nodes = rzalloc_array(ctx, struct air_stitch_node, 16);
+   unsigned n = 0;
+   for (char *node = strtok(eq + 1, "|"); node && n < 16; node = strtok(NULL, "|"), n++) {
+      char *fn = strchr(node, '@');
+      char *args = fn ? strchr(fn + 1, '@') : NULL;
+      if (!fn || !args)
+         return false;
+      *fn++ = 0;
+      *args++ = 0;
+      struct module_ref *mods;
+      if (modules_of(ctx, node, NULL, &mods) == 0)
+         return false;
+      int *a = rzalloc_array(ctx, int, 16);
+      unsigned na = 0;
+      for (char *t = args; *t && na < 16; ) {
+         a[na++] = t[0] == 'i' ? atoi(t + 1) : -1 - atoi(t + 1);
+         t = strchr(t, ',');
+         if (!t)
+            break;
+         t++;
+      }
+      nodes[n] = (struct air_stitch_node) { .bitcode = mods[0].bitcode, .size = mods[0].size,
+                                            .function = fn, .num_args = na, .args = a };
+   }
+   lf->nodes = nodes;
+   lf->num_nodes = n;
+   lf->output = n ? n - 1 : 0;
+   return n > 0;
+}
+
 int
 main(int argc, char **argv)
 {
    enum { TRANSLATE, LL, LIST, REPORT, EVAL, INTERFACE } mode = TRANSLATE;
    int i = 1;
-   while (i < argc && !strcmp(argv[i], "--library"))
-      library_wrapper = true, i++;
+   glsl_type_singleton_init_or_ref();
+   void *link_ctx = ralloc_context(NULL);
+   for (;;) {
+      if (i < argc && !strcmp(argv[i], "--library")) {
+         library_wrapper = true, i++;
+      } else if (i + 1 < argc && !strcmp(argv[i], "--link")) {
+         if (!parse_link(link_ctx, argv[i + 1])) {
+            fprintf(stderr, "air2nir: --link %s is not NAME=PATH@FUNCTION@ARGS|...\n",
+                    argv[i + 1]);
+            return 2;
+         }
+         i += 2;
+      } else {
+         break;
+      }
+   }
    if (i < argc && !strcmp(argv[i], "--ll"))
       mode = LL, i++;
    else if (i < argc && !strcmp(argv[i], "--list"))
@@ -537,13 +597,12 @@ main(int argc, char **argv)
       mode = INTERFACE, i++;
    if (i >= argc) {
       fprintf(stderr,
-              "usage: air2nir [--library] "
+              "usage: air2nir [--library] [--link NAME=PATH@FUNCTION@ARGS|...] "
               "[--ll | --list | --report | --eval | --interface] "
               "FILE [FUNCTION]\n");
       return 2;
    }
 
-   glsl_type_singleton_init_or_ref();
    void *ctx = ralloc_context(NULL);
    int status = 0;
 
@@ -607,7 +666,8 @@ main(int argc, char **argv)
       struct air_constant_value *fc;
       unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
       struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
-                                        .library_wrapper = library_wrapper };
+                                        .library_wrapper = library_wrapper,
+                                        .linked = links, .num_linked = num_links };
       struct air_shader_info info;
       nir_shader *nir = air_to_nir(ctx, mods[k].bitcode, mods[k].size, NULL, &options,
                                    &default_options, &info, &err);

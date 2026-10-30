@@ -1,0 +1,120 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -9,6 +9,9 @@
+ 
+ #include "pipe/p_state.h"
+ #include "util/perf_draw.h"
++#include <mach/mach.h>
++#include <pthread.h>
++#include <sys/resource.h>
+ #include "util/u_memory.h"
+ #include "util/u_prim.h"
+ #include "util/u_string.h"
+@@ -319,6 +322,53 @@
+          enum fd_gpu_event evt = (enum fd_gpu_event)(FD_FLUSH_SO_0 + i);
+          fd6_event_write<CHIP>(ctx, cs, evt);
+       }
++   }
++}
++
++/* Three segments of draw_vbos<>, read with three numbers each: the wall clock, this thread's CPU
++ * time and the process's page fault count. A wall of a second against a CPU of tens of microseconds
++ * is time asleep in the kernel, and the fault count says whether the sleep is a page coming in. */
++struct fd_draw_stamp {
++   uint64_t wall;
++   uint64_t cpu;
++   long flt;
++};
++
++static uint64_t
++fd_draw_thread_cpu_us(void)
++{
++   mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++   struct thread_basic_info info;
++
++   if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
++                   (thread_info_t)&info, &count) != KERN_SUCCESS)
++      return 0;
++   return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000 +
++          (uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds;
++}
++
++static struct fd_draw_stamp
++fd_draw_stamp_take(void)
++{
++   struct fd_draw_stamp stamp = { fd_perf_us(), fd_draw_thread_cpu_us(), 0 };
++   struct rusage usage;
++
++   if (getrusage(RUSAGE_SELF, &usage) == 0)
++      stamp.flt = usage.ru_minflt + usage.ru_majflt;
++   return stamp;
++}
++
++static void
++fd_draw_seg_say(const char *what, const struct fd_draw_stamp *began, const struct fd_draw_stamp *ended)
++{
++   uint64_t wall = ended->wall - began->wall;
++
++   /* 50,000 microseconds of the clock fd_perf_us reads, now real microseconds. */
++   if (wall > 50000) {
++      printf("fd draw seg slow: %s wall %llu cpu %llu flt %lld us\n", what,
++             (unsigned long long) wall, (unsigned long long)(ended->cpu - began->cpu),
++             (long long)(ended->flt - began->flt));
++      fflush(stdout);
+    }
+ }
+ 
+@@ -543,7 +593,13 @@
+          draw_emit_indirect<DRAW>(cs, &draw0, info, indirect, index_offset, dst_offset_dp);
+       }
+    } else {
+-      draw_emit<DRAW>(cs, &draw0, info, &draws[0], index_offset);
++      {
++         struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
++
++         draw_emit<DRAW>(cs, &draw0, info, &draws[0], index_offset);
++         ended = fd_draw_stamp_take();
++         fd_draw_seg_say("emit", &began, &ended);
++      }
+ 
+       if (unlikely(num_draws > 1)) {
+ 
+@@ -582,7 +638,13 @@
+ 
+             assert(!index_offset); /* handled by util_draw_multi() */
+ 
+-            draw_emit<DRAW>(cs, &draw0, info, &draws[i], 0);
++            {
++               struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
++
++               draw_emit<DRAW>(cs, &draw0, info, &draws[i], 0);
++               ended = fd_draw_stamp_take();
++               fd_draw_seg_say("emit", &began, &ended);
++            }
+          }
+ 
+          ctx->last.index_start = last_index_start;
+@@ -592,9 +654,21 @@
+    if (fd_perf_on())
+       fd_perf_current.draw = fd_perf_us();
+ 
+-   flush_streamout<CHIP>(ctx, cs, &emit);
++   {
++      struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
+ 
+-   fd_context_all_clean(ctx);
++      flush_streamout<CHIP>(ctx, cs, &emit);
++      ended = fd_draw_stamp_take();
++      fd_draw_seg_say("streamout", &began, &ended);
++   }
++
++   {
++      struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
++
++      fd_context_all_clean(ctx);
++      ended = fd_draw_stamp_take();
++      fd_draw_seg_say("allclean", &began, &ended);
++   }
+ }
+ 
+ template <chip CHIP, fd6_pipeline_type PIPELINE>

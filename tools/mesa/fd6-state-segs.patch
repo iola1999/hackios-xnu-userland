@@ -1,0 +1,100 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -393,6 +393,41 @@
+     * cannot. */
+    struct fd_draw_stamp entry = fd_draw_stamp_take();
+    bool state_said = false;
++
++   /* A cursor over the state emission, advanced after every call that stands on its own. Which calls
++    * those are follows the code rather than a list written here, so a branch that changes the count
++    * changes the line and not the probe. Wall clock only: cpu and flt already ride on the state
++    * line, and eight of each would bury the number that matters. */
++   struct fd_draw_state_seg {
++      const char *name;
++      uint64_t us;
++   };
++   struct fd_draw_state_seg segs[8];
++   unsigned seg_count = 0;
++   uint64_t cursor = entry.wall;
++
++   auto mark = [&](const char *name) {
++      uint64_t now = fd_perf_us();
++
++      if (seg_count < 8) {
++         segs[seg_count].name = name;
++         segs[seg_count].us = now - cursor;
++         seg_count++;
++      }
++      cursor = now;
++   };
++
++   auto say_state = [&]() {
++      uint64_t total = cursor - entry.wall;
++
++      if (total > 50000) {
++         printf("fd draw state segs: total %llu us;", (unsigned long long) total);
++         for (unsigned i = 0; i < seg_count; i++)
++            printf(" %s %llu", segs[i].name, (unsigned long long) segs[i].us);
++         printf("\n");
++         fflush(stdout);
++      }
++   };
+ 
+    if (++fd_draw_vbos_calls % 1000 == 0) {
+       printf("fd draw vbos calls %llu\n", (unsigned long long) fd_draw_vbos_calls);
+@@ -424,6 +459,7 @@
+    if ((PIPELINE == NO_TESS_GS) && !is_indirect(DRAW)) {
+       fd6_vsc_update_sizes(ctx->batch, info, &draws[0]);
+    }
++   mark("vsc_sizes");
+ 
+    /* If PROG state (which will mark PROG_KEY dirty) or any state that the
+     * key depends on, is dirty, then we actually need to construct the shader
+@@ -435,6 +471,7 @@
+    } else {
+       emit.prog = fd6_ctx->prog;
+    }
++   mark("prog_state");
+ 
+    if (fd_perf_on())
+       fd_perf_current.prog = fd_perf_us();
+@@ -444,6 +481,7 @@
+       return;
+ 
+    fixup_draw_state(ctx, &emit);
++   mark("fixup_state");
+ 
+    /* *after* fixup_shader_state(): */
+    emit.dirty_groups = ctx->gen_dirty;
+@@ -476,6 +514,7 @@
+    }
+ 
+    fd_cs cs(ctx->batch->draw);
++   mark("cs_begin");
+ 
+    struct CP_DRAW_INDX_OFFSET_0 draw0 = {
+       .prim_type = ctx->screen->primtypes[info->mode],
+@@ -549,6 +588,7 @@
+       fd_perf_current.emit0 = fd_perf_us();
+    if (emit.dirty_groups)
+       fd6_emit_3d_state<PIPELINE, CHIP>(cs, &emit);
++   mark("emit_3d_state");
+    if (fd_perf_on())
+       fd_perf_current.emit1 = fd_perf_us();
+ 
+@@ -610,6 +650,7 @@
+       if (!state_said) {
+          struct fd_draw_stamp now = fd_draw_stamp_take();
+ 
++         say_state();
+          fd_draw_seg_say("state", &entry, &now);
+          state_said = true;
+       }
+@@ -661,6 +702,7 @@
+             if (!state_said) {
+                struct fd_draw_stamp now = fd_draw_stamp_take();
+ 
++               say_state();
+                fd_draw_seg_say("state", &entry, &now);
+                state_said = true;
+             }

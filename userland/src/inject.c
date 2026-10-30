@@ -255,8 +255,8 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 	uintptr_t pc = 0, lr = 0;
 
 	if (context != NULL && context->uc_mcontext != NULL) {
-		pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
-		lr = (uintptr_t)context->uc_mcontext->__ss.__lr;
+		pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(context->uc_mcontext->__ss);
+		lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(context->uc_mcontext->__ss);
 	}
 	/*
 	 * And who called, by walking the frame pointers: on arm64 each frame holds the previous one
@@ -265,7 +265,8 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 	 */
 	char frames[8 * 20 + 1] = "";
 	size_t used = 0;
-	uintptr_t fp = context != NULL && context->uc_mcontext != NULL ? (uintptr_t)context->uc_mcontext->__ss.__fp : 0;
+	uintptr_t fp = context != NULL && context->uc_mcontext != NULL
+	               ? (uintptr_t)__darwin_arm_thread_state64_get_fp(context->uc_mcontext->__ss) : 0;
 
 	for (unsigned i = 0; i < 8 && fp != 0 && (fp & 7) == 0; i++) {
 		uintptr_t next = ((uintptr_t *)fp)[0], ret = ((uintptr_t *)fp)[1];
@@ -1257,6 +1258,12 @@ __attribute__((constructor))
 static void
 redwood_init(void)
 {
+	/* On stdout, the channel the driver's own lines use: say() below writes to fd 2, so a library
+	 * that loaded but whose stderr never reached the log would have looked like one that did not
+	 * load at all. One line at the first instruction answers which. */
+	printf("redwood lib loaded pid %d name %s\n", getpid(), getprogname());
+	fflush(stdout);
+
 	const char *name = getprogname();
 	size_t length = 0;
 	const void *cache = _dyld_get_shared_cache_range(&length);

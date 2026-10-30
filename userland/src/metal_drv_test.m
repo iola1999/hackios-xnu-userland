@@ -860,6 +860,12 @@ compute_path(id<MTLDevice> dev, id<MTLLibrary> library, const char *only)
 static const char *vertex_function;
 static const char *fragment_function = "clearFragment20";
 static bool draw_all;
+/* --samples N: how many samples the draw's attachments carry, one by default. Four makes the
+ * pass a multisample one whose result is read out of the resolve texture, which is the only
+ * way to tell a driver that resolves from one that stores the multisample attachment and
+ * leaves the texture the application means to read as it was. The picture is the same four
+ * words either way, so the comparison is between two runs of this one mode. */
+static unsigned draw_samples = 1;
 /* --draw-depth, which is the draw with a depth attachment under it and so with the first
  * depth test this port has ever run (depth_path). */
 static bool draw_depth;
@@ -2381,6 +2387,10 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 	[td setUsage:MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead];
 
 	id<MTLTexture> targets[3] = { nil, nil, nil };
+	/* With --samples above one the pass renders into these and resolves into `targets`,
+	 * which stay the one-sample textures everything below reads back. Kept as a separate
+	 * array so the readback code is the same at every sample count. */
+	id<MTLTexture> msaa[3] = { nil, nil, nil };
 
 	for (int i = 0; i < 3; i++) {
 		targets[i] = [dev newTextureWithDescriptor:td];
@@ -2388,6 +2398,24 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 			printf("drvtest: draw: attachment %d could not be made\n", i);
 			return;
 		}
+		if (draw_samples > 1) {
+			MTLTextureDescriptor *md = [[td copy] autorelease];
+
+			[md setTextureType:MTLTextureType2DMultisample];
+			[md setSampleCount:draw_samples];
+			[md setUsage:MTLTextureUsageRenderTarget];
+			msaa[i] = [dev newTextureWithDescriptor:md];
+			if (msaa[i] == nil) {
+				printf("drvtest: draw: the %u-sample attachment %d could not "
+				       "be made\n", draw_samples, i);
+				return;
+			}
+		}
+	}
+	if (draw_samples > 1) {
+		printf("drvtest: draw: %u samples, device answers -supportsSampleCount:%u "
+		       "with %s\n", draw_samples, draw_samples,
+		       [dev supportsSampleCount:draw_samples] ? "yes" : "no");
 	}
 
 	MTLRenderPipelineDescriptor *pd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -2409,6 +2437,9 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 		[[[pd colorAttachments] objectAtIndexedSubscript:i]
 		    setPixelFormat:MTLPixelFormatRGBA32Uint];
 	}
+	/* The pipeline's sample count has to agree with the attachments' -- Metal refuses a
+	 * pipeline of one sample with a four-sample attachment, and so does the library. */
+	[pd setSampleCount:draw_samples];
 	err = nil;
 	id<MTLRenderPipelineState> pipeline = [dev newRenderPipelineStateWithDescriptor:pd
 										  error:&err];
@@ -2481,6 +2512,14 @@ draw_path(id<MTLDevice> dev, const char *metallib)
 		[a setLoadAction:MTLLoadActionClear];
 		[a setClearColor:MTLClearColorMake(0, 0, 0, 0)];
 		[a setStoreAction:MTLStoreActionStore];
+		/* Above one sample the attachment is the multisample texture and `targets[i]` is
+		 * its resolve texture, which is where the picture is read from below. This is the
+		 * shape CoreAnimation asks for: storeAction 2 with a resolveTexture. */
+		if (draw_samples > 1) {
+			[a setTexture:msaa[i]];
+			[a setResolveTexture:targets[i]];
+			[a setStoreAction:MTLStoreActionMultisampleResolve];
+		}
 	}
 
 	/* Textures for the fragment stage, when the shader reads any. The first attempt at
@@ -7332,6 +7371,20 @@ main(int argc, char **argv)
 		draw = true;
 		next++;
 	}
+	/* --samples N: the draw's attachments carry N samples, and above one the pass resolves
+	 * into the one-sample texture it would otherwise have stored into directly. Its own
+	 * flag rather than a third size for --draw, because what it changes is the attachment's
+	 * type, and a driver that answered -supportsSampleCount: with one is exactly what it is
+	 * there to catch -- the run says which answer the device gave before it draws. */
+	if (argc > next && strcmp(argv[next], "--samples") == 0 && argc > next + 1) {
+		draw_samples = (unsigned)strtoul(argv[next + 1], NULL, 10);
+		if (draw_samples != 1 && draw_samples != 2 && draw_samples != 4) {
+			printf("drvtest: --samples takes 1, 2 or 4 and was given %u\n",
+			       draw_samples);
+			return 2;
+		}
+		next += 2;
+	}
 	/* --draw-index implies --draw: the indexed steps are compared with the ordinary
 	 * draw's own picture, so that draw has to happen first and in the same process. */
 	if (argc > next && strcmp(argv[next], "--draw-index") == 0) {
@@ -7537,6 +7590,15 @@ main(int argc, char **argv)
 		}
 		printf("drvtest: %s loaded, so _OBJC_CLASS_$__MTLDevice binds\n", path);
 		cls = objc_getClass("RedwoodMetalDevice");
+	}
+	/* --samples above one turns the driver's answer on itself: the driver reads this variable
+	 * in -supportsSampleCount: and answers four only when it is set, so a run that asks for
+	 * four samples has to have asked for the device that gives them. Set here rather than
+	 * taken from the environment because the boot's job list has no way to give this
+	 * process one: init's run_command() builds its own envp and passes no other.
+	 */
+	if (draw_samples > 1) {
+		setenv("REDWOOD_MSAA", "1", 1);
 	}
 	Class base = objc_getClass("_MTLDevice");
 	if (found != nil) {

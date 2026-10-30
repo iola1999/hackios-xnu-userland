@@ -1,0 +1,48 @@
+--- a/src/gallium/drivers/freedreno/freedreno_resource.h
++++ b/src/gallium/drivers/freedreno/freedreno_resource.h
+@@ -139,6 +139,12 @@
+     * writes, so undefined UBWC flag data results in undefined results.
+     */
+    bool needs_ubwc_clear : 1;
++
++   /* HackiOS: a linear import whose memory ends before the 4-row padding
++    * fd6_layout.c gives the last level for GMEM restores and resolves. It is
++    * drawn in sysmem (fd_gmem_render_tiles), which touches only its own rows.
++    */
++   bool sysmem_only : 1;
+ 
+    /* LRZ */
+    struct fdl_lrz_layout lrz_layout;
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc
+@@ -306,6 +306,19 @@
+    }
+ 
+    if (rsc->layout.size > fd_bo_size(rsc->bo)) {
++      /* HackiOS: IOSurface allocates rows * pitch rounded to a page, and the
++       * layout pads the last level to a multiple of 4 rows (a 42-row icon
++       * surface of iconservicesagent needs 44). The rows themselves fit, so the
++       * import is taken and drawn in sysmem, which never reaches the padding.
++       */
++      uint64_t rows_end = (uint64_t)handle->offset + (uint64_t)rsc->layout.pitch0 *
++                          util_format_get_nblocksy(prsc->format, prsc->height0);
++      if (rsc->layout.tile_mode == TILE6_LINEAR && !rsc->layout.ubwc &&
++          prsc->last_level == 0 && prsc->array_size == 1 && prsc->depth0 == 1 &&
++          rows_end <= fd_bo_size(rsc->bo)) {
++         rsc->sysmem_only = true;
++         return true;
++      }
+       if (FD_DBG(LAYOUT))
+          mesa_loge("invalid size (%" PRIu64 " vs %u) for: %" PRSC_FMT, rsc->layout.size,
+                    fd_bo_size(rsc->bo), PRSC_ARGS(prsc));
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
+@@ -743,6 +743,8 @@
+        * resolve stores (fd6_layout.c, min_pitch_align) is drawn in place. */
+       struct fd_resource *rsc = fd_resource(psurf->texture);
+       if (!rsc->layout.tile_mode && rsc->layout.pitch0 % (16 * rsc->layout.cpp))
++         sysmem = true;
++      if (rsc->sysmem_only)
+          sysmem = true;
+    }
+    if (pfb->zsbuf.texture && pfb->zsbuf.first_layer < pfb->zsbuf.last_layer)

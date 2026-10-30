@@ -1,0 +1,95 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -240,12 +240,40 @@
+       /* rasterizer state is effected by primitive-restart: */
+       fd_context_dirty(ctx, FD_DIRTY_RASTERIZER);
+       ctx->last.primitive_restart = emit->primitive_restart;
++   }
++}
++
++/* The program-state segment holds most of every slow draw measured so far. These marks split it at
++ * the calls that stand on their own; the recorder is the caller's cursor, so an inner mark lands in
++ * the same list as the draw's own segments. */
++struct fd_draw_state_seg {
++   const char *name;
++   uint64_t us;
++};
++
++struct fd_draw_seg_recorder {
++   struct fd_draw_state_seg *segs;
++   unsigned *count;
++   uint64_t *cursor;
++};
++
++static void
++fd_seg_mark(struct fd_draw_seg_recorder *rec, const char *name)
++{
++   uint64_t now = fd_perf_us();
++
++   if (rec->count && *rec->count < 12) {
++      rec->segs[*rec->count].name = name;
++      rec->segs[*rec->count].us = now - *rec->cursor;
++      (*rec->count)++;
+    }
++   *rec->cursor = now;
+ }
+ 
+ template <fd6_pipeline_type PIPELINE>
+ static const struct fd6_program_state *
+-get_program_state(struct fd_context *ctx, const struct pipe_draw_info *info)
++get_program_state(struct fd_context *ctx, const struct pipe_draw_info *info,
++                  struct fd_draw_seg_recorder *rec)
+    assert_dt
+ {
+    struct fd6_context *fd6_ctx = fd6_context(ctx);
+@@ -296,14 +324,19 @@
+       }
+    }
+ 
++   fd_seg_mark(rec, "prog_key");
++
+    ir3_fixup_shader_state(&ctx->base, &key.key);
++   fd_seg_mark(rec, "prog_fixup");
+ 
+    if (ctx->gen_dirty & BIT(FD6_GROUP_PROG)) {
+       if (fd_perf_on())
+          fd_perf_variants++;
+       struct ir3_program_state *s = ir3_cache_lookup(
+             ctx->shader_cache, &key, &ctx->debug);
++      fd_seg_mark(rec, "prog_lookup");
+       fd6_ctx->prog = fd6_program_state(s);
++      fd_seg_mark(rec, "prog_variant");
+    }
+ 
+    return fd6_ctx->prog;
+@@ -398,18 +431,15 @@
+     * those are follows the code rather than a list written here, so a branch that changes the count
+     * changes the line and not the probe. Wall clock only: cpu and flt already ride on the state
+     * line, and eight of each would bury the number that matters. */
+-   struct fd_draw_state_seg {
+-      const char *name;
+-      uint64_t us;
+-   };
+-   struct fd_draw_state_seg segs[8];
++   struct fd_draw_state_seg segs[12];
+    unsigned seg_count = 0;
+    uint64_t cursor = entry.wall;
++   struct fd_draw_seg_recorder rec = { segs, &seg_count, &cursor };
+ 
+    auto mark = [&](const char *name) {
+       uint64_t now = fd_perf_us();
+ 
+-      if (seg_count < 8) {
++      if (seg_count < 12) {
+          segs[seg_count].name = name;
+          segs[seg_count].us = now - cursor;
+          seg_count++;
+@@ -467,7 +497,7 @@
+     * Otherwise we can just use the previous prog state.
+     */
+    if (unlikely(ctx->gen_dirty & BIT(FD6_GROUP_PROG_KEY))) {
+-      emit.prog = get_program_state<PIPELINE>(ctx, info);
++      emit.prog = get_program_state<PIPELINE>(ctx, info, &rec);
+    } else {
+       emit.prog = fd6_ctx->prog;
+    }

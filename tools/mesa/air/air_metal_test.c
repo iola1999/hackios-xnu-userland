@@ -2153,11 +2153,10 @@ run_ms(const char *path, const char *func, const char *samplespec, const char *f
       for (unsigned k = 0; k < rwa_buffer_size(buffers[i]); k++)
          bits[k] = pattern_byte(k);
    }
-   /* One sampler per slot the API is expected to fill, even though every one of these
-    * shaders reads with read(coord, sample) and so ignores it: Apple declares the
-    * sampler argument and marks it air.arg_unused, and the contract still counts a slot
-    * the interface has. In pixels and nearest, which is what a read() would want if it
-    * looked. */
+   /* One sampler per slot the contract counts. These shaders read with
+    * read(coord, sample), and Apple marks their sampler argument air.arg_unused, which
+    * the frontend does not list, so the count is normally 0. In pixels and nearest,
+    * which is what a read() would want if it looked. */
    struct rwa_sampler *samplers[16] = { 0 };
    unsigned nsamp = info.fragment_samplers < COUNT_OF(samplers)
                        ? info.fragment_samplers : (unsigned)COUNT_OF(samplers);

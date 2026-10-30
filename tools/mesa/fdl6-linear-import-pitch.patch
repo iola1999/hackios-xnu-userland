@@ -1,0 +1,72 @@
+--- a/src/freedreno/fdl/freedreno_layout.h
++++ b/src/freedreno/fdl/freedreno_layout.h
+@@ -73,6 +73,11 @@
+ struct fdl_explicit_layout {
+    uint32_t offset;
+    uint32_t pitch;
++   /* HackiOS: when non-zero, a linear pitch under the layout's own alignment
++    * is accepted if it divides by this: a texel for an image that is only
++    * sampled, 64 bytes for a colour target (rendered in sysmem, see
++    * fd_gmem_render_tiles). */
++   uint32_t min_pitch_align;
+ };
+ 
+ /**
+@@ -189,6 +194,10 @@
+ static inline uint32_t
+ fdl_pitch(const struct fdl_layout *layout, unsigned level)
+ {
++   /* HackiOS: level 0 is pitch0 as laid out, which for an explicit layout can be
++    * finer than pitchalign (fd6_layout.c, min_pitch_align). */
++   if (level == 0)
++      return layout->pitch0;
+    return align(u_minify(layout->pitch0, level), 1 << layout->pitchalign);
+ }
+ 
+--- a/src/freedreno/fdl/fd6_layout.c
++++ b/src/freedreno/fdl/fd6_layout.c
+@@ -218,8 +218,12 @@
+    if (explicit_layout) {
+       offset = explicit_layout->offset;
+       layout->pitch0 = explicit_layout->pitch;
+-      if (align(layout->pitch0, 1 << layout->pitchalign) != layout->pitch0)
+-         return false;
++      if (align(layout->pitch0, 1 << layout->pitchalign) != layout->pitch0) {
++         if (layout->tile_mode || !explicit_layout->min_pitch_align ||
++             layout->pitch0 % explicit_layout->min_pitch_align)
++            return false;
++         layout->pitchalign = 6;
++      }
+    }
+ 
+    uint32_t ubwc_width0 = params->width0;
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_resource.cc
+@@ -281,6 +281,13 @@
+    struct fdl_explicit_layout l = {
+       .offset = handle->offset,
+       .pitch = handle->stride,
++      /* HackiOS: a texel for an image only sampled (the descriptor holds the
++       * pitch in bytes, in bits on a8xx), 64 bytes for a colour target, which
++       * fd_gmem_render_tiles renders in sysmem when the pitch is under 16 pixels. */
++      .min_pitch_align =
++         !(prsc->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SHADER_IMAGE))
++            ? util_format_get_blocksize(prsc->format)
++         : !(prsc->bind & (PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SHADER_IMAGE)) ? 64 : 0,
+    };
+ 
+    if (ubwc && !can_do_ubwc(prsc)) {
+--- a/src/gallium/drivers/freedreno/freedreno_gmem.c
++++ b/src/gallium/drivers/freedreno/freedreno_gmem.c
+@@ -739,6 +739,11 @@
+          continue;
+       if (psurf->first_layer < psurf->last_layer)
+          sysmem = true;
++      /* HackiOS: a linear import whose pitch is under the 16 pixels a GMEM
++       * resolve stores (fd6_layout.c, min_pitch_align) is drawn in place. */
++      struct fd_resource *rsc = fd_resource(psurf->texture);
++      if (!rsc->layout.tile_mode && rsc->layout.pitch0 % (16 * rsc->layout.cpp))
++         sysmem = true;
+    }
+    if (pfb->zsbuf.texture && pfb->zsbuf.first_layer < pfb->zsbuf.last_layer)
+       sysmem = true;

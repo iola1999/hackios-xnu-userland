@@ -1,0 +1,700 @@
+--- a/src/gallium/auxiliary/util/u_threaded_context.c
++++ b/src/gallium/auxiliary/util/u_threaded_context.c
+@@ -24,6 +24,7 @@
+  *
+  **************************************************************************/
+ 
++#include "util/perf_draw.h"
+ #include "util/u_threaded_context.h"
+ #include "util/u_cpu_detect.h"
+ #include "util/format/u_format.h"
+@@ -3667,6 +3668,8 @@
+          unsigned flags)
+ {
+    struct threaded_context *tc = threaded_context(_pipe);
++
++   fd_perf_close(&fd_perf_client);
+    struct pipe_context *pipe = tc->pipe;
+    struct pipe_screen *screen = pipe->screen;
+    bool async = flags & (PIPE_FLUSH_DEFERRED | PIPE_FLUSH_ASYNC);
+@@ -3721,8 +3724,11 @@
+ out_of_memory:
+    tc->flushing = true;
+    /* renderpass info is signaled during sync */
++   uint64_t perf_began = fd_perf_on() ? fd_perf_us() : 0;
+    tc_sync_msg(tc, flags & PIPE_FLUSH_END_OF_FRAME ? "end of frame" :
+                    flags & PIPE_FLUSH_DEFERRED ? "deferred fence" : "normal");
++   if (perf_began)
++      fd_perf_window_sync(perf_began);
+ 
+    if (!deferred) {
+       tc_flush_queries(tc);
+@@ -3730,7 +3736,10 @@
+       tc->query_ended = false;
+    }
+    tc_set_driver_thread(tc);
++   uint64_t perf_pass = fd_perf_on() ? fd_perf_us() : 0;
+    pipe->flush(pipe, fence, flags);
++   if (perf_pass)
++      fd_perf_window_pass(perf_pass);
+    tc_clear_driver_thread(tc);
+    tc->flushing = false;
+ }
+@@ -4235,6 +4244,14 @@
+                  sizeof(intptr_t) == offsetof(struct pipe_draw_info, min_index));
+ 
+    struct threaded_context *tc = threaded_context(_pipe);
++   struct fd_perf_draw perf;
++   uint64_t began = 0;
++
++   if (fd_perf_on()) {
++      memset(&perf, 0, sizeof(perf));
++      began = perf.entry = fd_perf_us();
++   }
++
+    if (tc->options.parse_renderpass_info)
+       tc_parse_draw(tc);
+ 
+@@ -4247,6 +4264,11 @@
+    /* This must be after tc_add_*call, which can flush the batch. */
+    if (unlikely(tc->add_all_gfx_bindings_to_buffer_list))
+       tc_add_all_gfx_bindings_to_buffer_list(tc);
++
++   if (fd_perf_on()) {
++      perf.wait = fd_perf_us() - began;
++      fd_perf_note_client(&perf);
++   }
+ }
+ 
+ struct tc_draw_single *
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c
+@@ -12,6 +12,7 @@
+ #include "util/u_helpers.h"
+ #include "util/u_memory.h"
+ #include "util/u_prim.h"
++#include "util/perf_draw.h"
+ #include "util/u_string.h"
+ 
+ #include "freedreno_blitter.h"
+@@ -24,6 +25,17 @@
+ #include "freedreno_state.h"
+ #include "freedreno_util.h"
+ 
++/* How many calls arrive at the driver's entry, and how many of those return before anything is
++ * emitted. The layer in front times the call and owns the difference. */
++unsigned fd_perf_entry_calls, fd_perf_entry_cond, fd_perf_entry_multi;
++uint64_t fd_perf_checks_sum, fd_perf_checks_seen, fd_perf_checks_worst;
++
++static uint64_t
++fd_perf_clock_us(void)
++{
++   return (uint64_t) (os_time_get_nano() / 1000);
++}
++
+ static bool
+ batch_references_resource(struct fd_batch *batch, struct pipe_resource *prsc)
+    assert_dt
+@@ -300,6 +312,15 @@
+ {
+    struct fd_context *ctx = fd_context(pctx);
+ 
++   /* Counted, not timed: a call that returns before anything is emitted still costs the layer in
++    * front, and telling those apart settles why the call site reports far more time than this
++    * function does. */
++   fd_perf_entry_calls++;
++   if (fd_perf_on()) {
++      memset(&fd_perf_current, 0, sizeof(fd_perf_current));
++      fd_perf_current.entry = fd_perf_us();
++   }
++
+    /* for debugging problems with indirect draw, it is convenient
+     * to be able to emulate it, to determine if game is feeding us
+     * bogus data:
+@@ -312,8 +333,10 @@
+    }
+ 
+    /* TODO: push down the region versions into the tiles */
+-   if (!fd_render_condition_check(pctx))
++   if (!fd_render_condition_check(pctx)) {
++      fd_perf_entry_cond++;
+       return;
++   }
+ 
+    /* Upload a user index buffer. */
+    struct pipe_resource *indexbuf = NULL;
+@@ -338,6 +361,7 @@
+    }
+ 
+    if ((ctx->streamout.num_targets > 0) && (num_draws > 1)) {
++      fd_perf_entry_multi++;
+       util_draw_multi(pctx, info, drawid_offset, indirect, draws, num_draws);
+       return;
+    }
+@@ -345,6 +369,8 @@
+    struct fd_batch *batch = fd_context_batch_draw(ctx);
+ 
+    batch_draw_tracking(batch, info, indirect);
++   if (fd_perf_on())
++      fd_perf_current.track = fd_perf_us();
+ 
+    while (unlikely(batch->flushed)) {
+       /* The current batch was flushed in batch_draw_tracking()
+@@ -377,6 +403,10 @@
+    batch->cost += ctx->draw_cost;
+ 
+    ctx->draw_vbos(ctx, info, drawid_offset, indirect, draws, num_draws, index_offset);
++   if (fd_perf_on()) {
++      fd_perf_current.exit = fd_perf_us();
++      fd_perf_note_driver(&fd_perf_current);
++   }
+ 
+    if (unlikely(ctx->stats_users > 0))
+       update_draw_stats(ctx, info, draws, num_draws);
+@@ -388,13 +418,175 @@
+ 
+    assert(!batch->flushed);
+ 
+-   fd_batch_check_size(batch);
++   /* Whether a slow draw waits or computes: fd_batch_check_size submits the batch when it is full, so
++    * the time it costs is waiting for a submit to be accepted, and the time after it is the driver
++    * thread's own work. Two sums are enough to tell the two apart. */
++   {
++      static uint64_t check_sum, check_worst;
++
++      uint64_t began = fd_perf_clock_us();
++      fd_batch_check_size(batch);
++      uint64_t took = fd_perf_clock_us() - began;
++
++      check_sum += took;
++      if (took > check_worst)
++         check_worst = took;
++      fd_perf_checks_sum += check_sum - fd_perf_checks_seen;
++      fd_perf_checks_seen = check_sum;
++      if (check_worst > fd_perf_checks_worst)
++         fd_perf_checks_worst = check_worst;
++   }
+    fd_batch_reference(&batch, NULL);
+ 
+    if (info == &new_info)
+       pipe_resource_reference(&indexbuf, NULL);
++}
++
++/* Nothing here reads the frame's state off this thread: the driver thread writes it and the flush on
++ * this thread closes it, which is also where a slow frame gets its line.
++ */
++struct fd_perf_frame fd_perf_client, fd_perf_driver;
++struct fd_perf_draw fd_perf_current;
++struct fd_perf_window fd_perf_win;
++unsigned fd_perf_progs, fd_perf_variants;
++uint64_t fd_perf_checks_sum, fd_perf_checks_seen, fd_perf_checks_worst;
++
++/* How many calls arrive at the driver's entry, and how many of those return before anything is
++ * emitted. The layer in front times the call and owns the difference. */
++
++
++/* One line per FD_PERF_WINDOW frames, from the driver thread, covering both threads' figures. The
++ * frame interval is measured between two closes on the driver thread, which is the same clock the
++ * kernel's tl: lines use, so it can be checked against them. */
++void
++fd_perf_window_add(uint64_t now, const struct fd_perf_frame *f)
++{
++   struct fd_perf_window *w = &fd_perf_win;
++
++   if (f == &fd_perf_client) {
++      /* the client closes once per frame too; its totals ride along in the driver's line */
++      w->client += f->wait;
++      if (f->wait > w->max_client)
++         w->max_client = f->wait;
++      return;
++   }
++
++   {
++      static unsigned seen_in, seen_cond, seen_multi;
++
++      w->calls += fd_perf_entry_calls - seen_in;
++      w->calls_cond += fd_perf_entry_cond - seen_cond;
++      w->calls_multi += fd_perf_entry_multi - seen_multi;
++      seen_in = fd_perf_entry_calls;
++      seen_cond = fd_perf_entry_cond;
++      seen_multi = fd_perf_entry_multi;
++   }
++   w->frames++;
++   w->draws += f->draws;
++   w->driver += f->driver;
++   if (f->driver > w->max_driver)
++      w->max_driver = f->driver;
++   w->own += f->drawn + f->emit + f->prog + f->track;
++   w->track += f->track;
++   w->prog += f->prog;
++   w->emit += f->emit;
++   w->draw += f->drawn;
++   if (w->last_close) {
++      uint64_t took = now - w->last_close;
++      static uint64_t first_gap, sum_gap, first_now;
++      static unsigned long total_flushes;
++
++      w->interval += took;
++      if (took > w->max_interval)
++         w->max_interval = took;
++
++      /* The gaps between one flush and the next have to add up to the time the process spent
++       * flushing at all. If they do not, the window is not counting what it claims and every rate
++       * derived from this line is wrong, which is cheap to check here and expensive to discover
++       * from an analysis three rounds later. */
++      if (!first_now)
++         first_now = now;
++      if (!first_gap)
++         first_gap = now;
++      sum_gap += took;
++      if (++total_flushes % 1024 == 0) {
++         uint64_t span = now - first_now;
++         long off = span ? (long) (((sum_gap * 100) / span) - 100) : 0;
++
++         printf("perf flush totals: %lu flushes, gaps %llu us of %llu us span, off by %ld%%\n",
++                total_flushes, (unsigned long long) sum_gap, (unsigned long long) span, off);
++      }
++   }
++   w->last_close = now;
++
++   if (w->frames < FD_PERF_WINDOW)
++      return;
++
++   printf("perf flush %u: %llu us/flush max %llu; %llu draws; batch submit %llu max %llu us; "
++          "driver %llu max %llu; "
++          "own %llu (track %llu prog %llu emit %llu draw %llu); submit %llu max %llu; "
++          "client %llu max %llu; sync %llu max %llu, pass %llu max %llu; calls %llu in "
++          "(condition %llu, multi %llu) us\n",
++          w->frames, (unsigned long long) (w->interval / w->frames),
++          (unsigned long long) w->max_interval,
++          (unsigned long long) (w->draws / w->frames),
++          (unsigned long long) (fd_perf_checks_sum / w->frames),
++          (unsigned long long) fd_perf_checks_worst,
++          (unsigned long long) (w->driver / w->frames), (unsigned long long) w->max_driver,
++          (unsigned long long) (w->own / w->frames),
++          (unsigned long long) (w->track / w->frames), (unsigned long long) (w->prog / w->frames),
++          (unsigned long long) (w->emit / w->frames), (unsigned long long) (w->draw / w->frames),
++          (unsigned long long) (w->submit / w->frames), (unsigned long long) w->max_submit,
++          (unsigned long long) (w->client / w->frames), (unsigned long long) w->max_client,
++          (unsigned long long) (w->sync / w->frames), (unsigned long long) w->max_sync,
++          (unsigned long long) (w->pass / w->frames), (unsigned long long) w->max_pass,
++          (unsigned long long) (w->calls / w->frames),
++          (unsigned long long) (w->calls_cond / w->frames),
++          (unsigned long long) (w->calls_multi / w->frames));
++   fflush(stdout);
++   memset(w, 0, sizeof(*w));
++   /* The window resets its counters; the time of the last close has to survive, or the first gap
++    * of the next window is lost and the gaps no longer add up to the span. */
++   w->last_close = now;
++}
++
++/* This file's draw entry, published so the layer in front can say which function a pipe actually
++ * dispatches to; the two timings disagree and naming the target is what tells them apart. */
++void *fd_perf_draw_vbo_symbol = (void *)fd_draw_vbo;
++
++/* tc_sync_msg: waiting for the driver thread to drain what the client queued. */
++void
++fd_perf_window_sync(uint64_t began)
++{
++   uint64_t took = fd_perf_us() - began;
++
++   fd_perf_win.sync += took;
++   if (took > fd_perf_win.max_sync)
++      fd_perf_win.max_sync = took;
+ }
+ 
++/* The rest of tc_flush before the driver's own flush is entered. */
++void
++fd_perf_window_pass(uint64_t began)
++{
++   uint64_t took = fd_perf_us() - began;
++
++   fd_perf_win.pass += took;
++   if (took > fd_perf_win.max_pass)
++      fd_perf_win.max_pass = took;
++}
++
++/* fd_context_flush, submit ioctl included. */
++void
++fd_perf_window_submit(uint64_t began)
++{
++   uint64_t took = fd_perf_us() - began;
++
++   fd_perf_win.submit += took;
++   if (took > fd_perf_win.max_submit)
++      fd_perf_win.max_submit = took;
++}
++
+ static void
+ fd_draw_vbo_dbg(struct pipe_context *pctx, const struct pipe_draw_info *info,
+                 unsigned drawid_offset,
+--- a/src/gallium/drivers/freedreno/freedreno_context.c
++++ b/src/gallium/drivers/freedreno/freedreno_context.c
+@@ -7,6 +7,10 @@
+  */
+ 
+ #include "freedreno_context.h"
++
++/* Published for the layer in front, which times the same call at the call site and gets a
++ * different number; naming the target tells a driver cost from a wrapper's. */
++void *fd_perf_context_flush_symbol;
+ #include "ir3/ir3_cache.h"
+ #include "util/u_upload_mgr.h"
+ #include "freedreno_blitter.h"
+@@ -21,6 +25,7 @@
+ #include "freedreno_texture.h"
+ #include "freedreno_util.h"
+ #include "freedreno_tracepoints.h"
++#include "util/perf_draw.h"
+ #include "util/u_trace_gallium.h"
+ 
+ static void
+@@ -33,6 +38,12 @@
+ 
+    DBG("%p: %p: flush: flags=%x, fencep=%p", ctx, batch, flags, fencep);
+ 
++   fd_perf_close(&fd_perf_driver);
++
++   /* The submission ioctl and the wait for batch space happen below, on this thread; its cost is
++    * the third piece of a frame after the client's draws and the driver's emission. */
++   uint64_t perf_began = fd_perf_on() ? fd_perf_us() : 0;
++
+    if (fencep && !batch) {
+       if (!(flags & TC_FLUSH_ASYNC) && ctx->last_fence &&
+           (fd_pipe_fence_is_fd(ctx->last_fence) ||
+@@ -44,6 +55,8 @@
+       fd_bc_dump(ctx, "need fence, last_fence=%p", ctx->last_fence);
+       batch = fd_context_batch(ctx);
+    } else if (!batch) {
++      if (perf_began)
++         fd_perf_window_submit(perf_began);
+       return;
+    }
+ 
+@@ -118,6 +131,9 @@
+    fd_bc_dump(ctx, "%p: remaining:\n", ctx);
+ 
+ out:
++   if (perf_began)
++      fd_perf_window_submit(perf_began);
++
+    if (fencep)
+       fd_pipe_fence_ref(fencep, fence);
+ 
+@@ -780,3 +796,8 @@
+ 
+    return tc;
+ }
++
++__attribute__((constructor)) static void fd_perf_name_flush(void)
++{
++   fd_perf_context_flush_symbol = (void *)fd_context_flush;
++}
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include "pipe/p_state.h"
++#include "util/perf_draw.h"
+ #include "util/u_memory.h"
+ #include "util/u_prim.h"
+ #include "util/u_string.h"
+@@ -245,6 +246,10 @@
+    assert_dt
+ {
+    struct fd6_context *fd6_ctx = fd6_context(ctx);
++
++   if (fd_perf_on())
++      fd_perf_progs++;
++
+    struct ir3_cache_key key = {
+          .vs = (struct ir3_shader_state *)ctx->prog.vs,
+          .gs = (struct ir3_shader_state *)ctx->prog.gs,
+@@ -291,6 +296,8 @@
+    ir3_fixup_shader_state(&ctx->base, &key.key);
+ 
+    if (ctx->gen_dirty & BIT(FD6_GROUP_PROG)) {
++      if (fd_perf_on())
++         fd_perf_variants++;
+       struct ir3_program_state *s = ir3_cache_lookup(
+             ctx->shader_cache, &key, &ctx->debug);
+       fd6_ctx->prog = fd6_program_state(s);
+@@ -365,6 +372,9 @@
+       emit.prog = fd6_ctx->prog;
+    }
+ 
++   if (fd_perf_on())
++      fd_perf_current.prog = fd_perf_us();
++
+    /* bail if compile failed: */
+    if (!emit.prog)
+       return;
+@@ -471,8 +481,12 @@
+       }
+    }
+ 
++   if (fd_perf_on())
++      fd_perf_current.emit0 = fd_perf_us();
+    if (emit.dirty_groups)
+       fd6_emit_3d_state<PIPELINE, CHIP>(cs, &emit);
++   if (fd_perf_on())
++      fd_perf_current.emit1 = fd_perf_us();
+ 
+    /* All known firmware versions do not wait for WFI's with CP_DRAW_AUTO.
+     * Plus, for the common case where the counter buffer is written by
+@@ -575,6 +589,9 @@
+       }
+    }
+ 
++   if (fd_perf_on())
++      fd_perf_current.draw = fd_perf_us();
++
+    flush_streamout<CHIP>(ctx, cs, &emit);
+ 
+    fd_context_all_clean(ctx);
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c
+@@ -606,11 +606,17 @@
+ 
+    fd_batch_add_resource(batch, rsc);
+ }
++
++/* How often the batch had to be cut because it was full, counted where the decision is made: a
++ * window of 256 draws that is cut every few draws pays the submission cost many times over, and
++ * that is invisible in the per-draw timing. */
++unsigned fd_perf_batch_cuts;
+ 
+ void
+ fd_batch_check_size(struct fd_batch *batch)
+ {
+    if (batch->num_draws > 100000) {
++      fd_perf_batch_cuts++;
+       fd_batch_flush(batch);
+       return;
+    }
+@@ -619,11 +625,13 @@
+    const unsigned limit_bits = 8 * 8 * 1024 * 1024;
+    if ((batch->prim_strm_bits > limit_bits) ||
+        (batch->draw_strm_bits > limit_bits)) {
++      fd_perf_batch_cuts++;
+       fd_batch_flush(batch);
+       return;
+    }
+ 
+    if (!fd_ringbuffer_check_size(batch->draw)) {
++      fd_perf_batch_cuts++;
+       fd_batch_flush(batch);
+    }
+ }
+--- /dev/null
++++ b/src/gallium/auxiliary/util/perf_draw.h
+@@ -0,0 +1,208 @@
++/* Per-draw and per-frame timing for the K90 iOS port.
++ *
++ * A frame interval here is made of the client thread's draws, the kernel's submissions and the
++ * panel. The driver's per-draw cost alone cannot say which of the three to look at once a frame is
++ * slow, and an average over 256 draws hides the few draws that made it slow. The stamps are grouped
++ * per frame, and every frame of the window is summed into one summary line, so a round always ends
++ * with numbers even when the cost sits outside the stamped stages; a frame over FD_PERF_SLOW_US
++ * also prints its own four segments, which is where an individual overrun becomes readable.
++ *
++ * The clock is mach_absolute_time over 1000, the one the kernel's "tl:" lines use, so a line here
++ * lines up with tl: s, tl: Q and tl: v in the same log.
++ *
++ * The two sides keep separate state: the client thread writes fd_perf_client, the driver thread
++ * writes fd_perf_driver, and neither reads the other's. Their lines pair up by order in the log.
++ *
++ * On by default in a library built from this patch: the switch that looks obvious, glenv=, is parsed
++ * by eagl.c and never reaches the window server, so a round gated on it prints nothing and burns 420
++ * seconds. FD_PERF_DRAW=0 turns it off instead, and the first draw says which way it went.
++ */
++#ifndef PERF_DRAW_H
++#define PERF_DRAW_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <mach/mach_time.h>
++
++static inline uint64_t
++fd_perf_us(void)
++{
++   return mach_absolute_time() / 1000;
++}
++
++/* A frame whose own accumulated CPU is beyond this no longer fits a 60 Hz budget (16667 us), and is
++ * worth a line of its own. */
++#define FD_PERF_SLOW_US 6000
++
++/* Frames per summary line. Printing only the slow frames leaves a round with no numbers at all when
++ * the cost turns out to sit outside the stamped stages, and then the round has to run again; a
++ * summary every 128 frames always says where the time went. */
++#define FD_PERF_WINDOW 128
++
++/* The draws kept for the slow-frame print: the two worst of a frame, by their own duration. */
++#define FD_PERF_WORST 2
++
++struct fd_perf_draw {
++   uint64_t wait;                            /* client: inside tc_draw_vbo */
++   uint64_t entry, track, prog, emit0, emit1, draw, exit;   /* driver: fd_draw_vbo and below */
++};
++
++struct fd_perf_frame {
++   uint64_t first;                           /* the first draw's entry */
++   uint64_t track, prog, emit, drawn, driver;   /* driver: the segments, summed over the frame */
++   uint64_t wait;                            /* client: tc_draw_vbo, summed over the frame */
++   uint64_t max_wait, max_driver;
++   unsigned draws;
++   struct fd_perf_draw worst[FD_PERF_WORST];
++};
++
++/* One summary line's worth of frames. Filled by both threads, each into its own fields. */
++struct fd_perf_window {
++   unsigned frames;
++   uint64_t interval, max_interval;          /* between two closes on the driver thread */
++   uint64_t last_close;
++   uint64_t draws;
++   uint64_t driver, max_driver;              /* fd_draw_vbo, per frame */
++   uint64_t own, track, prog, emit, draw;    /* inside fd_draw_vbo, summed over the window */
++   uint64_t submit, max_submit;              /* fd_context_flush, the ioctl included */
++   uint64_t sync, max_sync;                  /* tc_sync_msg: waiting for the driver thread */
++   uint64_t pass, max_pass;                  /* the rest of tc_flush before fd_context_flush */
++   uint64_t calls, calls_cond, calls_multi;  /* calls reaching fd_draw_vbo and the early returns */
++   uint64_t client, max_client;              /* the client's tc_draw_vbo, summed */
++};
++
++extern struct fd_perf_frame fd_perf_client, fd_perf_driver;
++extern struct fd_perf_draw fd_perf_current;   /* the driver thread's draw in flight */
++extern struct fd_perf_window fd_perf_win;
++extern unsigned fd_perf_progs, fd_perf_variants;   /* get_program_state calls and cache lookups */
++
++void fd_perf_window_add(uint64_t now, const struct fd_perf_frame *f);
++void fd_perf_window_submit(uint64_t began);
++void fd_perf_window_sync(uint64_t began);
++void fd_perf_window_pass(uint64_t began);
++
++static inline int
++fd_perf_on(void)
++{
++   static int on = -1;
++
++   if (on < 0) {
++      const char *off = getenv("FD_PERF_DRAW");
++
++      on = !(off && off[0] == '0');
++      if (on) {
++         printf("perf draw: timing on, frames over %d us are printed, %d frames per summary\n",
++                FD_PERF_SLOW_US, FD_PERF_WINDOW);
++         fflush(stdout);
++      }
++   }
++   return on;
++}
++
++/* A path that returns before one of the inner stamps leaves that field zero, and subtracting it
++ * would wrap to a number near 2^64 that ruins every sum it lands in. Filling it in from the stamp
++ * before it costs nothing and keeps a draw that took no inner path from poisoning the frame. */
++static inline void
++fd_perf_keep_worst(struct fd_perf_frame *f, const struct fd_perf_draw *d)
++{
++   if (f->draws <= FD_PERF_WORST) {
++      f->worst[f->draws - 1] = *d;
++      return;
++   }
++   for (unsigned i = 0; i < FD_PERF_WORST; i++) {
++      if (f->worst[i].exit - f->worst[i].entry < d->exit - d->entry) {
++         f->worst[i] = *d;
++         return;
++      }
++   }
++}
++
++static inline void
++fd_perf_note_client(struct fd_perf_draw *d)
++{
++   if (!fd_perf_client.draws)
++      fd_perf_client.first = d->entry;
++   fd_perf_client.draws++;
++   fd_perf_client.wait += d->wait;
++   if (d->wait > fd_perf_client.max_wait)
++      fd_perf_client.max_wait = d->wait;
++}
++
++static inline void
++fd_perf_note_driver(struct fd_perf_draw *d)
++{
++   struct fd_perf_draw c = *d;
++   uint64_t driver;
++
++   if (!c.track) c.track = c.entry;
++   if (!c.prog) c.prog = c.track;
++   if (!c.emit0) c.emit0 = c.prog;
++   if (!c.emit1) c.emit1 = c.emit0;
++   if (!c.draw) c.draw = c.emit1;
++   driver = c.exit - c.entry;
++
++   if (!fd_perf_driver.draws)
++      fd_perf_driver.first = c.entry;
++   fd_perf_driver.draws++;
++   fd_perf_driver.driver += driver;
++   fd_perf_driver.track += c.track - c.entry;
++   fd_perf_driver.prog += c.prog - c.track;
++   fd_perf_driver.emit += c.emit1 - c.emit0;
++   fd_perf_driver.drawn += c.draw - c.emit1;
++   if (driver > fd_perf_driver.max_driver)
++      fd_perf_driver.max_driver = driver;
++   fd_perf_keep_worst(&fd_perf_driver, &c);
++}
++
++/* Called by whichever thread has just finished a frame's worth of draws: the last draw's entry for
++ * the client, the flush that submits it for the driver. */
++static inline void
++fd_perf_close(struct fd_perf_frame *f)
++{
++   uint64_t now = fd_perf_us();
++
++   if (!f->draws) {
++      f->first = 0;
++      return;
++   }
++   if (now - f->first >= FD_PERF_SLOW_US) {
++      if (f == &fd_perf_driver) {
++         printf("perf driver %llu us: %u draws in %llu us, tracking %llu prog %llu emit %llu "
++                "draw %llu us, max %llu us, program calls %u cache lookups %u\n",
++                (unsigned long long) (now - f->first), f->draws, (unsigned long long) f->driver,
++                (unsigned long long) f->track, (unsigned long long) f->prog,
++                (unsigned long long) f->emit, (unsigned long long) f->drawn,
++                (unsigned long long) f->max_driver, fd_perf_progs, fd_perf_variants);
++         for (unsigned i = 0; i < FD_PERF_WORST; i++) {
++            const struct fd_perf_draw *d = &f->worst[i];
++
++            if (!d->exit)
++               continue;
++            printf("perf driver worst: entry %llu track %llu prog %llu emit %llu draw %llu "
++                   "exit %llu, total %llu us\n",
++                   (unsigned long long) d->entry, (unsigned long long) (d->track - d->entry),
++                   (unsigned long long) (d->prog - d->track),
++                   (unsigned long long) (d->emit1 - d->emit0),
++                   (unsigned long long) (d->draw - d->emit1),
++                   (unsigned long long) (d->exit - d->draw),
++                   (unsigned long long) (d->exit - d->entry));
++         }
++      } else {
++         printf("perf client %llu us: %u draws, queue wait sum %llu max %llu us\n",
++                (unsigned long long) (now - f->first), f->draws,
++                (unsigned long long) f->wait, (unsigned long long) f->max_wait);
++      }
++      fflush(stdout);
++   }
++   fd_perf_window_add(now, f);
++
++   f->draws = 0;
++   f->track = f->prog = f->emit = f->drawn = f->driver = 0;
++   f->wait = f->max_wait = f->max_driver = 0;
++   memset(f->worst, 0, sizeof(f->worst));
++}
++
++#endif /* PERF_DRAW_H */

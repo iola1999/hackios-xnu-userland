@@ -135,8 +135,21 @@ static int
 call_with_return(unsigned number, void *data, size_t size, kern_return_t *raw_result)
 {
 	size_t returned = size;
-	kern_return_t result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
+	struct timespec began, ended;
+	uint64_t us;
+	kern_return_t result;
 
+	clock_gettime(CLOCK_MONOTONIC, &began);
+	result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
+	clock_gettime(CLOCK_MONOTONIC, &ended);
+	us = (uint64_t)(ended.tv_sec - began.tv_sec) * 1000000u +
+	    (uint64_t)(ended.tv_nsec - began.tv_nsec) / 1000u;
+	/* A request that took long enough to lose a frame says so on its own line: the caller's
+	 * timings average over many commits and cannot show one request of several seconds. */
+	if (us > 50000u) {
+		printf("redwooddrm[%d]: request %u took %llu ms\n", (int)getpid(), number,
+		    (unsigned long long)(us / 1000u));
+	}
 	if (raw_result != NULL) {
 		*raw_result = result;
 	}

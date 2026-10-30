@@ -1,0 +1,20 @@
+--- a/src/gallium/auxiliary/util/perf_draw.h
++++ b/src/gallium/auxiliary/util/perf_draw.h
+@@ -27,10 +27,16 @@
+ 
+ #include <mach/mach_time.h>
+ 
++/* mach_absolute_time returns ticks, and one tick is 52.08 ns here (numer 625, denom 12), so dividing
++ * by 1000 alone gives 19.2 times the microseconds. The same conversion as the shim's device_us(). */
+ static inline uint64_t
+ fd_perf_us(void)
+ {
+-   return mach_absolute_time() / 1000;
++   static mach_timebase_info_data_t base;
++
++   if (base.denom == 0)
++      mach_timebase_info(&base);
++   return mach_absolute_time() * base.numer / base.denom / 1000;
+ }
+ 
+ /* A frame whose own accumulated CPU is beyond this no longer fits a 60 Hz budget (16667 us), and is

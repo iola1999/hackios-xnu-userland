@@ -1,0 +1,71 @@
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -7,6 +7,9 @@
+  */
+ 
+ #include "util/os_mman.h"
++#include "util/os_time.h"
++#include <mach/mach.h>
++#include <pthread.h>
+ 
+ #include "freedreno_drmif.h"
+ #include "freedreno_drm_perfetto.h"
+@@ -692,11 +695,29 @@
+       return bo->funcs->prefer_upload(bo, len);
+ 
+    return false;
++}
++
++/* The one call on the draw path that waits inside the kernel with a timeout: kMsmGemCpuPrep via
++ * fd_fence_wait below, and flush_streamout reaches it through the same map. It is timed in real
++ * microseconds (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us), with this
++ * thread's CPU time beside it: a wait asleep in the ioctl shows a wall of hundreds of milliseconds
++ * against a cpu of tens of microseconds, and that difference is the whole point of the line. */
++static uint64_t
++bo_prep_cpu_us(void)
++{
++   mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
++   struct thread_basic_info info;
++
++   if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
++                   (thread_info_t)&info, &count) != KERN_SUCCESS)
++      return 0;
++   return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000 +
++          (uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds;
+ }
+ 
+ /* a bit odd to take the pipe as an arg, but it's a, umm, quirk of kgsl.. */
+-int
+-fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++static int
++fd_bo_cpu_prep_body(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
+    enum fd_bo_state state = fd_bo_state(bo);
+ 
+@@ -764,6 +785,26 @@
+    return bo->funcs->cpu_prep(bo, pipe, op);
+ }
+ 
++int
++fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
++{
++   uint64_t began = os_time_get_nano() / 1000;
++   uint64_t cpu_began = bo_prep_cpu_us();
++   int rc = fd_bo_cpu_prep_body(bo, pipe, op);
++   uint64_t took = os_time_get_nano() / 1000 - began;
++
++   /* 1000 us: this line is about the seconds-long waits, and every prep of a busy bo would
++    * otherwise print one. `ver` is the BO handle, the nearest thing this struct has to a version
++    * (it carries no seqno). */
++   if (took >= 1000) {
++      printf("fd bo prep slow: bo %p flags %u %llu us (cpu %llu) ver %u\n", (void *)bo, op,
++             (unsigned long long)took, (unsigned long long)(bo_prep_cpu_us() - cpu_began),
++             bo->handle);
++      fflush(stdout);
++   }
++   return rc;
++}
++
+ /**
+  * Cleanup fences, dropping pipe references.  If 'expired' is true, only
+  * cleanup expired fences.

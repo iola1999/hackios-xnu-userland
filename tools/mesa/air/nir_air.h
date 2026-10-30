@@ -332,6 +332,35 @@ struct air_constant_value {
    uint64_t bits;      /* its value, as the bits of its type */
 };
 
+/* One call of a stitching graph (MTLFunctionStitchingFunctionNode): the function named
+ * `function` in the module `bitcode`, with argument i taken from the linked call's argument
+ * args[i] when args[i] >= 0, and from the result of node -1 - args[i] otherwise. With args
+ * NULL, argument i is the call's argument i.
+ */
+struct air_stitch_node {
+   const void *bitcode;
+   size_t size;
+   const char *function;
+   unsigned num_args;
+   const int *args;
+   /* nodes that must run before this one although it reads nothing of theirs
+    * (MTLFunctionStitchingFunctionNode.controlDependencies) */
+   unsigned num_after;
+   const unsigned *after;
+};
+
+/* A function linked into the shader at pipeline time (MTLLinkedFunctions). A call of a
+ * function the module only declares, under the name its air.visible_function_reference
+ * gives, runs the nodes in dependency order and takes the output node's result. A visible
+ * function linked as it is, is one node whose arguments are the call's own.
+ */
+struct air_linked_function {
+   const char *name;
+   unsigned num_nodes;
+   const struct air_stitch_node *nodes;
+   unsigned output;
+};
+
 struct air_to_nir_options {
    const struct air_constant_value *constants;
    unsigned num_constants;
@@ -346,6 +375,9 @@ struct air_to_nir_options {
     * entry point of the corpus and is counted separately.
     */
    bool library_wrapper;
+
+   const struct air_linked_function *linked;
+   unsigned num_linked;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may

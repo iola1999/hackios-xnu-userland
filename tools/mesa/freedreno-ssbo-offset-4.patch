@@ -1,0 +1,16 @@
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -538,8 +538,12 @@
+ 
+    caps->glsl_feature_level_compatibility = caps->glsl_feature_level;
+ 
++   /* HackiOS: 4 on a6xx+ as in turnip (minStorageBufferOffsetAlignment):
++    * fdl6_buffer_view_init puts the sub-64-byte part of the base in
++    * STARTOFFSETTEXELS before a8xx and the whole address in the descriptor on
++    * a8xx. Metal binds `device` buffers at 4-byte offsets. */
+    caps->shader_buffer_offset_alignment =
+-      is_a6xx(screen) ? 64 : (is_a5xx(screen) || is_a4xx(screen) ? 4 : 0);
++      is_a6xx(screen) ? 4 : (is_a5xx(screen) || is_a4xx(screen) ? 4 : 0);
+ 
+    if (is_a6xx(screen)) {
+       caps->linear_image_pitch_alignment = 64;

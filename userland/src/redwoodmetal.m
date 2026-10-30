@@ -1,7 +1,7 @@
 /*
  * This copy serves the iOS 16.5 line only: it is the snapshot the open-source release was made from.
- * The authoritative copy for iOS 26 is hackios-xnu-kernel/userland/src/redwoodmetal.m, which is what
- * package.py builds (DRIVER_SOURCES). The two files carry the same name and each builds a library
+ * The authoritative copy for iOS 26 is hackios-xnu-kernel/tools/userland-driver/redwoodmetal.m, which is
+ * what package.py builds (DRIVER_SOURCES). The two files carry the same name and each builds a library
  * called libredwoodmetal.dylib, so work on iOS 26 belongs in the kernel side of the workspace.
  *
  * The device object of a Metal driver for this port, as a real library.

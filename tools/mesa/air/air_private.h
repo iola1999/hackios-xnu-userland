@@ -46,6 +46,7 @@ enum air_ptr_class {
     * why argument buffers need no addresses here.
     */
    AIR_PTR_ARGBUF,
+   AIR_PTR_READ_SAMPLER,  /* compiler-provided integer-read handle; no resource binding */
 };
 
 struct air_ptr {
@@ -129,6 +130,18 @@ struct air_ctx {
    const struct air_function *fn;
    nir_shader *nir;
    nir_builder b;
+
+   /* Inline translation of a linked function (air_link.inc): its first block is
+    * inline_entry instead of the impl's start, a return jumps to inline_exit, and
+    * the returned value is kept in inline_ret (or stored to inline_ret_reg when
+    * the function has more than one return). NULL outside such a function.
+    */
+   nir_block *inline_entry, *inline_exit;
+   struct air_val *inline_ret;
+   nir_def *inline_ret_reg;
+   /* the modules linked functions came from, read and planned once each */
+   struct air_linked_module *linked_modules;
+   unsigned num_linked_modules;
 
    const struct air_to_nir_options *options;
    struct air_shader_info *info;
@@ -217,6 +230,8 @@ struct air_ctx {
 
    unsigned scratch_size;
    unsigned shared_size;
+   /* the threadgroup buffer argument the dispatch sizes, if the kernel has one */
+   struct air_val *dynamic_threadgroup;
 
    /* module-scope variables, by their air_global */
    struct hash_table *globals;
@@ -256,7 +271,10 @@ struct air_ptr air_ptr_add(struct air_ctx *c, struct air_ptr ptr, nir_def *bytes
 
 /* air.* and llvm.* calls; the result is set on the instruction by the callee */
 bool air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *name);
-/* a call of a function defined in this module, folded in by nir_inline_functions */
+/* a call of a function of this module: a defined one is folded in by nir_inline_functions,
+ * a declared one the pipeline linked is inlined at the call (air_link.inc) */
 bool air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name);
+/* the quad helper needs nir_shader_gather_info would record, set on a fragment shader */
+void air_gather_quad_helpers(nir_shader *nir);
 
 #endif /* AIR_PRIVATE_H */
