@@ -29,9 +29,16 @@
  *   restart NAME...            SIGKILL to every process of that name, for launchd to start again
  *   pull PATH                  kern.redwood.inbox, the last file the host pushed ("oem push"),
  *                              written to PATH (mode 755) through a temporary file and a rename
+ *   outbox PATH                the file into kern.redwood.outbox: after the run the loader stages it
+ *                              ("oem recording") and run-auto.py fetches it as run/outbox.bin
+ *   cat PATH [OFFSET]          the file from OFFSET on, 48 bytes a line in base64 ("cat AT DATA"),
+ *                              as many lines as fit, then "cat end SIZE next AT" (fetch.py on the host)
+ *   ls PATH                    the directory's entries: type, size, name
+ *   rm PATH                    unlink(2)
  * Anything else is a program: posix_spawnp with stdout and stderr read back, killed after
  * RWSH_LIMIT_SECONDS.
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <mach/mach_time.h>
@@ -44,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -76,7 +84,7 @@ struct proc_threadinfo {
 };
 
 #define RWSH_POLL_US            250000
-#define RWSH_LIMIT_SECONDS      15
+#define RWSH_LIMIT_SECONDS      120     /* var_store save FILE packs all of /private/var */
 #define RWSH_MAX_PIDS           2048
 #define RWSH_MAX_THREADS        1024
 
@@ -343,6 +351,38 @@ do_restart(int argc, char **argv)
 }
 
 static int
+do_outbox(const char *path)
+{
+	static char piece[16 + (1 << 20)];
+	uint64_t head[2] = { 0, 0 };
+	struct stat st;
+	int fd = open(path, O_RDONLY);
+
+	if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
+		out("outbox %s: %s", path, fd < 0 ? strerror(errno) : "empty or unreadable");
+		if (fd >= 0)
+			close(fd);
+		return 1;
+	}
+	head[0] = (uint64_t)st.st_size;
+	while (head[1] < head[0]) {
+		ssize_t n = read(fd, piece + sizeof(head), sizeof(piece) - sizeof(head));
+
+		if (n <= 0)
+			break;
+		memcpy(piece, head, sizeof(head));
+		if (sysctlbyname("kern.redwood.outbox", NULL, NULL, piece, sizeof(head) + (size_t)n) != 0) {
+			out("outbox %s: at %llu: %s", path, (unsigned long long)head[1], strerror(errno));
+			break;
+		}
+		head[1] += (uint64_t)n;
+	}
+	close(fd);
+	out("outbox %s: %llu of %llu bytes", path, (unsigned long long)head[1], (unsigned long long)head[0]);
+	return head[1] == head[0] ? 0 : 1;
+}
+
+static int
 do_pull(const char *path)
 {
 	size_t size = 0;
@@ -372,6 +412,70 @@ do_pull(const char *path)
 	}
 	out("pull: push %llu, %zu bytes to %s", (unsigned long long)seq, size - sizeof(seq), path);
 	free(data);
+	return 0;
+}
+
+static int
+do_cat(const char *path, long long from)
+{
+	static const char digits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	unsigned char chunk[48];
+	char text[65];
+	struct stat st;
+	long long at = from;
+	int fd = open(path, O_RDONLY);
+
+	if (fd < 0 || fstat(fd, &st) != 0 || lseek(fd, from, SEEK_SET) < 0) {
+		out("cat %s: %s", path, strerror(errno));
+		if (fd >= 0)
+			close(fd);
+		return 1;
+	}
+	while (lines + 2 < RWSH_MAX_LINES) {
+		ssize_t n = read(fd, chunk, sizeof(chunk));
+		size_t o = 0;
+
+		if (n <= 0)
+			break;
+		for (ssize_t i = 0; i < n; i += 3) {
+			unsigned v = chunk[i] << 16 | (i + 1 < n ? chunk[i + 1] << 8 : 0) | (i + 2 < n ? chunk[i + 2] : 0);
+
+			text[o++] = digits[v >> 18 & 63];
+			text[o++] = digits[v >> 12 & 63];
+			text[o++] = i + 1 < n ? digits[v >> 6 & 63] : '=';
+			text[o++] = i + 2 < n ? digits[v & 63] : '=';
+		}
+		text[o] = 0;
+		out("cat %lld %s", at, text);
+		at += n;
+	}
+	out("cat end %lld next %lld", (long long)st.st_size, at);
+	close(fd);
+	return 0;
+}
+
+static int
+do_ls(const char *path)
+{
+	DIR *dir = opendir(path);
+	struct dirent *e;
+
+	if (dir == NULL) {
+		out("ls %s: %s", path, strerror(errno));
+		return 1;
+	}
+	while ((e = readdir(dir)) != NULL) {
+		char full[1024];
+		struct stat st;
+
+		snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+		if (lstat(full, &st) != 0)
+			out("? %s", e->d_name);
+		else
+			out("%c %10lld %s", S_ISDIR(st.st_mode) ? 'd' : S_ISLNK(st.st_mode) ? 'l' : 'f',
+			    (long long)st.st_size, e->d_name);
+	}
+	closedir(dir);
 	return 0;
 }
 
@@ -417,6 +521,19 @@ run(char *text)
 		return do_restart(argc, argv);
 	if (strcmp(argv[0], "pull") == 0 && argc == 2)
 		return do_pull(argv[1]);
+	if (strcmp(argv[0], "outbox") == 0 && argc == 2)
+		return do_outbox(argv[1]);
+	if (strcmp(argv[0], "cat") == 0 && (argc == 2 || argc == 3))
+		return do_cat(argv[1], argc == 3 ? atoll(argv[2]) : 0);
+	if (strcmp(argv[0], "ls") == 0 && argc == 2)
+		return do_ls(argv[1]);
+	if (strcmp(argv[0], "rm") == 0 && argc == 2) {
+		if (unlink(argv[1]) != 0) {
+			out("rm %s: %s", argv[1], strerror(errno));
+			return 1;
+		}
+		return 0;
+	}
 	return do_spawn(argv);
 }
 

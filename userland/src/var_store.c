@@ -19,6 +19,12 @@
  *   var_store erase         forget both slots (the next boot starts empty again)
  *   var_store stamp PATH    write a line into PATH saying when: a marker for a run
  *
+ * save, load and show take a FILE after them to use a file in the flash's place: one slot, its
+ * header at the start of the file. `load` without one takes etc/var.seed from its own image when
+ * that exists, and then never reads the flash: a seed is what `save FILE` packed at the end of an
+ * earlier boot (tools/k90auto/package.py SEED=...), so the boot starts with the LaunchServices
+ * database, the icon cache and PosterBoard's data that boot spent its first minutes building.
+ *
  * Nobody has to remember to save. `watch` registers with the kernel (kern.redwood.var_save), and
  * on the orderly way back to the loader -- the run's time up, or "xl stop" -- the kernel asks it
  * for the volume and waits, bounded, before it goes (bsd/dev/redwood_ufs.c,
@@ -221,6 +227,9 @@ head_checksum(const struct head *h)
 /* ---- the store, as a stream of bytes in one slot ---- */
 
 static int fd = -1;
+static const char *store = DEVICE;      /* or a FILE: see the top */
+static off_t store_at = STORE_AT;
+static int slots = SLOTS;
 static uint8_t *buffer;
 static uint8_t *already;                /* what the slot holds there now, to not write it again */
 static uint64_t skipped_blocks, written_blocks;
@@ -236,7 +245,7 @@ static uint64_t entries;
 static off_t
 slot_at(int slot)
 {
-	return STORE_AT + (off_t)slot * SLOT_BYTES;
+	return store_at + (off_t)slot * SLOT_BYTES;
 }
 
 static int
@@ -427,7 +436,8 @@ static void
 stream_start(int slot, uint64_t bytes)
 {
 	at = slot_at(slot) + BLOCK;
-	stream_limit = slot_at(slot) + SLOT_BYTES;
+	/* a load reads no further than the archive's last block: a store in a file ends there */
+	stream_limit = bytes != 0 ? at + (off_t)((bytes + BLOCK - 1) / BLOCK * BLOCK) : slot_at(slot) + SLOT_BYTES;
 	buffered = taken = 0;
 	stream_bytes = 0;
 	stream_left = bytes;
@@ -461,7 +471,7 @@ newest(struct head *out_head)
 {
 	int best = -1;
 
-	for (int slot = 0; slot < SLOTS; slot++) {
+	for (int slot = 0; slot < slots; slot++) {
 		struct head h;
 
 		if (!read_head(slot, &h)) {
@@ -824,7 +834,7 @@ save(void)
 
 	memset(&old, 0, sizeof(old));
 	best = newest(&old);
-	slot = best < 0 ? 0 : (best + 1) % SLOTS;
+	slot = best < 0 ? 0 : (best + 1) % slots;
 	printf("var_store: saving into slot %d (slot %d holds generation %llu)\n", slot, best,
 	    best < 0 ? 0ULL : (unsigned long long)old.generation);
 
@@ -880,7 +890,7 @@ save(void)
 		    "(%llu seconds ago)\n", (unsigned long long)changed_entries,
 		    (unsigned long long)changed_bytes, (unsigned long long)(h.seconds - last_saved_at));
 	}
-	printf("var_store: %llu blocks into the flash, %llu left alone (they held this already)%s\n",
+	printf("var_store: %llu blocks written, %llu left alone (they held this already)%s\n",
 	    (unsigned long long)written_blocks, (unsigned long long)skipped_blocks,
 	    unsorted_dirs ? " (a directory was too big to put in order)" : "");
 	return 1;
@@ -934,6 +944,8 @@ set_times(const struct entry *e)
  * One entry out of the archive and into /private/var. make: with 0, the entry is only read past
  * (the first pass, which proves the archive's checksum before anything is made).
  */
+#include "var_store_acl.inc"
+
 static int
 unpack_one(int make)
 {
@@ -995,7 +1007,7 @@ unpack_one(int make)
 			break;
 		}
 		name[namelen] = 0;
-		if (make && e.kind != ENT_HARDLINK) {
+		if (make && e.kind != ENT_HARDLINK && !restore_acl(path, name, value, vlen)) {
 			setxattr(path, name, value, vlen, 0, XATTR_NOFOLLOW);
 		}
 	}
@@ -1168,7 +1180,7 @@ load(void)
 		int left = -1;
 
 		/* the newest is torn: the one before it, which a save never touches, may still be whole */
-		for (int slot = 0; slot < SLOTS; slot++) {
+		for (int slot = 0; slot < slots; slot++) {
 			if (slot != best && read_head(slot, &other) && pass(&other, 0)) {
 				left = slot;
 				break;
@@ -1199,7 +1211,7 @@ load(void)
 static void
 show(void)
 {
-	for (int slot = 0; slot < SLOTS; slot++) {
+	for (int slot = 0; slot < slots; slot++) {
 		static uint8_t block[BLOCK];
 		struct head *h = (struct head *)block;
 
@@ -1223,7 +1235,7 @@ erase(void)
 	static uint8_t block[BLOCK];
 
 	memset(block, 0, sizeof(block));
-	for (int slot = 0; slot < SLOTS; slot++) {
+	for (int slot = 0; slot < slots; slot++) {
 		if (!device_write(slot_at(slot), block, BLOCK)) {
 			return 0;
 		}
@@ -1312,46 +1324,22 @@ watch(int seconds)
 	}
 }
 
-/* A line saying when, for a run to leave behind and the next one to find. */
-static int
-stamp(const char *where)
+#include "var_store_stamp.inc"
+
+/* etc/var.seed of the image this program was started from (argv[0] ends in bin/var_store), or NULL */
+static const char *
+seed(const char *self)
 {
-	struct timeval tv = { 0, 0 };
-	char line[256];
-	int out_fd = open(where, O_WRONLY | O_CREAT | O_APPEND, 0644);
-	int n;
+	static char at[MAX_PATH];
+	size_t n = strlen(self), tail = strlen("bin/var_store");
+	struct stat st;
 
-	if (out_fd < 0) {
-		printf("var_store: %s: %s\n", where, strerror(errno));
-		return 0;
+	if (n < tail || n - tail + sizeof("etc/var.seed") > sizeof(at) || strcmp(self + n - tail, "bin/var_store") != 0) {
+		return NULL;
 	}
-	gettimeofday(&tv, NULL);
-	n = 0;
-	{
-		static const char head[] = "written by run of ";
-		unsigned long long seconds = (unsigned long long)tv.tv_sec;
-		char digits[24];
-		int k = 0;
-
-		memcpy(line, head, sizeof(head) - 1);
-		n = (int)sizeof(head) - 1;
-		do {
-			digits[k++] = (char)('0' + seconds % 10);
-			seconds /= 10;
-		} while (seconds > 0);
-		while (k-- > 0) {
-			line[n++] = digits[k];
-		}
-		line[n++] = '\n';
-	}
-	if (write(out_fd, line, (size_t)n) != n) {
-		printf("var_store: %s: %s\n", where, strerror(errno));
-		close(out_fd);
-		return 0;
-	}
-	close(out_fd);
-	printf("var_store: %s: %d bytes added\n", where, n);
-	return 1;
+	memcpy(at, self, n - tail);
+	strcpy(at + n - tail, "etc/var.seed");
+	return stat(at, &st) == 0 ? at : NULL;
 }
 
 int
@@ -1383,13 +1371,22 @@ main(int argc, char **argv, char **envp)
 		}
 		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
 	}
-	fd = open(DEVICE, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY : O_RDWR, 0);
+	if ((argc > 2 && strcmp(what, "erase") != 0) || (strcmp(what, "load") == 0 && seed(argv[0]) != NULL)) {
+		store = argc > 2 ? argv[2] : seed(argv[0]);
+		store_at = 0;
+		slots = 1;
+		already = NULL;         /* a new file holds nothing to compare with */
+	}
+	fd = open(store, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY :
+	    store_at == 0 ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR, 0644);
 	if (fd < 0) {
-		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", DEVICE,
-		    strerror(errno));
+		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", store, strerror(errno));
 		return 1;
 	}
-	if (strcmp(what, "save") == 0) {
+	if (strcmp(what, "save") == 0 && store_at == 0) {
+		/* a zeroed header first, so that the empty file reads as holding no archive */
+		ok = device_write(0, buffer, BLOCK) && save();
+	} else if (strcmp(what, "save") == 0) {
 		ok = claim() && save();
 		release();
 	} else if (strcmp(what, "load") == 0) {

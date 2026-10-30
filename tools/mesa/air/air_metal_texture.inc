@@ -99,16 +99,52 @@ buffer_texture_bytes(struct rwa_buffer_texture *backing, char *why, size_t why_s
    return (char *)source->map + backing->offset;
 }
 
-/* Copy the caller's bytes into the texture, row by row at the caller's stride. */
+static uint64_t
+rows_hash(const char *bytes, size_t size)
+{
+   uint64_t h = 0xcbf29ce484222325ull, word;
+   size_t i = 0;
+
+   for (; i + 8 <= size; i += 8) {
+      memcpy(&word, bytes + i, 8);
+      h = (h ^ word) * 0x100000001b3ull;
+   }
+   for (; i < size; i++)
+      h = (h ^ (unsigned char)bytes[i]) * 0x100000001b3ull;
+   return h;
+}
+
+/* How many refreshes found a texture's bytes unchanged, for the "rwa buffer textures" line. */
+static struct {
+   unsigned refreshes, uploads, unchanged;
+} upload_count;
+
+/*
+ * Copy the caller's bytes into the texture, row by row at the caller's stride, unless the
+ * texture already holds them. Writing a texture the GPU may still be reading makes freedreno
+ * wait for that work ("fd bo prep slow"), and most of these textures are images the caller
+ * wrote once: SpringBoard's glyph surfaces that go through rw_surface_through_copy.
+ */
 static int
 buffer_texture_upload(struct rwa_buffer_texture *backing, char *why, size_t why_size)
 {
    const char *bytes = buffer_texture_bytes(backing, why, why_size);
+   uint64_t h;
 
-   if (!bytes || rwa_texture_write(backing->texture, 0, 0, NULL, NULL, bytes,
-                                   backing->row_bytes, why, why_size) != 0)
+   if (!bytes)
       return -1;
+   h = rows_hash(bytes, (size_t)backing->row_bytes * backing->texture->res->height0);
+   if (backing->hashed && backing->hash == h) {
+      upload_count.unchanged++;
+      return 0;
+   }
+   if (rwa_texture_write(backing->texture, 0, 0, NULL, NULL, bytes, backing->row_bytes, why,
+                         why_size) != 0)
+      return -1;
+   upload_count.uploads++;
    backing->written = false;   /* the texture now holds the buffer's bytes */
+   backing->hashed = true;
+   backing->hash = h;
    return 0;
 }
 
@@ -130,6 +166,8 @@ buffer_texture_download(struct rwa_buffer_texture *backing, char *why, size_t wh
       backing->source->mirror_hashed = false;
       buffer_mirror_pull(backing->source);
    }
+   backing->hashed = true;
+   backing->hash = rows_hash(bytes, span);
    /* REDWOOD_THUMBS diagnostic: what the first writebacks carried, and where to */
    static unsigned said;
    if (said < 64 && getenv("REDWOOD_THUMBS")) {
@@ -365,6 +403,11 @@ rwa_buffer_textures_refresh(struct rwa_device *device)
          (void)buffer_texture_download(b, why, sizeof(why));
       else
          (void)buffer_texture_upload(b, why, sizeof(why));
+   }
+   if (device->buffer_textures && ++upload_count.refreshes == 1024) {
+      printf("rwa buffer textures: %u refreshes: %u uploads, %u unchanged\n",
+             upload_count.refreshes, upload_count.uploads, upload_count.unchanged);
+      memset(&upload_count, 0, sizeof(upload_count));
    }
 }
 

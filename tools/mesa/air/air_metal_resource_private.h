@@ -87,6 +87,9 @@ struct rwa_buffer_texture {
    /* The texture holds bytes the buffer does not have yet: the GPU or the processor wrote
     * the texture since the last copy between them (texture_written). */
    bool written;
+   /* The texture holds the bytes whose hash is `hash` (rows_hash), copied either way. */
+   bool hashed;
+   uint64_t hash;
 };
 
 /*
