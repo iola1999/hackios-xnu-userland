@@ -54,6 +54,10 @@ struct rwa_compute_info {
 	 * field a driver already fills keeps its offset.
 	 */
 	unsigned argbuf_mask;
+
+	/* Nonzero for a kernel any threadgroup size that divides the grid serves alike
+	 * (air_shader_info.group_free). Appended like argbuf_mask. */
+	unsigned group_free;
 };
 
 /* The device. One per Metal device object; it owns the screen and one context.

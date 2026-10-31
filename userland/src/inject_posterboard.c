@@ -33,12 +33,18 @@
  *   pb26 METHOD URL asked {VALUES} -> RESULT
  */
 #include <CoreFoundation/CoreFoundation.h>
+#include <crt_externs.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <mach-o/dyld.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 enum { ERROR_LINES = 300, FRAMES = 8 };
@@ -298,4 +304,130 @@ install_posterboard(void)
     replace("NSURL", "pbf_recursivelyUpdateResourceValues:error:", (IMP)logged_recursive_update,
         &recursive_update);
     fprintf(stderr, "pb26: watching NSError, the data store init and its steps\n");
+}
+
+/*
+ * MercuryPosterExtension, the provider of the default wallpaper, is an ExtensionKit extension
+ * whose standard error is /dev/null, so its os_log lines and the Metal library's printf output are
+ * lost. Here its standard error goes into a pipe and a thread passes each line to
+ * kern.redwood.say ("say PID MercuryPosterExtension: ...").
+ *
+ * It has no launchd job for JOB_ENV to give variables to: /redwood/etc/env/MercuryPosterExtension
+ * (EXT_ENV in tools/k90auto/package.py), one KEY=VALUE a line, is put in its environment here and
+ * the process executes itself again, because some variables are read once while libSystem starts,
+ * before any inserted library runs: OS_ACTIVITY_DT_MODE=YES, the copy of os_log on standard error,
+ * set here and not again in kernel-12377-cmd44-bo25 printed none of the extension's os_log lines.
+ * REDWOOD_EXT_ENV marks the second start. The kernel inserts this library again at that exec
+ * (kern.exec_inject matches the program name).
+ */
+#define EXT_ENV_FILE "/redwood/etc/env/MercuryPosterExtension"
+
+static int
+read_env(const char *path)
+{
+    FILE *file = fopen(path, "r");
+    char line[256];
+    int count = 0;
+
+    while (file != NULL && fgets(line, sizeof(line), file) != NULL) {
+        char *equals = strchr(line, '=');
+
+        line[strcspn(line, "\n")] = '\0';
+        if (equals == NULL || equals == line) continue;
+        *equals = '\0';
+        setenv(line, equals + 1, 1);
+        count++;
+    }
+    if (file != NULL) fclose(file);
+    return count;
+}
+
+static void *
+forward_stderr(void *arg)
+{
+    FILE *in = fdopen((int)(intptr_t)arg, "r");
+    char line[256];
+
+    /* paced under the 200 lines a second the kernel keeps; a full pipe makes the writer wait */
+    while (in != NULL && fgets(line, sizeof(line), in) != NULL) {
+        sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+        usleep(5000);
+    }
+    return NULL;
+}
+
+__attribute__((constructor)) static void
+install_mercury(void)
+{
+    int ends[2];
+    pthread_t thread;
+
+    if (!getprogname() || strcmp(getprogname(), "MercuryPosterExtension")) return;
+    if (getenv("REDWOOD_EXT_ENV") == NULL && read_env(EXT_ENV_FILE) > 0) {
+        char path[1024];
+        uint32_t size = sizeof(path);
+
+        setenv("REDWOOD_EXT_ENV", EXT_ENV_FILE, 1);
+        if (_NSGetExecutablePath(path, &size) == 0)
+            execve(path, *_NSGetArgv(), *_NSGetEnviron());
+    }
+    if (pipe(ends) != 0) return;
+    if (pthread_create(&thread, NULL, forward_stderr, (void *)(intptr_t)ends[0]) != 0) {
+        close(ends[0]);
+        close(ends[1]);
+        return;
+    }
+    pthread_detach(thread);
+    dup2(ends[1], STDERR_FILENO);
+    close(ends[1]);
+    if (getenv("REDWOOD_EXT_ENV") != NULL)
+        fprintf(stderr, "pb26: started again with the variables of %s\n", EXT_ENV_FILE);
+}
+
+/*
+ * Poster snapshots as PNG. PosterUIFoundation writes every snapshot as ATX ("Snapshot-[%@].atx",
+ * +[PUIImageOnDiskFormat defaultATX]): ASTC blocks laid out for Apple's GPU. SpringBoard's wallpaper
+ * window shows such a snapshot, QuartzCore sends it to backboardd as a block-compressed image, and
+ * here its data is empty: SpringBoard asks for a memory entry of 0 bytes (kernel-12377-cmd46-bo34),
+ * backboardd answers "CompressedImage port is MACH_PORT_NULL!" and drops the whole commit of the
+ * window, the hosted poster scene included. Both ATX formats answer with the PNG one instead; the
+ * reader goes by the bytes and not by the file name. PosterUIFoundation is loaded at launch by
+ * PosterBoard, SpringBoard and the poster extensions, and otherwise when an image is added.
+ */
+static id
+png_format(id self, SEL cmd)
+{
+    (void)cmd;
+    return ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("png"));
+}
+
+static id
+png_format_sized(id self, SEL cmd, long block_size, BOOL twiddling)
+{
+    (void)block_size;
+    (void)twiddling;
+    return png_format(self, cmd);
+}
+
+static void
+use_png_snapshots(const struct mach_header *header, intptr_t slide)
+{
+    static int done;
+    Class format = objc_getClass("PUIImageOnDiskFormat");
+
+    (void)header;
+    (void)slide;
+    if (done || !format) return;
+    done = 1;
+    method_setImplementation(class_getClassMethod(format, sel_registerName("defaultATX")),
+        (IMP)png_format);
+    method_setImplementation(class_getClassMethod(format, sel_registerName("atxWithBlockSize:twiddling:")),
+        (IMP)png_format_sized);
+    fprintf(stderr, "pb26: %s writes poster snapshots as PNG\n", getprogname());
+}
+
+__attribute__((constructor)) static void
+install_png_snapshots(void)
+{
+    _dyld_register_func_for_add_image(use_png_snapshots);
 }

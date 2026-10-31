@@ -510,6 +510,8 @@ report_one(const struct module_ref *mod)
       }
    }
    printf("\ttranslate=ok\tnir_instrs=%u", instrs);
+   if (info.group_free)
+      printf("\tgroup_free=1");
    /* What was translated with a caveat: the shader was accepted and something
     * other than exactly what it asked for was done (air_shader_info.notes).
     * On the report line rather than on stderr, because the report is the only

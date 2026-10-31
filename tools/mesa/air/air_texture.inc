@@ -272,10 +272,13 @@ set_tex_result(struct air_ctx *c, const struct air_inst *in, nir_def *value)
 /* A query: a size, a level count or a sample count, of a texture or an image. */
 static nir_def *
 query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex_name *t,
-              nir_texop op, nir_def *lod, unsigned comps)
+              nir_texop op, nir_def *lod, unsigned comps, nir_def *image_slot)
 {
    if (tex->is_image) {
-      nir_def *index = nir_imm_int(&c->b, tex->binding);
+      /* a level slot (image_level_slot) is that level alone, measured at its own level 0 */
+      nir_def *index = image_slot ? image_slot : nir_imm_int(&c->b, tex->binding);
+      if (image_slot)
+         lod = NULL;
       switch (op) {
       case nir_texop_txs: {
          /* an image size has as many components as the image has dimensions;
@@ -296,15 +299,19 @@ query_texture(struct air_ctx *c, const struct air_ptr *tex, const struct air_tex
       }
    }
 
-   nir_tex_instr *q = nir_tex_instr_create(c->nir, lod ? 1 : 0);
+   nir_tex_instr *q = nir_tex_instr_create(c->nir, (lod ? 1 : 0) + (tex->offset ? 1 : 0));
    q->op = op;
    q->sampler_dim = t->dim;
    q->is_array = t->is_array;
    q->dest_type = nir_type_int32;
    q->texture_index = tex->binding;
    q->sampler_index = 0;
+   unsigned qsrc = 0;
    if (lod)
-      q->src[0] = (nir_tex_src){ .src_type = nir_tex_src_lod, .src = nir_src_for_ssa(lod) };
+      q->src[qsrc++] = (nir_tex_src){ .src_type = nir_tex_src_lod, .src = nir_src_for_ssa(lod) };
+   if (tex->offset)   /* a texture chosen at run time (choosable_texture, air_to_nir.c) */
+      q->src[qsrc++] = (nir_tex_src){ .src_type = nir_tex_src_texture_offset,
+                                      .src = nir_src_for_ssa(tex->offset) };
    /* NIR fixes the size of a query's result itself -- txs is two components
     * for a 2D texture whatever the caller asks one of them for -- so it is
     * asked here and the component picked afterwards.
@@ -326,6 +333,54 @@ all_zero(nir_def *def)
       if (nir_src_comp_as_int(nir_src_for_ssa(def), i) != 0)
          return false;
    return true;
+}
+
+/* The image slot of one mip level of a written texture.
+ *
+ * A Gallium image is one level, and a Metal kernel may write or measure any
+ * level of a texture it was given, chosen at run time:
+ * MercuryPosterExtension's VariableBlurrer::downsample writes level n of a
+ * blur chain with n read from its constant buffer, and while it was refused
+ * the extension set up no renderer at all and the wallpaper stayed black.
+ * Such an image takes AIR_IMAGE_LEVELS more slots above every image the shader
+ * declares, level L at level_base + L, and the runtime binds a view of each
+ * level there (air_metal.c). ir3 reaches images through bindless descriptors,
+ * so the slot may be a value computed in the shader.
+ */
+#define AIR_IMAGE_LEVELS 15   /* a 16384 x 16384 texture has 15 levels */
+#define AIR_IMAGE_SLOTS  32   /* ir3's IR3_BINDLESS_IMAGE_COUNT */
+
+static nir_def *
+image_level_slot(struct air_ctx *c, const struct air_ptr *tex, nir_def *lod,
+                 const struct air_name *n)
+{
+   struct air_resource *own = NULL;
+   unsigned next = 0;
+
+   for (unsigned i = 0; i < c->info->num_resources; i++) {
+      struct air_resource *r = &c->info->resources[i];
+      if (r->kind != AIR_RESOURCE_IMAGE)
+         continue;
+      next = MAX2(next, MAX2(r->index + 1, r->level_base + r->level_count));
+      if (r->index == tex->binding)
+         own = r;
+   }
+   if (!own) {
+      air_error(c, "intrinsic: air.%s at a computed level of image %u, which the "
+                   "interface does not declare", n->part[0], tex->binding);
+      return NULL;
+   }
+   if (own->level_count == 0) {
+      if (next + AIR_IMAGE_LEVELS > AIR_IMAGE_SLOTS) {
+         air_error(c, "intrinsic: air.%s at a computed level of image %u, with no room "
+                      "for its %u level slots above slot %u", n->part[0], tex->binding,
+                   AIR_IMAGE_LEVELS, next);
+         return NULL;
+      }
+      own->level_base = next;
+      own->level_count = AIR_IMAGE_LEVELS;
+   }
+   return nir_iadd_imm(&c->b, nir_u2u32(&c->b, lod), own->level_base);
 }
 
 /* The coordinate, with the array index that follows it folded into it.
@@ -400,9 +455,75 @@ tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
    return coord;
 }
 
+/* Metal's null texture. air.get_null_texture_<dim> is a texture with nothing behind
+ * it -- space::rasterizeCylinderFragment passes one to the light it evaluates without
+ * a gobo -- and reading it gives zeros. air.is_null_texture_<dim> is true for it, and
+ * on a texture argument it is a test made at run time: the argument is marked
+ * nullable, the runtime binds no view when the application bound no texture, and an
+ * empty slot measures 0 wide (fd6 gives it an all-zero descriptor).
+ */
+/* Metal lets a shader be given no texture where it does not read one: a texture tested with
+ * is_null_texture, and the textures a run-time choice does not pick (texture_slot in
+ * air_to_nir.c; space::rasterizeBackgroundFragment picks one of four gobo textures and the
+ * wallpaper binds only that one). The runtime gives an unbound one no view, so it reads as
+ * zero and measures 0 wide. */
+void
+air_texture_may_be_unbound(struct air_ctx *c, unsigned binding)
+{
+   for (unsigned i = 0; i < c->info->num_resources; i++) {
+      struct air_resource *r = &c->info->resources[i];
+      if ((r->kind == AIR_RESOURCE_TEXTURE || r->kind == AIR_RESOURCE_IMAGE) &&
+          r->index == binding && r->argbuf_set == ~0u)
+         r->nullable = true;
+   }
+}
+
+static bool
+null_texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
+                bool *handled)
+{
+   const char *op = n->part[0];
+
+   *handled = !strncmp(op, "get_null_texture_", 17) || !strncmp(op, "is_null_texture_", 16);
+   if (!*handled)
+      return true;
+   if (op[0] == 'g') {
+      air_set(c, &in->base, air_val_ptr(c, (struct air_ptr){ .class = AIR_PTR_TEXTURE,
+                                                            .binding = ~0u,
+                                                            .is_null = true }));
+      return true;
+   }
+
+   struct air_ptr tex;
+   if (in->num_operands != 2)
+      return air_error(c, "intrinsic: air.%s takes one texture", op);
+   if (!tex_handle(c, in, 1, AIR_PTR_TEXTURE, &tex))
+      return false;
+   if (tex.is_null) {
+      air_set(c, &in->base, air_val_ssa(c, nir_imm_true(&c->b)));
+      return true;
+   }
+   char size_name[64];
+   struct air_tex_name t;
+   snprintf(size_name, sizeof(size_name), "get_width_%s", op + strlen("is_null_"));
+   if (!parse_tex_name(size_name, &t))
+      return air_error(c, "intrinsic: air.%s (a texture name this cannot take apart)", op);
+   if (!tex.offset)
+      air_texture_may_be_unbound(c, tex.binding);
+   nir_def *size = query_texture(c, &tex, &t, nir_texop_txs, nir_imm_int(&c->b, 0), 0, NULL);
+   air_set(c, &in->base, air_val_ssa(c, nir_ieq_imm(&c->b, nir_channel(&c->b, size, 0), 0)));
+   return true;
+}
+
 static bool
 texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n)
 {
+   bool null_handled;
+   if (!null_texture_op(c, in, n, &null_handled))
+      return false;
+   if (null_handled)
+      return true;
+
    struct air_tex_name t;
    if (!parse_tex_name(n->part[0], &t))
       return air_error(c, "intrinsic: air.%s (a texture name this cannot take apart)",
@@ -487,13 +608,27 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    nir_alu_type dest_type = tex_dest_type(c, in->base.type, n);
    unsigned dest_bits = nir_alu_type_get_type_size(dest_type);
 
+   /* a null texture (null_texture_op): nothing is written, and what is read is zero */
+   if (tex.is_null) {
+      if (!strcmp(t.op, "write"))
+         return true;
+      if (!strcmp(t.op, "get")) {
+         air_set(c, &in->base, air_val_ssa(c, nir_imm_intN_t(&c->b, 0, dest_bits)));
+         return true;
+      }
+      if (strcmp(t.op, "sample") && strcmp(t.op, "read") && strcmp(t.op, "gather"))
+         return air_error(c, "intrinsic: air.%s of a null texture", n->part[0]);
+      set_tex_result(c, in, nir_imm_zero(&c->b, 4, dest_bits));
+      return true;
+   }
+
    if (!strcmp(t.op, "get")) {
       /* the queries: a size, a level count or a sample count */
       nir_def *res;
       if (!strcmp(t.query, "num_samples")) {
-         res = query_texture(c, &tex, &t, nir_texop_texture_samples, NULL, 1);
+         res = query_texture(c, &tex, &t, nir_texop_texture_samples, NULL, 1, NULL);
       } else if (!strcmp(t.query, "num_mip_levels")) {
-         res = query_texture(c, &tex, &t, nir_texop_query_levels, NULL, 1);
+         res = query_texture(c, &tex, &t, nir_texop_query_levels, NULL, 1, NULL);
       } else {
          nir_def *lod = nir_imm_int(&c->b, 0);
          if (in->num_operands > arg) {
@@ -502,7 +637,10 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
                return false;
             lod = nir_u2u32(&c->b, given);
          }
-         nir_def *size = query_texture(c, &tex, &t, nir_texop_txs, lod, 0);
+         nir_def *slot = NULL;
+         if (tex.is_image && !all_zero(lod) && !(slot = image_level_slot(c, &tex, lod, n)))
+            return false;
+         nir_def *size = query_texture(c, &tex, &t, nir_texop_txs, lod, 0, slot);
          unsigned comp = !strcmp(t.query, "width") ? 0 :
                          !strcmp(t.query, "height") ? 1 :
                          !strcmp(t.query, "depth") ? 2 : size->num_components - 1;
@@ -525,16 +663,21 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *value = air_get_ssa(c, in->operands[arg++]);
       if (!value)
          return false;
-      uint64_t lod;
-      if (!tex_flag(c, in, arg, &lod))
-         return false;
-      if (lod != 0)
-         return air_error(c, "intrinsic: air.%s to mip level %u (only 0 is handled)",
-                          n->part[0], (unsigned)lod);
       if (!tex.is_image)
          return air_error(c, "intrinsic: air.%s to a texture the interface says is not "
                              "written", n->part[0]);
-      nir_image_store(&c->b, nir_imm_int(&c->b, tex.binding),
+      if (in->num_operands <= arg)
+         return air_error(c, "intrinsic: air.%s without its level", n->part[0]);
+      uint64_t level;
+      nir_def *index;
+      if (air_const_uint(in->operands[arg], &level) && level == 0) {
+         index = nir_imm_int(&c->b, tex.binding);
+      } else {
+         nir_def *lod = air_get_ssa(c, in->operands[arg]);
+         if (!lod || !(index = image_level_slot(c, &tex, lod, n)))
+            return false;
+      }
+      nir_image_store(&c->b, index,
                       nir_pad_vector(&c->b, nir_u2u32(&c->b, coord), 4),
                       nir_imm_int(&c->b, 0), nir_pad_vector(&c->b, value, 4),
                       nir_imm_int(&c->b, 0),
@@ -611,7 +754,7 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
     * exactly six, and the next source anyone adds should not be the one that overflows
     * this silently.
     */
-   nir_tex_src srcs[7];
+   nir_tex_src srcs[8];
    unsigned nsrc = 0;
    srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_coord,
                                  .src = nir_src_for_ssa(coord) };
@@ -739,6 +882,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       };
    }
 
+   if (tex.offset)   /* a texture chosen at run time (choosable_texture, air_to_nir.c) */
+      srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_texture_offset,
+                                    .src = nir_src_for_ssa(tex.offset) };
    nir_tex_instr *tex_instr = nir_tex_instr_create(c->nir, nsrc);
    tex_instr->op = op;
    tex_instr->sampler_dim = t.dim;

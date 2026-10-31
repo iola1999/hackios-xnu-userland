@@ -8,7 +8,7 @@
  * below it up to LAYER_BELOW levels. `com.redwood.layers.all` prints the whole tree. Each line is the depth,
  * the layer class, the view class, the bounds size and position in points (in the superlayer),
  * hidden/opacity, the contents (CGImage and IOSurface with their size, and the surface's ID and
- * FourCC; any other object by its CF type or class) and the effects (describe_effects). The total is capped at LAYER_LINES, because the console ring is 1.3 MB.
+ * FourCC, and a full-screen CGImage's mean colour; any other object by its CF type or class) and the effects (describe_effects). The total is capped at LAYER_LINES, because the console ring is 1.3 MB.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
@@ -31,6 +31,9 @@ struct rect { double x, y, w, h; };
 struct point { double x, y; };
 
 static size_t (*image_width)(const void *), (*image_height)(const void *);
+static size_t (*image_row_bytes)(const void *), (*image_pixel_bits)(const void *);
+static const void *(*image_provider)(const void *);
+static CFDataRef (*provider_copy)(const void *);
 static CFTypeID (*image_type)(void), (*surface_type)(void);
 static size_t (*surface_width)(const void *), (*surface_height)(const void *);
 static uint32_t (*surface_id)(const void *), (*surface_format)(const void *);
@@ -72,6 +75,51 @@ name_of(id object)
     return object ? class_getName(object_getClass(object)) : "-";
 }
 
+/* A full-screen image's mean over a 64x64 grid, as its four bytes in memory order: tells a black
+ * wallpaper snapshot from one that has a picture. Only 32-bit images of at least 512x512. */
+static void
+describe_pixels(id image, char *out, size_t size)
+{
+    size_t width = image_width(image), height = image_height(image);
+    if (!provider_copy || width < 512 || height < 512 || image_pixel_bits(image) != 32) return;
+    CFDataRef data = provider_copy(image_provider(image));
+    if (!data) return;
+    const uint8_t *bytes = CFDataGetBytePtr(data);
+    size_t row = image_row_bytes(image), length = (size_t)CFDataGetLength(data);
+    unsigned long sum[4] = { 0 }, count = 0;
+    for (size_t y = 0; y < 64; y++) {
+        for (size_t x = 0; x < 64; x++) {
+            size_t at = (y * height / 64) * row + (x * width / 64) * 4;
+            if (at + 4 > length) continue;
+            for (int c = 0; c < 4; c++) sum[c] += bytes[at + c];
+            count++;
+        }
+    }
+    CFRelease(data);
+    if (count)
+        snprintf(out, size, " mean %02lx%02lx%02lx%02lx", sum[0] / count, sum[1] / count,
+            sum[2] / count, sum[3] / count);
+}
+
+/* CoreGraphics' own description of a full-screen image, on one line: says what provides its bytes,
+ * which the wallpaper snapshot needs because QuartzCore sends it as a block-compressed image. */
+static void
+describe_image(id contents, unsigned depth)
+{
+    if (!contents || !image_type || CFGetTypeID((CFTypeRef)contents) != image_type() ||
+        image_width(contents) < 512 || image_height(contents) < 512)
+        return;
+    CFStringRef described = CFCopyDescription((CFTypeRef)contents);
+    char text[1024] = "";
+    if (described) {
+        CFStringGetCString(described, text, sizeof(text), kCFStringEncodingUTF8);
+        CFRelease(described);
+    }
+    for (char *c = text; *c; c++)
+        if (*c == '\n' || *c == '\t') *c = ' ';
+    out("sb26 layer %2u image %s\n", depth, text);
+}
+
 static void
 describe_contents(id contents, char *out, size_t size)
 {
@@ -81,7 +129,9 @@ describe_contents(id contents, char *out, size_t size)
     }
     CFTypeID type = CFGetTypeID((CFTypeRef)contents);
     if (image_type && type == image_type()) {
-        snprintf(out, size, "CGImage %zux%zu", image_width(contents), image_height(contents));
+        size_t written = (size_t)snprintf(out, size, "CGImage %zux%zu", image_width(contents),
+            image_height(contents));
+        describe_pixels(contents, out + written, size - written);
     } else if (surface_type && type == surface_type()) {
         uint32_t f = surface_format(contents);
         snprintf(out, size, "IOSurface %u %zux%zu '%c%c%c%c'", surface_id(contents),
@@ -184,6 +234,7 @@ walk(id layer, unsigned depth, const char *filter, int below)
         out("sb26 layer %2u %s view=%s %.0fx%.0f at %.0f,%.0f%s a=%.2f contents=%s fx=%s\n",
             depth, name_of(layer), name_of(send(layer, "delegate")), bounds.w, bounds.h, at.x, at.y,
             hidden ? " hidden" : "", opacity, contents, effects);
+        describe_image(send(layer, "contents"), depth);
         lines++;
         describe_scene(send(layer, "delegate"), depth);
     }
@@ -212,7 +263,11 @@ dump(const char *filter)
     for (unsigned long i = 0; i < count && lines < LAYER_LINES; i++) {
         id window = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows,
             sel_registerName("objectAtIndex:"), i);
-        out("sb26 layer window %lu %s\n", i, name_of(window));
+        SEL context = sel_registerName("_contextId");
+        unsigned id_of_context = class_respondsToSelector(object_getClass(window), context)
+            ? ((unsigned (*)(id, SEL))objc_msgSend)(window, context) : 0;
+        /* the context ID is the one backboardd names in "serialization error from context %x" */
+        out("sb26 layer window %lu %s context %x\n", i, name_of(window), id_of_context);
         walk(send(window, "layer"), 0, filter, filter ? -1 : 1 << 30);
     }
     out("sb26 layers end lines=%u%s\n", lines, lines >= LAYER_LINES ? " (cut)" : "");
@@ -328,6 +383,11 @@ resolve(void *context)
         *(void **)&image_width = dlsym(cg, "CGImageGetWidth");
         *(void **)&image_height = dlsym(cg, "CGImageGetHeight");
         if (!image_width || !image_height) image_type = NULL;
+        *(void **)&image_row_bytes = dlsym(cg, "CGImageGetBytesPerRow");
+        *(void **)&image_pixel_bits = dlsym(cg, "CGImageGetBitsPerPixel");
+        *(void **)&image_provider = dlsym(cg, "CGImageGetDataProvider");
+        *(void **)&provider_copy = dlsym(cg, "CGDataProviderCopyData");
+        if (!image_row_bytes || !image_pixel_bits || !image_provider) provider_copy = NULL;
     }
     if (io) {
         *(void **)&surface_type = dlsym(io, "IOSurfaceGetTypeID");

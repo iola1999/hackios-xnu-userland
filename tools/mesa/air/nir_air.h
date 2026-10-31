@@ -138,6 +138,21 @@ struct air_resource {
     */
    int raster_order_group;
 
+   /* An image the shader writes or measures at a mip level it computes, which
+    * a Gallium image (one level each) cannot take: the texture is bound once
+    * per level, level L at image slot level_base + L, for level_count levels
+    * from the bound view's first level (image_level_slot in air_texture.inc).
+    * Both 0 for an image used at level 0 only.
+    */
+   unsigned level_base, level_count;
+
+   /* A texture the shader tests with air.is_null_texture_*, or one candidate of
+    * a texture chosen at run time: Metal lets the application leave it unbound,
+    * and the runtime then binds no view, which the test reads as a size of 0
+    * (air_texture_may_be_unbound in air_texture.inc).
+    */
+   bool nullable;
+
    /* A member of an ARGUMENT BUFFER (`air.indirect_buffer`, Metal's
     * `[[id(n)]]` struct) rather than an argument of its own, and the one place
     * in this structure where `.index` is not Metal's number: ~0u when this
@@ -318,6 +333,13 @@ struct air_shader_info {
    const char **notes;
 
    unsigned threadgroup_bytes; /* static threadgroup memory */
+
+   /* A kernel whose threads read nothing about their threadgroup (reads_threadgroup in
+    * air_to_nir.c), so any threadgroup size that divides the grid gives the same result.
+    * A runtime can then serve -dispatchThreads: over a grid the requested size does not
+    * divide, which freedreno has no partial threadgroups for.
+    */
+   bool group_free;
 };
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call

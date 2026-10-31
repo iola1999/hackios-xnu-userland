@@ -141,6 +141,7 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
    slot_shapes(compute->nir, compute->slots, compute->compare_sampler);
 
    compute->caps.static_shared_bytes = compute->info.threadgroup_bytes;
+   compute->caps.group_free = compute->info.group_free;
    compute->caps.max_threads_per_group = device->max_threads_per_group;
    compute->caps.thread_execution_width = device->thread_execution_width;
    /* And which of those buffer indices are sets rather than arguments, so that a driver

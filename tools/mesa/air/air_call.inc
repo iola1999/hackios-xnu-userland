@@ -56,7 +56,88 @@ enum call_param_kind {
    CALL_PARAM_NONE,
    CALL_PARAM_VALUE,
    CALL_PARAM_OFFSET,
+   CALL_PARAM_AGG,
 };
+
+/* A struct or array passed by value travels as one parameter per number inside
+ * it, in member order (CALL_PARAM_AGG): NIR has no aggregate parameter, and
+ * Mercury's space:: shaders pass float4x4 (`%"struct.metal::matrix.12"`) and
+ * light records to the functions they call. The number of such parameters, or
+ * -1 when the type holds something that is neither a number nor an aggregate.
+ */
+#define CALL_AGG_MAX_LEAVES 256
+
+static int
+agg_leaves(const struct air_type *t)
+{
+   if (ret_member_is_number(t))
+      return 1;
+   if (t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_ARRAY)
+      return -1;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   int sum = 0;
+   for (unsigned i = 0; i < n && sum <= CALL_AGG_MAX_LEAVES; i++) {
+      int k = agg_leaves(t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem);
+      if (k < 0)
+         return -1;
+      sum += k;
+   }
+   return sum <= CALL_AGG_MAX_LEAVES ? sum : -1;
+}
+
+/* the callee's parameters for one aggregate, made in agg_leaves' order */
+static void
+agg_params(struct air_ctx *c, const struct air_type *t, nir_function *fn, unsigned *idx)
+{
+   if (ret_member_is_number(t)) {
+      fn->params[(*idx)++] = (nir_parameter){
+         .num_components = (uint8_t)air_nir_components(t),
+         .bit_size = (uint8_t)air_nir_bit_size(c, t),
+      };
+      return;
+   }
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   for (unsigned i = 0; i < n; i++)
+      agg_params(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem, fn, idx);
+}
+
+/* inside the callee: the aggregate rebuilt from those parameters */
+static struct air_val *
+agg_from_params(struct air_ctx *c, const struct air_type *t, unsigned *pidx)
+{
+   if (ret_member_is_number(t))
+      return air_val_ssa(c, nir_load_param(&c->b, (*pidx)++));
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   struct air_val *v = air_val_agg(c, n);
+   for (unsigned i = 0; i < n; i++)
+      v->elems[i] = agg_from_params(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem,
+                                    pidx);
+   return v;
+}
+
+/* at the call site: the caller's aggregate taken apart the same way; a field
+ * nothing was inserted into travels as undef */
+static bool
+agg_to_sources(struct air_ctx *c, const struct air_type *t, const struct air_val *v,
+               nir_call_instr *call, unsigned *idx)
+{
+   if (ret_member_is_number(t)) {
+      nir_def *d = v && v->kind == AIR_VAL_SSA ? v->def :
+                   v ? NULL : nir_undef(&c->b, air_nir_components(t), air_nir_bit_size(c, t));
+      if (!d)
+         return air_error(c, "intrinsic: a field of an aggregate argument that is not a number");
+      call->params[(*idx)++] = nir_src_for_ssa(d);
+      return true;
+   }
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   if (v && (v->kind != AIR_VAL_AGG || v->num_elems != n))
+      return air_error(c, "intrinsic: an aggregate argument whose value has another shape");
+   for (unsigned i = 0; i < n; i++)
+      if (!agg_to_sources(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem,
+                          v ? v->elems[i] : NULL, call, idx))
+         return false;
+   return true;
+}
 
 /* A function of the module, translated as a nir_function so that
  * nir_inline_functions can fold it into its callers afterwards.
@@ -121,10 +202,12 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
                       ? CALL_PARAM_OFFSET : CALL_PARAM_NONE;
       } else if (ret_member_is_number(f->args[i].type)) {
          kind[i] = CALL_PARAM_VALUE;
+      } else if (val_carries_def(argv[i]) && agg_leaves(f->args[i].type) > 0) {
+         kind[i] = CALL_PARAM_AGG;
       } else if (val_carries_def(argv[i])) {
-         /* An array or a nested struct by value with something in it: NIR has
-          * no parameter that could carry it, and handing the callee the
-          * caller's defs would be a use outside its own impl.
+         /* An aggregate holding something that is neither a number nor an
+          * aggregate, or too many numbers to pass one by one: handing the
+          * callee the caller's defs would be a use outside its own impl.
           */
          air_error(c, "intrinsic: a call passing argument %u (%s) by value, which "
                       "has no parameter to travel as",
@@ -170,7 +253,8 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    }
    unsigned nparams = nret;
    for (unsigned i = 0; i < f->num_args; i++)
-      nparams += kind[i] != CALL_PARAM_NONE;
+      nparams += kind[i] == CALL_PARAM_AGG ? (unsigned)agg_leaves(f->args[i].type) :
+                 kind[i] != CALL_PARAM_NONE;
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
    fn->params = rzalloc_array(c->nir, nir_parameter, MAX2(nparams, 1));
@@ -203,6 +287,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       if (kind[i] == CALL_PARAM_OFFSET) {
          /* the pointer's byte offset, 32-bit like every offset in air_ptr */
          fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };
+         continue;
+      }
+      if (kind[i] == CALL_PARAM_AGG) {
+         agg_params(c, at, fn, &idx);
          continue;
       }
       if (kind[i] != CALL_PARAM_VALUE)
@@ -285,6 +373,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          struct air_ptr p = argv[i]->ptr;
          p.offset = nir_load_param(&c->b, pidx++);
          air_set(c, &f->args[i], air_val_ptr(c, p));
+         continue;
+      }
+      if (kind[i] == CALL_PARAM_AGG) {
+         air_set(c, &f->args[i], agg_from_params(c, f->args[i].type, &pidx));
          continue;
       }
       if (kind[i] != CALL_PARAM_VALUE) {
@@ -396,6 +488,11 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    for (unsigned i = 0; i < f->num_args; i++) {
       if (kind[i] == CALL_PARAM_OFFSET) {
          call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
+         continue;
+      }
+      if (kind[i] == CALL_PARAM_AGG) {
+         if (!agg_to_sources(c, f->args[i].type, argv[i], call, &idx))
+            return false;
          continue;
       }
       if (kind[i] != CALL_PARAM_VALUE)

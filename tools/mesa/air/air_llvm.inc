@@ -95,6 +95,20 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       air_set(c, &in->base, air_val_ssa(c, nir_fabs(&c->b, a)));
       return true;
    }
+   /* LLVM's integer minimum and maximum, which the Metal compiler emits for
+    * min()/max() of shorts (space::rasterizeArcFragment: llvm.smax.i16). */
+   if (!strncmp(name, "llvm.smax.", 10) || !strncmp(name, "llvm.smin.", 10) ||
+       !strncmp(name, "llvm.umax.", 10) || !strncmp(name, "llvm.umin.", 10)) {
+      nir_def *a = air_get_ssa(c, in->operands[1]);
+      nir_def *b = air_get_ssa(c, in->operands[2]);
+      if (!a || !b)
+         return false;
+      bool max = name[7] == 'a', is_signed = name[5] == 's';
+      nir_def *r = is_signed ? (max ? nir_imax(&c->b, a, b) : nir_imin(&c->b, a, b))
+                             : (max ? nir_umax(&c->b, a, b) : nir_umin(&c->b, a, b));
+      air_set(c, &in->base, air_val_ssa(c, r));
+      return true;
+   }
    if (!strcmp(name, "llvm.trap"))
       return air_error(c, "intrinsic: llvm.trap");
    return air_error(c, "intrinsic: %s", name);

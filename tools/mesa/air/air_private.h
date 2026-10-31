@@ -53,7 +53,10 @@ struct air_ptr {
    enum air_ptr_class class;
    unsigned binding;
    bool is_image;                    /* a texture the shader writes: an image, not a view */
-   nir_def *offset;                  /* bytes, 32-bit; NULL means zero */
+   bool is_null;                     /* air.get_null_texture_*: nothing behind it */
+   nir_def *offset;                  /* bytes, 32-bit; NULL means zero. For a texture
+                                      * chosen at run time, the texture slot itself,
+                                      * with binding 0 (air_texture_slot) */
    const struct air_type *pointee;   /* for sizes, and for loads without a type */
 };
 
@@ -276,5 +279,7 @@ bool air_translate_call(struct air_ctx *c, const struct air_inst *in, const char
 bool air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name);
 /* the quad helper needs nir_shader_gather_info would record, set on a fragment shader */
 void air_gather_quad_helpers(nir_shader *nir);
+/* the texture at this binding may be left unbound by the application (air_resource.nullable) */
+void air_texture_may_be_unbound(struct air_ctx *c, unsigned binding);
 
 #endif /* AIR_PRIVATE_H */

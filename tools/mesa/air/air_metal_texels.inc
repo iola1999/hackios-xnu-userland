@@ -71,14 +71,14 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
 /* How wide a row of the caller's memory is, with Metal's convention that zero means
  * tightly packed, and the check that it is at least a row: a stride shorter than the
  * region would make every row after the first read from inside the one before it,
- * which produces an image rather than an error.
+ * which produces an image rather than an error. A row of a compressed format is a row of
+ * blocks.
  */
 static bool
 caller_stride(const struct rwa_texture *texture, const struct pipe_box *box, size_t stride,
               size_t *out, char *why, size_t why_size)
 {
-   unsigned texel = util_format_get_blocksize(texture->res->format);
-   size_t least = (size_t)box->width * texel;
+   size_t least = util_format_get_stride(texture->res->format, box->width);
    if (stride == 0) {
       *out = least;
       return true;
@@ -184,7 +184,8 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
 
    texture->device->pipe->texture_subdata(texture->device->pipe, texture->res, level,
                                           PIPE_MAP_WRITE, &box, bytes, row,
-                                          row * box.height);
+                                          row * util_format_get_nblocksy(texture->res->format,
+                                                                         box.height));
    texture_written(texture);
    return 0;
 }
