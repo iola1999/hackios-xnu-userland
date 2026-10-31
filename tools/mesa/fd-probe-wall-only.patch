@@ -1,0 +1,119 @@
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -9,9 +9,6 @@
+ 
+ #include "pipe/p_state.h"
+ #include "util/perf_draw.h"
+-#include <mach/mach.h>
+-#include <pthread.h>
+-#include <sys/resource.h>
+ #include "util/u_memory.h"
+ #include "util/u_prim.h"
+ #include "util/u_string.h"
+@@ -370,37 +367,17 @@
+    }
+ }
+ 
+-/* Three segments of draw_vbos<>, read with three numbers each: the wall clock, this thread's CPU
+- * time and the process's page fault count. A wall of a second against a CPU of tens of microseconds
+- * is time asleep in the kernel, and the fault count says whether the sleep is a page coming in. */
++/* Segments of draw_vbos<>, read with the wall clock only. Each stamp used to read this thread's CPU
++ * time (thread_info) and the process's fault count (getrusage) as well, eight of each per draw, and
++ * those calls cost more than the draw (kernel-12377-cmd36-bo10). */
+ struct fd_draw_stamp {
+    uint64_t wall;
+-   uint64_t cpu;
+-   long flt;
+ };
+ 
+-static uint64_t
+-fd_draw_thread_cpu_us(void)
+-{
+-   mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+-   struct thread_basic_info info;
+-
+-   if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
+-                   (thread_info_t)&info, &count) != KERN_SUCCESS)
+-      return 0;
+-   return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000 +
+-          (uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds;
+-}
+-
+ static struct fd_draw_stamp
+ fd_draw_stamp_take(void)
+ {
+-   struct fd_draw_stamp stamp = { fd_perf_us(), fd_draw_thread_cpu_us(), 0 };
+-   struct rusage usage;
+-
+-   if (getrusage(RUSAGE_SELF, &usage) == 0)
+-      stamp.flt = usage.ru_minflt + usage.ru_majflt;
+-   return stamp;
++   return (struct fd_draw_stamp){ fd_perf_us() };
+ }
+ 
+ static void
+@@ -410,9 +387,7 @@
+ 
+    /* 50,000 microseconds of the clock fd_perf_us reads, now real microseconds. */
+    if (wall > 50000) {
+-      printf("fd draw seg slow: %s wall %llu cpu %llu flt %lld us\n", what,
+-             (unsigned long long) wall, (unsigned long long)(ended->cpu - began->cpu),
+-             (long long)(ended->flt - began->flt));
++      printf("fd draw seg slow: %s wall %llu us\n", what, (unsigned long long) wall);
+       fflush(stdout);
+    }
+ }
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -740,24 +740,6 @@
+    return false;
+ }
+ 
+-/* The one call on the draw path that waits inside the kernel with a timeout: kMsmGemCpuPrep via
+- * fd_fence_wait below, and flush_streamout reaches it through the same map. It is timed in real
+- * microseconds (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us), with this
+- * thread's CPU time beside it: a wait asleep in the ioctl shows a wall of hundreds of milliseconds
+- * against a cpu of tens of microseconds, and that difference is the whole point of the line. */
+-static uint64_t
+-bo_prep_cpu_us(void)
+-{
+-   mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+-   struct thread_basic_info info;
+-
+-   if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
+-                   (thread_info_t)&info, &count) != KERN_SUCCESS)
+-      return 0;
+-   return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000 +
+-          (uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds;
+-}
+-
+ /* a bit odd to take the pipe as an arg, but it's a, umm, quirk of kgsl.. */
+ static int
+ fd_bo_cpu_prep_body(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+@@ -828,11 +810,13 @@
+    return bo->funcs->cpu_prep(bo, pipe, op);
+ }
+ 
++/* The one call on the draw path that waits inside the kernel with a timeout: kMsmGemCpuPrep via
++ * fd_fence_wait, and flush_streamout reaches it through the same map. Timed in real microseconds
++ * (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us). */
+ int
+ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
+    uint64_t began = os_time_get_nano() / 1000;
+-   uint64_t cpu_began = bo_prep_cpu_us();
+    int rc = fd_bo_cpu_prep_body(bo, pipe, op);
+    uint64_t took = os_time_get_nano() / 1000 - began;
+ 
+@@ -840,9 +824,8 @@
+     * otherwise print one. `ver` is the BO handle, the nearest thing this struct has to a version
+     * (it carries no seqno). */
+    if (took >= 1000) {
+-      printf("fd bo prep slow: bo %p flags %u %llu us (cpu %llu) ver %u\n", (void *)bo, op,
+-             (unsigned long long)took, (unsigned long long)(bo_prep_cpu_us() - cpu_began),
+-             bo->handle);
++      printf("fd bo prep slow: bo %p flags %u %llu us ver %u\n", (void *)bo, op,
++             (unsigned long long)took, bo->handle);
+       fflush(stdout);
+    }
+    return rc;

@@ -1,0 +1,75 @@
+--- a/src/gallium/auxiliary/util/perf_draw.h
++++ b/src/gallium/auxiliary/util/perf_draw.h
+@@ -13,9 +13,10 @@
+  * The two sides keep separate state: the client thread writes fd_perf_client, the driver thread
+  * writes fd_perf_driver, and neither reads the other's. Their lines pair up by order in the log.
+  *
+- * On by default in a library built from this patch: the switch that looks obvious, glenv=, is parsed
+- * by eagl.c and never reaches the window server, so a round gated on it prints nothing and burns 420
+- * seconds. FD_PERF_DRAW=0 turns it off instead, and the first draw says which way it went.
++ * Off unless the process has FD_PERF_DRAW=1 in its environment (package.py JOB_ENV): with it off,
++ * fd_perf_us() returns 0 and reads no clock. Every read is an ISB and a counter read, and the stamps
++ * on every draw, bind and state segment were a fifth of backboardd's samples in
++ * kernel-12377-cmd39-bo15, mostly in mach_absolute_time.
+  */
+ #ifndef PERF_DRAW_H
+ #define PERF_DRAW_H
+@@ -27,13 +28,18 @@
+ 
+ #include <mach/mach_time.h>
+ 
++static inline int fd_perf_on(void);
++
+ /* mach_absolute_time returns ticks, and one tick is 52.08 ns here (numer 625, denom 12), so dividing
+- * by 1000 alone gives 19.2 times the microseconds. The same conversion as the shim's device_us(). */
++ * by 1000 alone gives 19.2 times the microseconds. The same conversion as the shim's device_us().
++ * 0 while the timing is off. */
+ static inline uint64_t
+ fd_perf_us(void)
+ {
+    static mach_timebase_info_data_t base;
+ 
++   if (!fd_perf_on())
++      return 0;
+    if (base.denom == 0)
+       mach_timebase_info(&base);
+    return mach_absolute_time() * base.numer / base.denom / 1000;
+@@ -106,9 +112,9 @@
+    static int on = -1;
+ 
+    if (on < 0) {
+-      const char *off = getenv("FD_PERF_DRAW");
++      const char *wanted = getenv("FD_PERF_DRAW");
+ 
+-      on = !(off && off[0] == '0');
++      on = wanted && wanted[0] == '1';
+       {
+          const char *slow = getenv("FD_PERF_SLOW_US");
+ 
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -818,10 +818,23 @@
+ 
+ /* The one call on the draw path that waits inside the kernel with a timeout: kMsmGemCpuPrep via
+  * fd_fence_wait, and flush_streamout reaches it through the same map. Timed in real microseconds
+- * (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us). */
++ * (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us), and only with
++ * FD_PERF_DRAW=1 as the draw stamps are (util/perf_draw.h): most calls return without a wait,
++ * and the two clock reads were most of what they cost. The kernel's "tl: f cpu-prep" lines time
++ * the waits themselves. */
+ int
+ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
++   static int timed = -1;
++
++   if (timed < 0) {
++      const char *wanted = getenv("FD_PERF_DRAW");
++
++      timed = wanted && wanted[0] == '1';
++   }
++   if (!timed)
++      return fd_bo_cpu_prep_body(bo, pipe, op);
++
+    uint64_t began = os_time_get_nano() / 1000;
+    int rc = fd_bo_cpu_prep_body(bo, pipe, op);
+    uint64_t took = os_time_get_nano() / 1000 - began;

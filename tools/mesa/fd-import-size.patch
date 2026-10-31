@@ -1,0 +1,68 @@
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -860,7 +860,10 @@
+    if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+       bo = fd_bo_from_name(screen->dev, whandle->handle);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+-      bo = fd_bo_from_handle(screen->dev, whandle->handle, 0);
++      /* HackiOS: AIR imports a buffer over the caller's memory (kRedwoodMemory) by its handle and
++       * passes its size here. With 0 the bo has no size, and every texture laid over that buffer
++       * fails the layout's size check. */
++      bo = fd_bo_from_handle(screen->dev, whandle->handle, whandle->size);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+       bo = fd_bo_from_dmabuf(screen->dev, whandle->handle);
+    } else {
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -1659,7 +1659,12 @@
+    rsc->b.is_shared = true;
+ 
+    struct fd_bo *bo = fd_screen_bo_from_handle(pscreen, handle);
++   static unsigned said;
++
+    if (!bo) {
++      if (said++ < 16)
++         printf("fd import: no bo for handle %u (type %u), %ux%u format %u\n", handle->handle,
++                handle->type, tmpl->width0, tmpl->height0, tmpl->format);
+       if (FD_DBG(LAYOUT))
+          mesa_loge("handle import failed for: %" PRSC_FMT, PRSC_ARGS(tmpl));
+       goto fail;
+@@ -1672,12 +1677,19 @@
+    if (tmpl->target == PIPE_BUFFER) {
+       fdl_layout_buffer(&rsc->layout, tmpl->width0);
+    } else if (!screen->layout_resource_for_handle(rsc, handle)) {
++      if (said++ < 16)
++         printf("fd import: layout refused %ux%u format %u, stride %u offset %u, bo %u bytes\n",
++                tmpl->width0, tmpl->height0, tmpl->format, handle->stride, handle->offset,
++                fd_bo_size(bo));
+       if (FD_DBG(LAYOUT))
+          mesa_loge("layout failed for: %" PRSC_FMT, PRSC_ARGS(tmpl));
+       goto fail;
+    }
+ 
+    if (rsc->layout.pitch0 != handle->stride) {
++      if (said++ < 16)
++         printf("fd import: pitch %u for stride %u, %ux%u format %u\n", rsc->layout.pitch0,
++                handle->stride, tmpl->width0, tmpl->height0, tmpl->format);
+       if (FD_DBG(LAYOUT))
+          mesa_loge("invalid pitch (%u vs %u) for: %" PRSC_FMT, rsc->layout.pitch0,
+                    handle->stride, PRSC_ARGS(tmpl));
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -671,8 +671,14 @@
+       page = 4096;
+ 
+    began = os_time_get_nano() / 1000;
+-   for (unsigned off = 0; off < bo->size; off += page)
+-      bytes[off] = bytes[off];   /* read then write the same byte: the write is what faults it in */
++   /* An imported bo can be memory the caller mapped read-only (kRedwoodMemory with
++    * MSM_BO_GPU_READONLY), whose mapping here is read-only too: it is only read. */
++   for (unsigned off = 0; off < bo->size; off += page) {
++      if (bo->alloc_flags & FD_BO_SHARED)
++         (void)bytes[off];
++      else
++         bytes[off] = bytes[off];   /* read then write the same byte: the write is what faults it in */
++   }
+    took = os_time_get_nano() / 1000 - began;
+ 
+    if (took >= 5000) {

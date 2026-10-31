@@ -78,6 +78,92 @@ rwa_buffer_set_mirror(struct rwa_buffer *buffer, void *mirror)
    buffer_mirror_pull(buffer);   /* the hash of what the driver has just copied */
 }
 
+/*
+ * A buffer that is the caller's own memory, for -newBufferWithBytesNoCopy: in place of a copy with a
+ * mirror. The kernel wires the pages and enters them into the GPU's address space (RedwoodGPU's
+ * request 0x7c, which drmIoctl passes on by the request's low byte), and the buffer object is
+ * imported by its handle: the GPU reads what the caller writes, and no batch reads, hashes or
+ * copies the memory first. A texture over such a buffer can be laid over it (buffer_texture_alias).
+ * map is the kernel's second mapping of the same pages, still there after the caller unmaps its
+ * own. NULL when the kernel refuses (no gpu_coherent=1, memory not in whole 4 KB pages).
+ */
+#include <errno.h>
+#include <sys/ioccom.h>
+
+struct redwood_memory_request {
+   uint64_t address, size;
+   uint32_t handle, pad;
+};
+
+struct rwa_buffer *rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size,
+                                          char *why, size_t why_size);
+
+struct rwa_buffer *
+rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char *why,
+                       size_t why_size)
+{
+   RWA_LOCKED;
+   struct redwood_memory_request request = { (uint64_t)(uintptr_t)bytes, size, 0, 0 };
+   struct pipe_resource templ = {
+      .target = PIPE_BUFFER, .format = PIPE_FORMAT_R8_UNORM, .usage = PIPE_USAGE_STAGING,
+      .bind = PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_INDEX_BUFFER |
+              PIPE_BIND_SHARED,
+      .width0 = (unsigned)size, .height0 = 1, .depth0 = 1, .array_size = 1,
+   };
+   struct winsys_handle whandle = { .type = WINSYS_HANDLE_TYPE_KMS, .stride = (unsigned)size,
+                                    .size = size };
+   struct rwa_buffer *buffer;
+
+   if (!device || device->software || !device->screen->resource_from_handle) {
+      say(why, why_size, "this device imports no memory");
+      return NULL;
+   }
+   if (size == 0 || size > UINT32_MAX || ((uintptr_t)bytes | size) % 4096 != 0) {
+      say(why, why_size, "%zu bytes at %p are not whole 4 KB pages", size, bytes);
+      return NULL;
+   }
+   if (drmIoctl(-1, _IOWR('d', 0x7c, struct redwood_memory_request), &request) != 0) {
+      /* what kind of memory the kernel would not wire: its region, protection, tag and sharing */
+      int error = errno;
+      vm_address_t at = (vm_address_t)(uintptr_t)bytes;
+      vm_size_t length = 0;
+      natural_t depth = 8;
+      vm_region_submap_info_data_64_t info = { 0 };
+      mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+      vm_region_recurse_64(mach_task_self(), &at, &length, &depth, (vm_region_recurse_info_t)&info,
+                           &count);
+      say(why, why_size, "the kernel would not take %zu bytes at %p as a buffer: %s (region "
+                         "%#lx+%#lx prot %d/%d tag %u share %u object %#x)", size, bytes,
+          strerror(error), (unsigned long)at, (unsigned long)length, info.protection,
+          info.max_protection, info.user_tag, info.share_mode, info.object_id);
+      return NULL;
+   }
+   whandle.handle = request.handle;
+   buffer = calloc(1, sizeof(*buffer));
+   if (buffer)
+      buffer->res = device->screen->resource_from_handle(device->screen, &templ, &whandle,
+                                                         PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   if (buffer && buffer->res)
+      buffer->map = pipe_buffer_map(device->pipe, buffer->res, PIPE_MAP_READ | PIPE_MAP_WRITE,
+                                    &buffer->xfer);
+   if (!buffer || !buffer->map) {
+      struct { uint32_t handle, pad; } close = { request.handle, 0 };
+
+      say(why, why_size, "buffer %u over %zu bytes at %p could not be %s", request.handle, size,
+          bytes, buffer && buffer->res ? "mapped" : "imported");
+      if (buffer && buffer->res)
+         pipe_resource_reference(&buffer->res, NULL);   /* the import closes the handle */
+      else
+         drmIoctl(-1, _IOW('d', 0x09, close), &close);  /* DRM_IOCTL_GEM_CLOSE */
+      free(buffer);
+      return NULL;
+   }
+   buffer->device = device;
+   buffer->size = size;
+   return buffer;
+}
+
 /* Where the texture's rows lie in the buffer, or NULL when they do not fit in it. */
 static char *
 buffer_texture_bytes(struct rwa_buffer_texture *backing, char *why, size_t why_size)

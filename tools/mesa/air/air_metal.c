@@ -295,23 +295,6 @@ device_us(void)
    return mach_absolute_time() * base.numer / base.denom / 1000;
 }
 
-/* The same thread's user plus system microseconds, for telling time spent in the code from time the
- * process was not running at all: a wall clock can grow while this thread is preempted or blocked on
- * a page fault, and neither is the driver's cost. pthread_mach_thread_np returns an existing port, so
- * nothing has to be deallocated per draw. */
-static uint64_t
-thread_cpu_us(void)
-{
-   mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
-   struct thread_basic_info info;
-
-   if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
-                   (thread_info_t)&info, &count) != KERN_SUCCESS)
-      return 0;
-   return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000 +
-          (uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds;
-}
-
 /* Every rwa_texture_write entry, before it validates anything: a call that carries a NULL or a
  * garbage `bytes` is the answer to one of the two questions this ring exists for, so the record
  * cannot sit behind the checks. `size` is the caller's array and is read only for its first two
@@ -2935,11 +2918,10 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
    return 0;
 }
 
-/* Hand the work over without waiting for it, keeping the fence for rwa_finish.
- *
- * A draw does not finish itself any more (rwa_render_draw, and the note there): the
- * caller submits at the end of a command buffer and waits when Metal says to wait. This
- * is the submitting half; the fence nobody has taken yet stays on the device.
+/* Hand the work over without waiting for it, keeping the fence for rwa_finish: a draw does not
+ * finish itself (rwa_render_draw), the caller submits at the end of a command buffer and waits
+ * when Metal says to. A wait of no time on the fence gives the kernel the submissions freedreno
+ * merged (tools/mesa/fd-submit-merge.patch); the fence nobody has taken yet stays on the device.
  */
 int
 rwa_flush(struct rwa_device *device, char *why, size_t why_size)
@@ -2947,10 +2929,10 @@ rwa_flush(struct rwa_device *device, char *why, size_t why_size)
    RWA_LOCKED;
    struct pipe_fence_handle *fence = NULL;
 
-   (void)why;
-   (void)why_size;
+   (void)why, (void)why_size;
    device->pipe->flush(device->pipe, &fence, 0);
    if (fence) {
+      device->screen->fence_finish(device->screen, NULL, fence, 0);
       device->screen->fence_reference(device->screen, &device->pending, NULL);
       device->pending = fence;
    }
@@ -3367,12 +3349,21 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
 
 /* A microsecond clock for the two phase timers below: rwa_render_draw's per-draw
  * breakdown and bind_stage's per-call one. It reads the clock the row ring uses, so a phase
- * timed here sits on the timeline of the `tl:` lines the rest of the boot prints.
+ * timed here sits on the timeline of the `tl:` lines the rest of the boot prints. 0 unless
+ * FD_PERF_DRAW=1, as the driver's own stamps (util/perf_draw.h): the reads on every draw and
+ * bind were most of a fifth of backboardd's samples in kernel-12377-cmd39-bo15.
  */
 static uint64_t
 draw_mark(void)
 {
-   return device_us();
+   static int timed = -1;
+
+   if (timed < 0) {
+      const char *wanted = getenv("FD_PERF_DRAW");
+
+      timed = wanted && wanted[0] == '1';
+   }
+   return timed ? device_us() : 0;
 }
 
 /* What bind_stage bound, so unbind_stage can take it all back once the fence is in. The
@@ -6295,19 +6286,18 @@ rwa_render_create_linked(struct rwa_device *device,
     * boundary is the first thing to look at (docs/metal.md 10.30).
     */
    /*
-    * `multisample` is set from the pass's own sample count, and what it actually
-    * decides on this GPU is worth saying because it is almost nothing: freedreno reads
-    * it in one place, fd6_rasterizer.cc, to pick RECTANGULAR over BRESENHAM line
-    * rasterisation. Sample coverage itself comes from the framebuffer's sample count,
-    * which freedreno computes off the attachments (fd_set_framebuffer_state ->
-    * util_framebuffer_get_num_samples) and emits with emit_msaa. So this bit is the
-    * honest state for a multisample pass and not the thing that turns multisampling on.
+    * `multisample` follows the pass's sample count. freedreno reads it only in
+    * fd6_rasterizer.cc, to pick RECTANGULAR over BRESENHAM lines; sample coverage comes
+    * from the attachments (util_framebuffer_get_num_samples, emit_msaa). `line_width` is
+    * 1 because a Metal line is one pixel wide: at 0 fd6 writes a line half width of 0 and
+    * MTLPrimitiveTypeLine covers no pixel. Core Animation draws a stroked CAShapeLayer as
+    * lines (TcmaA2LlnXhf), and with width 0 the strokes were missing (kernel-12377-cmd33-bo5).
     */
    render->rast = device->pipe->create_rasterizer_state(device->pipe,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .multisample = samples > 1 });
+         .multisample = samples > 1, .line_width = 1.0f });
    /* The same state with the clip rectangle turned on. Scissor enable is part of this
     * state and not a call of its own in Gallium, and the rectangle itself is encoder
     * state, so a draw that carries one binds this copy and sets the rectangle beside it.
@@ -6316,7 +6306,7 @@ rwa_render_create_linked(struct rwa_device *device,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .multisample = samples > 1, .scissor = 1 });
+         .multisample = samples > 1, .line_width = 1.0f, .scissor = 1 });
    if (!render->blend || !render->dsa || !render->rast || !render->rast_scissor) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
       goto fail;
@@ -7170,21 +7160,17 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * most 26 us means either that this call does not reach fd6_draw_vbos at all, or that the
        * time sits in fd_draw_vbo outside that function. The address decides which. */
       {
-         uint64_t call_began = device_us();
-         uint64_t cpu_began = thread_cpu_us();
-         uint64_t call_took, call_cpu;
+         uint64_t call_began = draw_mark(), call_took;
 
          pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
-         call_took = device_us() - call_began;
-         call_cpu = thread_cpu_us() - cpu_began;
+         call_took = draw_mark() - call_began;
          if (call_took > 20000) {
             Dl_info where = { 0 };
             const char *what = dladdr((void *)pipe->draw_vbo, &where) != 0 && where.dli_sname != NULL
                                ? where.dli_sname : "?";
 
-            printf("rwa draw call: pipe %p draw_vbo %p wall %llu cpu %llu us (%s)\n", (void *)pipe,
-                   (void *)pipe->draw_vbo, (unsigned long long)call_took,
-                   (unsigned long long)call_cpu, what);
+            printf("rwa draw call: pipe %p draw_vbo %p wall %llu us (%s)\n", (void *)pipe,
+                   (void *)pipe->draw_vbo, (unsigned long long)call_took, what);
             fflush(stdout);
          }
       }

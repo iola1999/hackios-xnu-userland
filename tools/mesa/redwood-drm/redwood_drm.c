@@ -131,6 +131,51 @@ error_from_return(kern_return_t result)
 	}
 }
 
+/*
+ * Calls per selector and the microseconds they took, one line every 4 s while there are calls: in
+ * an animation the render thread spends most of its time in these round trips (thread dumps of
+ * kernel-12377-cmd37-bo12). Slots 0xf0 and 0xf1 are the maps and unmaps of buffer memory. Counted
+ * without a lock: two threads may lose a count between them, which a rate does not notice.
+ */
+static struct { uint32_t calls; uint64_t us; } tally[256];
+static uint64_t tally_since;
+
+static uint64_t
+now_us(void)
+{
+	struct timespec at;
+
+	clock_gettime(CLOCK_MONOTONIC, &at);
+	return (uint64_t)at.tv_sec * 1000000u + (uint64_t)at.tv_nsec / 1000u;
+}
+
+static void
+tally_add(unsigned slot, uint64_t ended, uint64_t us)
+{
+	char line[1024];
+	int n;
+
+	tally[slot & 0xff].calls++;
+	tally[slot & 0xff].us += us;
+	if (tally_since == 0) {
+		tally_since = ended;
+	}
+	if (ended - tally_since < 4000000u) {
+		return;
+	}
+	n = snprintf(line, sizeof(line), "redwooddrm[%d]: calls in %llu ms, selector:calls/us", (int)getpid(),
+	    (unsigned long long)((ended - tally_since) / 1000u));
+	for (unsigned i = 0; i < 256 && n < (int)sizeof(line) - 32; i++) {
+		if (tally[i].calls != 0) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %#x:%u/%llu", i, tally[i].calls,
+			    (unsigned long long)tally[i].us);
+		}
+	}
+	printf("%s\n", line);
+	memset(tally, 0, sizeof(tally));
+	tally_since = ended;
+}
+
 static int
 call_with_return(unsigned number, void *data, size_t size, kern_return_t *raw_result)
 {
@@ -142,8 +187,8 @@ call_with_return(unsigned number, void *data, size_t size, kern_return_t *raw_re
 	clock_gettime(CLOCK_MONOTONIC, &began);
 	result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
 	clock_gettime(CLOCK_MONOTONIC, &ended);
-	us = (uint64_t)(ended.tv_sec - began.tv_sec) * 1000000u +
-	    (uint64_t)(ended.tv_nsec - began.tv_nsec) / 1000u;
+	us = (uint64_t)(((int64_t)(ended.tv_sec - began.tv_sec) * 1000000000 + (ended.tv_nsec - began.tv_nsec)) / 1000);
+	tally_add(number, (uint64_t)ended.tv_sec * 1000000u + (uint64_t)ended.tv_nsec / 1000u, us);
 	/* A request that took long enough to lose a frame says so on its own line: the caller's
 	 * timings average over many commits and cannot show one request of several seconds. */
 	if (us > 50000u) {
@@ -250,7 +295,13 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 	 * the program and the memory the GPU sees. So does the kernel's driver here: the memory is
 	 * made that way, and this mapping is as the memory is.
 	 */
-	if (IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped, kIOMapAnywhere) != 0) {
+	uint64_t began = now_us(), ended;
+	kern_return_t result = IOConnectMapMemory64(connection, handle, mach_task_self(), &address, &mapped,
+	    kIOMapAnywhere);
+
+	ended = now_us();
+	tally_add(0xf0, ended, ended - began);
+	if (result != 0) {
 		return (void *)-1;              /* mmap()'s MAP_FAILED */
 	}
 	return (void *)(uintptr_t)address;
@@ -259,8 +310,12 @@ redwood_drm_map(int fd, uint32_t handle, uint64_t size)
 void
 redwood_drm_unmap(int fd, uint32_t handle, void *address)
 {
+	uint64_t began = now_us(), ended;
+
 	(void)fd;
 	IOConnectUnmapMemory64(connection, handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)address);
+	ended = now_us();
+	tally_add(0xf1, ended, ended - began);
 }
 
 int

@@ -1,0 +1,15 @@
+--- a/src/freedreno/drm/msm/msm_bo.c
++++ b/src/freedreno/drm/msm/msm_bo.c
+@@ -72,6 +72,12 @@
+    /* older kernels do not support this: */
+    if (bo->dev->version < FD_VERSION_MADVISE)
+       return willneed;
++#ifdef __APPLE__
++   /* RedwoodGPU keeps every buffer and answers "retained" (kMsmGemMadvise); the answer cost an IOKit
++    * round trip twice for every buffer through the cache, which was the render thread's most frequent
++    * place in kernel-12377-cmd37-bo12. */
++   return willneed;
++#endif
+ 
+    ret =
+       drmCommandWriteRead(bo->dev->fd, DRM_MSM_GEM_MADVISE, &req, sizeof(req));

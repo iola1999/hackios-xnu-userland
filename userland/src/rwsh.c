@@ -184,7 +184,7 @@ do_threads(int pid)
 static int
 do_sysctl(char *name)
 {
-	static unsigned char value[9000];
+	static unsigned char value[128 * 1024];         /* kern.redwood.prof prints up to 96 KB */
 	size_t size = sizeof(value) - 1;
 	size_t printable = 0;
 	char *equals = strchr(name, '=');
@@ -479,6 +479,89 @@ do_ls(const char *path)
 	return 0;
 }
 
+/*
+ * "maps PID": the files mapped into a process, one line per run of regions from the same file,
+ * for telling whether an inserted library is in it. The iOS SDK has no libproc.h; the layout is
+ * that of bsd/sys/proc_info.h (PROC_PIDREGIONPATHINFO, struct proc_regionwithpathinfo).
+ */
+struct maps_region {
+	uint32_t protection, max_protection, inheritance, flags;
+	uint64_t offset;
+	uint32_t behavior, user_wired_count, user_tag, pages_resident, pages_shared_now_private, pages_swapped_out,
+	    pages_dirtied, ref_count, shadow_depth, share_mode, private_pages_resident, shared_pages_resident, obj_id, depth;
+	uint64_t address, size;
+	unsigned char vnode_info[152];  /* struct vnode_info: vinfo_stat, vi_type, vi_pad, fsid_t */
+	char path[1024];
+};
+static int
+do_maps_pid(int pid)
+{
+	struct maps_region r;
+	char last[1024] = "";
+	uint64_t at = 0, from = 0;
+
+	while (proc_pidinfo(pid, 8 /* PROC_PIDREGIONPATHINFO */, at, &r, sizeof(r)) == (int)sizeof(r)) {
+		r.path[sizeof(r.path) - 1] = 0;
+		if (strcmp(r.path, last) != 0) {
+			if (last[0] != 0)
+				out("%llx-%llx %s", (unsigned long long)from, (unsigned long long)at, last);
+			strlcpy(last, r.path, sizeof(last));
+			from = r.address;
+		}
+		at = r.address + r.size;
+	}
+	if (last[0] != 0)
+		out("%llx-%llx %s", (unsigned long long)from, (unsigned long long)at, last);
+	return 0;
+}
+
+static int
+do_dump_pid(int pid)
+{
+	if (sysctlbyname("kern.redwood.thread_dump", NULL, NULL, &pid, sizeof(pid)) != 0) {
+		out("dump %d: %s", pid, strerror(errno));
+		return 1;
+	}
+	out("dump %d: the threads are in the kernel log", pid);
+	return 0;
+}
+
+/* "maps|dump PID" or "maps|dump NAME": with a name, every process of that name. */
+static int
+for_named(const char *verb, const char *which, int (*each)(int pid))
+{
+	static int pids[RWSH_MAX_PIDS];
+	int count, found = 0;
+
+	if (which[strspn(which, "0123456789")] == 0)
+		return each(atoi(which));
+	count = proc_listpids(PROC_ALL_PIDS, 0, pids, (int)sizeof(pids)) / (int)sizeof(pids[0]);
+	for (int i = 0; i < count; i++) {
+		char name[64] = "";
+
+		if (pids[i] <= 0 || proc_name(pids[i], name, sizeof(name)) <= 0 || strcmp(name, which) != 0)
+			continue;
+		out("%s %s: pid %d", verb, which, pids[i]);
+		each(pids[i]);
+		found++;
+	}
+	if (found == 0)
+		out("%s %s: no such process", verb, which);
+	return found == 0;
+}
+
+static int
+do_maps(const char *which)
+{
+	return for_named("maps", which, do_maps_pid);
+}
+
+static int
+do_dump(const char *which)
+{
+	return for_named("dump", which, do_dump_pid);
+}
+
 static int
 run(char *text)
 {
@@ -492,18 +575,12 @@ run(char *text)
 		return 0;
 	if (strcmp(argv[0], "ps") == 0)
 		return do_ps();
+	if (strcmp(argv[0], "maps") == 0 && argc == 2)
+		return do_maps(argv[1]);
 	if (strcmp(argv[0], "threads") == 0 && argc == 2)
 		return do_threads(atoi(argv[1]));
-	if (strcmp(argv[0], "dump") == 0 && argc == 2) {
-		int pid = atoi(argv[1]);
-
-		if (sysctlbyname("kern.redwood.thread_dump", NULL, NULL, &pid, sizeof(pid)) != 0) {
-			out("dump %d: %s", pid, strerror(errno));
-			return 1;
-		}
-		out("dump %d: the threads are in the kernel log", pid);
-		return 0;
-	}
+	if (strcmp(argv[0], "dump") == 0 && argc == 2)
+		return do_dump(argv[1]);
 	if (strcmp(argv[0], "kill") == 0 && argc == 3) {
 		if (kill(atoi(argv[2]), atoi(argv[1])) != 0) {
 			out("kill: %s", strerror(errno));

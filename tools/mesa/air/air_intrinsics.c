@@ -447,6 +447,27 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "fast_fmax") || !strcmp(op, "fmax") || !strcmp(op, "max")) {
       r = is_float ? nir_fmax(&c->b, a[0], a[1])
                    : (is_signed ? nir_imax(&c->b, a[0], a[1]) : nir_umax(&c->b, a[0], a[1]));
+   } else if (!strcmp(op, "fast_fmin3") || !strcmp(op, "fmin3") || !strcmp(op, "min3")) {
+      /* min3, max3 and median3 (MSL 2.1): backboardd's fragment module TimgBadcA2S1Xhfu_Ialp
+       * calls air.fmax3.f16, and Core Animation aborts when that pipeline is refused */
+      r = is_float ? nir_fmin(&c->b, nir_fmin(&c->b, a[0], a[1]), a[2])
+                   : is_signed ? nir_imin(&c->b, nir_imin(&c->b, a[0], a[1]), a[2])
+                               : nir_umin(&c->b, nir_umin(&c->b, a[0], a[1]), a[2]);
+   } else if (!strcmp(op, "fast_fmax3") || !strcmp(op, "fmax3") || !strcmp(op, "max3")) {
+      r = is_float ? nir_fmax(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2])
+                   : is_signed ? nir_imax(&c->b, nir_imax(&c->b, a[0], a[1]), a[2])
+                               : nir_umax(&c->b, nir_umax(&c->b, a[0], a[1]), a[2]);
+   } else if (!strcmp(op, "fast_fmedian3") || !strcmp(op, "fmedian3") || !strcmp(op, "median3")) {
+      /* median(x, y, z) = max(min(x, y), min(max(x, y), z)) */
+      if (is_float)
+         r = nir_fmax(&c->b, nir_fmin(&c->b, a[0], a[1]),
+                      nir_fmin(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]));
+      else if (is_signed)
+         r = nir_imax(&c->b, nir_imin(&c->b, a[0], a[1]),
+                      nir_imin(&c->b, nir_imax(&c->b, a[0], a[1]), a[2]));
+      else
+         r = nir_umax(&c->b, nir_umin(&c->b, a[0], a[1]),
+                      nir_umin(&c->b, nir_umax(&c->b, a[0], a[1]), a[2]));
    } else if (!strcmp(op, "fast_clamp") || !strcmp(op, "clamp")) {
       if (is_float)
          r = nir_fmin(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]);

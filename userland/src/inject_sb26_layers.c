@@ -17,7 +17,11 @@
 #include <objc/runtime.h>
 #include <dispatch/dispatch.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
 
 void sb26_install_layer_dump(void);
 
@@ -31,6 +35,28 @@ static CFTypeID (*image_type)(void), (*surface_type)(void);
 static size_t (*surface_width)(const void *), (*surface_height)(const void *);
 static uint32_t (*surface_id)(const void *), (*surface_format)(const void *);
 static unsigned lines;
+static int to_say;      /* a process whose stderr goes nowhere: lines go to kern.redwood.say */
+
+/* One line of the dump: to stderr, and in a process whose stderr goes nowhere to the kernel log in
+ * pieces of at most 240 bytes (kern.redwood.say keeps 255), paced under its 200 lines a second. */
+static void __attribute__((format(printf, 1, 2)))
+out(const char *format, ...)
+{
+    char line[4600];
+    va_list args;
+
+    va_start(args, format);
+    vsnprintf(line, sizeof(line), format, args);
+    va_end(args);
+    fputs(line, stderr);
+    for (size_t at = 0, length = strlen(line); to_say && at < length; at += 240) {
+        char piece[248];
+
+        snprintf(piece, sizeof(piece), "%s%.240s", at ? "+ " : "", line + at);
+        sysctlbyname("kern.redwood.say", NULL, NULL, piece, strlen(piece) + 1);
+        usleep(6000);
+    }
+}
 
 static id
 send(id object, const char *selector)
@@ -88,6 +114,53 @@ describe_effects(id layer, char *out, size_t size)
         name_of(send(layer, "mask")));
 }
 
+/* A scene host view's scene (FBScene: client process, settings, content state) on one line, for
+ * telling a poster scene that was never given content from one whose layer was never hosted. */
+static const char *
+text_of(id object, char *line, size_t size)
+{
+    id text = send(object, "description");
+    const char *utf8 = text ? ((const char *(*)(id, SEL))objc_msgSend)(text, sel_registerName("UTF8String")) : NULL;
+
+    snprintf(line, size, "%s", utf8 ? utf8 : "-");
+    for (char *c = line; *c; c++) if (*c == '\n') *c = ' ';
+    return line;
+}
+
+static long
+number_of(id object, const char *selector)
+{
+    SEL sel = sel_registerName(selector);
+    return object && class_respondsToSelector(object_getClass(object), sel)
+        ? ((long (*)(id, SEL))objc_msgSend)(object, sel) : -1;
+}
+
+static void
+describe_scene(id view, unsigned depth)
+{
+    id scene = send(view, "scene");
+    char process[256], client[1200], value_text[1600];
+
+    /* what the container hosts: its layers, its host views and the context that filters them */
+    if (strcmp(name_of(view), "_UISceneLayerHostContainerView") == 0) {
+        static const char *keys[] = { "_hostedLayers", "_hostViews", "_presentationContext", "_hiddenLayers" };
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+            CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+            id value = ((id (*)(id, SEL, id))objc_msgSend)(view, sel_registerName("valueForKey:"), (id)key);
+            out("sb26 layer %2u %s of %s: %s\n", depth, keys[i], name_of(view),
+                value ? text_of(value, value_text, sizeof(value_text)) : "nil");
+            CFRelease(key);
+        }
+    }
+    if (!scene) return;
+    out("sb26 layer %2u scene of %s: %s valid %ld active %ld content %ld layers %ld process %s client %s\n",
+        depth, name_of(view), name_of(scene), number_of(scene, "isValid") & 0xff, number_of(scene, "isActive") & 0xff,
+        number_of(scene, "contentState"), number_of(send(send(scene, "layerManager"), "layers"), "count"),
+        text_of(send(scene, "clientProcess"), process, sizeof(process)),
+        text_of(send(scene, "clientSettings"), client, sizeof(client)));
+    lines++;
+}
+
 static int
 matches(id layer, const char *filter)
 {
@@ -108,10 +181,11 @@ walk(id layer, unsigned depth, const char *filter, int below)
         char contents[96], effects[96];
         describe_contents(send(layer, "contents"), contents, sizeof(contents));
         describe_effects(layer, effects, sizeof(effects));
-        fprintf(stderr, "sb26 layer %2u %s view=%s %.0fx%.0f at %.0f,%.0f%s a=%.2f contents=%s fx=%s\n",
+        out("sb26 layer %2u %s view=%s %.0fx%.0f at %.0f,%.0f%s a=%.2f contents=%s fx=%s\n",
             depth, name_of(layer), name_of(send(layer, "delegate")), bounds.w, bounds.h, at.x, at.y,
             hidden ? " hidden" : "", opacity, contents, effects);
         lines++;
+        describe_scene(send(layer, "delegate"), depth);
     }
     id sublayers = send(layer, "sublayers");
     unsigned long count = sublayers ? ((unsigned long (*)(id, SEL))objc_msgSend)(sublayers,
@@ -134,14 +208,14 @@ dump(const char *filter)
     unsigned long count = windows ? ((unsigned long (*)(id, SEL))objc_msgSend)(windows,
         sel_registerName("count")) : 0;
     lines = 0;
-    fprintf(stderr, "sb26 layers begin filter=%s windows=%lu\n", filter ? filter : "all", count);
+    out("sb26 layers begin filter=%s windows=%lu\n", filter ? filter : "all", count);
     for (unsigned long i = 0; i < count && lines < LAYER_LINES; i++) {
         id window = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows,
             sel_registerName("objectAtIndex:"), i);
-        fprintf(stderr, "sb26 layer window %lu %s\n", i, name_of(window));
+        out("sb26 layer window %lu %s\n", i, name_of(window));
         walk(send(window, "layer"), 0, filter, filter ? -1 : 1 << 30);
     }
-    fprintf(stderr, "sb26 layers end lines=%u%s\n", lines, lines >= LAYER_LINES ? " (cut)" : "");
+    out("sb26 layers end lines=%u%s\n", lines, lines >= LAYER_LINES ? " (cut)" : "");
 }
 
 /*
@@ -157,7 +231,7 @@ clear_filters(id layer, int inside)
     if (!layer) return;
     inside = inside || strstr(name_of(send(layer, "delegate")), "Battery") != NULL;
     if (inside && send(layer, "compositingFilter")) {
-        fprintf(stderr, "sb26 nofx %s view=%s\n", name_of(layer), name_of(send(layer, "delegate")));
+        out("sb26 nofx %s view=%s\n", name_of(layer), name_of(send(layer, "delegate")));
         ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setCompositingFilter:"), nil);
     }
     id sublayers = send(layer, "sublayers");
@@ -180,7 +254,66 @@ clear_battery_filters(void)
     for (unsigned long i = 0; i < count; i++)
         clear_filters(send(((id (*)(id, SEL, unsigned long))objc_msgSend)(windows,
             sel_registerName("objectAtIndex:"), i), "layer"), 0);
-    fprintf(stderr, "sb26 nofx done windows=%lu\n", count);
+    out("sb26 nofx done windows=%lu\n", count);
+}
+
+/*
+ * `notify com.redwood.shapes.test` puts six test layers into the status bar window, in a row under
+ * the status bar: a red CALayer, the same with a corner radius, with continuous corners, a filled
+ * CAShapeLayer ellipse, a stroked one, and a filled one in white at 35% (the battery body's kind of
+ * colour). A probe: the battery's two shape layers and its plain fill layer are missing under GPU
+ * compositing while bitmap contents beside them are drawn, and the row says which kind of layer
+ * the GPU path loses.
+ */
+static void
+add_test_layers(void)
+{
+    void *cg = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOLOAD);
+    void *(*color)(double, double, double, double) = cg ? dlsym(cg, "CGColorCreateSRGB") : NULL;
+    void *(*ellipse)(struct rect, const void *) = cg ? dlsym(cg, "CGPathCreateWithEllipseInRect") : NULL;
+    Class window_class = objc_getClass("UIWindow"), layer_class = objc_getClass("CALayer");
+    Class shape_class = objc_getClass("CAShapeLayer");
+    SEL all = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+    id windows = window_class && class_respondsToSelector(object_getClass((id)window_class), all)
+        ? ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)window_class, all, YES, NO) : nil;
+    unsigned long count = windows ? ((unsigned long (*)(id, SEL))objc_msgSend)(windows,
+        sel_registerName("count")) : 0;
+    id host = nil;
+
+    for (unsigned long i = 0; i < count && !host; i++) {
+        id window = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows, sel_registerName("objectAtIndex:"), i);
+        if (strcmp(name_of(window), "SBStatusBarWindow") == 0) host = send(window, "layer");
+    }
+    if (!host || !color || !ellipse || !layer_class || !shape_class) {
+        out("sb26 shapes: nothing to add them to (window %p)\n", (void *)host);
+        return;
+    }
+    void *red = color(1, 0, 0, 1), *faint = color(1, 1, 1, 0.35);
+    for (int i = 0; i < 6; i++) {
+        struct rect frame = { 15 + i * 60, 60, 50, 40 }, local = { 0, 0, 50, 40 };
+        id layer = ((id (*)(id, SEL))objc_msgSend)((id)(i < 3 ? layer_class : shape_class), sel_registerName("new"));
+        ((void (*)(id, SEL, struct rect))objc_msgSend)(layer, sel_registerName("setFrame:"), frame);
+        if (i < 3) {
+            ((void (*)(id, SEL, void *))objc_msgSend)(layer, sel_registerName("setBackgroundColor:"), red);
+            if (i > 0) ((void (*)(id, SEL, double))objc_msgSend)(layer, sel_registerName("setCornerRadius:"), 10);
+            if (i == 2) ((void (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("setCornerCurve:"),
+                ((id (*)(id, SEL, const char *))objc_msgSend)((id)objc_getClass("NSString"),
+                    sel_registerName("stringWithUTF8String:"), "continuous"));
+        } else {
+            void *path = ellipse(local, NULL);
+            ((void (*)(id, SEL, void *))objc_msgSend)(layer, sel_registerName("setPath:"), path);
+            ((void (*)(id, SEL, void *))objc_msgSend)(layer, sel_registerName("setFillColor:"), i == 4 ? NULL : i == 5 ? faint : red);
+            if (i == 4) {
+                ((void (*)(id, SEL, void *))objc_msgSend)(layer, sel_registerName("setStrokeColor:"), red);
+                ((void (*)(id, SEL, double))objc_msgSend)(layer, sel_registerName("setLineWidth:"), 4);
+            }
+            CFRelease(path);
+        }
+        ((void (*)(id, SEL, id))objc_msgSend)(host, sel_registerName("addSublayer:"), layer);
+    }
+    CFRelease(red);
+    CFRelease(faint);
+    out("sb26 shapes: six test layers added to %s\n", name_of(host));
 }
 
 /* Looked up when the first dump is asked for, by which time SpringBoard has both frameworks. */
@@ -227,4 +360,27 @@ sb26_install_layer_dump(void)
         (void)t;
         clear_battery_filters();
     });
+    notify_register_dispatch("com.redwood.shapes.test", &token, dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        add_test_layers();
+    });
+}
+
+/* MercuryPosterExtension draws the wallpaper SpringBoard hosts (PBUIPosterSceneLayerHostView): the
+ * same dump of its own windows, by the same notifications. */
+__attribute__((constructor)) static void
+install_poster_dump(void)
+{
+    if (!getprogname() || strcmp(getprogname(), "MercuryPosterExtension")) return;
+    to_say = 1;
+    sb26_install_layer_dump();
+    out("sb26 layers: dump installed in %s\n", getprogname());
+    /* The sandbox does not deliver the notifications here (kernel-12377-cmd37-bo13): dump on a timer. */
+    for (int64_t seconds = 40; seconds <= 160; seconds += 120) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, seconds * (int64_t)NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            static dispatch_once_t once;
+            dispatch_once_f(&once, NULL, resolve);
+            dump(NULL);
+        });
+    }
 }

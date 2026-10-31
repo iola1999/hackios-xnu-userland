@@ -1,0 +1,34 @@
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -309,6 +309,17 @@
+ should_defer(struct fd_submit *submit)
+ {
+    struct fd_submit_sp *fd_submit = to_fd_submit_sp(submit);
++
++#ifdef __APPLE__
++   /* RedwoodGPU: each submission costs one call into the kernel and a place in the A830's short
++    * queue, and a Metal command buffer whose passes depend on each other flushed one batch per
++    * dependency: 24 submissions a frame in backboardd's blurred views (cmd36-bo9). They are merged
++    * here regardless of how many buffers they name, up to 64 command buffers, under the 82 the
++    * kernel takes in one submission (GPU_A830_SUBMIT_CMDS); rwa_flush pushes the merged
++    * submission out at the command buffer's commit.
++    */
++   return submit->pipe->dev->deferred_cmds + fd_ringbuffer_cmd_count(submit->primary) <= 64;
++#endif
+ 
+    /* if too many bo's, it may not be worth the CPU cost of submit merging: */
+    if (fd_submit->nr_bos > 30)
+@@ -368,6 +379,13 @@
+     */
+    if (pipe->no_implicit_sync)
+       has_shared = false;
++#ifdef __APPLE__
++   /* RedwoodGPU does not order submissions by the buffers they share: it records a surface's last
++    * submission when that submission reaches it, and rwa_flush gives it this program's merged
++    * submission before the command buffer's commit returns, so others still see the work in order.
++    */
++   has_shared = false;
++#endif
+ 
+    assert(fd_fence_before(pipe->last_enqueue_fence, submit->fence));
+    pipe->last_enqueue_fence = submit->fence;
