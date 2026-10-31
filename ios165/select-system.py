@@ -103,6 +103,14 @@ KEEP_METALLIB = ('System/Library/Frameworks/QuartzCore.framework/default.metalli
                  # are another 47 MB and nothing in this port has asked for them yet.
                  'System/Library/Frameworks/MetalPerformanceShaders.framework/Frameworks/MPSCore.framework/default.metallib',
                  'System/Library/Frameworks/MetalPerformanceShaders.framework/Frameworks/MPSImage.framework/default.metallib')
+# ... and Spotlight's required assets whole, models included: +[PRSModelManager
+# cannedInfoForType:directivesPath:modelName:] names a model, the file "<name>.mlmodelc" is looked up
+# among the asset's files, and Spotlight throws when it is not there. On kernel-12377-cmd43-bo20 the
+# first pull-down to search started a loop of 664 Spotlight aborts, and ReportCrash used 72 s of
+# processor time on their reports. The root asset and English add 21 MB: 8.5 MB of models, and the
+# parser's lexicon and the safety map, 6 MB each, that the size limit below left out.
+KEEP_MODELS = tuple(f'System/Library/PrivateFrameworks/SpotlightResources.framework/RequiredAssets_{name}.bundle/'
+                    for name in ('root', 'en'))
 # ... and '.dat' and '.bin' are also what these keep the tables in that the user interface is made with:
 # the layouts of the on-screen keyboard, the emoji, the list of public domain suffixes
 DATA_FRAMEWORKS = tuple(f'System/Library/{name}.framework/' for name in (
@@ -198,7 +206,7 @@ def wanted_file(path, size):
     if path.startswith(('Applications/', HEALTH)):
         return not path.lower().endswith(SKIP_APP_EXT) and '.mlmodelc/' not in path
     if path.startswith(FRAMEWORKS):
-        if path in KEEP_METALLIB or (path.endswith('.metallib') and size <= MAX_METALLIB):
+        if path in KEEP_METALLIB or (path.endswith('.metallib') and size <= MAX_METALLIB) or path.startswith(KEEP_MODELS):
             return True
         if re.search(r'/(XPCServices|Support|Helpers)/', path):
             return size <= 32 << 20 and not path.lower().endswith(('.png', '.car', '.loctable', '.caml'))

@@ -1315,8 +1315,18 @@ redwood_init(void)
 		 * service was made before or after the touch processing starts. (Most likely it only
 		 * moved the start of the event server onto the moment make_service() now knows how to
 		 * survive; not tried again since, and until it is, the five seconds stay.)
+		 *
+		 * Where the input26-service job exists (the iOS 26 images), that service reads
+		 * /dev/redwood-touch, and the queue has one reader: a second one here takes whichever
+		 * samples it reads first. On kernel-12377-cmd44-bo21 backboardd had two touch screens
+		 * (senders 1443E56000000 and 1443E58000002), and swipes whose lift went to the other
+		 * one had no answer or turned into a long press.
 		 */
-		input_start();
+		if (access("/redwood/LaunchDaemons/com.redwood.input26.plist", F_OK) == 0) {
+			say("redwood: input: input26-service reads the touch queue, so no service of ours\n");
+		} else {
+			input_start();
+		}
 		watch_window_server_loop();
 	} else if (strncmp(name, "containermanagerd", 17) == 0) {
 		container_manager_fixes();

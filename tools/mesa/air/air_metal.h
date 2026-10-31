@@ -548,9 +548,8 @@ struct rwa_bindings {
  * them, both as Metal counts them.
  *
  * Returns 0, or -1 with a sentence in `why`. A dispatch that the GPU does not finish is a
- * failure here and says so: air_run learned that the hard way (docs/air.md section 5) --
- * before it waited on a fence it printed its own fill pattern as a result, and 21 of 47
- * kernels in one run were vacuous.
+ * failure here and says so: before it waited on a fence, air_run printed its own fill pattern
+ * as the result of 21 of 47 kernels in one run (docs/air.md section 5).
  */
 int rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 		 const unsigned groups[3], const unsigned group_size[3],
@@ -565,11 +564,9 @@ int rwa_dispatch(struct rwa_compute *compute, const struct rwa_bindings *binding
  * rwa_dispatch is this with no table at all: every offset is then zero, and a kernel that
  * declares an argument buffer is refused through it by name.
  *
- * It is a second entry point and not two more fields in rwa_bindings, and the reason is
- * the one rwa_buffer_bind gives: rwa_bindings is embedded by value in rwa_draw, so
- * growing it would move half of that struct for every driver built against the other
- * header. A new symbol, by contrast, is simply absent in an older library -- which the
- * driver's own dlsym already treats as a library too old to use.
+ * A second entry point, because rwa_bindings is embedded by value in rwa_draw and two more
+ * fields would move half of it for a driver built against the other header (rwa_buffer_bind);
+ * a new symbol is absent in an older library, which the driver's dlsym treats as too old.
  */
 int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 			 const struct rwa_buffer_bind *table, unsigned table_count,
@@ -580,12 +577,15 @@ int rwa_dispatch_buffers(struct rwa_compute *compute, const struct rwa_bindings 
  * rwa_dispatch_buffers with the length Metal's -setThreadgroupMemoryLength:atIndex: gave
  * for threadgroup buffer 0, in bytes. A kernel that declares such a buffer is refused when
  * the length is 0; for any other kernel the length is ignored. A new symbol for the reason
- * rwa_dispatch_buffers gives.
+ * rwa_dispatch_buffers gives; rwa_dispatch_nowait leaves the wait to a later rwa_flush's fence.
  */
 int rwa_dispatch_threadgroup(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 			     const struct rwa_buffer_bind *table, unsigned table_count,
 			     const unsigned groups[3], const unsigned group_size[3],
 			     unsigned threadgroup_bytes, char *why, size_t why_size);
+int rwa_dispatch_nowait(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+			const struct rwa_buffer_bind *table, unsigned table_count, const unsigned groups[3],
+			const unsigned group_size[3], unsigned threadgroup_bytes, char *why, size_t why_size);
 
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);
