@@ -6526,7 +6526,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
 
    /* Each colour attachment: a 2D texture, made as a render target, of the format the
-    * pipeline was compiled for, and all the same size -- one render pass has one size.
+    * pipeline was compiled for. The pass draws into the area all attachments share, as Metal
+    * does: CoreAnimation's blur draws one mip level of a texture as attachment 0 beside a
+    * full-size attachment 1.
     */
    unsigned samples = render->shape.sample_count ? render->shape.sample_count : 1;
    unsigned w = 0, h = 0;
@@ -6553,14 +6555,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       unsigned tw = t->shape.width;
       unsigned th = t->shape.height ? t->shape.height : 1;
-      if (i == 0) {
-         w = tw;
-         h = th;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "colour attachment %u is %ux%u and attachment 0 is %ux%u", i,
-             tw, th, w, h);
-         return -1;
-      }
+      w = i == 0 ? tw : MIN2(w, tw);
+      h = i == 0 ? th : MIN2(h, th);
    }
 
    /* The depth/stencil attachment, by the same checks and one more: it is the only
@@ -6590,14 +6586,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       unsigned tw = t->shape.width;
       unsigned th = t->shape.height ? t->shape.height : 1;
-      if (draw->color_count == 0) {
-         w = tw;        /* a depth-only pass: the depth attachment is the pass's size */
-         h = th;
-      } else if (tw != w || th != h) {
-         say(why, why_size, "the depth attachment is %ux%u and colour attachment 0 is %ux%u",
-             tw, th, w, h);
-         return -1;
-      }
+      w = draw->color_count == 0 ? tw : MIN2(w, tw);   /* a depth-only pass: its size */
+      h = draw->color_count == 0 ? th : MIN2(h, th);
    }
 
 

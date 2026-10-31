@@ -121,6 +121,8 @@ same_resource(const struct air_ptr *a, const struct air_ptr *b)
    return a->class == b->class && a->binding == b->binding && a->is_image == b->is_image;
 }
 
+#include "air_ptr_slot.inc"
+
 /* A texture CHOSEN AT RUN TIME. space::rasterizeBackgroundFragment picks one of four
  * gobo textures by a uniform, with a `select` chain and a `phi` of texture arguments,
  * and passes the result to the function that samples it. A texture is not a value to
@@ -2252,12 +2254,8 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       uint64_t count;
       if (!air_const_uint(in->operands[0], &count))
          return air_error(c, "instruction: an alloca of a run-time size");
-      /* A local holding a POINTER. Scratch memory cannot hold one -- a pointer
-       * here is a resolution and not bytes -- so it becomes a translation-time
-       * slot instead, when and only when that is sound: see AIR_VAL_SLOT. The
-       * two GL-on-Metal fragment shaders store their last two buffer arguments
-       * into such a local and never read them back, which LLVM left behind and
-       * which used to stop the module at "a pointer where a number belongs".
+      /* A local that holds a POINTER keeps it in a translation-time slot rather
+       * than in scratch memory (store_pointer).
        */
       uint64_t size = air_type_alloc_size(c->m, in->aux_type) * count;
       unsigned align = MAX2(in->align, air_type_abi_align(c->m, in->aux_type));
@@ -2284,6 +2282,12 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       }
       if (p->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a load from something that is not a pointer");
+      struct air_val *stored = in->base.type && in->base.type->kind == AIR_TYPE_POINTER
+         ? stored_pointer(c, p) : NULL;
+      if (stored) {
+         air_set(c, &in->base, stored);
+         return true;
+      }
       /* An argument buffer resolves before it loads: the byte offset names a
        * member and the member's descriptor names a binding, so this load
        * becomes a pointer and not an instruction.
@@ -2305,19 +2309,11 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *p = air_get(c, in->operands[1]);
       if (!p)
          return false;
-      /* A POINTER stored into memory. There is nothing to write: a pointer in
-       * this frontend is a resolution -- a binding and a byte offset decided
-       * while translating -- and not an address, so it has no bytes. Naming
-       * that here rather than letting air_get_ssa say "a pointer where a
-       * number belongs" is the difference between a wall with a reason and a
-       * wall with a symptom; the reason is in docs/air.md section 3.
-       */
       struct air_val *sv = air_get(c, in->operands[0]);
       if (!sv)
          return false;
       if (val_is_pointerish(sv))
-         return air_error(c, "instruction: a store of a pointer into memory, which this "
-                             "frontend has no address to write");
+         return store_pointer(c, p, sv);
       if (p->kind == AIR_VAL_PTR_SELECT)
          return air_error(c, "instruction: a store through a chosen pointer, which would "
                              "have to write both of them");

@@ -402,7 +402,8 @@ resolve(void *context)
 void
 sb26_install_layer_dump(void)
 {
-    static const char *filters[] = { "all", "Icon", "Wallpaper", "Poster", "StatusBar", "Battery", "Widget" };
+    static const char *filters[] = { "all", "Icon", "Wallpaper", "Poster", "StatusBar", "Battery", "Widget",
+                                     "DateView", "Time", "SDF" };
     for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
         char name[64];
         int token;
