@@ -128,6 +128,11 @@ MAX_ASSET_CATALOG = 4 << 20
 MAX_FONT = 25 << 20
 TRIMMED_FONTS = ('System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc',
                  'System/Library/Fonts/LanguageSupport/PingFang.ttc')
+# iOS 26 has no LanguageSupport/PingFang.ttc: its Chinese faces are one variable font inside FontServices,
+# 61 MB, taken whole. Its 32 faces share the glyph tables (59 MB of the 61), so keeping fewer faces would
+# save almost nothing. Without it Safari and the Wi-Fi list drew Chinese as boxes with a question mark
+# (kernel-12377-cmd82-wd31).
+WHOLE_FONTS = ('System/Library/PrivateFrameworks/FontServices.framework/CorePrivate/PingFangUI.ttc',)
 # string tables hold every language; the biggest (Shortcuts' actions, Home) are 5-12 MB
 MAX_STRING_TABLE = 16 << 20
 # applications waiting here to be installed by the first boot go to /Applications instead
@@ -199,6 +204,8 @@ def wanted_file(path, size):
         return False
     if path.startswith('System/Library/Fonts/'):
         return size <= MAX_FONT or path in TRIMMED_FONTS
+    if path in WHOLE_FONTS:
+        return True
     if path.startswith(ALL_PICTURES) and path.lower().endswith('.png'):
         return True
     if path.startswith(('usr/libexec/', 'usr/sbin/')):
