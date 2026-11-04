@@ -39,6 +39,7 @@ static void (*WiFiManagerClientSetPower)(WiFiManagerClientRef, Boolean);
 static int (*WiFiDeviceClientScanAsync)(WiFiDeviceClientRef, CFDictionaryRef, WiFiScanCallback, void *);
 static int (*WiFiDeviceClientAssociateAsync)(WiFiDeviceClientRef, WiFiNetworkRef, WiFiAssociateCallback, void *);
 static CFStringRef (*WiFiNetworkGetSSID)(WiFiNetworkRef);
+static CFTypeRef (*WiFiNetworkGetProperty)(WiFiNetworkRef, CFStringRef);
 static WiFiNetworkRef (*WiFiDeviceClientCopyCurrentNetwork)(WiFiDeviceClientRef);
 static Boolean (*WiFiNetworkSetPassword)(WiFiNetworkRef, CFStringRef);
 
@@ -59,6 +60,7 @@ load_mobilewifi(void)
 	LOOKUP(WiFiDeviceClientScanAsync)
 	LOOKUP(WiFiDeviceClientAssociateAsync)
 	LOOKUP(WiFiNetworkGetSSID)
+	LOOKUP(WiFiNetworkGetProperty)
 	LOOKUP(WiFiDeviceClientCopyCurrentNetwork)
 	LOOKUP(WiFiNetworkSetPassword)
 #undef LOOKUP
@@ -68,9 +70,29 @@ load_mobilewifi(void)
 struct join {
 	CFStringRef name;
 	WiFiNetworkRef found;
+	int found_rssi;
 	int error;
 	Boolean done;
 };
+
+/*
+ * A record read at the noise floor is taken again: wifid shows the signal of the record it was asked
+ * to join, and in kernel-12377-rate8-app1 one with -94 dBm (a single frame the firmware reported at
+ * 1 dB SNR; the access point is at -17 to -25) kept the status bar at one dot after the join.
+ */
+#define RSSI_FLOOR (-85)
+
+static int
+rssi_of(WiFiNetworkRef network)
+{
+	CFTypeRef value = WiFiNetworkGetProperty(network, CFSTR("RSSI"));
+	int rssi = -128;
+
+	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
+		CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &rssi);
+	}
+	return rssi;
+}
 
 static void
 scanned(WiFiDeviceClientRef device, CFArrayRef results, int error, void *context)
@@ -83,13 +105,16 @@ scanned(WiFiDeviceClientRef device, CFArrayRef results, int error, void *context
 		WiFiNetworkRef network = (WiFiNetworkRef)CFArrayGetValueAtIndex(results, i);
 		CFStringRef ssid = WiFiNetworkGetSSID(network);
 
-		if (ssid != NULL && CFEqual(ssid, join->name)) {
+		if (ssid != NULL && CFEqual(ssid, join->name) && (join->found == NULL || rssi_of(network) > join->found_rssi)) {
+			if (join->found != NULL) {
+				CFRelease(join->found);
+			}
 			join->found = (WiFiNetworkRef)CFRetain(network);
-			break;
+			join->found_rssi = rssi_of(network);
 		}
 	}
-	printf("wifijoin: scan: %ld networks, error %d, %s\n", results ? (long)CFArrayGetCount(results) : 0L, error,
-	       join->found ? "the network is among them" : "the network is not among them");
+	printf("wifijoin: scan: %ld networks, error %d, %s (%d dBm)\n", results ? (long)CFArrayGetCount(results) : 0L,
+	       error, join->found ? "the network is among them" : "the network is not among them", join->found_rssi);
 	join->done = true;
 	CFRunLoopStop(CFRunLoopGetCurrent());
 }
@@ -155,7 +180,7 @@ main(int argc, char **argv)
 {
 	const char *path = argc > 1 ? argv[1] : "/redwood/fw/network";
 	FILE *f = fopen(path, "r");
-	struct join join = { 0 };
+	struct join join = { .found_rssi = -128 };
 	CFStringRef password;
 	WiFiManagerClientRef manager;
 	CFArrayRef devices = NULL;
@@ -206,7 +231,7 @@ main(int argc, char **argv)
 	device = (WiFiDeviceClientRef)CFArrayGetValueAtIndex(devices, 0);
 	WiFiManagerClientSetPower(manager, true);
 
-	for (int i = 0; i < 5 && join.found == NULL; i++) {
+	for (int i = 0; i < 5 && (join.found == NULL || join.found_rssi < RSSI_FLOOR); i++) {
 		const void *key = CFSTR("SSID_STR");
 		const void *value = join.name;
 		CFDictionaryRef request = CFDictionaryCreate(NULL, &key, &value, 1, &kCFTypeDictionaryKeyCallBacks,
@@ -219,7 +244,7 @@ main(int argc, char **argv)
 		} else if (!wait_for(&join, 20)) {
 			printf("wifijoin: no scan result in 20 s\n");
 		}
-		if (join.found == NULL) {
+		if (join.found == NULL || join.found_rssi < RSSI_FLOOR) {
 			sleep(3);
 		}
 	}
