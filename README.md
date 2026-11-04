@@ -1,58 +1,43 @@
-# HackiOS — userland
+# hackios-xnu-userland（REDMI K90 移植分支）
 
-> **REDMI K90 移植分支：`k90-port`。** 本仓库基于 [OOSEX GANG 的原用户态仓库](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史并维护本项目的用户态和构建修改。感谢原作者及贡献者开放 init、注入库、APFS 镜像工具和图形适配；本项目沿用这些实现开展 K90 移植。
+本仓库是 [HackiOS K90 移植](https://github.com/iola1999/hackios-redmi-k90-annibale)的用户态部分：init 与注入库、launchd 任务、APFS 镜像构建、从 IPSW 选取 iOS 文件的脚本、Mesa 补丁与 AIR（Metal IR）前端，以及 Adreno 830 固件。默认分支 `k90-port`。使用方法、当前进展和排查记录都在顶层工作区。
 
-[顶层工作区](https://github.com/iola1999/hackios-redmi-k90-annibale)保存计划、实测和子模块版本，[K90 内核仓库](https://github.com/iola1999/hackios-xnu-kernel/tree/k90-port)维护 XNU、loader 与固件相关修改，本仓库维护用户态及镜像工具。两个代码仓库均已建立与对应上游的 GitHub fork 关系，默认分支均为 `k90-port`。原许可证和版权声明保留；K90 的验证范围以顶层工作区文档为准。
+本仓库 fork 自 OOSEX GANG 的 [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史。上游面向 iOS 16.5 的内容（`ios165/fetch.sh`、`prebuilt/userland/`、16.5 的测试场景）仍在仓库里，本分支不维护这部分；`ios26/fetch.sh` 仍调用 `ios165/` 里的选取脚本。
 
-K90 构建使用对应内核仓库的 `k90-port`，运行 `common/setup.sh` 时显式指定 `USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port`。userland 会作为 `.userland.git` 管理的 overlay 放入 kernel 工作树；下文的上游获取方式保留其原始来源。
+## 1. 获取
 
-The user-space half of **HackiOS**: Apple's open-source XNU kernel on Android phone hardware (POCO X5 Pro 5G) and in QEMU, running the unmodified iOS 16.5 user space. The kernel, loader, UEFI and the `common/` scripts are in [hackios-xnu-kernel](https://github.com/oosexgang/hackios-xnu-kernel) — **start there**.
-
-> **No Apple files are in this repository.** `ios165/fetch.sh` downloads the iOS 16.5 IPSW from Apple's CDN to your machine and extracts what is needed there. HackiOS is an independent research project by OOSEX GANG and is not affiliated with, authorised or endorsed by Apple Inc.
-
-## 1. Getting it
-
-The two repositories are built as one tree. Clone the kernel repository and let it bring this one in:
+本仓库不单独使用，要检出到 [K90 内核仓库](https://github.com/iola1999/hackios-xnu-kernel)的工作目录里，两个仓库的脚本按同一棵目录树互相引用：
 
 ```sh
-git clone https://github.com/oosexgang/hackios-xnu-kernel.git hackios
-cd hackios
-common/setup.sh        # checks this repository out into the same directory (git dir .userland.git)
-common/ugit status     # git for this repository inside that tree
+cd hackios-xnu-kernel
+USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port common/setup.sh
+common/ugit status        # 在这棵树里操作本仓库
 ```
 
-## 2. What is here
+开发在内核工作树的 `.userland.git` 里进行，提交再移植到本仓库，所以提交说明里会写「移植 `.userland.git` 某提交」。
 
-| Path | What |
+## 2. 目录
+
+| 路径 | 内容 |
 |---|---|
-| `userland/build.sh` | builds the APFS images: `root.apfs` (our init, libraries, launchd jobs, firmware) and `system.apfs` (the selected part of iOS 16.5 and its cryptexes); every option is documented at the top |
-| `userland/src/` | `init.c` (process 1), injected libraries (`inject.c` backboardd, `inject_sb.c` SpringBoard, `inject_media.c` mediaserverd, `inject_tweaks.c`), the CoreAudio output device (`audio_plugin.c`), the OpenGL ES bridge to Mesa (`eagl.c`), Metal driver work, tests |
-| `userland/libmini/` | a tiny libc for the static programs |
-| `userland/rc.*`, `com.redwood.*.plist` | job lists and launchd jobs for test scenarios (`RC_JOBS=rc.jobs.tour`, `rc.jobs.ssh`, ...) |
-| `userland/mkjobs.py`, `jobinfo.py` | the stock iOS launchd jobs: which are loaded, who provides a Mach service |
-| `userland/var/` | our default preferences for `/private/var` |
-| `ios165/` | `fetch.sh` / `fetch-from-ipsw.py` (take iOS out of the IPSW), `select-system.py` (what goes into the image) |
-| `tools/apfs/` | APFS on the computer: `mkapfs.py` (image writer), reader, checks, write tests |
-| `tools/mk-mesa.sh`, `tools/mesa/` | Mesa 25.0.7 with our patches: freedreno on Darwin, the AIR (Metal IR) frontend |
-| `tools/air/`, `tools/metal/`, `tools/metallib.py` | Metal shader (AIR) checks and analysis; notes in `docs/air.md` |
-| `tools/mk-jb.sh`, `jb-preinstall.py` | Procursus bootstrap + Sileo for the package manager prefix |
-| `tools/font_trim.py` | trims two oversized iOS fonts so the image fits |
-| `prebuilt/userland/` | our programs and libraries, built — used when there is no cross toolchain |
+| `userland/build.sh` | 构建 APFS 镜像，变量说明在文件开头。iOS 26 系统盘：`IOS=../ios26 bash build.sh`，得到 `system26.apfs` |
+| `userland/src/` | `init.c`（1 号进程）、注入 SpringBoard 等进程的库（`inject_sb26*.c` 等）、触摸与按键服务、OpenGL ES 到 Mesa 的桥接（`eagl.c`）、测试程序 |
+| `userland/var/`、`var.skel.extra` | `/private/var` 的默认内容 |
+| `ios26/` | `fetch.sh` 从 iPhone 17 的 iOS 26.6.2 IPSW 取出文件（IPSW 需另行下载）；哪些文件进系统盘由 `ios165/select-system.py` 决定，`ios26/select-system.py` 是指向它的符号链接 |
+| `tools/mk-mesa.sh`、`tools/mesa/` | Mesa 加本项目补丁。K90 用 26.2.5 与 `REBASE=26`，补丁说明见 [tools/mesa/rebase-26/README.md](tools/mesa/rebase-26/README.md) |
+| `tools/mesa/air/`、`tools/air/` | AIR 前端与它的检查。说明在 [docs/air.md](docs/air.md)（上游，英文），[docs/air-report.md](docs/air-report.md) 是 `tools/air/check.sh` 生成的报告 |
+| `tools/apfs/` | 在电脑上写入和读取 APFS 镜像 |
+| `firmware-gen8/` | Adreno 830 固件，见 [firmware-gen8/README.md](firmware-gen8/README.md) |
 
-## 3. Building the images
+iOS 26 的 Metal 驱动在内核仓库的 `tools/userland-driver/`。根盘、Metal 驱动与 AIR 库的打包由顶层工作区的 `tools/k90auto/` 完成，见顶层 [k90auto 说明](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/tools/k90auto/README.md)；Mesa 的 iOS 交叉构建见顶层 [Mesa 26.2.5 移植层](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/analysis/mesa-rebase-2026-10.md)。
 
-```sh
-ios165/fetch.sh               # once
-REST=1 userland/build.sh      # -> userland/root.apfs, userland/system.apfs
-GL=1 REST=1 userland/build.sh # with OpenGL ES (Mesa) for the window server; on the phone with gpu=1
-```
+## 3. 许可证
 
-Without the cross toolchain (theos + iPhoneOS16.5.sdk, see the kernel repository) the build takes our programs from `prebuilt/userland`; with it, it compiles `userland/src`.
+- 仓库不含 iOS 文件。系统盘在使用者自己的机器上由 `ios26/fetch.sh` 从 IPSW 取出。
+- 本仓库的代码按 [MIT License](LICENSE) 发布。
+- Mesa（MIT）不在仓库里：`tools/mk-mesa.sh` 下载固定版本，`tools/mesa/*.patch` 与 `tools/mesa/rebase-26/*.patch` 是对它的修改。
+- apfsprogs（GPL-2.0）不在仓库里：`tools/apfs/check-image.sh` 下载它，只构建 `apfsck`。
+- `firmware-gen8/` 的固件按 [LICENSE.qcom.txt](firmware-gen8/LICENSE.qcom.txt) 与 [NOTICE.qcom.txt](firmware-gen8/NOTICE.qcom.txt) 分发。
+- HackiOS 是独立研究项目，与 Apple Inc. 没有关联，也没有得到其授权或认可。
 
-A job list (`RC_JOBS=file`) is run by our `init`, not by a shell: iOS 16.5's root has no shell, lines are split on blanks, there is no quoting and no variable assignment; only `>> FILE` and a trailing `&` are understood.
-
-## 4. Licenses
-
-Our code in this repository is released under the [MIT License](LICENSE). Mesa (MIT) is not in the repository: `tools/mk-mesa.sh` fetches release 25.0.7, `tools/mesa/*.patch` are our changes to it. apfsprogs (GPL-2.0) is not in the repository either: `tools/apfs/check-image.sh` fetches and builds only `apfsck`.
-
-OOSEX GANG — [t.me/oosexgangdevs](https://t.me/oosexgangdevs)
+上游作者：OOSEX GANG，动态见 [t.me/oosexgangdevs](https://t.me/oosexgangdevs)。

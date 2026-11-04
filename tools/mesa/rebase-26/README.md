@@ -1,4 +1,4 @@
-# rebase-26 —— Mesa 26.x 移植层（`REBASE=26 tools/mk-mesa.sh` 时应用）
+# rebase-26：Mesa 26.x 移植层（`REBASE=26 tools/mk-mesa.sh` 时应用）
 
 应用顺序（在 mk-mesa.sh 的 tar 解包之后、原有 `tools/mesa/*.patch` 循环之后）：
 
