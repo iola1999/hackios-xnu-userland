@@ -9,7 +9,7 @@
 +         # Darwin on redwood: with early preambles, gallium draws whose fragment shader
 +         # reads the framebuffer through the bindless fb-read descriptors hang the GPU
 +         # (CP done, HLSQ busy) on this part; they finish without them
-+         # (docs/progress/2026-10-30-ios26-usable-desktop.md section 8.12).
++         # (docs/progress/2026-10-30-ios26-usable-desktop.md section 4.3).
 +         GPUProps(has_early_preamble = False)],
          num_ccu = 6,
          num_slices = 3,

@@ -61,8 +61,7 @@ if len(slots) < SLOTS_MIN:
              % (len(slots), slots_path, SLOTS_MIN))
 if len(by_hand) < BY_HAND_MIN:
     sys.exit('mkeagl.py: only %d of the %d functions written by hand were found in %s -- the rest '
-             'would become generated pass-ons; extend the scan list (docs/analysis/'
-             'linecount-audit-userland-2026-10.md) if the file was split'
+             'would become generated pass-ons; extend the scan list if the file was split'
              % (len(by_hand), BY_HAND_MIN, source_path))
 
 def trace_format(ctype):

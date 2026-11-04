@@ -1,8 +1,7 @@
 /*
  * DRAFT (2026-10-25, mesa/task-22 idle prep) — not included by any TU yet, so it is zero bytes
- * to every build until its adoption batch lands. Adoption = the dedup the audit scheduled as the
- * general first step AFTER the device round (docs/analysis/linecount-audit-userland-2026-10.md
- * section 4): metal_drv_test.m, redwoodmetal.m and drawable_test.c drop their private copies of
+ * to every build until its adoption batch lands. Adoption = the dedup the line-count audit
+ * scheduled as the general first step AFTER the device round: metal_drv_test.m, redwoodmetal.m and drawable_test.c drop their private copies of
  * what is below and include this header instead (a quoted include resolves beside the includer,
  * so build.sh needs no change for the adoption itself).
  *
