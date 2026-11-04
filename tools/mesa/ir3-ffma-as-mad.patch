@@ -1,0 +1,28 @@
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -733,6 +733,10 @@
+    case nir_op_fsub:
+       dst = ir3_ADD_F_rpt(b, dst_sz, src[0], 0, src[1], IR3_REG_FNEG);
+       break;
++   case nir_op_ffma:
++      /* A strict fused multiply-add, which the AIR frontend emits for Metal's fma() and for
++       * llvm.fmuladd. No NIR pass lowers it for ir3 (float_mul_add has fmad, not ffma), so it
++       * is emitted as the unfused mad: one more rounding than the source asked for. */
+    case nir_op_fmad:
+       /* The scalar ALU doesn't support mad, so expand to mul+add so that we
+        * don't unnecessarily fall back to non-earlypreamble. This is safe
+--- a/src/freedreno/ir3/ir3_context.c
++++ b/src/freedreno/ir3/ir3_context.c
+@@ -348,7 +348,11 @@
+    nir_log_shader_annotated(ctx->s, errors);
+    ralloc_free(errors);
+    ctx->error = true;
+-   UNREACHABLE("");
++   /* UNREACHABLE is __builtin_unreachable in this release build, and the compile thread that got
++    * here ran on inside this function and never returned: the draw waiting for the shader then
++    * waited forever (SpringBoard on 2026-10-30, "Unhandled ALU op: ffma"). Ending the process
++    * leaves the shader dump above as its last words and lets launchd start it again. */
++   abort();
+ }
+ 
+ static struct ir3_instruction *

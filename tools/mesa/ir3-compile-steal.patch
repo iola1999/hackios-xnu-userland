@@ -1,0 +1,148 @@
+--- a/src/util/u_queue.c
++++ b/src/util/u_queue.c
+@@ -681,6 +681,32 @@
+       util_queue_fence_signal(fence);
+    else
+       util_queue_fence_wait(fence);
++}
++
++/* Take a job off the queue before any thread has started it, without signalling its fence: true
++ * means the caller now owns the job and must run it and signal the fence itself. False when the job
++ * has started, has finished or was never queued. A waiter on another thread keeps waiting on the
++ * fence until the caller signals it. */
++bool
++util_queue_steal_job(struct util_queue *queue, struct util_queue_fence *fence)
++{
++   bool removed = false;
++
++   if (util_queue_fence_is_signalled(fence))
++      return false;
++
++   mtx_lock(&queue->lock);
++   for (unsigned i = queue->read_idx; i != queue->write_idx;
++        i = (i + 1) % queue->max_jobs) {
++      if (queue->jobs[i].fence == fence) {
++         /* Just clear it. The threads will treat as a no-op job. */
++         memset(&queue->jobs[i], 0, sizeof(queue->jobs[i]));
++         removed = true;
++         break;
++      }
++   }
++   mtx_unlock(&queue->lock);
++   return removed;
+ }
+ 
+ /**
+--- a/src/util/u_queue.h
++++ b/src/util/u_queue.h
+@@ -257,6 +257,8 @@
+                         util_queue_execute_func execute,
+                         util_queue_execute_func cleanup,
+                         const size_t job_size);
++bool util_queue_steal_job(struct util_queue *queue,
++                          struct util_queue_fence *fence);
+ void util_queue_drop_job(struct util_queue *queue,
+                          struct util_queue_fence *fence);
+ 
+--- a/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
+@@ -28,8 +28,12 @@
+ #include "ir3/ir3_nir.h"
+ #include "ir3/ir3_shader.h"
+ #include "util/os_time.h"
++#include "util/detect_os.h"
+ #include <mach/mach.h>
+ #include <pthread.h>
++#if DETECT_OS_APPLE
++#include <pthread/qos.h>
++#endif
+ #include <sys/resource.h>
+ 
+ /**
+@@ -47,6 +51,10 @@
+    /* Probe: when the initial-variant job went on the queue, and how many jobs were ahead of it. */
+    uint64_t queued_us;
+    int queued_ahead;
++
++   /* The queue and function of the initial-variant job, so ir3_get_shader() can run it itself. */
++   struct util_queue *queue;
++   util_queue_execute_func job;
+ };
+ 
+ /* The first draw of a new pipeline waits in ir3_get_shader() for this queue's initial-variant job,
+@@ -272,7 +280,27 @@
+    shader->initial_variants_done = true;
+ }
+ 
++/* Darwin gives the queue's threads the default priority, below the render threads that wait for
++ * them, so with two CPUs a compile could sit runnable behind other work while a draw waited on it
++ * (2026-10-29: 1.7 s of wall time for 8 ms of CPU). User-initiated keeps it below the render threads,
++ * which run the job themselves when they need it first (ir3_get_shader). thread_index is -1 there,
++ * and that thread's own class is left alone. */
+ static void
++ir3_queue_thread_qos(int thread_index)
++{
++#if DETECT_OS_APPLE
++   static __thread bool set;
++
++   if (thread_index >= 0 && !set) {
++      pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
++      set = true;
++   }
++#else
++   (void)thread_index;
++#endif
++}
++
++static void
+ create_initial_variants_async(void *job, void *gdata, int thread_index)
+ {
+    struct ir3_shader_state *hwcso = job;
+@@ -281,6 +309,7 @@
+    long flt = ir3_probe_flt();
+ 
+    MESA_TRACE_FUNC();
++   ir3_queue_thread_qos(thread_index);
+ 
+    create_initial_variants(hwcso, &debug);
+    ir3_probe_job(hwcso, began, cpu, flt);
+@@ -297,6 +326,7 @@
+    long flt = ir3_probe_flt();
+ 
+    MESA_TRACE_FUNC();
++   ir3_queue_thread_qos(thread_index);
+ 
+    ir3_shader_variant(shader, key, false, &debug);
+    shader->initial_variants_done = true;
+@@ -366,6 +396,8 @@
+    } else {
+       struct fd_screen *screen = ctx->screen;
+       ir3_probe_queue(hwcso, &screen->compile_queue);
++      hwcso->queue = &screen->compile_queue;
++      hwcso->job = create_initial_compute_variants_async;
+       util_queue_add_job(&screen->compile_queue, hwcso, &hwcso->ready,
+                          create_initial_compute_variants_async, NULL, 0);
+    }
+@@ -435,6 +467,8 @@
+       create_initial_variants(hwcso, &ctx->debug);
+    } else {
+       ir3_probe_queue(hwcso, &ctx->screen->compile_queue);
++      hwcso->queue = &ctx->screen->compile_queue;
++      hwcso->job = create_initial_variants_async;
+       util_queue_add_job(&ctx->screen->compile_queue, hwcso, &hwcso->ready,
+                          create_initial_variants_async, NULL, 0);
+    }
+@@ -493,6 +527,13 @@
+               shader->nir->info.label) {
+       /* wait for initial variants to compile: */
+       uint64_t began = ir3_probe_us();
++      /* A job that has not started yet runs on this thread instead of waiting behind every job
++       * queued before it: the queue has one thread with two CPUs, and the first home screen put
++       * 34 jobs ahead of a draw on 2026-10-29. */
++      if (hwcso->queue && util_queue_steal_job(hwcso->queue, &hwcso->ready)) {
++         hwcso->job(hwcso, NULL, -1);
++         util_queue_fence_signal(&hwcso->ready);
++      }
+       util_queue_fence_wait(&hwcso->ready);
+       uint64_t waited = ir3_probe_us() - began;
+       if (waited >= 1000) {

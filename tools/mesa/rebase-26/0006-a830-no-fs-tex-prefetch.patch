@@ -1,0 +1,17 @@
+--- a/src/freedreno/common/freedreno_devices.py
++++ b/src/freedreno/common/freedreno_devices.py
+@@ -1394,7 +1394,13 @@
+          # reads the framebuffer through the bindless fb-read descriptors hang the GPU
+          # (CP done, HLSQ busy) on this part; they finish without them
+          # (docs/progress/2026-10-30-ios26-usable-desktop.md section 4.3).
+-         GPUProps(has_early_preamble = False)],
++         # The fragment-shader texture prefetch returned zero on this part: in QuartzCore's
++         # glass_background_no_bleed_lph (texture 4, sampler 1) every prefetched read of the
++         # distance field was 0, so the Dock's glass discarded all of its fragments; with the
++         # prefetch off the same read returns the field (bo51,
++         # docs/progress/2026-10-31-boot-order-and-performance.md). Upstream already turns it
++         # off for the A810 and a8xx_gen2, and its A810 note says the A830 may need it too.
++         GPUProps(has_early_preamble = False, has_fs_tex_prefetch = False)],
+         num_ccu = 6,
+         num_slices = 3,
+         tile_align_w = 96,

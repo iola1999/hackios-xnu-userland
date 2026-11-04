@@ -6927,9 +6927,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
             continue;
          /* CoreAnimation names a resolve texture on passes whose attachment is NOT
           * multisampled -- measured: 354 times in one 420 s run, all of them with
-          * storeAction 2 on a one-sample target. There is nothing to resolve there, and
-          * Metal itself leaves the resolve texture untouched for a one-sample pass, so
-          * this is a skip rather than an error. */
+          * storeAction 2 on a one-sample target. The driver draws those straight into
+          * the resolve texture and does not pass it here; the rest (a pass that loads,
+          * storeAction 4, another pixel format) is skipped rather than refused. */
          if (from->nr_samples <= 1)
             continue;
          if (into->first_level != 0) {

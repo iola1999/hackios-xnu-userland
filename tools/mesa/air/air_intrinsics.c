@@ -517,13 +517,26 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
    } else if (!strcmp(op, "insert_bits")) {
       r = nir_bitfield_insert(&c->b, a[0], a[1], nir_u2u32(&c->b, a[2]),
                               nir_u2u32(&c->b, a[3]));
-   } else if (!strcmp(op, "dfdx")) {
-      r = nir_ddx(&c->b, a[0]);
-   } else if (!strcmp(op, "dfdy")) {
-      r = nir_ddy(&c->b, a[0]);
-   } else if (!strcmp(op, "fwidth")) {
-      r = nir_fadd(&c->b, nir_fabs(&c->b, nir_ddx(&c->b, a[0])),
-                   nir_fabs(&c->b, nir_ddy(&c->b, a[0])));
+   } else if (!strcmp(op, "dfdx") || !strcmp(op, "dfdy") || !strcmp(op, "fwidth")) {
+      /* In 32 bits and per pixel, whatever the operand. ir3 issues dsx/dsy as TYPE_F32 on the
+       * register it is given, so a half operand is read as half of a float: the dada port
+       * measured fwidth.f16 as inf/NaN on the Adreno 830 where Apple's GPU gives 0.5
+       * (glass_background_sdf_lph takes its edge width this way). Apple differentiates per
+       * pixel; ir3's plain dsx/dsy are per quad, which put fwidth-antialiased edges in a
+       * different place. AIR_COARSE_DERIVATIVES=1 restores the old form, for a comparison. */
+      bool coarse = getenv("AIR_COARSE_DERIVATIVES") != NULL;
+      nir_def *x = a[0]->bit_size == 32 || coarse ? a[0] : nir_f2f32(&c->b, a[0]);
+      nir_def *dx = coarse ? nir_ddx(&c->b, x) : nir_ddx_fine(&c->b, x);
+      nir_def *dy = coarse ? nir_ddy(&c->b, x) : nir_ddy_fine(&c->b, x);
+
+      if (!strcmp(op, "dfdx"))
+         r = dx;
+      else if (!strcmp(op, "dfdy"))
+         r = dy;
+      else
+         r = nir_fadd(&c->b, nir_fabs(&c->b, dx), nir_fabs(&c->b, dy));
+      if (r->bit_size != a[0]->bit_size)
+         r = nir_f2fN(&c->b, r, a[0]->bit_size);
    } else if (!strcmp(op, "get_simd_width") || !strcmp(op, "get_thread_execution_width")) {
       r = nir_load_subgroup_size(&c->b);
    } else if (!strcmp(op, "all")) {
@@ -1170,3 +1183,5 @@ air_gather_quad_helpers(nir_shader *nir)
       }
    }
 }
+
+#include "air_debug.inc"

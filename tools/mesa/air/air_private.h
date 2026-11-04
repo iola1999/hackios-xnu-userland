@@ -281,6 +281,8 @@ bool air_translate_call(struct air_ctx *c, const struct air_inst *in, const char
 bool air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *name);
 /* the quad helper needs nir_shader_gather_info would record, set on a fragment shader */
 void air_gather_quad_helpers(nir_shader *nir);
+/* AIR_DEBUG_SOLID / AIR_DEBUG_NODISCARD for one fragment shader (air_debug.inc) */
+void air_debug_fragment(nir_shader *nir);
 /* the texture at this binding may be left unbound by the application (air_resource.nullable) */
 void air_texture_may_be_unbound(struct air_ctx *c, unsigned binding);
 

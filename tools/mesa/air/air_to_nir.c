@@ -3554,9 +3554,9 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       }
       info->entry_point = ralloc_strdup(mem_ctx, info->entry_point);
    }
+   air_debug_fragment(c.nir);
    air_gather_quad_helpers(c.nir);
    ralloc_free(ctx);
-   if (error)
-      *error = NULL;
+   if (error) *error = NULL;
    return c.nir;
 }
