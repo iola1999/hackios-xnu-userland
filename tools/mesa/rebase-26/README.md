@@ -11,6 +11,7 @@
 7. `0007-ir3-retry-spilling-stage-without-preamble.patch`：用了私有内存的 stage 打印一行 `ir3[进程 pid]:`（私有内存字节数、`max_reg`、preamble 指令数，每进程前 64 行）；任务环境变量 `REDWOOD_IR3_SPILL_RETRY=1` 时，对有 preamble 的这类 stage 关掉 preamble 再编一次，私有内存更少、或私有内存相同而寄存器更少的一份胜出。不设变量时只多打印。`kernel-12377-rate1-rt1` 里这类 stage 只有 11 个，在 SpringBoard 与 iconservicesagent，backboardd 没有，重编一批没有跑。
 8. `0008-u-trace-redwood-pass-times.patch`：任务环境变量 `REDWOOD_PASS_TIMES=1` 打开 Mesa 的 GPU 时间戳，按 pass 种类（画布尺寸、GMEM bin 数、颜色附件数、深度／模板格式）每 5 秒汇总一行 `pass times`；`fd_trace_read_ts` 去掉 `FD_BO_PREP_NOSYNC` 加 10 ms 睡眠的轮询，直接阻塞等待，这一处对所有打开 u_trace 的用法生效。读法见顶层 `docs/analysis/2026-11-02-120hz-after-gpu-clock.md` §6。
 9. `0009-fd-resource-contents-undefined.patch`：新增 `fd_resource_contents_undefined()`，把资源标为内容无效，下一个画进它的 batch 不再把它读回 GMEM；上一个写它的 batch 照样写回。AIR 在 Metal pass 的第一次绘制前，对 `MTLLoadActionDontCare` 的颜色附件调用它。CoreAnimation 整屏 pass 的第二个 RGBA16Float 附件属于这种情况，此前每个 bin 都读回，见顶层 `docs/analysis/2026-11-02-120hz-after-gpu-clock.md` §6。
+10. `0010-fd-no-store-of-masked-cbufs.patch`：batch 结束时不写回绑定的混合状态写不到的颜色附件（`colormask` 为 0）。混合状态变化也触发附件的读写登记，写不到的附件按读入登记。CoreAnimation 整屏 pass 的颜色 1 由管线的 `writeMask 0` 关掉，此前每个 bin 都写回。`kernel-12377-rate8-ns1` 对 r8a：tile store 合计 3.33 → 2.76 s，整屏 pass 每次 808 → 787 µs，手势帧率在轮次间波动范围内，截图无差异，见顶层 `docs/progress/2026-11-05-defaults-and-charging.md`。
 
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，改的文件互不重叠。
 

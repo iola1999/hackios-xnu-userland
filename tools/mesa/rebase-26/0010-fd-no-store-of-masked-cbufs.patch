@@ -1,0 +1,62 @@
+diff --color -ru a/src/gallium/drivers/freedreno/freedreno_context.h b/src/gallium/drivers/freedreno/freedreno_context.h
+--- a/src/gallium/drivers/freedreno/freedreno_context.h	2026-11-05 01:49:50
++++ b/src/gallium/drivers/freedreno/freedreno_context.h	2026-11-05 01:49:50
+@@ -658,8 +658,10 @@
+    ctx->gen_dirty |= ctx->gen_dirty_map[ffs(dirty) - 1];
+    ctx->dirty |= dirty;
+ 
+-   /* These are still not handled at bind time: */
+-   if (dirty & (FD_DIRTY_FRAMEBUFFER | FD_DIRTY_QUERY | FD_DIRTY_ZSA))
++   /* These are still not handled at bind time (HackiOS: the blend state too, whose colour write
++    * masks decide which attachments a batch stores, freedreno_draw.c):
++    */
++   if (dirty & (FD_DIRTY_FRAMEBUFFER | FD_DIRTY_QUERY | FD_DIRTY_ZSA | FD_DIRTY_BLEND))
+       ctx->dirty_resource |= dirty;
+ }
+ 
+diff --color -ru a/src/gallium/drivers/freedreno/freedreno_draw.c b/src/gallium/drivers/freedreno/freedreno_draw.c
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c	2026-11-05 01:49:50
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c	2026-11-05 01:49:50
+@@ -59,6 +59,20 @@
+    fd_batch_resource_write(batch, fd_resource(prsc));
+ }
+ 
++/*
++ * HackiOS: whether a draw with the bound blend state can write colour attachment i. One that cannot
++ * is not stored at the end of the batch: CoreAnimation's full-screen pass binds a second, RGBA16Float
++ * attachment that its pipeline masks off (writeMask 0), and storing it was a fifth of the window
++ * server's GPU time (docs/analysis/2026-11-02-120hz-after-gpu-clock.md).
++ */
++static bool
++cbuf_written(struct fd_context *ctx, unsigned i) assert_dt
++{
++   const struct pipe_blend_state *blend = ctx->blend;
++
++   return !blend || blend->rt[blend->independent_blend_enable ? i : 0].colormask != 0;
++}
++
+ static void
+ batch_draw_tracking_for_dirty_bits(struct fd_batch *batch) assert_dt
+ {
+@@ -105,7 +119,7 @@
+       }
+    }
+ 
+-   if (dirty & FD_DIRTY_FRAMEBUFFER) {
++   if (dirty & (FD_DIRTY_FRAMEBUFFER | FD_DIRTY_BLEND)) {
+       for (unsigned i = 0; i < pfb->nr_cbufs; i++) {
+          struct pipe_resource *surf;
+ 
+@@ -118,6 +132,12 @@
+             restore_buffers |= PIPE_CLEAR_COLOR0 << i;
+          } else {
+             batch->invalidated |= PIPE_CLEAR_COLOR0 << i;
++         }
++
++         /* (still restored above: a framebuffer fetch may read it) */
++         if (!cbuf_written(ctx, i)) {
++            resource_read(batch, surf);
++            continue;
+          }
+ 
+          buffers |= PIPE_CLEAR_COLOR0 << i;

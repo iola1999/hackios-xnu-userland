@@ -29,6 +29,8 @@
  *   restart NAME...            SIGKILL to every process of that name, for launchd to start again
  *   pull PATH                  kern.redwood.inbox, the last file the host pushed ("oem push"),
  *                              written to PATH (mode 755) through a temporary file and a rename
+ *   pull PATH OFFSET           ... written into PATH at OFFSET, PATH kept otherwise: a file larger
+ *                              than the 16 MB inbox arrives in pieces (tools/k90auto/install-ipa.py)
  *   outbox PATH                the file into kern.redwood.outbox: after the run the loader stages it
  *                              ("oem recording") and run-auto.py fetches it as run/outbox.bin
  *   cat PATH [OFFSET]          the file from OFFSET on, 48 bytes a line in base64 ("cat AT DATA"),
@@ -383,7 +385,7 @@ do_outbox(const char *path)
 }
 
 static int
-do_pull(const char *path)
+do_pull(const char *path, long long at)
 {
 	size_t size = 0;
 	char *data, temporary[1024];
@@ -400,6 +402,15 @@ do_pull(const char *path)
 		out("pull: nothing has been pushed");
 		free(data);
 		return 1;
+	}
+	if (at >= 0) {
+		fd = open(path, O_WRONLY | O_CREAT, 0644);
+		ok = fd >= 0 && pwrite(fd, data + sizeof(seq), size - sizeof(seq), at) == (ssize_t)(size - sizeof(seq));
+		ok = (fd < 0 || close(fd) == 0) && ok;
+		out("pull: push %llu, %zu bytes to %s at %lld%s%s", (unsigned long long)seq, size - sizeof(seq), path, at,
+		    ok ? "" : ": ", ok ? "" : strerror(errno));
+		free(data);
+		return ok ? 0 : 1;
 	}
 	snprintf(temporary, sizeof(temporary), "%s.pull", path);
 	fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -596,8 +607,8 @@ run(char *text)
 		return do_env(argc, argv, argv[0][0] == 'a');
 	if (strcmp(argv[0], "restart") == 0 && argc >= 2)
 		return do_restart(argc, argv);
-	if (strcmp(argv[0], "pull") == 0 && argc == 2)
-		return do_pull(argv[1]);
+	if (strcmp(argv[0], "pull") == 0 && (argc == 2 || argc == 3))
+		return do_pull(argv[1], argc == 3 ? atoll(argv[2]) : -1);
 	if (strcmp(argv[0], "outbox") == 0 && argc == 2)
 		return do_outbox(argv[1]);
 	if (strcmp(argv[0], "cat") == 0 && (argc == 2 || argc == 3))
