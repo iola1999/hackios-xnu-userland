@@ -1,0 +1,242 @@
+diff --color -ru a/src/gallium/drivers/freedreno/freedreno_context.c b/src/gallium/drivers/freedreno/freedreno_context.c
+--- a/src/gallium/drivers/freedreno/freedreno_context.c	2026-11-02 01:47:10
++++ b/src/gallium/drivers/freedreno/freedreno_context.c	2026-11-02 01:47:10
+@@ -552,11 +552,9 @@
+ 
+    /* Only need to stall on results for the first entry: */
+    if (offset_B == 0) {
+-      /* Avoid triggering deferred submits from flushing, since that
+-       * changes the behavior of what we are trying to measure:
++      /* HackiOS: no FD_BO_PREP_NOSYNC polling with 10 ms sleeps first: the blocking prep waits in
++       * the kernel for the bo's last submission (REDWOOD_PASS_TIMES printed nothing with the poll).
+        */
+-      while (fd_bo_cpu_prep(ts_bo, ctx->pipe, FD_BO_PREP_NOSYNC))
+-         usleep(10000);
+       int ret = fd_bo_cpu_prep(ts_bo, ctx->pipe, FD_BO_PREP_READ);
+       if (ret)
+          return U_TRACE_NO_TIMESTAMP;
+diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
+--- a/src/util/perf/u_trace.c	2026-11-02 01:47:10
++++ b/src/util/perf/u_trace.c	2026-11-02 01:47:10
+@@ -29,6 +29,12 @@
+ #include "util/u_call_once.h"
+ #include "util/u_debug.h"
+ #include "util/u_vector.h"
++#include "util/os_misc.h"
++#include "util/os_time.h"
++#include "util/simple_mtx.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #define __NEEDS_TRACE_PRIV
+ #include "u_trace_priv.h"
+@@ -303,6 +309,176 @@
+    .event = &print_json_event,
+ };
+ 
++/*
++ * HackiOS: REDWOOD_PASS_TIMES=1 turns on the GPU timestamps of the driver's tracepoints and, in
++ * place of a line per event, adds up the GPU time of each range by kind: render passes by target
++ * size, GMEM or sysmem and sample count, then compute, blits and the rest by tracepoint name. Every
++ * five seconds one line per kind goes to stdout, which the inserted library forwards to the log.
++ * Start and end are each an RB_DONE timestamp, so a range is the time from the work before it
++ * finishing to its own last draw finishing. FD_GPU_TRACEPOINT picks which tracepoints record.
++ */
++#define PASS_KINDS 32
++#define PASS_DEPTH 8
++#define PASS_KEY 48
++
++struct pass_open {
++   unsigned depth;
++   struct {
++      const struct u_tracepoint *tp;
++      uint64_t ns;
++      char key[PASS_KEY];
++   } at[PASS_DEPTH];
++};
++
++struct pass_kind {
++   char key[PASS_KEY];
++   uint32_t count;
++   uint64_t total_ns, longest_ns;
++};
++
++static struct {
++   simple_mtx_t lock;
++   uint64_t since;
++   unsigned kinds;
++   struct pass_kind kind[PASS_KINDS];
++} pass_times = { .lock = SIMPLE_MTX_INITIALIZER };
++
++static void
++pass_key(const struct u_trace_event *evt, const void *indirect, char *key)
++{
++   const char *name = evt->tp->name;
++   char text[256] = "";
++   unsigned width = 0, height = 0, samples = 0, nbins = 0;
++   const char *at;
++
++   if (strncmp(name, "start_", 6) == 0)
++      name += 6;
++   if (strcmp(name, "render_pass") != 0 || !evt->tp->print) {
++      snprintf(key, PASS_KEY, "%s", name);
++      return;
++   }
++   FILE *f = fmemopen(text, sizeof(text) - 1, "w");
++   if (f) {
++      evt->tp->print(f, evt->payload, indirect);
++      fclose(f);
++   }
++   if ((at = strstr(text, "width=")))
++      sscanf(at, "width=%u", &width);
++   if ((at = strstr(text, "height=")))
++      sscanf(at, "height=%u", &height);
++   if ((at = strstr(text, "samples=")))
++      sscanf(at, "samples=%u", &samples);
++   if ((at = strstr(text, "nbins=")))
++      sscanf(at, "nbins=%u", &nbins);
++   snprintf(key, PASS_KEY, "pass %ux%u %s%s", width, height, nbins ? "gmem" : "sysmem",
++            samples > 1 ? " msaa" : "");
++}
++
++static void
++pass_add(const char *key, uint64_t ns)
++{
++   unsigned i;
++
++   for (i = 0; i < pass_times.kinds && strcmp(pass_times.kind[i].key, key); i++)
++      ;
++   if (i == pass_times.kinds) {
++      if (pass_times.kinds == PASS_KINDS) {
++         i = PASS_KINDS - 1;
++         snprintf(pass_times.kind[i].key, PASS_KEY, "other");
++      } else {
++         pass_times.kinds++;
++         snprintf(pass_times.kind[i].key, PASS_KEY, "%s", key);
++      }
++   }
++   pass_times.kind[i].count++;
++   pass_times.kind[i].total_ns += ns;
++   if (ns > pass_times.kind[i].longest_ns)
++      pass_times.kind[i].longest_ns = ns;
++}
++
++static int
++pass_by_total(const void *a, const void *b)
++{
++   const struct pass_kind *x = a, *y = b;
++   return x->total_ns < y->total_ns ? 1 : x->total_ns > y->total_ns ? -1 : 0;
++}
++
++static void
++pass_times_event(struct u_trace_context *utctx, const struct u_trace_event *evt, uint64_t ns,
++                 int32_t delta, const void *indirect)
++{
++   struct pass_open *open = utctx->pass_times;
++   uint64_t now = os_time_get_nano();
++
++   if (!open) {
++      open = utctx->pass_times = calloc(1, sizeof(*open));
++      printf("pass times: first event %s\n", evt->tp->name);
++      fflush(stdout);
++   }
++   /* freedreno's begin_end_tp() leaves every tracepoint a marker: the pair is start_X and end_X
++    * (start_tile is a single marker) */
++   const char *name = evt->tp->name;
++   bool begin = evt->tp->type == u_tracepoint_type_begin_range ||
++                (strncmp(name, "start_", 6) == 0 && strcmp(name, "start_tile") != 0);
++   bool end = evt->tp->type == u_tracepoint_type_end_range || strncmp(name, "end_", 4) == 0;
++
++   if (!open || ns == U_TRACE_NO_TIMESTAMP)
++      return;
++   if (begin) {
++      if (open->depth < PASS_DEPTH) {
++         open->at[open->depth].tp = evt->tp;
++         open->at[open->depth].ns = ns;
++         pass_key(evt, indirect, open->at[open->depth].key);
++      }
++      open->depth++;
++      return;
++   }
++   if (!end || open->depth == 0)
++      return;
++   open->depth--;
++   if (open->depth >= PASS_DEPTH || ns < open->at[open->depth].ns)
++      return;
++   simple_mtx_lock(&pass_times.lock);
++   pass_add(open->at[open->depth].key, ns - open->at[open->depth].ns);
++   if (!pass_times.since)
++      pass_times.since = now;
++   if (now - pass_times.since >= 5000000000ull) {
++      qsort(pass_times.kind, pass_times.kinds, sizeof(pass_times.kind[0]), pass_by_total);
++      for (unsigned i = 0; i < pass_times.kinds && i < 12; i++)
++         printf("pass times %u ms: %s: %u in %" PRIu64 " us, %" PRIu64 " us each, longest %" PRIu64 "\n",
++                (unsigned)((now - pass_times.since) / 1000000), pass_times.kind[i].key,
++                pass_times.kind[i].count, pass_times.kind[i].total_ns / 1000,
++                pass_times.kind[i].total_ns / 1000 / pass_times.kind[i].count,
++                pass_times.kind[i].longest_ns / 1000);
++      fflush(stdout);
++      pass_times.kinds = 0;
++      pass_times.since = now;
++   }
++   simple_mtx_unlock(&pass_times.lock);
++}
++
++static void
++pass_times_nothing(struct u_trace_context *utctx)
++{
++}
++
++static void
++pass_times_start(struct u_trace_context *utctx)
++{
++   printf("pass times: tracing context %p\n", (void *)utctx);
++   fflush(stdout);
++}
++
++static struct u_trace_printer pass_times_printer = {
++   .start = pass_times_start,
++   .end = pass_times_nothing,
++   .start_of_frame = pass_times_nothing,
++   .end_of_frame = pass_times_nothing,
++   .start_of_batch = pass_times_nothing,
++   .end_of_batch = pass_times_nothing,
++   .event = pass_times_event,
++};
++
+ static const struct debug_named_value config_control[] = {
+    { "print", U_TRACE_TYPE_PRINT, "Enable print" },
+    { "print_csv", U_TRACE_TYPE_PRINT_CSV, "Enable print in CSV" },
+@@ -330,6 +506,8 @@
+ {
+    u_trace_state.enabled_traces =
+       debug_get_flags_option("MESA_GPU_TRACES", config_control, 0);
++   if (os_get_option("REDWOOD_PASS_TIMES"))
++      u_trace_state.enabled_traces |= U_TRACE_TYPE_PRINT;
+    const char *tracefile_name = debug_get_option_trace_file();
+    if (tracefile_name && __normal_user()) {
+       u_trace_state.trace_file = fopen(tracefile_name, "w");
+@@ -444,7 +622,10 @@
+    if (utctx->enabled_traces & U_TRACE_TYPE_PRINT) {
+       utctx->out = u_trace_state.trace_file;
+ 
+-      if (utctx->enabled_traces & U_TRACE_TYPE_JSON) {
++      if (os_get_option("REDWOOD_PASS_TIMES")) {
++         utctx->out = stdout;
++         utctx->out_printer = &pass_times_printer;
++      } else if (utctx->enabled_traces & U_TRACE_TYPE_JSON) {
+          utctx->out_printer = &json_printer;
+       } else if (utctx->enabled_traces & U_TRACE_TYPE_CSV) {
+          utctx->out_printer = &csv_printer;
+diff --color -ru a/src/util/perf/u_trace.h b/src/util/perf/u_trace.h
+--- a/src/util/perf/u_trace.h	2026-11-02 01:47:10
++++ b/src/util/perf/u_trace.h	2026-11-02 01:47:10
+@@ -249,6 +249,7 @@
+ 
+    FILE *out;
+    struct u_trace_printer *out_printer;
++   void *pass_times;   /* HackiOS: REDWOOD_PASS_TIMES, the ranges still open (u_trace.c) */
+ 
+    /* Once u_trace_flush() is called u_trace_chunk's are queued up to
+     * render tracepoints on a queue.  The per-chunk queue jobs block until

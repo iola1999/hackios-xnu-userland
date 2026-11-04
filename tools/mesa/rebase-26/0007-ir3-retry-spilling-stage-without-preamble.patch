@@ -1,0 +1,168 @@
+--- a/src/freedreno/ir3/ir3_nir.c
++++ b/src/freedreno/ir3/ir3_nir.c
+@@ -1639,7 +1639,7 @@
+     * have to lower the preamble after UBO lowering so that UBO lowering can
+     * insert instructions in the preamble to push UBOs.
+     */
+-   if (so->compiler->has_preamble &&
++   if (so->compiler->has_preamble && !so->no_preamble &&
+        !(ir3_shader_debug & IR3_DBG_NOPREAMBLE))
+       progress |= OPT(s, ir3_nir_opt_preamble, so);
+ 
+@@ -1661,7 +1661,7 @@
+ 
+    progress |= OPT(s, ir3_nir_lower_ubo_loads, so);
+ 
+-   if (so->compiler->gen >= 7 &&
++   if (so->compiler->gen >= 7 && !so->no_preamble &&
+        !(ir3_shader_debug & (IR3_DBG_NOPREAMBLE | IR3_DBG_NODESCPREFETCH)))
+       progress |= OPT(s, ir3_nir_opt_prefetch_descriptors, so);
+ 
+--- a/src/freedreno/ir3/ir3_shader.c
++++ b/src/freedreno/ir3/ir3_shader.c
+@@ -5,9 +5,14 @@
+  * Authors:
+  *    Rob Clark <robclark@freedesktop.org>
+  */
++
++#include <stdio.h>
++#include <unistd.h>
+ 
+ #include "util/format/u_format.h"
+ #include "util/u_atomic.h"
++#include "util/u_debug.h"
++#include "util/u_process.h"
+ #include "util/u_math.h"
+ #include "util/u_memory.h"
+ #include "util/u_string.h"
+@@ -564,6 +569,87 @@
+    if ((v->type == MESA_SHADER_VERTEX) && ir3_has_binning_vs(&v->key))
+       return true;
+    return false;
++}
++
++/* What compile_variant() reads besides the variant's own fields: set for every variant compiled. */
++static void
++init_variant_inputs(struct ir3_shader *shader, struct ir3_shader_variant *v)
++{
++   if (ir3_shader_compute(v)) {
++      v->cs.force_linear_dispatch = shader->cs.force_linear_dispatch;
++      v->cs.round_robin_mode = shader->nir->info.occupancy_bounded_workgroup_fairness;
++
++      v->local_size[0] = shader->nir->info.workgroup_size[0];
++      v->local_size[1] = shader->nir->info.workgroup_size[1];
++      v->local_size[2] = shader->nir->info.workgroup_size[2];
++      v->local_size_variable = shader->nir->info.workgroup_size_variable;
++   }
++
++   struct ir3_const_state *const_state = ir3_const_state_mut(v);
++   const_state->num_app_ubos = MAX2(1, shader->nir->info.num_ubos);
++}
++
++/*
++ * A stage that needs private memory with the preamble pass is compiled again without it. The preamble
++ * hoists uniform work into a prologue whose registers count against every fiber: QuartzCore's
++ * fixed_frag_lph_cpf used all 48 full registers and still spilled 512 bytes a fiber with it, and needed
++ * 21 registers and no spill without it, 6.6 ms a draw on the GPU against 2.6 (an A635, hakios-metal
++ * 9a61305). Private memory also holds scratch arrays, which the second compile keeps too, so it is
++ * taken only when it needs less of it, or as much with fewer registers. Stages with a binning variant
++ * (vertex shaders under binning) are left as they are. Every other stage that uses private memory gets
++ * one line on stdout (the first SPILL_LINES of a process), with or without REDWOOD_IR3_SPILL_RETRY=1,
++ * the switch for the second compile, which is made only for a stage that has a preamble.
++ */
++#define SPILL_LINES 64
++
++static struct ir3_shader_variant *
++retry_without_preamble(struct ir3_shader *shader, struct ir3_shader_variant *v, void *mem_ctx)
++{
++   static int retry = -1;
++   static unsigned lines;
++   struct ir3_shader_variant *other = NULL;
++   const char *taken = "";
++
++   if (retry < 0)
++      retry = debug_get_bool_option("REDWOOD_IR3_SPILL_RETRY", false);
++   if (retry && v->info.preamble_instrs_count > 0) {
++      other = alloc_variant(shader, &v->key, NULL, mem_ctx);
++      if (other) {
++         other->no_preamble = true;
++         other->disasm_info.write_disasm = v->disasm_info.write_disasm;
++         init_variant_inputs(shader, other);
++         if (!compile_variant(shader, other)) {
++            ralloc_free(other);
++            other = NULL;
++         }
++      }
++      taken = !other ? ", second compile failed" : "";
++   }
++   bool better = other && (other->pvtmem_size < v->pvtmem_size ||
++                           (other->pvtmem_size == v->pvtmem_size &&
++                            other->info.max_reg < v->info.max_reg));
++   if (p_atomic_inc_return(&lines) <= SPILL_LINES) {
++      if (other) {
++         printf("ir3[%s %d]: %s %s: private memory %u bytes, max_reg %d, %u preamble instructions; "
++                "without the preamble %u bytes, max_reg %d: %s\n",
++                util_get_process_name(), getpid(), _mesa_shader_stage_to_abbrev(v->type), v->name,
++                v->pvtmem_size, v->info.max_reg, v->info.preamble_instrs_count, other->pvtmem_size,
++                other->info.max_reg, better ? "taken" : "kept the first");
++      } else {
++         printf("ir3[%s %d]: %s %s: private memory %u bytes, max_reg %d, %u preamble instructions%s\n",
++                util_get_process_name(), getpid(), _mesa_shader_stage_to_abbrev(v->type), v->name,
++                v->pvtmem_size, v->info.max_reg, v->info.preamble_instrs_count, taken);
++      }
++      fflush(stdout);
++   }
++   if (!other)
++      return v;
++   if (!better) {
++      ralloc_free(other);
++      return v;
++   }
++   ralloc_free(v);
++   return other;
+ }
+ 
+ static struct ir3_shader_variant *
+@@ -600,24 +686,16 @@
+       }
+ 
+       shader->nir_finalized = true;
+-   }
+-
+-   if (ir3_shader_compute(v)) {
+-      v->cs.force_linear_dispatch = shader->cs.force_linear_dispatch;
+-      v->cs.round_robin_mode = shader->nir->info.occupancy_bounded_workgroup_fairness;
+-
+-      v->local_size[0] = shader->nir->info.workgroup_size[0];
+-      v->local_size[1] = shader->nir->info.workgroup_size[1];
+-      v->local_size[2] = shader->nir->info.workgroup_size[2];
+-      v->local_size_variable = shader->nir->info.workgroup_size_variable;
+    }
+ 
+-   struct ir3_const_state *const_state = ir3_const_state_mut(v);
+-   const_state->num_app_ubos = MAX2(1, shader->nir->info.num_ubos);
++   init_variant_inputs(shader, v);
+ 
+    if (!compile_variant(shader, v))
+       goto fail;
+ 
++   if (!needs_binning_variant(v) && v->pvtmem_size > 0)
++      v = retry_without_preamble(shader, v, mem_ctx);
++
+    if (needs_binning_variant(v) && !compile_variant(shader, v->binning))
+       goto fail;
+ 
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -653,6 +653,11 @@
+     * which is pointed to by so->binning:
+     */
+    bool binning_pass;
++
++   /* Compiled with the preamble pass off: the second compile of a stage that used private memory
++    * with it (create_variant, REDWOOD_IR3_SPILL_RETRY=1). Not part of the disk cache's range.
++    */
++   bool no_preamble;
+    //	union {
+    struct ir3_shader_variant *binning;
+    struct ir3_shader_variant *nonbinning;

@@ -60,7 +60,8 @@
 #                    real one is /sbin/launchd.ios). 2.5 GB; upload once per loader session with
 #                    `xl ramdisk userland/system.apfs`. Rebuilt when missing, when its inputs
 #                    (stage0, the manifest, the cryptex files) are newer, or with SYSTEM=1 (after
-#                    changing the recipe below).
+#                    changing the recipe below). HIGHRATE=1 (with SYSTEM=1 to remake an existing image):
+#                    CADisableMinimumFrameDurationOnPhone in every application's Info.plist (mkhighrate.py).
 #   flashboot.apfs   FLASHBOOT=1: the RAM part of a boot whose root is the iOS volume on the phone's
 #                    flash (see below); with CRYPTEXES=flash the boot volume alone, the cryptexes being
 #                    on the flash. FLASHBOOT=1 also decides what goes into root.apfs: the job list is
@@ -1130,6 +1131,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 		# -f: a cryptex fetched with the cache already in it would otherwise stop the build
 		ln -f "$f" $D/
 	done
+	[ -z "$HIGHRATE" ] || python3 mkhighrate.py sysroot
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
 	python3 ../tools/apfs/mkapfs.py -z -o system$V.apfs System=sysroot,manifest=$IOS/system.manifest | tail -1

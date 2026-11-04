@@ -1395,6 +1395,15 @@ struct rwa_draw {
 	 * `viewport` is.
 	 */
 	struct rwa_texture *const *resolve;
+
+	/*
+	 * The colour attachments the pass does not load (MTLLoadActionDontCare), bit i for
+	 * attachment i, on the pass's first draw only and 0 on the others. Appended, like the
+	 * fields above it, and filled by the same driver build. What the library does with it is
+	 * a hint to the GPU driver that the attachment's contents can be left out of the tile
+	 * memory; the picture is the same with it ignored.
+	 */
+	unsigned discard;
 };
 
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,

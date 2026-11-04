@@ -110,6 +110,10 @@ rwa_unlock_scope(int *unused)
 #include "air_metal_resource_private.h"
 #include "air_metal_state.inc"
 
+/* freedreno_resource.c (tools/mesa/rebase-26/0009): the resource's contents stop mattering to the
+ * next batch that draws into it, which then does not read it back into GMEM. */
+void fd_resource_contents_undefined(struct pipe_context *pctx, struct pipe_resource *prsc);
+
 /* A sampler is a Gallium state object and nothing more. The state it was built from is
  * not kept: a refusal about a sampler happens while it is being created, where the
  * caller's struct is still in hand.
@@ -6641,6 +6645,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       fb.zsbuf = zsurf;
    }
    state_framebuffer(device, &fb);
+   /* rwa_draw.discard. pipe->invalidate_resource would also drop the stores of the batch that wrote
+    * the attachment last, which a batch recorded since may still sample. CoreAnimation's full-screen
+    * pass has a second, RGBA16Float attachment loaded with MTLLoadActionDontCare, which freedreno
+    * read back into GMEM in every bin (kernel-12377-rate7-c7). */
+   for (unsigned i = 0; i < draw->color_count && !device->software; i++) {
+      if (draw->discard & (1u << i))
+         fd_resource_contents_undefined(pipe, draw->color[i]->res);
+   }
 
    /* The viewport, and now its z as well. Gallium's window depth is
     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state

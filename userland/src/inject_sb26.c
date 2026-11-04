@@ -25,6 +25,7 @@
 extern const void *_dyld_get_shared_cache_range(size_t *);
 extern id MTLCreateSystemDefaultDevice(void);
 void sb26_install_layer_dump(void);   /* inject_sb26_layers.c */
+void sb26_install_rate(uintptr_t slide);   /* inject_sb26_rate.c */
 
 static atomic_uint activation_calls;
 
@@ -181,8 +182,8 @@ boot_unlock(void *context)
         dispatch_get_main_queue(), (void *)attempt, boot_unlock);
 }
 
-static int
-boot_arg_present(const char *wanted)
+int
+sb26_boot_arg_present(const char *wanted)
 {
     char args[1024] = "";
     size_t size = sizeof(args) - 1;
@@ -201,7 +202,7 @@ install_unlock(void)
         (void)t;
         if (unlock_once("notification") == 0) fprintf(stderr, "sb26: unlock notification: not locked\n");
     });
-    if (boot_arg_present("autounlock=0")) {
+    if (sb26_boot_arg_present("autounlock=0")) {
         fprintf(stderr, "sb26: autounlock=0, the lock screen stays until it is swiped away\n");
         return;
     }
@@ -261,4 +262,5 @@ install_sb26(void)
     install_bitmap_selection(slide);
     install_unlock();
     sb26_install_layer_dump();
+    sb26_install_rate(slide);
 }
