@@ -778,11 +778,6 @@ if [ -f ../fw-wifi/wpss.mdt ]; then
 	for f in bd_m20gl.elf regdb_xiaomi.bin; do
 		[ -f ../fw-wifi/qca6750/$f ] && install -m 0644 ../fw-wifi/qca6750/$f root/fw/
 	done
-	# the network the radio is to join: its name on the first line, its passphrase on the second. Yours, and
-	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
-	rm -f root/fw/network
-	# SHARE=1: leave it out, for an image that is going to somebody else -- it is a passphrase
-	if [ -z "$SHARE" ] && [ -f ../fw-wifi/network ]; then install -m 0600 ../fw-wifi/network root/fw/network; fi
 fi
 # ... and the vibration motor's waveforms, the phone's /vendor/firmware/aw8697_haptic.bin, from ../fw-haptic
 # (bsd/dev/redwood_haptic.c, haptic=3; 3.6 KB, the vendor's and not in the repository either)
@@ -825,11 +820,9 @@ for d in gpu wifi haptic camera audio; do
 	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
 done
 echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
-# The images are what somebody would be handed to run this on a second phone, and two of the things
-# build.sh puts in them are secrets: the Wi-Fi network's name and passphrase, and the host's own
-# private key for ssh. Both are one small file inside 2.5 GB, and nobody would notice either leave.
+# The images are what somebody would be handed to run this on a second phone, and build.sh may put
+# the host's own private key for ssh in them.
 secrets=
-[ -f root/fw/network ] && secrets="$secrets fw/network (the name and passphrase of your Wi-Fi)"
 [ -f root/var/root/.ssh/ssh_host_ed25519_key ] &&
 	secrets="$secrets /var/root/.ssh/ssh_host_ed25519_key (a private key)"
 if [ -n "$secrets" ]; then
