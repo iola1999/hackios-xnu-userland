@@ -10,6 +10,8 @@
 static const char *const WATCH_DIRS[] = {
 	"/private/var/mobile/Library/SpringBoard",
 	"/private/var/mobile/Library/Preferences",
+	"/private/var/mobile/Library/BulletinBoard",
+	"/private/var/mobile/Library/UserNotifications",
 	"/private/var/containers",
 	"/private/var/db",
 	NULL,
@@ -116,8 +118,8 @@ is_transient_name(const char *name)
 static void
 scan_path_snapshot(const char *dir_path, int depth, struct dir_snapshot *snap)
 {
-	static char child[MAX_PATH];
-	static char dentry_buf[2048];
+	char child[MAX_PATH];
+	static char dentry_buf[5][2048];
 	struct stat st;
 #ifdef MINI_H
 	off_t pos = 0;
@@ -139,7 +141,7 @@ scan_path_snapshot(const char *dir_path, int depth, struct dir_snapshot *snap)
 	snap->total_size += (uint64_t)st.st_size;
 	snap->count++;
 
-	if ((st.st_mode & S_IFMT) != S_IFDIR || depth >= 4) {
+	if ((st.st_mode & S_IFMT) != S_IFDIR || depth < 0 || depth >= 4) {
 		return;
 	}
 
@@ -149,9 +151,12 @@ scan_path_snapshot(const char *dir_path, int depth, struct dir_snapshot *snap)
 	}
 
 	size_t base_len = strlen(dir_path);
-	while ((n = getdirentries(dfd, dentry_buf, sizeof(dentry_buf), &pos)) > 0) {
+	while ((n = getdirentries(dfd, dentry_buf[depth], sizeof(dentry_buf[depth]), &pos)) > 0) {
 		for (ssize_t i = 0; i < n;) {
-			struct dirent *d = (struct dirent *)(dentry_buf + i);
+			struct dirent *d = (struct dirent *)(dentry_buf[depth] + i);
+			if (d->d_reclen == 0) {
+				break;
+			}
 			const char *name = d->d_name;
 			size_t name_len = strlen(name);
 			i += d->d_reclen;

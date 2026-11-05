@@ -12,6 +12,7 @@
 struct rwa_vertex_cso_entry {
    uint8_t hash[32];
    char entry_name[64];
+   void *mem_ctx;
    void *vs_cso;
    struct air_shader_info vinfo;
    struct rwa_slot vert_slots[RWA_MAX_TEXTURES];
@@ -70,9 +71,47 @@ rwa_vertex_cso_insert(struct rwa_device *device, const void *bitcode, size_t siz
 
    rwa_vertex_compute_hash(bitcode, size, e->hash);
    snprintf(e->entry_name, sizeof(e->entry_name), "%s", entry_name ? entry_name : "");
+   e->mem_ctx = ralloc_context(NULL);
    e->vs_cso = vs_cso;
-   if (vinfo)
+   if (vinfo) {
       e->vinfo = *vinfo;
+      e->vinfo.notes = NULL;
+      e->vinfo.num_notes = 0;
+      if (vinfo->entry_point)
+         e->vinfo.entry_point = ralloc_strdup(e->mem_ctx, vinfo->entry_point);
+      if (vinfo->resources && vinfo->num_resources > 0) {
+         e->vinfo.resources = ralloc_array(e->mem_ctx, struct air_resource, vinfo->num_resources);
+         memcpy(e->vinfo.resources, vinfo->resources, vinfo->num_resources * sizeof(struct air_resource));
+         for (unsigned i = 0; i < vinfo->num_resources; i++) {
+            if (vinfo->resources[i].name)
+               e->vinfo.resources[i].name = ralloc_strdup(e->mem_ctx, vinfo->resources[i].name);
+            if (vinfo->resources[i].type_name)
+               e->vinfo.resources[i].type_name = ralloc_strdup(e->mem_ctx, vinfo->resources[i].type_name);
+         }
+      }
+      if (vinfo->varyings && vinfo->num_varyings > 0) {
+         e->vinfo.varyings = ralloc_array(e->mem_ctx, struct air_varying, vinfo->num_varyings);
+         memcpy(e->vinfo.varyings, vinfo->varyings, vinfo->num_varyings * sizeof(struct air_varying));
+         for (unsigned i = 0; i < vinfo->num_varyings; i++) {
+            if (vinfo->varyings[i].name)
+               e->vinfo.varyings[i].name = ralloc_strdup(e->mem_ctx, vinfo->varyings[i].name);
+         }
+      }
+      if (vinfo->vertex_attributes && vinfo->num_vertex_attributes > 0) {
+         e->vinfo.vertex_attributes = ralloc_array(e->mem_ctx, struct air_vertex_attribute,
+                                                   vinfo->num_vertex_attributes);
+         memcpy(e->vinfo.vertex_attributes, vinfo->vertex_attributes,
+                vinfo->num_vertex_attributes * sizeof(struct air_vertex_attribute));
+         for (unsigned i = 0; i < vinfo->num_vertex_attributes; i++) {
+            if (vinfo->vertex_attributes[i].name)
+               e->vinfo.vertex_attributes[i].name = ralloc_strdup(e->mem_ctx, vinfo->vertex_attributes[i].name);
+            if (vinfo->vertex_attributes[i].type_name)
+               e->vinfo.vertex_attributes[i].type_name = ralloc_strdup(e->mem_ctx, vinfo->vertex_attributes[i].type_name);
+            if (vinfo->vertex_attributes[i].function_constant)
+               e->vinfo.vertex_attributes[i].function_constant = ralloc_strdup(e->mem_ctx, vinfo->vertex_attributes[i].function_constant);
+         }
+      }
+   }
    if (vert_slots)
       memcpy(e->vert_slots, vert_slots, sizeof(e->vert_slots));
    if (vert_compare_sampler)
@@ -118,6 +157,8 @@ rwa_vertex_cso_cache_destroy(struct rwa_device *device)
       struct rwa_vertex_cso_entry *next = e->next;
       if (e->vs_cso && pipe)
          pipe->delete_vs_state(pipe, e->vs_cso);
+      if (e->mem_ctx)
+         ralloc_free(e->mem_ctx);
       free(e);
       e = next;
    }

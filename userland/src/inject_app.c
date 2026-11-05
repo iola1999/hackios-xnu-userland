@@ -363,6 +363,8 @@ setup_app_container_env(const char *name)
 			uuid = "39D6F88F-A8D6-4A38-B1F1-15A98FCA5776";
 		} else if (strcmp(name, "Reminders") == 0) {
 			uuid = "5BF8A0AF-C8E6-4B1A-9D2E-2C3D4E5F6A71";
+		} else if (strcmp(name, "MobileCal") == 0) {
+			uuid = "7DFA02CB-E0A8-4D3C-BF40-4E5F6A7B8C93";
 		}
 		if (uuid != NULL) {
 			char home[256], tmp[256];

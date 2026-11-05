@@ -613,15 +613,11 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
        * first thing that would tell a wrong packing from a right one is a
        * pipeline that sets one of these two constants.
        */
-      if (comps * bits > 64)
-         return air_error(c, "interface: a function constant of %u components of %u bits, "
-                             "which does not fit the one word air_constant_value carries",
-                          comps, bits), NULL;
       nir_def *fields[NIR_MAX_VEC_COMPONENTS];
       for (unsigned i = 0; i < comps; i++) {
          uint64_t mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
-         fields[i] = nir_imm_intN_t(&c->b, (v->bits >> (i * bits)) & mask,
-                                    as_bool ? 8 : bits);
+         uint64_t val = (i * bits < 64) ? ((v->bits >> (i * bits)) & mask) : 0ull;
+         fields[i] = nir_imm_intN_t(&c->b, val, as_bool ? 8 : bits);
       }
       res = nir_vec(&c->b, fields, comps);
       break;

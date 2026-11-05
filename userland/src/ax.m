@@ -20,7 +20,11 @@
 #import <UIKit/UIKit.h>
 #include <dlfcn.h>
 #include <notify.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #define MAX_DEPTH 64
@@ -146,10 +150,45 @@ accessibility_on(void)
 	}
 }
 
+static void
+ax_suppress_notification_prompt(void)
+{
+	dlopen("/System/Library/Frameworks/UserNotifications.framework/UserNotifications", RTLD_LAZY);
+	Class cls = objc_getClass("UNUserNotificationCenter");
+	if (cls == nil) {
+		return;
+	}
+	SEL req_sel = sel_registerName("requestAuthorizationWithOptions:completionHandler:");
+	Method req_m = class_getInstanceMethod(cls, req_sel);
+	if (req_m != NULL) {
+		IMP imp = imp_implementationWithBlock(^(id _self, NSUInteger options, void (^handler)(BOOL, NSError *)) {
+			(void)_self;
+			(void)options;
+			if (handler != nil) {
+				dispatch_async(dispatch_get_main_queue(), ^{
+					handler(YES, nil);
+				});
+			}
+		});
+		method_setImplementation(req_m, imp);
+	}
+}
+
 __attribute__((constructor)) static void
 ax_start(void)
 {
 	int token;
+	const char *prog = getprogname();
+
+	if (prog != NULL && strcmp(prog, "MobileCal") == 0) {
+		const char *home = "/private/var/mobile/Containers/Data/Application/7DFA02CB-E0A8-4D3C-BF40-4E5F6A7B8C93";
+		setenv("CFFIXED_USER_HOME", home, 1);
+		setenv("HOME", home, 0);
+		setenv("TMPDIR", "/private/var/mobile/Containers/Data/Application/7DFA02CB-E0A8-4D3C-BF40-4E5F6A7B8C93/tmp", 0);
+	}
+	if (prog != NULL && strcmp(prog, "SpringBoard") != 0) {
+		ax_suppress_notification_prompt();
+	}
 
 	notify_register_dispatch("com.redwood.ax.on", &token, dispatch_get_main_queue(), ^(int t) {
 		(void)t;

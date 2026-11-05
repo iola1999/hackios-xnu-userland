@@ -544,11 +544,6 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
       tmpl.swizzle_g = t->swizzle_g < 6 ? swz[t->swizzle_g] : PIPE_SWIZZLE_0;
       tmpl.swizzle_b = t->swizzle_b < 6 ? swz[t->swizzle_b] : PIPE_SWIZZLE_0;
       tmpl.swizzle_a = t->swizzle_a < 6 ? swz[t->swizzle_a] : PIPE_SWIZZLE_0;
-   } else if (texture_format(t) == PIPE_FORMAT_A8_UNORM) {
-      tmpl.swizzle_r = PIPE_SWIZZLE_W;
-      tmpl.swizzle_g = PIPE_SWIZZLE_W;
-      tmpl.swizzle_b = PIPE_SWIZZLE_W;
-      tmpl.swizzle_a = PIPE_SWIZZLE_W;
    }
    t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
    if (!t->view) {

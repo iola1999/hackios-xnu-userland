@@ -330,7 +330,7 @@ show(void)
 		    (unsigned long long)h->entries, (unsigned long long)h->bytes, h->crc,
 		    (unsigned long long)h->seconds, h->head_crc == head_checksum(h) ? "right" : "WRONG");
 	}
-	if (store_at != 0 && slots > 1) {
+	if (slots > 1) {
 		struct delta_head dh;
 		if (delta_read_head(&dh)) {
 			printf("var_store: delta slot: version %u, base_gen %llu, seq %llu, %llu entries, %llu bytes, "

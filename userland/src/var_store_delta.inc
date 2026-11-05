@@ -56,7 +56,7 @@ delta_reset(uint64_t new_base_generation)
 {
 	static uint8_t block[BLOCK];
 	struct delta_head *dh = (struct delta_head *)block;
-	if (store_at == 0 || slots <= 1) {
+	if (slots <= 1) {
 		return 1;
 	}
 	memset(block, 0, sizeof(block));
@@ -72,10 +72,26 @@ static int
 delta_is_near_full(void)
 {
 	struct delta_head dh;
-	if (delta_read_head(&dh) && dh.flags == 0) {
-		return dh.bytes >= (DELTA_BYTES - (4u << 20)); /* within 4 MiB of 64 MiB limit (60 MiB) */
+	int temp_open = 0, near = 0;
+
+	if (slots <= 1) {
+		return 0;
 	}
-	return 0;
+	if (fd < 0) {
+		fd = open(DEVICE, O_RDONLY, 0);
+		if (fd < 0) {
+			return 0;
+		}
+		temp_open = 1;
+	}
+	if (delta_read_head(&dh) && dh.flags == 0) {
+		near = dh.bytes >= (DELTA_BYTES - (4u << 20)); /* within 4 MiB of 64 MiB limit (60 MiB) */
+	}
+	if (temp_open) {
+		close(fd);
+		fd = -1;
+	}
+	return near;
 }
 
 static void
@@ -101,7 +117,7 @@ delta_save(void)
 	uint64_t delta_seq = 1;
 	int best;
 
-	if (store_at == 0 || slots <= 1) {
+	if (slots <= 1) {
 		return 1;
 	}
 	set_background_qos();
@@ -137,6 +153,11 @@ delta_save(void)
 	delta_mode = 0;
 
 	if (!pack_ok) {
+		if (at + (off_t)buffered >= stream_limit || stream_bytes > DELTA_PAYLOAD_LIMIT) {
+			printf("var_store: delta payload (%llu bytes) exceeds limit: merging base slot\n",
+			    (unsigned long long)stream_bytes);
+			return save();
+		}
 		return 0;
 	}
 
@@ -180,7 +201,7 @@ delta_restore(uint64_t base_gen)
 {
 	struct delta_head dh;
 
-	if (store_at == 0 || slots <= 1) {
+	if (slots <= 1) {
 		return 1;
 	}
 	if (!delta_read_head(&dh)) {
