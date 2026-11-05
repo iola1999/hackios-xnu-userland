@@ -1140,6 +1140,10 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 		# -f: a cryptex fetched with the cache already in it would otherwise stop the build
 		ln -f "$f" $D/
 	done
+	# IDA keeps its database beside the binary it opened (launchd.i64; .id0, .id1, .id2, .nam and .til while
+	# open), so one opened in $IOS/rootfs would go into the image. No iOS file has these extensions.
+	find sysroot -type f \( -name '*.i64' -o -name '*.idb' -o -name '*.id[0-2]' -o -name '*.nam' -o -name '*.til' \) \
+		-print -delete | sed 's|^sysroot/|build.sh: left out of the system image: /|'
 	[ -z "$HIGHRATE" ] || python3 mkhighrate.py sysroot
 	# zlib where it saves room, as Apple keeps the root (a small file whole in its attribute): 5.4 GB of
 	# files in 2.5 GB, what fits into the phone's RAM beside iOS
