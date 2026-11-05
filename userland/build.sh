@@ -161,7 +161,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 if [ "$V" = 26 ]; then
 	# The default injection libraries use 20F66 private layouts.
-	INJECT=${INJECT-"/redwood/lib/libredwood-sb26.dylib SpringBoard"}
+	INJECT=${INJECT-"/redwood/lib/libredwood-sb26.dylib SpringBoard Preferences"}
 fi
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
@@ -209,7 +209,7 @@ if [ "$V" = 26 ]; then
 			/usr/bin/codesign --force --sign - --entitlements src/input26_service.entitlements obj/input26-service
 			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
 				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os -Wall -Wextra -Werror \
-				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
+				-framework CoreFoundation -framework Metal -lobjc -lMobileGestalt src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
 			/usr/bin/codesign --force --sign - obj/libredwood-sb26.dylib
 			# Metal device registration in SpringBoard and backboardd, and the compression
 			# preference the driver needs set before QuartzCore picks a format: it imports
@@ -236,7 +236,7 @@ if [ "$V" = 26 ]; then
 			${LDID:-ldid} -Ssrc/input26_service.entitlements obj/input26-service
 			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
 				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os \
-				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
+				-framework CoreFoundation -framework Metal -lobjc -lMobileGestalt src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
 			${LDID:-ldid} -S obj/libredwood-sb26.dylib
 			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
 				-dynamiclib -install_name /redwood/lib/libredwood-sbmetal-experiment.dylib \

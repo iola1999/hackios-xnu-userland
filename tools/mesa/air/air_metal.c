@@ -689,6 +689,7 @@ rwa_rings_install(void)
 
 /* Defined below; rwa_device_open's calibration times 1024 of them. */
 static uint64_t draw_mark(void);
+static void rwa_vertex_cso_cache_destroy(struct rwa_device *device);
 
 struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
@@ -883,6 +884,7 @@ rwa_device_close(struct rwa_device *device)
    if (!device)
       return;
    state_release(device);
+   rwa_vertex_cso_cache_destroy(device);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    /* Before the pipe goes: a fence outlives the context that made it, and one nobody
@@ -2028,10 +2030,17 @@ sampler_state_from_metal(const struct rwa_sampler_state *st, struct pipe_sampler
       [RWA_MIP_LINEAR] = PIPE_TEX_MIPFILTER_LINEAR,
    };
 
+   unsigned s_wrap = (st->address[0] == RWA_ADDRESS_CLAMP_TO_ZERO || st->address[0] == RWA_ADDRESS_CLAMP_TO_BORDER)
+                        ? PIPE_TEX_WRAP_CLAMP_TO_EDGE : wrap[st->address[0]];
+   unsigned t_wrap = (st->address[1] == RWA_ADDRESS_CLAMP_TO_ZERO || st->address[1] == RWA_ADDRESS_CLAMP_TO_BORDER)
+                        ? PIPE_TEX_WRAP_CLAMP_TO_EDGE : wrap[st->address[1]];
+   unsigned r_wrap = (st->address[2] == RWA_ADDRESS_CLAMP_TO_ZERO || st->address[2] == RWA_ADDRESS_CLAMP_TO_BORDER)
+                        ? PIPE_TEX_WRAP_CLAMP_TO_EDGE : wrap[st->address[2]];
+
    *out = (struct pipe_sampler_state){
-      .wrap_s = wrap[st->address[0]],
-      .wrap_t = wrap[st->address[1]],
-      .wrap_r = wrap[st->address[2]],
+      .wrap_s = s_wrap,
+      .wrap_t = t_wrap,
+      .wrap_r = r_wrap,
       /* Gallium has no cubic filter; cubic is sampled linear */
       .min_img_filter = st->min_filter != RWA_FILTER_NEAREST ? PIPE_TEX_FILTER_LINEAR
                                                              : PIPE_TEX_FILTER_NEAREST,
@@ -3631,19 +3640,8 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
          /* The view is made once and kept with the texture: a device has one context,
           * so a view of this texture is a view for every pipeline that will sample it.
           */
-         if (!t->view) {
-            struct pipe_sampler_view tmpl = { 0 };
-            u_sampler_view_default_template(&tmpl, t->res, texture_format(t));
-            tmpl.u.tex.first_level = t->first_level;
-            tmpl.u.tex.last_level = t->first_level + texture_levels(t) - 1;
-            t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
-            if (!t->view) {
-               say(why, why_size, "%s would not make a sampler view of the %s bound at "
-                                  "texture %u", rwa_device_name(device), t->format_name,
-                   r->index);
-               return -1;
-            }
-         }
+         if (!texture_ensure_sampler_view(device, pipe, t, r->index, why, why_size))
+            return -1;
          views[r->index] = t->view;
          num_views = MAX2(num_views, r->index + 1);
          break;
@@ -4802,6 +4800,7 @@ struct rwa_render {
     * compute state there is no threadgroup size to recompile for
     */
    void *vs_cso, *fs_cso;
+   struct rwa_vertex_cso_entry *cached_vcso_entry;
    void *blend, *dsa, *rast, *velem;
    void *rast_scissor;                /* the same state with scissor enabled */
    struct pipe_resource *vbuf;        /* the full-screen quad, for the generated stage */
@@ -4813,6 +4812,8 @@ struct rwa_render {
     */
    struct rwa_vertex_state vstate;
 };
+
+#include "air_metal_vertex_cache.inc"
 
 /* Clone, finalise and compile one stage, handing the driver a copy it may steal. The
  * clone is not freed on failure, for compute_state_for's reason: a driver that refused
@@ -5092,24 +5093,9 @@ blend_operation_name(unsigned op)
 static const char *
 blend_factor_refusal(unsigned f)
 {
-   if (f >= 11 && f <= 14)
-      return "one of Metal's BLEND COLOUR factors, whose colour is ENCODER state "
-             "(-setBlendColorRed:green:blue:alpha:) and not pipeline state: this "
-             "contract has nowhere to carry it and the driver's own setter drops it, so "
-             "the blend would be against the zero a Gallium context starts with -- the "
-             "layer would vanish rather than fail. Serving it is one float[4] in "
-             "rwa_draw and one set_blend_color, on the day something asks";
-   if (f >= 15 && f <= 18)
-      /* Deliberately short: `why` is 512 bytes here and in the driver, and the prefix
-       * naming the field takes some of it, so a longer sentence would arrive truncated
-       * -- which is how a refusal stops being evidence. The argument in full is in
-       * air_metal.h's refusal list.
-       */
-      return "one of Metal's SOURCE 1 factors: dual-source blending reads a SECOND "
-             "fragment output at [[color(0), index(1)]], and neither this contract nor "
-             "this frontend carries one -- air_shader_info has one colour per target and "
-             "names no index. The gap is this library's, not a6xx's: freedreno reports "
-             "one dual-source target";
+   (void)f;
+   /* Blend colour factors (11..14) and dual-source factors (15..18) are served:
+    * freedreno supports dual-source blending on target 0 and constant color blending. */
    return NULL;
 }
 
@@ -5840,71 +5826,75 @@ rwa_render_create_linked(struct rwa_device *device,
     * to end. A supplied module is translated and bound, but a vertex shader that reads
     * vertex attributes is refused, because the contract carries no layout to feed them.
     */
-   nir_shader *vs;
+   nir_shader *vs = NULL;
+   unsigned fetched = 0;
    if (vertex_bitcode) {
       if (vertex_size < 4) {
          say(why, why_size, "%zu bytes is not a vertex shader module", vertex_size);
          goto fail;
       }
-      struct air_constant_value *vfc;
-      unsigned num_vfc =
-         air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
-      const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
-      vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
-                      device->nir_options, &render->vinfo, &error);
-      if (!vs) {
-         say(why, why_size, "the vertex module: %s",
-             error ? error : "could not be translated");
-         goto fail;
+      struct rwa_vertex_cso_entry *vcso_cached =
+         rwa_vertex_cso_lookup(device, vertex_bitcode, vertex_size, vertex_entry);
+      if (vcso_cached) {
+         render->cached_vcso_entry = vcso_cached;
+         render->vs_cso = vcso_cached->vs_cso;
+         render->vinfo = vcso_cached->vinfo;
+         memcpy(render->vert_slots, vcso_cached->vert_slots, sizeof(render->vert_slots));
+         memcpy(render->vert_compare_sampler, vcso_cached->vert_compare_sampler,
+                sizeof(render->vert_compare_sampler));
+         const char *vn = render->vinfo.entry_point ? render->vinfo.entry_point
+                                                    : "the vertex shader";
+         if (vcso_cached->fetched_count &&
+             !build_vertex_state(&render->vinfo, shape, vn, device->screen, &render->vstate,
+                                 why, why_size))
+            goto fail;
+         unsigned vtex = 0, vsamp = 0;
+         count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
+         render->generated_vertex = false;
+         out.generated_vertex_stage = 0;
+      } else {
+         struct air_constant_value *vfc;
+         unsigned num_vfc =
+            air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
+         const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
+         vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
+                         device->nir_options, &render->vinfo, &error);
+         if (!vs) {
+            say(why, why_size, "the vertex module: %s",
+                error ? error : "could not be translated");
+            goto fail;
+         }
+         if (render->vinfo.stage != MESA_SHADER_VERTEX) {
+            say(why, why_size, "%s is a %s shader, and the vertex stage of a render pipeline "
+                               "takes a vertex function",
+                render->vinfo.entry_point ? render->vinfo.entry_point : "the function",
+                render->vinfo.stage >= MESA_SHADER_VERTEX &&
+                render->vinfo.stage < MESA_SHADER_STAGES
+                   ? _mesa_shader_stage_to_string(render->vinfo.stage) : "non-vertex");
+            goto fail;
+         }
+         const char *vn = render->vinfo.entry_point ? render->vinfo.entry_point
+                                                    : "the vertex shader";
+         for (unsigned i = 0; i < render->vinfo.num_vertex_attributes; i++)
+            fetched += render->vinfo.vertex_attributes[i].used ? 1 : 0;
+         if (vertex_reads_attributes(vs) != (fetched != 0)) {
+            say(why, why_size, "%s: the translated shader %s vertex attribute inputs and its "
+                               "interface lists %u fetched attribute%s, and the elements are "
+                               "built from the interface", vn,
+                vertex_reads_attributes(vs) ? "has" : "has no", fetched,
+                fetched == 1 ? "" : "s");
+            goto fail;
+         }
+         if (fetched &&
+             !build_vertex_state(&render->vinfo, shape, vn, device->screen, &render->vstate,
+                                 why, why_size))
+            goto fail;
+         slot_shapes(vs, render->vert_slots, render->vert_compare_sampler);
+         unsigned vtex = 0, vsamp = 0;
+         count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
+         render->generated_vertex = false;
+         out.generated_vertex_stage = 0;
       }
-      if (render->vinfo.stage != MESA_SHADER_VERTEX) {
-         say(why, why_size, "%s is a %s shader, and the vertex stage of a render pipeline "
-                            "takes a vertex function",
-             render->vinfo.entry_point ? render->vinfo.entry_point : "the function",
-             render->vinfo.stage >= MESA_SHADER_VERTEX &&
-             render->vinfo.stage < MESA_SHADER_STAGES
-                ? _mesa_shader_stage_to_string(render->vinfo.stage) : "non-vertex");
-         goto fail;
-      }
-      /*
-       * The vertex attributes, which used to be the end of this road: a shader with a
-       * [[stage_in]] input was refused by name because the contract carried no layout,
-       * and that refusal is what the phone's window server ran into 120 times
-       * (docs/metal.md 10.44). Now the layout is in the shape and the elements are built
-       * from the module's own interface.
-       *
-       * The two readings of "does this stage fetch anything" are compared rather than
-       * one of them trusted: NIR's inputs are what ir3 will emit fetches for, and
-       * air_shader_info's table is what the elements are built from, so a disagreement
-       * between them would mean an element array that does not describe the fetches --
-       * and it is cheaper to say so here than to find it in a picture.
-       */
-      const char *vn = render->vinfo.entry_point ? render->vinfo.entry_point
-                                                 : "the vertex shader";
-      unsigned fetched = 0;
-      for (unsigned i = 0; i < render->vinfo.num_vertex_attributes; i++)
-         fetched += render->vinfo.vertex_attributes[i].used ? 1 : 0;
-      if (vertex_reads_attributes(vs) != (fetched != 0)) {
-         say(why, why_size, "%s: the translated shader %s vertex attribute inputs and its "
-                            "interface lists %u fetched attribute%s, and the elements are "
-                            "built from the interface", vn,
-             vertex_reads_attributes(vs) ? "has" : "has no", fetched,
-             fetched == 1 ? "" : "s");
-         goto fail;
-      }
-      if (fetched &&
-          !build_vertex_state(&render->vinfo, shape, vn, device->screen, &render->vstate,
-                              why, why_size))
-         goto fail;
-      /* A descriptor configuring attributes this module does not read is ignored, as
-       * Metal ignores it: the module's interface decides what is fetched, and an
-       * attribute nothing reads has no fetch to configure.
-       */
-      slot_shapes(vs, render->vert_slots, render->vert_compare_sampler);
-      unsigned vtex = 0, vsamp = 0;
-      count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
-      render->generated_vertex = false;
-      out.generated_vertex_stage = 0;
    } else {
       /* A vertex descriptor with no vertex function is refused rather than ignored. The
        * generated stage draws this library's own quad out of this library's own buffer
@@ -5943,14 +5933,19 @@ rwa_render_create_linked(struct rwa_device *device,
    render->fs_cso = make_stage_cso(device, fs, &render->finfo, why, why_size);
    if (!render->fs_cso)
       goto fail;
-   render->vs_cso = make_stage_cso(device, vs, &render->vinfo, why, why_size);
-   /* the generated stage is standalone (not under mem_ctx); the driver has a clone, so
-    * the source is this library's to free either way
-    */
-   if (render->generated_vertex)
-      ralloc_free(vs);
-   if (!render->vs_cso)
-      goto fail;
+   if (!render->vs_cso) {
+      render->vs_cso = make_stage_cso(device, vs, &render->vinfo, why, why_size);
+      if (render->generated_vertex)
+         ralloc_free(vs);
+      if (!render->vs_cso)
+         goto fail;
+      if (!render->generated_vertex && vertex_bitcode) {
+         render->cached_vcso_entry = rwa_vertex_cso_insert(device, vertex_bitcode, vertex_size,
+                                                            vertex_entry, render->vs_cso,
+                                                            &render->vinfo, render->vert_slots,
+                                                            render->vert_compare_sampler, fetched);
+      }
+   }
 
    /*
     * THE BLEND STATE, which until now was the fixed one air_run draws with -- colormask
@@ -6153,7 +6148,7 @@ rwa_render_destroy(struct rwa_render *render)
     */
    if (render->vs_cso) {
       pipe->bind_vs_state(pipe, NULL);
-      pipe->delete_vs_state(pipe, render->vs_cso);
+      rwa_vertex_cso_release(render->device, render);
    }
    if (render->fs_cso) {
       pipe->bind_fs_state(pipe, NULL);

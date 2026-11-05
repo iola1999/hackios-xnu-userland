@@ -23,7 +23,7 @@ enum {
 	SYS_unlink = 10, SYS_chdir = 12, SYS_chmod = 15, SYS_chown = 16, SYS_getpid = 20, SYS_getuid = 24,
 	SYS_chflags = 34, SYS_kill = 37, SYS_getppid = 39, SYS_dup = 41, SYS_ioctl = 54, SYS_reboot = 55,
 	SYS_symlink = 57, SYS_readlink = 58, SYS_execve = 59, SYS_msync = 65, SYS_munmap = 73, SYS_dup2 = 90,
-	SYS_select = 93, SYS_fsync = 95, SYS_socket = 97, SYS_bind = 104, SYS_gettimeofday = 116,
+	SYS_select = 93, SYS_fsync = 95, SYS_setpriority = 96, SYS_socket = 97, SYS_bind = 104, SYS_gettimeofday = 116,
 	SYS_rename = 128, SYS_mkdir = 136, SYS_rmdir = 137, SYS_utimes = 138, SYS_pread = 153, SYS_pwrite = 154,
 	SYS_mount = 167, SYS_mmap = 197, SYS_lseek = 199, SYS_ftruncate = 201, SYS_getxattr = 234,
 	SYS_setxattr = 236, SYS_listxattr = 240, SYS_sysctlbyname = 274, SYS_stat64 = 338, SYS_fstat64 = 339,
@@ -41,11 +41,18 @@ int pipe(int fds[2]);
 #define O_RDONLY        0
 #define O_WRONLY        1
 #define O_RDWR          2
+#define O_NONBLOCK      0x0004
 #define O_APPEND        0x8
 #define O_CREAT         0x200
 #define O_TRUNC         0x400
 #define O_EXCL          0x800
 #define O_DIRECTORY     0x100000
+
+#define PRIO_PROCESS        0
+#define PRIO_DARWIN_THREAD  3
+#define PRIO_DARWIN_PROCESS 4
+#define PRIO_DARWIN_BG      0x1000
+#define QOS_CLASS_BACKGROUND 0x09
 
 #define AF_UNIX         1
 #define SOCK_STREAM     1
@@ -169,6 +176,7 @@ ssize_t pread(int fd, void *buf, size_t count, off_t offset);
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
 int     socket(int domain, int type, int protocol);
 int     bind(int fd, const void *address, unsigned length);
+int     setpriority(int which, int who, int prio);
 
 size_t  strlen(const char *s);
 int     strcmp(const char *a, const char *b);

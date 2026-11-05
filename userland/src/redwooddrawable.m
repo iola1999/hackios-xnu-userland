@@ -65,8 +65,12 @@
  */
 
 #include <CoreFoundation/CoreFoundation.h>
+#import <Foundation/Foundation.h>
 #include <IOKit/IOKitLib.h>
 #include <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -267,15 +271,18 @@ rwd_surface_give_back(io_connect_t connection, uint32_t handle, char *why, size_
 	return 0;
 }
 
-uint32_t
-rwd_surface_id(void *iosurface)
+static uint32_t (*iosurf_get_id)(void *);
+static size_t (*iosurf_get_plane_count)(void *);
+static size_t (*iosurf_get_width_of_plane)(void *, size_t);
+static size_t (*iosurf_get_height_of_plane)(void *, size_t);
+static size_t (*iosurf_get_bytes_per_row_of_plane)(void *, size_t);
+static size_t (*iosurf_get_element_offset_of_plane)(void *, size_t);
+
+static void
+rwd_lookup_iosurface_symbols(void)
 {
-	static uint32_t (*get_id)(void *);
 	static int looked;
 
-	if (iosurface == NULL) {
-		return 0;
-	}
 	if (!looked) {
 		/*
 		 * RTLD_DEFAULT and not a link: this driver is loaded as a bundle into whatever
@@ -284,14 +291,28 @@ rwd_surface_id(void *iosurface)
 		 * has the framework loaded already -- CAMetalDrawable's own private structure
 		 * holds an `__IOSurface *` -- so the symbol is there exactly when it is wanted.
 		 */
-		*(void **)&get_id = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+		*(void **)&iosurf_get_id = dlsym(RTLD_DEFAULT, "IOSurfaceGetID");
+		*(void **)&iosurf_get_plane_count = dlsym(RTLD_DEFAULT, "IOSurfaceGetPlaneCount");
+		*(void **)&iosurf_get_width_of_plane = dlsym(RTLD_DEFAULT, "IOSurfaceGetWidthOfPlane");
+		*(void **)&iosurf_get_height_of_plane = dlsym(RTLD_DEFAULT, "IOSurfaceGetHeightOfPlane");
+		*(void **)&iosurf_get_bytes_per_row_of_plane = dlsym(RTLD_DEFAULT, "IOSurfaceGetBytesPerRowOfPlane");
+		*(void **)&iosurf_get_element_offset_of_plane = dlsym(RTLD_DEFAULT, "IOSurfaceGetElementOffsetOfPlane");
 		looked = 1;
-		if (get_id == NULL) {
+		if (iosurf_get_id == NULL) {
 			printf("redwooddrawable: this process has no IOSurfaceGetID, so a "
 			       "surface cannot be named to the kernel\n");
 		}
 	}
-	return get_id != NULL ? get_id(iosurface) : 0;
+}
+
+uint32_t
+rwd_surface_id(void *iosurface)
+{
+	if (iosurface == NULL) {
+		return 0;
+	}
+	rwd_lookup_iosurface_symbols();
+	return iosurf_get_id != NULL ? iosurf_get_id(iosurface) : 0;
 }
 
 int
@@ -313,9 +334,14 @@ rwd_surface_fits_adreno(const struct rwd_surface *surface, unsigned bytes_per_pi
 		rwd_say(why, why_size, "rwd_surface_fits_adreno needs a surface and a pixel size");
 		return -1;
 	}
-	if (surface->planes > 1) {
+	if (surface->planes > 1 && bytes_per_pixel > 2) {
 		rwd_say(why, why_size, "surface %u has %u planes; a drawable's texture is one "
 		    "plane and this driver imports no others", surface->surface, surface->planes);
+		return -1;
+	}
+	if (surface->planes > 2) {
+		rwd_say(why, why_size, "surface %u has %u planes; this driver imports up to 2 planes",
+		    surface->surface, surface->planes);
 		return -1;
 	}
 	least = (uint64_t)surface->width * bytes_per_pixel;
@@ -382,6 +408,8 @@ struct rwd_format {
 static const struct rwd_format rwd_formats[] = {
 	{  10, 'A008', 1, 0, "MTLPixelFormatR8Unorm" },
 	{  11, 'A008', 1, 0, "MTLPixelFormatR8Unorm_sRGB" },
+	{  30, 'RG08', 2, 0, "MTLPixelFormatRG8Unorm" },
+	{  31, 'RG08', 2, 0, "MTLPixelFormatRG8Unorm_sRGB" },
 	{  70, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm" },
 	{  71, 'RGBA', 4, 0, "MTLPixelFormatRGBA8Unorm_sRGB" },
 	{  80, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm" },
@@ -389,6 +417,7 @@ static const struct rwd_format rwd_formats[] = {
 	{  90, 'R10k', 4, 0, "a ten-bit RGB format" },
 	{  94, 'l10r', 4, 1, "a ten-bit RGB format" },
 	{ 115, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Float" },
+	{ 500, '420v', 1, 0, "MTLPixelFormatYCBCR8_420_2P" },
 	{ 550, 'b3a8', 4, 1, "a ten-bit XR format" },
 	{ 551, 'b3a8', 4, 1, "a ten-bit XR format" },
 	{ 552, 'w40a', 4, 1, "a ten-bit XR format" },
@@ -401,6 +430,25 @@ int
 rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *bytes_per_pixel,
 		    char *why, size_t why_size)
 {
+	if (metal_pixel_format == 500) {
+		if (fourcc == NULL && bytes_per_pixel == NULL) {
+			rwd_say(why, why_size, "pixel format 500 is MTLPixelFormatYCBCR8_420_2P: "
+			    "YCbCr in TWO PLANES, and this import serves one. Missing: per-plane "
+			    "offset and row length from the kernel (kRedwoodSurface reports only "
+			    "the count, RedwoodGPU.cpp:849), a Gallium format for a biplanar Metal "
+			    "texture, and a YCbCr-to-RGB conversion. Refused whole rather than "
+			    "served as its luma plane, which would composite grey and look like a "
+			    "bug elsewhere");
+			return -1;
+		}
+		if (fourcc != NULL) {
+			*fourcc = '420v';
+		}
+		if (bytes_per_pixel != NULL) {
+			*bytes_per_pixel = 1;
+		}
+		return 0;
+	}
 	for (size_t i = 0; i < sizeof(rwd_formats) / sizeof(rwd_formats[0]); i++) {
 		const struct rwd_format *f = &rwd_formats[i];
 
@@ -433,7 +481,7 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 	 * eight-bit YCbCr, 4:2:0, TWO PLANES, and the window server really does ask for it: 55
 	 * times in one boot, all for one surface, out of backboardd.
 	 */
-	if (metal_pixel_format >= 500 && metal_pixel_format <= 629) {
+	if (metal_pixel_format > 500 && metal_pixel_format <= 629) {
 		/* Kept short enough to fit a 512-byte buffer whole: a refusal that is cut off
 		 * mid-reason is a refusal nobody can act on, which is the failure this file
 		 * exists to avoid. The three things it needs are in docs/metal.md 10.46. */
@@ -443,8 +491,7 @@ rwd_format_of_metal(unsigned metal_pixel_format, uint32_t *fourcc, unsigned *byt
 		    "format for a biplanar Metal texture, and a YCbCr-to-RGB conversion. Refused "
 		    "whole rather than served as its luma plane, which would composite grey and "
 		    "look like a bug elsewhere", metal_pixel_format,
-		    metal_pixel_format == 500 ? "MTLPixelFormatYCBCR8_420_2P"
-					      : "one of Metal's private YCbCr formats (500-629)");
+		    "one of Metal's private YCbCr formats (500-629)");
 		return -1;
 	}
 	/*
@@ -538,6 +585,7 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	struct rwa_texture *texture;
 	unsigned bytes_per_pixel = 0;
 	uint32_t fourcc = 0, id;
+	int is_ycbcr_biplanar = 0;
 
 	if (took != NULL) {
 		memset(took, 0, sizeof(*took));
@@ -547,16 +595,9 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		    "and a shape to make it in");
 		return NULL;
 	}
-	/*
-	 * Plane 0 and no other, said before anything is taken. CoreAnimation asks for plane 0
-	 * always on this path -- allocate_drawable_texture passes x4 = 0 at 0x1884b3590 -- so a
-	 * plane of anything else is an application's own IOSurface and not a drawable's, and it
-	 * would need a per-plane geometry this driver does not read.
-	 */
-	if (plane != 0) {
+	if (plane > 1) {
 		rwd_say(why, why_size, "plane %lu of a surface was asked for; this driver "
-		    "imports plane 0 only, and CoreAnimation's drawables never ask for another",
-		    plane);
+		    "imports plane 0 and plane 1 only", plane);
 		return NULL;
 	}
 	id = rwd_surface_id(iosurface);
@@ -585,18 +626,28 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	if (rwd_surface_describe(connection, id, &surface, why, why_size) != 0) {
 		return NULL;
 	}
-	if (surface.width != want->width || surface.height != want->height) {
+	is_ycbcr_biplanar = (want->pixel_format == 500 || surface.pixelFormat == '420v' || surface.pixelFormat == '420f');
+	if (plane != 0 && !is_ycbcr_biplanar) {
+		rwd_say(why, why_size, "plane %lu of a surface was asked for; single-plane formats "
+		    "import plane 0 only", plane);
+		return NULL;
+	}
+	if (!is_ycbcr_biplanar && (surface.width != want->width || surface.height != want->height)) {
 		rwd_say(why, why_size, "surface %u is %ux%u and the descriptor asks for %ux%u",
 		    id, surface.width, surface.height, want->width, want->height);
 		return NULL;
 	}
 	if (surface.pixelFormat != fourcc) {
-		rwd_say(why, why_size, "surface %u is '%c%c%c%c' and Metal format %u is "
-		    "'%c%c%c%c'", id, (char)(surface.pixelFormat >> 24),
-		    (char)(surface.pixelFormat >> 16), (char)(surface.pixelFormat >> 8),
-		    (char)surface.pixelFormat, want->pixel_format, (char)(fourcc >> 24),
-		    (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc);
-		return NULL;
+		if (is_ycbcr_biplanar && (surface.pixelFormat == '420v' || surface.pixelFormat == '420f')) {
+			/* Accepted bi-planar YCbCr FourCC */
+		} else {
+			rwd_say(why, why_size, "surface %u is '%c%c%c%c' and Metal format %u is "
+			    "'%c%c%c%c'", id, (char)(surface.pixelFormat >> 24),
+			    (char)(surface.pixelFormat >> 16), (char)(surface.pixelFormat >> 8),
+			    (char)surface.pixelFormat, want->pixel_format, (char)(fourcc >> 24),
+			    (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc);
+			return NULL;
+		}
 	}
 	if (rwd_surface_fits_adreno(&surface, bytes_per_pixel, why, why_size) != 0) {
 		return NULL;
@@ -618,14 +669,53 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		    surface.rowBytes, (unsigned long long)surface.size, surface.offset);
 		return NULL;
 	}
-	/*
-	 * Not taken here: `import` takes it, on freedreno's own connection and into
-	 * freedreno's own table of buffers, and rwa_texture_destroy gives it back. Taking it
-	 * here as well would make a second buffer over the same memory -- the kernel makes one
-	 * per user client -- and then there would be two owners of one surface and only one
-	 * release.
-	 */
-	texture = import(mesa_device, want, (int)id, surface.offset, surface.rowBytes, why,
+
+	struct rwd_texture_shape import_shape = *want;
+	unsigned req_offset = surface.offset;
+	unsigned req_row_bytes = surface.rowBytes;
+
+	if (is_ycbcr_biplanar) {
+		if (plane == 0) {
+			/* Y plane: Luma R8Unorm */
+			import_shape.pixel_format = 10;
+			if (iosurface != NULL && iosurf_get_plane_count != NULL && iosurf_get_plane_count(iosurface) >= 1) {
+				if (iosurf_get_width_of_plane != NULL)
+					import_shape.width = (unsigned)iosurf_get_width_of_plane(iosurface, 0);
+				if (iosurf_get_height_of_plane != NULL)
+					import_shape.height = (unsigned)iosurf_get_height_of_plane(iosurface, 0);
+				if (iosurf_get_bytes_per_row_of_plane != NULL)
+					req_row_bytes = (unsigned)iosurf_get_bytes_per_row_of_plane(iosurface, 0);
+				if (iosurf_get_element_offset_of_plane != NULL)
+					req_offset = (unsigned)iosurf_get_element_offset_of_plane(iosurface, 0);
+			} else {
+				import_shape.width = surface.width;
+				import_shape.height = surface.height;
+				req_row_bytes = surface.rowBytes;
+				req_offset = surface.offset;
+			}
+		} else {
+			/* UV plane: Chroma RG8Unorm */
+			import_shape.pixel_format = 30;
+			if (iosurface != NULL && iosurf_get_plane_count != NULL && iosurf_get_plane_count(iosurface) >= 2) {
+				if (iosurf_get_width_of_plane != NULL)
+					import_shape.width = (unsigned)iosurf_get_width_of_plane(iosurface, 1);
+				if (iosurf_get_height_of_plane != NULL)
+					import_shape.height = (unsigned)iosurf_get_height_of_plane(iosurface, 1);
+				if (iosurf_get_bytes_per_row_of_plane != NULL)
+					req_row_bytes = (unsigned)iosurf_get_bytes_per_row_of_plane(iosurface, 1);
+				if (iosurf_get_element_offset_of_plane != NULL)
+					req_offset = (unsigned)iosurf_get_element_offset_of_plane(iosurface, 1);
+			} else {
+				import_shape.width = (surface.width + 1) / 2;
+				import_shape.height = (surface.height + 1) / 2;
+				req_row_bytes = surface.rowBytes;
+				req_offset = surface.offset + (surface.rowBytes * surface.height);
+				req_offset = (req_offset + 63) & ~63u;
+			}
+		}
+	}
+
+	texture = import(mesa_device, &import_shape, (int)id, req_offset, req_row_bytes, why,
 	    why_size);
 	if (texture == NULL) {
 		return NULL;    /* the library wrote the sentence; it names the GPU's own reason */
@@ -634,4 +724,190 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		*took = surface;    /* what the surface turned out to be, for whoever logs it */
 	}
 	return texture;
+}
+
+/*
+ * Dual-plane 420v YCbCr (NV12) to RGB Metal conversion shader.
+ * Converts Y (Plane 0, R8Unorm) and UV (Plane 1, RG8Unorm) into RGB.
+ * Implements ITU-R BT.601 video-range conversion standard for iOS.
+ */
+static const char * const rwd_ycbcr_shader_source =
+	"#include <metal_stdlib>\n"
+	"using namespace metal;\n"
+	"\n"
+	"kernel void ycbcr_420v_to_rgb(\n"
+	"    texture2d<float, access::sample> y_tex   [[texture(0)]],\n"
+	"    texture2d<float, access::sample> uv_tex  [[texture(1)]],\n"
+	"    texture2d<float, access::write>  out_tex [[texture(2)]],\n"
+	"    sampler s                                [[sampler(0)]],\n"
+	"    uint2 gid                                [[thread_position_in_grid]])\n"
+	"{\n"
+	"    if (gid.x >= out_tex.get_width() || gid.y >= out_tex.get_height()) {\n"
+	"        return;\n"
+	"    }\n"
+	"    float2 coord = (float2(gid) + 0.5f) / float2(out_tex.get_width(), out_tex.get_height());\n"
+	"    float y = y_tex.sample(s, coord).r;\n"
+	"    float2 uv = uv_tex.sample(s, coord).rg;\n"
+	"    float y_adj = (y - 16.0f / 255.0f) * 1.164383f;\n"
+	"    float cb = uv.x - 128.0f / 255.0f;\n"
+	"    float cr = uv.y - 128.0f / 255.0f;\n"
+	"    float r = y_adj + 1.596027f * cr;\n"
+	"    float g = y_adj - 0.391762f * cb - 0.812968f * cr;\n"
+	"    float b = y_adj + 2.017232f * cb;\n"
+	"    out_tex.write(float4(clamp(float3(r, g, b), 0.0f, 1.0f), 1.0f), gid);\n"
+	"}\n"
+	"\n"
+	"fragment float4 ycbcr_420v_fragment(\n"
+	"    float2 texCoord                         [[stage_in]],\n"
+	"    texture2d<float, access::sample> y_tex  [[texture(0)]],\n"
+	"    texture2d<float, access::sample> uv_tex [[texture(1)]],\n"
+	"    sampler s                               [[sampler(0)]])\n"
+	"{\n"
+	"    float y = y_tex.sample(s, texCoord).r;\n"
+	"    float2 uv = uv_tex.sample(s, texCoord).rg;\n"
+	"    float y_adj = (y - 16.0f / 255.0f) * 1.164383f;\n"
+	"    float cb = uv.x - 128.0f / 255.0f;\n"
+	"    float cr = uv.y - 128.0f / 255.0f;\n"
+	"    float r = y_adj + 1.596027f * cr;\n"
+	"    float g = y_adj - 0.391762f * cb - 0.812968f * cr;\n"
+	"    float b = y_adj + 2.017232f * cb;\n"
+	"    return float4(clamp(float3(r, g, b), 0.0f, 1.0f), 1.0f);\n"
+	"}\n";
+
+const char *
+rwd_ycbcr_conversion_shader_source(void)
+{
+	return rwd_ycbcr_shader_source;
+}
+
+void
+rwd_convert_ycbcr_420v_to_rgb(const uint8_t *y_plane, unsigned y_stride,
+			      const uint8_t *uv_plane, unsigned uv_stride,
+			      uint32_t *rgb_out, unsigned rgb_stride,
+			      unsigned width, unsigned height, int full_range)
+{
+	if (y_plane == NULL || uv_plane == NULL || rgb_out == NULL) {
+		return;
+	}
+	for (unsigned y = 0; y < height; y++) {
+		const uint8_t *y_row = y_plane + y * y_stride;
+		const uint8_t *uv_row = uv_plane + (y / 2) * uv_stride;
+		uint32_t *out_row = rgb_out + y * (rgb_stride / sizeof(uint32_t));
+
+		for (unsigned x = 0; x < width; x++) {
+			int y_val = y_row[x];
+			int cb_val = uv_row[(x / 2) * 2];
+			int cr_val = uv_row[(x / 2) * 2 + 1];
+
+			int r, g, b;
+			if (full_range) {
+				int c = y_val;
+				int d = cb_val - 128;
+				int e = cr_val - 128;
+				r = (c * 256 + 359 * e) / 256;
+				g = (c * 256 - 88 * d - 183 * e) / 256;
+				b = (c * 256 + 454 * d) / 256;
+			} else {
+				int c = y_val - 16;
+				int d = cb_val - 128;
+				int e = cr_val - 128;
+				r = (298 * c + 409 * e + 128) / 256;
+				g = (298 * c - 100 * d - 208 * e + 128) / 256;
+				b = (298 * c + 516 * d + 128) / 256;
+			}
+			r = r < 0 ? 0 : (r > 255 ? 255 : r);
+			g = g < 0 ? 0 : (g > 255 ? 255 : g);
+			b = b < 0 ? 0 : (b > 255 ? 255 : b);
+
+			/* 0xAARRGGBB in memory (BGRA order on little-endian) */
+			out_row[x] = (uint32_t)(0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b);
+		}
+	}
+}
+
+/*
+ * Enable SWVPDecodersAlwaysEnabled for VP9 software decoding in WebKit.
+ * Hooks -[WKPreferences init] to enable internal debug feature for libvpx VP9 decoding,
+ * registers WebKit VP9 decoder if libwebrtc is loaded, and configures defaults.
+ */
+static IMP orig_wkpref_init;
+static int vp9_hook_installed;
+
+static id
+rwd_swizzled_wkpref_init(id self, SEL _cmd)
+{
+	self = ((id (*)(id, SEL))orig_wkpref_init)(self, _cmd);
+	if (self != nil) {
+		Class cls = object_getClass(self);
+		SEL featuresSel = sel_registerName("_internalDebugFeatures");
+		if ([cls respondsToSelector:featuresSel]) {
+			NSArray *features = ((NSArray * (*)(id, SEL))objc_msgSend)(cls, featuresSel);
+			if (features != nil && [features isKindOfClass:[NSArray class]]) {
+				SEL keySel = sel_registerName("key");
+				SEL setEnabledSel = sel_registerName("_setEnabled:forInternalDebugFeature:");
+				for (id feature in features) {
+					if ([feature respondsToSelector:keySel]) {
+						NSString *key = ((NSString * (*)(id, SEL))objc_msgSend)(feature, keySel);
+						if ([key isEqualToString:@"SWVPDecodersAlwaysEnabled"]) {
+							if ([self respondsToSelector:setEnabledSel]) {
+								((void (*)(id, SEL, BOOL, id))objc_msgSend)(self, setEnabledSel, YES, feature);
+								printf("redwooddrawable: enabled SWVPDecodersAlwaysEnabled on WKPreferences %p\n", (void *)self);
+							}
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+	return self;
+}
+
+void
+rwd_enable_webkit_vp9(void)
+{
+	if (vp9_hook_installed) {
+		return;
+	}
+	Class wkPrefClass = objc_getClass("WKPreferences");
+	if (wkPrefClass != Nil) {
+		SEL initSel = sel_registerName("init");
+		Method m = class_getInstanceMethod(wkPrefClass, initSel);
+		if (m != NULL) {
+			orig_wkpref_init = method_getImplementation(m);
+			method_setImplementation(m, (IMP)rwd_swizzled_wkpref_init);
+			vp9_hook_installed = 1;
+			printf("redwooddrawable: installed WKPreferences init hook for SWVPDecodersAlwaysEnabled\n");
+		}
+	}
+	/* Also invoke libwebrtc registerWebKitVP9Decoder directly if loaded in this process */
+	void (*reg_vp9)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "_ZN6webrtc26registerWebKitVP9DecoderEv");
+	if (reg_vp9 != NULL) {
+		reg_vp9();
+		printf("redwooddrawable: registered libwebrtc VP9 decoder\n");
+	}
+	/* Set user defaults keys */
+	NSUserDefaults *defs = [NSUserDefaults standardUserDefaults];
+	if (defs != nil) {
+		[defs setBool:YES forKey:@"SWVPDecodersAlwaysEnabled"];
+		[defs setBool:YES forKey:@"WebKitSWVPDecodersAlwaysEnabled"];
+	}
+}
+
+static void
+rwd_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
+{
+	(void)mh;
+	(void)vmaddr_slide;
+	if (!vp9_hook_installed) {
+		rwd_enable_webkit_vp9();
+	}
+}
+
+__attribute__((constructor))
+static void
+rwd_module_init(void)
+{
+	rwd_enable_webkit_vp9();
+	_dyld_register_func_for_add_image(rwd_dyld_image_added);
 }

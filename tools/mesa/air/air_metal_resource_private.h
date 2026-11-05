@@ -15,9 +15,12 @@ struct rwa_bound_state {
    unsigned num_views[2], num_samplers[2];
 };
 
+struct rwa_vertex_cso_entry;
+
 struct rwa_device {
    struct pipe_screen *screen;
    struct pipe_context *pipe;
+   struct rwa_vertex_cso_entry *vertex_cso_cache;
 
    /* NIR's options for this screen, asked once: the translator needs them to know what
     * the consumer can be handed (what it may leave for the backend to lower).
@@ -189,6 +192,9 @@ struct rwa_texture {
    /* The run of the resource's levels a view covers; num_levels is 0 for a texture that
     * made its own resource. Read through texture_levels(). */
    unsigned first_level, num_levels;
+
+   /* Channel swizzle for sampler views (0 = default/identity). */
+   uint8_t swizzle_r, swizzle_g, swizzle_b, swizzle_a;
 };
 
 /*

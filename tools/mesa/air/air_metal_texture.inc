@@ -434,7 +434,24 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
    view->shader_read = texture->shader_read;
    view->shader_write = texture->shader_write;
    view->view_format = fmt->pipe;
+   view->swizzle_r = texture->swizzle_r;
+   view->swizzle_g = texture->swizzle_g;
+   view->swizzle_b = texture->swizzle_b;
+   view->swizzle_a = texture->swizzle_a;
    return view;
+}
+
+void
+rwa_texture_set_swizzle(struct rwa_texture *texture, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+   if (!texture)
+      return;
+   texture->swizzle_r = r;
+   texture->swizzle_g = g;
+   texture->swizzle_b = b;
+   texture->swizzle_a = a;
+   if (texture->view)
+      pipe_sampler_view_reference(&texture->view, NULL);
 }
 
 /* The textures laid over this buffer keep a borrowed pointer to it and read its `map` and
@@ -507,4 +524,37 @@ rwa_buffer_textures_writeback(struct rwa_device *device)
       if (b->source && b->written)
          (void)buffer_texture_download(b, why, sizeof(why));
    }
+}
+
+static bool
+texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe,
+                            struct rwa_texture *t, unsigned index,
+                            char *why, size_t why_size)
+{
+   if (t->view)
+      return true;
+   struct pipe_sampler_view tmpl = { 0 };
+   u_sampler_view_default_template(&tmpl, t->res, texture_format(t));
+   tmpl.u.tex.first_level = t->first_level;
+   tmpl.u.tex.last_level = t->first_level + texture_levels(t) - 1;
+   if (t->swizzle_r || t->swizzle_g || t->swizzle_b || t->swizzle_a) {
+      unsigned swz[6] = { PIPE_SWIZZLE_0, PIPE_SWIZZLE_1, PIPE_SWIZZLE_X,
+                          PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W };
+      tmpl.swizzle_r = t->swizzle_r < 6 ? swz[t->swizzle_r] : PIPE_SWIZZLE_0;
+      tmpl.swizzle_g = t->swizzle_g < 6 ? swz[t->swizzle_g] : PIPE_SWIZZLE_0;
+      tmpl.swizzle_b = t->swizzle_b < 6 ? swz[t->swizzle_b] : PIPE_SWIZZLE_0;
+      tmpl.swizzle_a = t->swizzle_a < 6 ? swz[t->swizzle_a] : PIPE_SWIZZLE_0;
+   } else if (texture_format(t) == PIPE_FORMAT_A8_UNORM) {
+      tmpl.swizzle_r = PIPE_SWIZZLE_W;
+      tmpl.swizzle_g = PIPE_SWIZZLE_W;
+      tmpl.swizzle_b = PIPE_SWIZZLE_W;
+      tmpl.swizzle_a = PIPE_SWIZZLE_W;
+   }
+   t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
+   if (!t->view) {
+      say(why, why_size, "%s would not make a sampler view of the %s bound at "
+                         "texture %u", rwa_device_name(device), t->format_name, index);
+      return false;
+   }
+   return true;
 }

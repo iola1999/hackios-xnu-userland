@@ -26,7 +26,11 @@
  *   codesign --force --sign - --entitlements userland/src/appinst.entitlements out/ios26-resume/appinst/appinst
  */
 #import <Foundation/Foundation.h>
+#include <arpa/inet.h>
+#include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
+#include <mach-o/loader.h>
+#include <notify.h>
 #include <stdio.h>
 #include <sys/stat.h>
 
@@ -121,9 +125,303 @@ app_in(NSString *dir)
 	return nil;
 }
 
+static BOOL
+sign_macho(NSString *path, NSDictionary *extraEntitlements)
+{
+	NSMutableData *data = [NSMutableData dataWithContentsOfFile:path];
+	if (data == nil || data.length < sizeof(struct mach_header_64)) {
+		return NO;
+	}
+	uint32_t magic = *(const uint32_t *)data.bytes;
+	if (magic != MH_MAGIC_64) {
+		return NO;
+	}
+	struct mach_header_64 *mh = (struct mach_header_64 *)data.mutableBytes;
+	uint32_t at = sizeof(struct mach_header_64);
+	uint32_t cs_cmd_offset = 0;
+	uint32_t linkedit_cmd_offset = 0;
+	uint32_t first_fileoff = (uint32_t)data.length;
+	uint32_t orig_dataoff = 0;
+	uint32_t orig_datasize = 0;
+
+	for (uint32_t i = 0; i < mh->ncmds; i++) {
+		struct load_command *lc = (struct load_command *)(data.mutableBytes + at);
+		if (lc->cmd == LC_SEGMENT_64) {
+			struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+			if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+				linkedit_cmd_offset = at;
+			}
+			if (seg->fileoff > 0 && seg->fileoff < first_fileoff) {
+				first_fileoff = (uint32_t)seg->fileoff;
+			}
+		} else if (lc->cmd == 0x1d) { /* LC_CODE_SIGNATURE */
+			cs_cmd_offset = at;
+			struct linkedit_data_command *cs = (struct linkedit_data_command *)lc;
+			orig_dataoff = cs->dataoff;
+			orig_datasize = cs->datasize;
+		}
+		at += lc->cmdsize;
+	}
+	if (linkedit_cmd_offset == 0) {
+		return NO;
+	}
+
+	NSMutableDictionary *ent = [NSMutableDictionary dictionary];
+	if (cs_cmd_offset != 0 && orig_dataoff + orig_datasize <= data.length && orig_datasize >= 12) {
+		const uint8_t *sb_bytes = (const uint8_t *)data.bytes + orig_dataoff;
+		uint32_t sb_magic = ntohl(*(const uint32_t *)sb_bytes);
+		uint32_t sb_count = ntohl(*(const uint32_t *)(sb_bytes + 8));
+		if (sb_magic == 0xfade0cc0 && 12 + sb_count * 8 <= orig_datasize) {
+			for (uint32_t i = 0; i < sb_count; i++) {
+				uint32_t stype = ntohl(*(const uint32_t *)(sb_bytes + 12 + i * 8));
+				uint32_t soff = ntohl(*(const uint32_t *)(sb_bytes + 16 + i * 8));
+				if (stype == 5 && soff + 8 <= orig_datasize) {
+					uint32_t emagic = ntohl(*(const uint32_t *)(sb_bytes + soff));
+					uint32_t elen = ntohl(*(const uint32_t *)(sb_bytes + soff + 4));
+					if (emagic == 0xfade7171 && elen >= 8 && soff + elen <= orig_datasize) {
+						NSData *exData = [NSData dataWithBytes:sb_bytes + soff + 8 length:elen - 8];
+						NSDictionary *existing = [NSPropertyListSerialization propertyListWithData:exData
+						                                                                   options:0
+						                                                                    format:NULL
+						                                                                     error:nil];
+						if ([existing isKindOfClass:[NSDictionary class]]) {
+							[ent addEntriesFromDictionary:existing];
+						}
+					}
+				}
+			}
+		}
+	}
+
+	ent[@"get-task-allow"] = @YES;
+	ent[@"com.apple.private.security.no-sandbox"] = @YES;
+
+	NSMutableSet<NSString *> *groups = [NSMutableSet setWithObjects:
+		@"group.com.SideStore.SideStore",
+		@"group.com.rileytestut.AltStore", nil];
+	id existingGroups = ent[@"com.apple.security.application-groups"];
+	if ([existingGroups isKindOfClass:[NSArray class]]) {
+		for (id g in (NSArray *)existingGroups) {
+			if ([g isKindOfClass:[NSString class]]) {
+				[groups addObject:g];
+			}
+		}
+	}
+	ent[@"com.apple.security.application-groups"] = [groups allObjects];
+	if (extraEntitlements != nil) {
+		[ent addEntriesFromDictionary:extraEntitlements];
+	}
+
+	NSData *xml = [NSPropertyListSerialization dataWithPropertyList:ent
+	                                                         format:NSPropertyListXMLFormat_v1_0
+	                                                        options:0
+	                                                          error:nil];
+	if (xml == nil) return NO;
+
+	uint32_t ent_blob_len = 8 + (uint32_t)xml.length;
+	NSMutableData *ent_blob = [NSMutableData dataWithLength:ent_blob_len];
+	uint32_t *eh = (uint32_t *)ent_blob.mutableBytes;
+	eh[0] = htonl(0xfade7171);
+	eh[1] = htonl(ent_blob_len);
+	memcpy(ent_blob.mutableBytes + 8, xml.bytes, xml.length);
+
+	uint8_t ent_hash[32];
+	CC_SHA256(ent_blob.bytes, (CC_LONG)ent_blob.length, ent_hash);
+
+	uint32_t req_blob[3] = { htonl(0xfade0c01), htonl(12), 0 };
+	uint8_t req_hash[32];
+	CC_SHA256(req_blob, 12, req_hash);
+
+	uint32_t sig_blob[2] = { htonl(0xfade0b01), htonl(8) };
+
+	uint32_t codeLimit = (cs_cmd_offset != 0) ? orig_dataoff : (uint32_t)data.length;
+	if (data.length > codeLimit) {
+		[data setLength:codeLimit];
+	}
+	while (codeLimit % 16 != 0) {
+		[data appendBytes:"\0" length:1];
+		codeLimit++;
+	}
+
+	uint32_t nCodeSlots = (codeLimit + 4095) / 4096;
+	uint32_t nSpecialSlots = 5;
+	const char *ident = [path.lastPathComponent.stringByDeletingPathExtension UTF8String];
+	if (!ident || strlen(ident) == 0) ident = "binary";
+	uint32_t ident_offset = 44;
+	uint32_t hash_offset = ident_offset + (uint32_t)strlen(ident) + 1;
+	while (hash_offset % 4 != 0) hash_offset++;
+	uint32_t actual_hash_offset = hash_offset + nSpecialSlots * 32;
+	uint32_t cd_length = actual_hash_offset + nCodeSlots * 32;
+
+	NSMutableData *cd_data = [NSMutableData dataWithLength:cd_length];
+	uint32_t *cd_words = (uint32_t *)cd_data.mutableBytes;
+	cd_words[0] = htonl(0xfade0c02);
+	cd_words[1] = htonl(cd_length);
+	cd_words[2] = htonl(0x20100);
+	cd_words[3] = htonl(0x00000006);
+	cd_words[4] = htonl(actual_hash_offset);
+	cd_words[5] = htonl(ident_offset);
+	cd_words[6] = htonl(nSpecialSlots);
+	cd_words[7] = htonl(nCodeSlots);
+	cd_words[8] = htonl(codeLimit);
+	uint8_t *cd_bytes = (uint8_t *)cd_data.mutableBytes;
+	cd_bytes[36] = 32;
+	cd_bytes[37] = 2;
+	cd_bytes[38] = 0;
+	cd_bytes[39] = 12;
+	memcpy(cd_bytes + ident_offset, ident, strlen(ident) + 1);
+
+	memcpy(cd_bytes + actual_hash_offset - 2 * 32, req_hash, 32);
+	memcpy(cd_bytes + actual_hash_offset - 5 * 32, ent_hash, 32);
+
+	for (uint32_t p = 0; p < nCodeSlots; p++) {
+		uint32_t pstart = p * 4096;
+		uint32_t plen = (pstart + 4096 <= codeLimit) ? 4096 : (codeLimit - pstart);
+		CC_SHA256((const uint8_t *)data.bytes + pstart, plen, cd_bytes + actual_hash_offset + p * 32);
+	}
+
+	uint32_t sb_index_size = 12 + 4 * 8;
+	uint32_t cd_offset = (sb_index_size + 15) & ~15;
+	uint32_t req_offset = (cd_offset + (uint32_t)cd_data.length + 15) & ~15;
+	uint32_t ent_offset_val = (req_offset + 12 + 15) & ~15;
+	uint32_t sig_offset = (ent_offset_val + (uint32_t)ent_blob.length + 15) & ~15;
+	uint32_t sb_total_size = (sig_offset + 8 + 15) & ~15;
+
+	NSMutableData *sb = [NSMutableData dataWithLength:sb_total_size];
+	uint32_t *sb_words = (uint32_t *)sb.mutableBytes;
+	sb_words[0] = htonl(0xfade0cc0);
+	sb_words[1] = htonl(sb_total_size);
+	sb_words[2] = htonl(4);
+	sb_words[3] = htonl(0);
+	sb_words[4] = htonl(cd_offset);
+	sb_words[5] = htonl(2);
+	sb_words[6] = htonl(req_offset);
+	sb_words[7] = htonl(5);
+	sb_words[8] = htonl(ent_offset_val);
+	sb_words[9] = htonl(0x10000);
+	sb_words[10] = htonl(sig_offset);
+
+	memcpy(sb.mutableBytes + cd_offset, cd_data.bytes, cd_data.length);
+	memcpy(sb.mutableBytes + req_offset, req_blob, 12);
+	memcpy(sb.mutableBytes + ent_offset_val, ent_blob.bytes, ent_blob.length);
+	memcpy(sb.mutableBytes + sig_offset, sig_blob, 8);
+
+	[data appendData:sb];
+
+	mh = (struct mach_header_64 *)data.mutableBytes;
+	struct segment_command_64 *linkedit_cmd = (struct segment_command_64 *)(data.mutableBytes + linkedit_cmd_offset);
+
+	if (cs_cmd_offset != 0) {
+		struct linkedit_data_command *cs_cmd = (struct linkedit_data_command *)(data.mutableBytes + cs_cmd_offset);
+		cs_cmd->dataoff = codeLimit;
+		cs_cmd->datasize = sb_total_size;
+	} else {
+		if (first_fileoff < sizeof(struct mach_header_64) + mh->sizeofcmds + sizeof(struct linkedit_data_command)) {
+			return NO;
+		}
+		struct linkedit_data_command *new_cs = (struct linkedit_data_command *)(data.mutableBytes + sizeof(struct mach_header_64) + mh->sizeofcmds);
+		memset(new_cs, 0, sizeof(*new_cs));
+		new_cs->cmd = 0x1d;
+		new_cs->cmdsize = sizeof(*new_cs);
+		new_cs->dataoff = codeLimit;
+		new_cs->datasize = sb_total_size;
+
+		mh->ncmds += 1;
+		mh->sizeofcmds += sizeof(*new_cs);
+	}
+
+	linkedit_cmd->filesize = (codeLimit + sb_total_size) - linkedit_cmd->fileoff;
+	linkedit_cmd->vmsize = (linkedit_cmd->filesize + 0x3fff) & ~0x3fff;
+
+	if (![data writeToFile:path atomically:YES]) {
+		return NO;
+	}
+	chmod(path.fileSystemRepresentation, 0755);
+	return YES;
+}
+
+static void
+collect_machos(NSString *dir, NSMutableArray<NSString *> *machos)
+{
+	NSFileManager *fm = NSFileManager.defaultManager;
+	for (NSString *name in [fm contentsOfDirectoryAtPath:dir error:nil]) {
+		NSString *path = [dir stringByAppendingPathComponent:name];
+		BOOL isDir = NO;
+		if ([fm fileExistsAtPath:path isDirectory:&isDir]) {
+			if (isDir) {
+				collect_machos(path, machos);
+			} else {
+				NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+				if (fh) {
+					NSData *magicData = [fh readDataOfLength:4];
+					[fh closeFile];
+					if (magicData.length == 4) {
+						uint32_t m = *(const uint32_t *)magicData.bytes;
+						if (m == 0xfeedfacf || m == 0xfeedface || m == 0xcafebabe || m == 0xcafebabf) {
+							[machos addObject:path];
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+static void
+sign_all_machos(NSString *appDir, NSDictionary *extraEntitlements)
+{
+	NSMutableArray<NSString *> *machos = [NSMutableArray array];
+	collect_machos(appDir, machos);
+	printf("appinst: found %lu Mach-O binary/binaries to sign in %s\n", (unsigned long)machos.count, appDir.UTF8String);
+	for (NSString *macho in machos) {
+		chmod(macho.fileSystemRepresentation, 0755);
+		BOOL ok = sign_macho(macho, extraEntitlements);
+		printf("appinst: ad-hoc signed %s: %s\n", macho.lastPathComponent.UTF8String, ok ? "OK" : "FAILED");
+	}
+}
+
+static NSDictionary<NSString *, NSString *> *
+setup_app_groups(NSArray<NSString *> *groups)
+{
+	NSFileManager *fm = NSFileManager.defaultManager;
+	NSMutableDictionary<NSString *, NSString *> *containers = [NSMutableDictionary dictionary];
+	NSString *baseShared = @"/private/var/mobile/Containers/Shared/AppGroup";
+	[fm createDirectoryAtPath:baseShared withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0775 } error:nil];
+
+	for (NSString *groupId in groups) {
+		NSString *containerPath = nil;
+		MCMContainer *group = [NSClassFromString(@"MCMSharedDataContainer") containerWithIdentifier:groupId
+		                                                                          createIfNecessary:YES
+		                                                                                    existed:NULL
+		                                                                                      error:NULL];
+		if (group.url != nil && group.url.path != nil) {
+			containerPath = group.url.path;
+		} else {
+			NSString *uuid = [[NSUUID UUID] UUIDString];
+			containerPath = [baseShared stringByAppendingPathComponent:uuid];
+			NSDictionary *meta = @{
+				@"MCMMetadataIdentifier": groupId,
+				@"MCMMetadataUUID": uuid,
+				@"MCMMetadataContentClass": @7,
+			};
+			[fm createDirectoryAtPath:containerPath withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0775 } error:nil];
+			NSString *metaPath = [containerPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+			[meta writeToFile:metaPath atomically:YES];
+		}
+
+		for (NSString *sub in @[@"Library", @"Library/Preferences", @"Library/Caches", @"Documents"]) {
+			NSString *subPath = [containerPath stringByAppendingPathComponent:sub];
+			[fm createDirectoryAtPath:subPath withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0775 } error:nil];
+		}
+		containers[groupId] = containerPath;
+		printf("appinst: configured AppGroup %s at %s\n", groupId.UTF8String, containerPath.UTF8String);
+	}
+	return containers;
+}
+
 /* the application extensions inside, as LaunchServices wants them listed with their bundle */
 static NSDictionary *
-plugins_of(NSString *app)
+plugins_of(NSString *app, NSDictionary<NSString *, NSString *> *groupContainers)
 {
 	NSMutableDictionary *plugins = [NSMutableDictionary dictionary];
 	NSString *dir = [app stringByAppendingPathComponent:@"PlugIns"];
@@ -132,15 +430,38 @@ plugins_of(NSString *app)
 		NSString *path = [dir stringByAppendingPathComponent:name];
 		NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[path stringByAppendingPathComponent:@"Info.plist"]];
 		NSString *identifier = info[@"CFBundleIdentifier"];
+		NSString *executable = info[@"CFBundleExecutable"];
 
 		if (identifier == nil) {
 			continue;
 		}
-		plugins[identifier] = @{ @"ApplicationType": @"PluginKitPlugin", @"CFBundleIdentifier": identifier,
-		                         @"CodeInfoIdentifier": identifier, @"Path": path, @"IsAdHocSigned": @YES,
-		                         @"SignerOrganization": @"Apple Inc.", @"SignerIdentity": @"Apple iPhone OS Application Signing",
-		                         @"PluginOwnerBundleID": [NSDictionary dictionaryWithContentsOfFile:
-		                             [app stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleIdentifier"] ?: @"" };
+		if (executable != nil) {
+			chmod([path stringByAppendingPathComponent:executable].fileSystemRepresentation, 0755);
+		}
+
+		NSMutableDictionary *pRecord = [NSMutableDictionary dictionaryWithDictionary:@{
+			@"ApplicationType": @"PluginKitPlugin",
+			@"CFBundleIdentifier": identifier,
+			@"CodeInfoIdentifier": identifier,
+			@"Path": path,
+			@"IsAdHocSigned": @YES,
+			@"SignerOrganization": @"Apple Inc.",
+			@"SignerIdentity": @"Apple iPhone OS Application Signing",
+			@"PluginOwnerBundleID": [NSDictionary dictionaryWithContentsOfFile:
+			    [app stringByAppendingPathComponent:@"Info.plist"]][@"CFBundleIdentifier"] ?: @""
+		}];
+
+		MCMContainer *pdata = [NSClassFromString(@"MCMPluginKitPluginDataContainer") containerWithIdentifier:identifier
+		                                                                                    createIfNecessary:YES
+		                                                                                              existed:NULL
+		                                                                                                error:NULL];
+		if (pdata.url.path != nil) {
+			pRecord[@"Container"] = pdata.url.path;
+		}
+		if (groupContainers.count > 0) {
+			pRecord[@"GroupContainers"] = groupContainers;
+		}
+		plugins[identifier] = pRecord;
 	}
 	return plugins;
 }
@@ -189,12 +510,20 @@ install_into(NSString *source, NSString *bundle)
 		fprintf(stderr, "appinst: no data container for %s: %s\n", identifier.UTF8String, error.description.UTF8String);
 		return 1;
 	}
+
+	NSDictionary<NSString *, NSString *> *groupContainers = setup_app_groups(@[
+		@"group.com.SideStore.SideStore",
+		@"group.com.rileytestut.AltStore"
+	]);
+	sign_all_machos(app, nil);
+
 	NSDictionary *record = @{
 		@"ApplicationType": @"System",
 		@"CFBundleIdentifier": identifier,
 		@"CodeInfoIdentifier": identifier,
 		@"CompatibilityState": @0,
 		@"Container": home,
+		@"GroupContainers": groupContainers,
 		@"IsContainerized": @YES,
 		@"EnvironmentVariables": @{ @"CFFIXED_USER_HOME": home, @"HOME": home, @"TMPDIR": [home stringByAppendingPathComponent:@"tmp"] },
 		@"IsDeletable": @NO,
@@ -208,13 +537,16 @@ install_into(NSString *source, NSString *bundle)
 		@"SignerOrganization": @"Apple Inc.",
 		@"SignatureVersion": @132352,
 		@"SignerIdentity": @"Apple iPhone OS Application Signing",
-		@"_LSBundlePlugins": plugins_of(app),
+		@"_LSBundlePlugins": plugins_of(app, groupContainers),
 	};
 	if (![[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] registerApplicationDictionary:record]) {
 		fprintf(stderr, "appinst: LaunchServices refused %s\n", identifier.UTF8String);
 		return 1;
 	}
 	printf("appinst: %s installed at %s, data in %s\n", identifier.UTF8String, app.UTF8String, home.UTF8String);
+
+	notify_post("com.redwood.var_save");
+	printf("appinst: posted com.redwood.var_save for %s\n", identifier.UTF8String);
 	return 0;
 }
 
@@ -367,8 +699,13 @@ int
 main(int argc, char **argv)
 {
 	@autoreleasepool {
-		if (argc == 3 && strcmp(argv[1], "install") == 0) {
-			return install(@(argv[2]));
+		if ((argc == 2 || argc == 3) && strcmp(argv[1], "install") == 0) {
+			const char *target = (argc == 3) ? argv[2] : (getenv("IPA_PATH") ?: getenv("K90_IPA"));
+			if (target != NULL) {
+				return install(@(target));
+			}
+			fprintf(stderr, "appinst install requires an IPA or app path argument or IPA_PATH/K90_IPA env var\n");
+			return 2;
 		}
 		if (argc == 3 && strcmp(argv[1], "remove") == 0) {
 			return remove_app(@(argv[2]));

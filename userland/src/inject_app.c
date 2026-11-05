@@ -332,6 +332,50 @@ watch(const char *name, const char *selector, IMP ours, void *theirs)
 	}
 }
 
+static void
+setup_app_container_env(const char *name)
+{
+	char env_path[128];
+	char line[256];
+	FILE *f;
+
+	snprintf(env_path, sizeof(env_path), "/redwood/etc/env/%s", name);
+	f = fopen(env_path, "r");
+	if (f != NULL) {
+		while (fgets(line, sizeof(line), f) != NULL) {
+			char *eq = strchr(line, '=');
+
+			line[strcspn(line, "\r\n")] = '\0';
+			if (eq != NULL && eq != line) {
+				*eq = '\0';
+				setenv(line, eq + 1, 1);
+			}
+		}
+		fclose(f);
+	}
+	/* Ensure CFFIXED_USER_HOME, HOME and TMPDIR are defined for containerized applications */
+	if (getenv("CFFIXED_USER_HOME") == NULL) {
+		const char *uuid = NULL;
+
+		if (strcmp(name, "Calculator") == 0) {
+			uuid = "28C5E77E-97C5-4927-A2B0-04987EBF4665";
+		} else if (strcmp(name, "MobileNotes") == 0) {
+			uuid = "39D6F88F-A8D6-4A38-B1F1-15A98FCA5776";
+		} else if (strcmp(name, "Reminders") == 0) {
+			uuid = "5BF8A0AF-C8E6-4B1A-9D2E-2C3D4E5F6A71";
+		}
+		if (uuid != NULL) {
+			char home[256], tmp[256];
+
+			snprintf(home, sizeof(home), "/private/var/mobile/Containers/Data/Application/%s", uuid);
+			snprintf(tmp, sizeof(tmp), "%s/tmp", home);
+			setenv("CFFIXED_USER_HOME", home, 1);
+			setenv("HOME", home, 0);
+			setenv("TMPDIR", tmp, 0);
+		}
+	}
+}
+
 __attribute__((constructor))
 static void
 redwood_app_init(void)
@@ -348,6 +392,7 @@ redwood_app_init(void)
 	}
 	who = name;
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+	setup_app_container_env(name);
 	/*
 	 * An application's standard error goes nowhere here, and that is where the Swift runtime says
 	 * what it is about to die of ("Fatal error: ..."), so it is pointed at the console.

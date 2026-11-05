@@ -288,6 +288,12 @@ bind(int fd, const void *address, unsigned length)
 }
 
 int
+setpriority(int which, int who, int prio)
+{
+	return (int)SC(SYS_setpriority, which, who, prio, 0, 0, 0);
+}
+
+int
 reboot(int howto)
 {
 	return (int)SC(SYS_reboot, howto, 0, 0, 0, 0, 0);

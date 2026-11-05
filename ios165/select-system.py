@@ -43,7 +43,7 @@ WHOLE = ('usr/libexec/', 'usr/sbin/', 'usr/bin/', 'usr/lib/', 'usr/share/', 'sbi
 # News refuses to start without its own -- "a legal requirement"; nor Health, the plug-ins the Health
 # application and its daemon are made of: both stop with a fatal error when the directory is not there.
 # Of Health only the pictures and films of the activity awards are left out, see SKIP_PREFIX and HEALTH)
-SKIP_SYSTEM_LIBRARY = ('LinguisticData', 'PreinstalledAssetsV2', 'NanoTimeKit', 'Audio',
+SKIP_SYSTEM_LIBRARY = ('PreinstalledAssetsV2', 'NanoTimeKit', 'Audio',
                        'Assistant', 'AccessibilityBundles',
                        'VideoProcessors', 'ScreenReader', 'Photos', 'Carrier Bundles', 'NanoPreferenceBundles',
                        'ImagingNetworks', 'ProductDocuments', 'AppPlaceholders', 'UserNotifications',
@@ -156,14 +156,16 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
 # ... but for these: bluetoothd, 11.6 MB (docs/analysis/2026-11-02-bluetooth-bringup.md)
-BIG_PROGRAMS_KEPT = ('usr/sbin/bluetoothd',)
+# remindd, 11.4 MB (docs/analysis/2026-11-05-app-exits-root-cause-and-fixes.md)
+BIG_PROGRAMS_KEPT = ('usr/sbin/bluetoothd', 'usr/libexec/remindd')
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
 # system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
          'System/Library/Audio/UISounds/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
-KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
+KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB',
+             'zh', 'zh_CN', 'zh-Hans', 'zh_Hans', 'zh_TW', 'zh_HK', 'zh-Hant', 'zh_Hant', 'Chinese')
 
 
 def entries(listing):
@@ -204,8 +206,15 @@ def mode_bits(text):
 
 def wanted_file(path, size):
     lproj = re.search(r'/([^/]+)\.lproj/', path)
-    if lproj and lproj.group(1) not in KEEP_LANG:
-        return False
+    if lproj:
+        if lproj.group(1) not in KEEP_LANG:
+            return False
+        if lproj.group(1).startswith('zh') or lproj.group(1) == 'Chinese':
+            return True
+    if path.startswith('System/Library/LinguisticData/'):
+        return True
+    if 'DataDetectorsCore.framework/com.apple.datadetectorscore.cache.' in path:
+        return True
     if path.startswith(AUDIO):
         return not path.startswith(SKIP_AUDIO) and '.espresso.' not in path
     if path.startswith(SKIP_PREFIX):
@@ -251,7 +260,8 @@ def main():
             source['Applications/' + path[len(STAGED_APPS):]] = path
             path = 'Applications/' + path[len(STAGED_APPS):]
         elif path.startswith('private/var/'):
-            continue
+            if not re.search(r'/(zh[^/]*|Chinese)\.lproj($|/)', path):
+                continue
         meta[path] = (mode, int(e.get('User ID') or 0), int(e.get('Group ID') or 0),
                       e.get('Symbolic Link', ''), int(e.get('Size') or 0))
 
@@ -266,13 +276,26 @@ def main():
             # (the sound plug-ins' too: Library/Audio is skipped but for AUDIO, and without its en.lproj the
             # virtual audio device's port names came out NULL -- mediaserverd died naming the microphone)
             lproj = re.search(r'/([^/]+)\.lproj$', path)
+            is_zh = lproj and (lproj.group(1).startswith('zh') or lproj.group(1) == 'Chinese')
             keep = '/' not in path or path in ('private/var', 'private/tmp', 'private/etc', 'private/preboot',
                                                'private/xarts', 'private') or \
-                bool(lproj) and lproj.group(1) in KEEP_LANG and \
-                (path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX) or
-                 path.startswith(AUDIO) and not path.startswith(SKIP_AUDIO))
+                is_zh or \
+                (bool(lproj) and lproj.group(1) in KEEP_LANG and \
+                 (path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX) or
+                  path.startswith(AUDIO) and not path.startswith(SKIP_AUDIO)))
         if keep:
             chosen.add(path)
+
+    extra_dirs = [
+        ('private/var/mobile', 0o40755, 501, 501),
+        ('private/var/mobile/Library', 0o40755, 501, 501),
+        ('private/var/mobile/Library/SafariSafeBrowsing', 0o40755, 501, 501),
+        ('private/var/mobile/Library/Safari', 0o40700, 501, 501),
+    ]
+    for dpath, dmode, duid, dgid in extra_dirs:
+        meta[dpath] = (dmode, duid, dgid, '', 0)
+        chosen.add(dpath)
+
     # every directory on the way to something chosen
     for path in list(chosen):
         while '/' in path:

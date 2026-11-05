@@ -2,29 +2,87 @@
  * var_store watch / stamp / seed helpers (included by var_store.c).
  */
 
-/*
- * Stay and save by itself. The kernel is told there is a saver, and then this waits: for the
- * kernel to ask (the run is ending, and it waits for the answer before it goes), and, if seconds
- * is given, for that long to pass between saves of its own accord. A save that fails is said so
- * and the waiting goes on -- the one at the end of the run still gets its chance.
- */
+#define NOTIFY_STATUS_OK 0
+#define NOTIFY_TRIGGER_VAR "/private/var/run/com.redwood.var_save"
+#define NOTIFY_TRIGGER_TMP "/tmp/com.redwood.var_save"
+
+static int
+notify_register_check(const char *name, int *out_token)
+{
+	(void)name;
+	if (out_token != NULL) {
+		*out_token = 1;
+	}
+	return NOTIFY_STATUS_OK;
+}
+
+static int
+notify_check(int token, int *check)
+{
+	struct stat st;
+	int state = VAR_SAVE_NONE;
+
+	(void)token;
+	if (check == NULL) {
+		return NOTIFY_STATUS_OK;
+	}
+	*check = 0;
+
+	if (stat(NOTIFY_TRIGGER_VAR, &st) == 0) {
+		unlink(NOTIFY_TRIGGER_VAR);
+		*check = 1;
+		return NOTIFY_STATUS_OK;
+	}
+	if (stat(NOTIFY_TRIGGER_TMP, &st) == 0) {
+		unlink(NOTIFY_TRIGGER_TMP);
+		*check = 1;
+		return NOTIFY_STATUS_OK;
+	}
+
+	if (sysctl_int("kern.redwood.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
+		*check = 1;
+		return NOTIFY_STATUS_OK;
+	}
+
+	return NOTIFY_STATUS_OK;
+}
+
 static int
 save_once(void)
 {
 	int ok;
 
-	/*
-	 * The device is opened for the save and closed again, not held: while a write is in flight
-	 * this kernel's own transfer list is out of the controller, and it goes back in when the
-	 * device is closed (bsd/dev/redwood_ufs.c, ufs_cclose). A watcher that kept the device open
-	 * would leave iOS reading the flash through the loader for the rest of the run.
-	 */
+	set_background_qos();
 	fd = open(DEVICE, O_RDWR, 0);
 	if (fd < 0) {
 		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
 		return 0;
 	}
 	ok = claim() && save();
+	if (ok) {
+		klog_flush();
+	}
+	release();
+	close(fd);
+	fd = -1;
+	return ok;
+}
+
+static int
+delta_save_once(void)
+{
+	int ok;
+
+	set_background_qos();
+	fd = open(DEVICE, O_RDWR, 0);
+	if (fd < 0) {
+		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
+		return 0;
+	}
+	ok = claim() && delta_save();
+	if (ok) {
+		klog_flush();
+	}
 	release();
 	close(fd);
 	fd = -1;
@@ -34,8 +92,16 @@ save_once(void)
 static int
 watch(int seconds)
 {
-	uint64_t last = 0;
+	struct dir_snapshot prev_snap, curr_snap;
+	uint64_t last_saved = 0;
+	uint64_t last_checked = 0;
+	uint64_t last_klog = 0;
+	int interval = seconds > 0 ? seconds : 20;
+	int token = 0;
 	int asked = 0;
+
+	set_background_qos();
+	notify_register_check("com.redwood.var_save", &token);
 
 	fd = open(DEVICE, O_RDWR, 0);
 	if (fd < 0) {
@@ -45,44 +111,95 @@ watch(int seconds)
 	}
 	close(fd);
 	fd = -1;
+
 	if (sysctl_set_int("kern.redwood.var_save", VAR_SAVE_IDLE) != 0) {
 		printf("var_store: this kernel does not keep the data volume (%s)\n", strerror(errno));
 		return 0;
 	}
-	printf("var_store: watching: the volume is saved when the run ends%s\n",
-	    seconds > 0 ? ", and in between" : "");
+	printf("var_store: watching: auto snapshot check every %d s, notify listener active\n", interval);
+
+	compute_snapshot(&prev_snap);
 	{
 		struct timeval tv = { 0, 0 };
-
 		gettimeofday(&tv, NULL);
-		last = (uint64_t)tv.tv_sec;
+		last_saved = (uint64_t)tv.tv_sec;
+		last_checked = (uint64_t)tv.tv_sec;
+		last_klog = (uint64_t)tv.tv_sec;
 	}
+
 	for (;;) {
 		struct timeval tv = { 0, 0 };
 		int state = VAR_SAVE_NONE;
+		int notify_triggered = 0;
 
 		if (sysctl_int("kern.redwood.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
 			asked = 1;
 		}
-		gettimeofday(&tv, NULL);
-		if (asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {
-			int ok = save_once();
 
+		notify_check(token, &notify_triggered);
+		gettimeofday(&tv, NULL);
+
+		if (asked) {
+			int ok = save_once();
 			if (!ok) {
 				printf("var_store: this save came to nothing; the store keeps what it had\n");
 			}
-			last = (uint64_t)tv.tv_sec;
-			if (asked) {
-				/* answered either way: the kernel is waiting on this to go back to the loader */
-				(void)sysctl_set_int("kern.redwood.var_save", VAR_SAVE_DONE);
-				return ok;
+			(void)sysctl_set_int("kern.redwood.var_save", VAR_SAVE_DONE);
+			return ok;
+		}
+
+		if (notify_triggered) {
+			printf("var_store: save triggered by com.redwood.var_save notification\n");
+			int ok = 0;
+			if (delta_is_near_full()) {
+				printf("var_store: delta slot near full (>=60 MiB): merging base slot\n");
+				ok = save_once();
+			} else {
+				ok = delta_save_once();
+			}
+			if (ok) {
+				last_saved = (uint64_t)tv.tv_sec;
+				compute_snapshot(&prev_snap);
+			}
+		} else if ((uint64_t)tv.tv_sec - last_checked >= (uint64_t)interval) {
+			last_checked = (uint64_t)tv.tv_sec;
+			compute_snapshot(&curr_snap);
+
+			if (snapshot_is_dirty(&curr_snap, &prev_snap)) {
+				if ((uint64_t)tv.tv_sec - last_saved >= 10) {
+					printf("var_store: changes detected in watched paths, performing incremental save\n");
+					int ok = 0;
+					if (delta_is_near_full()) {
+						printf("var_store: delta slot near full (>=60 MiB): merging base slot\n");
+						ok = save_once();
+					} else {
+						ok = delta_save_once();
+					}
+					if (ok) {
+						last_saved = (uint64_t)tv.tv_sec;
+						prev_snap = curr_snap;
+					}
+				}
 			}
 		}
+
+		if ((uint64_t)tv.tv_sec - last_klog >= 25) {
+			last_klog = (uint64_t)tv.tv_sec;
+			fd = open(DEVICE, O_RDWR, 0);
+			if (fd >= 0) {
+				if (claim()) {
+					klog_flush();
+					release();
+				}
+				close(fd);
+				fd = -1;
+			}
+		}
+
 		usleep(100000);
 	}
 }
 
-/* A line saying when, for a run to leave behind and the next one to find. */
 static int
 stamp(const char *where)
 {
@@ -124,7 +241,6 @@ stamp(const char *where)
 	return 1;
 }
 
-/* etc/var.seed of the image this program was started from (argv[0] ends in bin/var_store), or NULL */
 static const char *
 seed(const char *self)
 {

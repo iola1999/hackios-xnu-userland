@@ -217,7 +217,7 @@ import sys
 # it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.)
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
-        'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'camera', 'ReportCrash',
+        'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties',
         'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'bird',
@@ -225,6 +225,12 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
         'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+
+# cameracaptured and fontservicesd must not be blocked:
+# - cameracaptured allows on-demand camera capture service for Control Center and Camera.
+# - fontservicesd allows WebContent/Safari to register dynamic web fonts (e.g. YouTube icon/web fonts).
+assert not any(word in 'com.apple.cameracaptured' for word in DENY), "cameracaptured must not be in DENY"
+assert not any(word in 'com.apple.fontservicesd' for word in DENY), "fontservicesd must not be in DENY"
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
@@ -292,9 +298,11 @@ for label in labels:
     # it. The boot of 22 October showed what declining costs: SpringBoard's icons stopped being
     # drawn, because its layers ask for one of those formats and a refused texture is a layer
     # that never appears.
-    for env_name in ('RWA_PACKED16',):
+    for env_name in ('RWA_PACKED16', 'WEBKIT_FONT_SANDBOX_UNBLOCK', 'FONT_SERVICES_UNBLOCKED'):
         if os.environ.get(env_name):
             job.setdefault('EnvironmentVariables', {})[env_name] = os.environ[env_name]
+    if 'fontservices' in label or 'WebContent' in label:
+        job.setdefault('EnvironmentVariables', {})['FONT_SERVICES_UNBLOCKED'] = '1'
     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
     # device tree, which the loader's tree does not have yet
     job.pop('_LimitLoadToDeviceTree', None)
@@ -332,9 +340,11 @@ if rest:
         # it. The boot of 22 October showed what declining costs: SpringBoard's icons stopped being
         # drawn, because its layers ask for one of those formats and a refused texture is a layer
         # that never appears.
-        for env_name in ('RWA_PACKED16',):
+        for env_name in ('RWA_PACKED16', 'WEBKIT_FONT_SANDBOX_UNBLOCK', 'FONT_SERVICES_UNBLOCKED'):
             if os.environ.get(env_name):
                 job.setdefault('EnvironmentVariables', {})[env_name] = os.environ[env_name]
+        if 'fontservices' in label or 'WebContent' in label:
+            job.setdefault('EnvironmentVariables', {})['FONT_SERVICES_UNBLOCKED'] = '1'
         if label in oslog:
             job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
         with open(f'{dest}/{name}', 'wb') as f:

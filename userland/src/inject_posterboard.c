@@ -46,6 +46,8 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#include <notify.h>
+#include <dispatch/dispatch.h>
 
 enum { ERROR_LINES = 300, FRAMES = 8 };
 
@@ -356,6 +358,139 @@ forward_stderr(void *arg)
     return NULL;
 }
 
+static int s_wallpaper_suspended = 0;
+#define MAX_DISPLAY_LINKS 16
+static id s_display_links[MAX_DISPLAY_LINKS];
+static int s_num_display_links = 0;
+static pthread_mutex_t s_link_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void (*orig_add_to_run_loop)(id, SEL, id, id);
+static void (*orig_display_link_invalidate)(id, SEL);
+static void (*orig_cmdbuf_commit)(id, SEL);
+
+static void
+mercury_display_link_add_to_run_loop(id self, SEL cmd, id runloop, id mode)
+{
+    pthread_mutex_lock(&s_link_mutex);
+    int found = 0;
+    for (int i = 0; i < s_num_display_links; i++) {
+        if (s_display_links[i] == self) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found && s_num_display_links < MAX_DISPLAY_LINKS) {
+        s_display_links[s_num_display_links++] = self;
+    }
+    if (s_wallpaper_suspended) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(self, sel_registerName("setPaused:"), YES);
+    }
+    pthread_mutex_unlock(&s_link_mutex);
+
+    if (orig_add_to_run_loop) {
+        orig_add_to_run_loop(self, cmd, runloop, mode);
+    }
+}
+
+static void
+mercury_display_link_invalidate(id self, SEL cmd)
+{
+    pthread_mutex_lock(&s_link_mutex);
+    for (int i = 0; i < s_num_display_links; i++) {
+        if (s_display_links[i] == self) {
+            s_display_links[i] = s_display_links[--s_num_display_links];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_link_mutex);
+
+    if (orig_display_link_invalidate) {
+        orig_display_link_invalidate(self, cmd);
+    }
+}
+
+static void
+mercury_set_suspended(int suspend)
+{
+    pthread_mutex_lock(&s_link_mutex);
+    s_wallpaper_suspended = suspend;
+    for (int i = 0; i < s_num_display_links; i++) {
+        id link = s_display_links[i];
+        if (link) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(link, sel_registerName("setPaused:"), suspend ? YES : NO);
+        }
+    }
+    pthread_mutex_unlock(&s_link_mutex);
+    fprintf(stderr, "pb26: mercury poster submissions %s\n", suspend ? "suspended" : "resumed");
+}
+
+static void
+mercury_cmdbuf_commit(id self, SEL cmd)
+{
+    if (s_wallpaper_suspended) {
+        usleep(200000);
+    }
+    if (orig_cmdbuf_commit) {
+        orig_cmdbuf_commit(self, cmd);
+    }
+}
+
+static void
+install_mercury_hooks(void)
+{
+    static int hooks_installed = 0;
+    if (hooks_installed) return;
+    hooks_installed = 1;
+
+    Class dl_cls = objc_getClass("CADisplayLink");
+    if (dl_cls) {
+        Method m_add = class_getInstanceMethod(dl_cls, sel_registerName("addToRunLoop:forMode:"));
+        if (m_add) {
+            orig_add_to_run_loop = (void (*)(id, SEL, id, id))method_getImplementation(m_add);
+            method_setImplementation(m_add, (IMP)mercury_display_link_add_to_run_loop);
+        }
+        Method m_inv = class_getInstanceMethod(dl_cls, sel_registerName("invalidate"));
+        if (m_inv) {
+            orig_display_link_invalidate = (void (*)(id, SEL))method_getImplementation(m_inv);
+            method_setImplementation(m_inv, (IMP)mercury_display_link_invalidate);
+        }
+    }
+
+    Class cb_cls = objc_getClass("_MTLCommandBuffer");
+    if (cb_cls) {
+        Method m_commit = class_getInstanceMethod(cb_cls, sel_registerName("commit"));
+        if (m_commit) {
+            orig_cmdbuf_commit = (void (*)(id, SEL))method_getImplementation(m_commit);
+            method_setImplementation(m_commit, (IMP)mercury_cmdbuf_commit);
+        }
+    }
+
+    int token_suspend = 0;
+    notify_register_dispatch("com.redwood.wallpaper.suspend", &token_suspend, dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        mercury_set_suspended(1);
+    });
+
+    int token_resume = 0;
+    notify_register_dispatch("com.redwood.wallpaper.resume", &token_resume, dispatch_get_main_queue(), ^(int t) {
+        (void)t;
+        mercury_set_suspended(0);
+    });
+
+    fprintf(stderr, "pb26: mercury poster throttling and suspension hooks installed\n");
+}
+
+static void
+mercury_image_callback(const struct mach_header *header, intptr_t slide)
+{
+    (void)header;
+    (void)slide;
+    Class dl_cls = objc_getClass("CADisplayLink");
+    if (dl_cls) {
+        install_mercury_hooks();
+    }
+}
+
 __attribute__((constructor)) static void
 install_mercury(void)
 {
@@ -371,6 +506,10 @@ install_mercury(void)
         if (_NSGetExecutablePath(path, &size) == 0)
             execve(path, *_NSGetArgv(), *_NSGetEnviron());
     }
+
+    install_mercury_hooks();
+    _dyld_register_func_for_add_image(mercury_image_callback);
+
     if (pipe(ends) != 0) return;
     if (pthread_create(&thread, NULL, forward_stderr, (void *)(intptr_t)ends[0]) != 0) {
         close(ends[0]);
@@ -383,6 +522,7 @@ install_mercury(void)
     if (getenv("REDWOOD_EXT_ENV") != NULL)
         fprintf(stderr, "pb26: started again with the variables of %s\n", EXT_ENV_FILE);
 }
+
 
 /*
  * Poster snapshots as PNG. PosterUIFoundation writes every snapshot as ATX ("Snapshot-[%@].atx",

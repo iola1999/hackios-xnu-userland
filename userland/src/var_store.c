@@ -59,6 +59,8 @@
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
 #define STORE_AT        0LL
 #define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots (xnuloader/loader_dsu.inc DSU_STORE_SLOT) */
+#define DELTA_OFFSET    0xFB000000LL
+#define DELTA_BYTES     (64u << 20)
 #define SLOTS           2
 #define DEVICE          "/dev/rufs_dsu_store"
 #define ROOT            "/private/var"
@@ -251,22 +253,32 @@ slot_at(int slot)
 	return store_at + (off_t)slot * SLOT_BYTES;
 }
 
+static void
+set_background_qos(void)
+{
+	setpriority(PRIO_PROCESS, 0, 19);
+	setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG);
+	setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG);
+}
+
 static int
 device_write(off_t where, const void *data, uint64_t n)
 {
 	const uint8_t *p = data;
 
 	while (n > 0) {
-		ssize_t wrote = pwrite(fd, p, (size_t)n, where);
+		uint64_t chunk = n > BUFFER ? BUFFER : n;
+		ssize_t wrote = pwrite(fd, p, (size_t)chunk, where);
 
 		if (wrote <= 0) {
-			printf("var_store: writing %llu bytes at %lld: %s\n", (unsigned long long)n,
+			printf("var_store: writing %llu bytes at %lld: %s\n", (unsigned long long)chunk,
 			    (long long)where, strerror(errno));
 			return 0;
 		}
 		p += wrote;
 		where += wrote;
 		n -= (uint64_t)wrote;
+		usleep(10000);
 	}
 	return 1;
 }
@@ -440,7 +452,8 @@ stream_start(int slot, uint64_t bytes)
 {
 	at = slot_at(slot) + BLOCK;
 	/* a load reads no further than the archive's last block: a store in a file ends there */
-	stream_limit = bytes != 0 ? at + (off_t)((bytes + BLOCK - 1) / BLOCK * BLOCK) : slot_at(slot) + SLOT_BYTES;
+	off_t slot_limit = (slot == 0 || store_at == 0) ? slot_at(slot) + SLOT_BYTES : (off_t)DELTA_OFFSET;
+	stream_limit = bytes != 0 ? at + (off_t)((bytes + BLOCK - 1) / BLOCK * BLOCK) : slot_limit;
 	buffered = taken = 0;
 	stream_bytes = 0;
 	stream_left = bytes;
@@ -502,15 +515,14 @@ static char path[MAX_PATH];               /* the whole path, under ROOT */
 static struct { uint64_t ino; char path[LINK_PATH]; } *links;
 static uint64_t skipped_kinds, skipped_big;
 
+static int delta_mode = 0;
+
+#include "var_store_dirty.inc"
+
 static int
 is_skipped(const char *relative)
 {
-	for (int i = 0; SKIP[i] != NULL; i++) {
-		if (strcmp(relative, SKIP[i]) == 0) {
-			return 1;
-		}
-	}
-	return 0;
+	return is_transient_path(relative);
 }
 
 /* The name this inode was first met under, if it has one; otherwise this one is remembered. */
@@ -775,8 +787,17 @@ pack_tree(const char *relative)
 	if (lstat(path, &st) != 0) {
 		return 1;
 	}
-	if (relative[0] != 0 && !pack_one(relative, &st)) {
-		return 0;
+	if (relative[0] != 0) {
+		if ((st.st_mode & S_IFMT) != S_IFDIR && is_skipped(relative)) {
+			return 1;
+		}
+		int should_pack = 1;
+		if (delta_mode) {
+			should_pack = ((uint64_t)st.st_mtimespec.tv_sec >= last_saved_at);
+		}
+		if (should_pack && !pack_one(relative, &st)) {
+			return 0;
+		}
 	}
 	if ((st.st_mode & S_IFMT) != S_IFDIR || (relative[0] != 0 && is_skipped(relative))) {
 		return 1;
@@ -823,10 +844,15 @@ pack_tree(const char *relative)
 	depth--;
 	close(dir_fd);
 	if (ok && relative[0] != 0 && lstat(path, &st) == 0) {
-		ok = pack_dirtime(relative, &st);
+		if (!delta_mode || (uint64_t)st.st_mtimespec.tv_sec >= last_saved_at) {
+			ok = pack_dirtime(relative, &st);
+		}
 	}
 	return ok;
 }
+
+#include "var_store_klog.inc"
+#include "var_store_delta.inc"
 
 static int
 save(void)
@@ -835,6 +861,7 @@ save(void)
 	int slot, best;
 	static uint8_t block[BLOCK];
 
+	set_background_qos();
 	memset(&old, 0, sizeof(old));
 	best = newest(&old);
 	slot = best < 0 ? 0 : (best + 1) % slots;
@@ -896,356 +923,12 @@ save(void)
 	printf("var_store: %llu blocks written, %llu left alone (they held this already)%s\n",
 	    (unsigned long long)written_blocks, (unsigned long long)skipped_blocks,
 	    unsorted_dirs ? " (a directory was too big to put in order)" : "");
+	delta_reset(h.generation);
+	klog_flush();
 	return 1;
 }
 
-/* ---- unpacking ---- */
-
-static uint64_t made_dirs, made_files, made_links, made_bytes, short_files, lost_bytes;
-/*
- * A belt, after the braces: the memory filesystem no longer answers ENOSPC for want of a page
- * (bsd/miscfs/ramfs, ramfs_grow_slots now takes an array found without the mount lock), so a short
- * write here means the volume really is full. Waiting a little and trying again still earns its
- * place -- the pageout path cannot wait for an array either, and it may be what answered -- but
- * the whole restore spends at most RETRY_MS on it, so a volume that is truly full does not turn
- * the boot into a crawl.
- */
-#define RETRY_MS        2000
-static uint64_t retry_ms_left = RETRY_MS;
-
-static int
-whole_path(const char *relative, uint32_t len)
-{
-	if (len == 0 || len >= MAX_PATH - sizeof(ROOT) - 1 || relative[0] == '/') {
-		return 0;
-	}
-	for (uint32_t i = 0; i + 1 < len; i++) {
-		if (relative[i] == '.' && relative[i + 1] == '.' &&
-		    (i == 0 || relative[i - 1] == '/') && (i + 2 == len || relative[i + 2] == '/')) {
-			return 0;       /* nothing of this archive is unpacked outside ROOT */
-		}
-	}
-	strcpy(path, ROOT);
-	path[sizeof(ROOT) - 1] = '/';
-	memcpy(path + sizeof(ROOT), relative, len);
-	path[sizeof(ROOT) + len] = 0;
-	return 1;
-}
-
-static void
-set_times(const struct entry *e)
-{
-	struct timeval times[2];
-
-	times[0].tv_sec = (long)e->mtime_sec;
-	times[0].tv_usec = (int)(e->mtime_nsec / 1000);
-	times[1] = times[0];
-	utimes(path, times);
-}
-
-/*
- * One entry out of the archive and into /private/var. make: with 0, the entry is only read past
- * (the first pass, which proves the archive's checksum before anything is made).
- */
-#include "var_store_acl.inc"
-
-static int
-unpack_one(int make)
-{
-	struct entry e;
-	static char relative[MAX_PATH];
-	static uint8_t value[MAX_XATTR];
-	static char name[1024];
-	int out_fd = -1, ok = 1;
-
-	if (!in(&e, sizeof(e))) {
-		return 0;
-	}
-	if (e.pathlen >= MAX_PATH || e.nxattr > 4096) {
-		printf("var_store: an entry this program cannot read (kind %u, path %u bytes)\n", e.kind,
-		    e.pathlen);
-		return 0;
-	}
-	if (!in(relative, e.pathlen)) {
-		return 0;
-	}
-	relative[e.pathlen] = 0;
-	if (make && !whole_path(relative, e.pathlen)) {
-		make = 0;               /* read past it: an archive is not to make names of its own choosing */
-	}
-	if (make) {
-		switch (e.kind) {
-		case ENT_DIR:
-			if (mkdir(path, (int)e.mode) == 0) {
-				made_dirs++;
-			}
-			break;
-		case ENT_FILE:
-			out_fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, (int)e.mode);
-			if (out_fd < 0) {
-				printf("var_store: %s cannot be made: %s\n", path, strerror(errno));
-			} else {
-				made_files++;
-			}
-			break;
-		default:
-			break;
-		}
-	}
-	/* the attributes, before the contents, as they were packed */
-	acl_restored = 0;
-	for (uint32_t i = 0; i < e.nxattr; i++) {
-		uint32_t namelen, vlen;
-
-		if (!in(&namelen, sizeof(namelen)) || !in(&vlen, sizeof(vlen))) {
-			ok = 0;
-			break;
-		}
-		if (namelen >= sizeof(name) || vlen > sizeof(value)) {
-			ok = in_skip(namelen) && in_skip(vlen);
-			skipped_big++;
-			continue;
-		}
-		if (!in(name, namelen) || !in(value, vlen)) {
-			ok = 0;
-			break;
-		}
-		name[namelen] = 0;
-		if (make && e.kind != ENT_HARDLINK && !restore_acl(path, name, value, vlen)) {
-			setxattr(path, name, value, vlen, 0, XATTR_NOFOLLOW);
-		}
-	}
-	drop_inherited_acl(make && ok && (e.kind == ENT_DIR || e.kind == ENT_FILE) ? path : NULL);
-	if (!ok) {
-		if (out_fd >= 0) {
-			close(out_fd);
-		}
-		return 0;
-	}
-	/* the contents */
-	if (e.kind == ENT_FILE) {
-		static uint8_t piece[256 * 1024];
-		uint64_t left = e.size, in_file = 0;
-
-		while (left > 0) {
-			uint64_t want = left > sizeof(piece) ? sizeof(piece) : left, done = 0;
-
-			if (!in(piece, want)) {
-				ok = 0;
-				break;
-			}
-			/*
-			 * A whole data volume goes in at once, faster than the memory filesystem can find
-			 * pages for it, and it then says ENOSPC for want of one page rather than for want
-			 * of room (bsd/miscfs/ramfs, ramfs_grow_slots and the page limit). So a short write
-			 * is waited out and tried again, and only a file that will not go in at all after a
-			 * second of trying is given up on -- with its name, so it is known which.
-			 */
-			while (out_fd >= 0 && done < want) {
-				ssize_t wrote = write(out_fd, piece + done, (size_t)(want - done));
-
-				if (wrote > 0) {
-					done += (uint64_t)wrote;
-					continue;
-				}
-				if (retry_ms_left < 5) {
-					printf("var_store: %s: %llu of %llu bytes, no more would go in: %s\n",
-					    path, (unsigned long long)(in_file + done),
-					    (unsigned long long)e.size, strerror(errno));
-					short_files++;
-					lost_bytes += e.size - in_file - done;
-					close(out_fd);
-					out_fd = -1;
-					break;
-				}
-				usleep(5000);
-				retry_ms_left -= 5;
-			}
-			in_file += done;
-			left -= want;
-		}
-		if (make) {
-			made_bytes += in_file;
-		}
-	} else if (e.kind == ENT_SYMLINK || e.kind == ENT_HARDLINK) {
-		static char target[MAX_PATH];
-
-		if (e.size >= MAX_PATH) {
-			ok = in_skip(e.size);
-		} else if (!in(target, e.size)) {
-			ok = 0;
-		} else {
-			target[e.size] = 0;
-			if (make && e.kind == ENT_SYMLINK) {
-				/* a name the skeleton made too comes out as the store has it */
-				unlink(path);
-				if (symlink(target, path) == 0) {
-					made_links++;
-				}
-			} else if (make) {
-				static char from[MAX_PATH];
-				char keep[MAX_PATH];
-
-				strcpy(keep, path);
-				if (whole_path(target, (uint32_t)e.size)) {
-					strcpy(from, path);
-					strcpy(path, keep);
-					unlink(path);
-					if (link(from, path) == 0) {
-						made_links++;
-					}
-				} else {
-					strcpy(path, keep);
-				}
-			}
-		}
-	}
-	if (out_fd >= 0) {
-		close(out_fd);
-	}
-	if (!ok || !in_pad()) {
-		return 0;
-	}
-	if (!make) {
-		return 1;
-	}
-	/* Owner, then permissions, then the times (writing moved them), and the flags last of all: one
-	 * of them may be what keeps the file from being changed again. */
-	switch (e.kind) {
-	case ENT_DIR:
-		/* its flags wait for ENT_DIRTIME: one of them may be what stops anything being made in it */
-		chown(path, (int)e.uid, (int)e.gid);
-		chmod(path, (int)e.mode);
-		break;
-	case ENT_DIRTIME:
-		set_times(&e);
-		if (e.flags != 0) {
-			chflags(path, (int)e.flags);
-		}
-		break;
-	case ENT_SYMLINK:
-		lchown(path, (int)e.uid, (int)e.gid);
-		break;
-	case ENT_HARDLINK:
-		break;                  /* the same inode: it has them already */
-	default:
-		chown(path, (int)e.uid, (int)e.gid);
-		chmod(path, (int)e.mode);
-		set_times(&e);
-		if (e.flags != 0) {
-			chflags(path, (int)e.flags);
-		}
-		break;
-	}
-	return 1;
-}
-
-static int
-pass(const struct head *h, int make)
-{
-	stream_start((int)h->slot, h->bytes);
-	for (uint64_t i = 0; i < h->entries; i++) {
-		if (!unpack_one(make)) {
-			return 0;
-		}
-	}
-	if (stream_left != 0) {
-		printf("var_store: %llu bytes left over after %llu entries\n",
-		    (unsigned long long)stream_left, (unsigned long long)h->entries);
-		return 0;
-	}
-	if ((stream_crc ^ 0xffffffffu) != h->crc) {
-		printf("var_store: slot %u: the contents are not the %08x the header says (%08x)\n", h->slot,
-		    h->crc, stream_crc ^ 0xffffffffu);
-		return 0;
-	}
-	return 1;
-}
-
-static int
-load(void)
-{
-	struct head h;
-	int best;
-
-	memset(&h, 0, sizeof(h));
-	best = newest(&h);
-	if (best < 0) {
-		printf("var_store: no store yet: /private/var stays as init made it\n");
-		return 1;
-	}
-	printf("var_store: slot %d: generation %llu of %llu seconds, %llu entries, %llu bytes\n", best,
-	    (unsigned long long)h.generation, (unsigned long long)h.seconds,
-	    (unsigned long long)h.entries, (unsigned long long)h.bytes);
-	/* read once to prove the checksum, and only then make anything */
-	if (!pass(&h, 0)) {
-		struct head other;
-		int left = -1;
-
-		/* the newest is torn: the one before it, which a save never touches, may still be whole */
-		for (int slot = 0; slot < slots; slot++) {
-			if (slot != best && read_head(slot, &other) && pass(&other, 0)) {
-				left = slot;
-				break;
-			}
-		}
-		if (left < 0) {
-			printf("var_store: nothing good in the store: /private/var stays as init made it\n");
-			return 1;
-		}
-		h = other;
-		printf("var_store: slot %d is good after all: generation %llu\n", left,
-		    (unsigned long long)h.generation);
-	}
-	if (!pass(&h, 1)) {
-		printf("var_store: the archive read differently the second time: what was made stays\n");
-		return 0;
-	}
-	printf("var_store: %llu directories, %llu files (%llu bytes), %llu links back in /private/var\n",
-	    (unsigned long long)made_dirs, (unsigned long long)made_files, (unsigned long long)made_bytes,
-	    (unsigned long long)made_links);
-	if (short_files != 0) {
-		printf("var_store: %llu files did not fit: %llu bytes of them are not there\n",
-		    (unsigned long long)short_files, (unsigned long long)lost_bytes);
-	}
-	return 1;
-}
-
-static void
-show(void)
-{
-	for (int slot = 0; slot < slots; slot++) {
-		static uint8_t block[BLOCK];
-		struct head *h = (struct head *)block;
-
-		if (!device_read(slot_at(slot), block, BLOCK)) {
-			continue;
-		}
-		if (memcmp(h->magic, HEAD_MAGIC, sizeof(h->magic)) != 0) {
-			printf("var_store: slot %d: empty\n", slot);
-			continue;
-		}
-		printf("var_store: slot %d: version %u, generation %llu, %llu entries, %llu bytes, crc %08x, "
-		    "written at %llu, header %s\n", slot, h->version, (unsigned long long)h->generation,
-		    (unsigned long long)h->entries, (unsigned long long)h->bytes, h->crc,
-		    (unsigned long long)h->seconds, h->head_crc == head_checksum(h) ? "right" : "WRONG");
-	}
-}
-
-static int
-erase(void)
-{
-	static uint8_t block[BLOCK];
-
-	memset(block, 0, sizeof(block));
-	for (int slot = 0; slot < slots; slot++) {
-		if (!device_write(slot_at(slot), block, BLOCK)) {
-			return 0;
-		}
-	}
-	printf("var_store: both slots forgotten\n");
-	return 1;
-}
+#include "var_store_unpack.inc"
 
 #include "var_store_stamp.inc"
 
@@ -1310,6 +993,9 @@ main(int argc, char **argv, char **envp)
 		ok = device_write(0, buffer, BLOCK) && save();
 	} else if (strcmp(what, "save") == 0) {
 		ok = claim() && save();
+		release();
+	} else if (strcmp(what, "delta") == 0) {
+		ok = claim() && delta_save();
 		release();
 	} else if (strcmp(what, "load") == 0) {
 		ok = load();

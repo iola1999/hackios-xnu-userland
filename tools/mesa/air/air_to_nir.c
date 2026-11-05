@@ -145,6 +145,8 @@ texture_slot(struct air_ctx *c, const struct air_ptr *p)
 {
    if (p->offset)
       return nir_iadd_imm(&c->b, p->offset, p->binding);
+   if (p->is_null)
+      return nir_imm_int(&c->b, 0);
    air_texture_may_be_unbound(c, p->binding);
    return nir_imm_int(&c->b, p->binding);
 }
@@ -2671,119 +2673,7 @@ wrap_library_function(struct air_ctx *c, const struct air_md *out_md,
    return true;
 }
 
-/* A phi of textures (choosable_texture): one register for the slot when the operands
- * name different textures or one comes round a loop. False when an operand is not such
- * a texture, and resolve_pointer_phi's general rules apply. */
-static bool
-resolve_texture_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
-{
-   struct air_val *first = NULL;
-   bool differ = false, loop_carried = false;
-   for (unsigned k = 0; k < in->num_operands; k++) {
-      if (!in->targets[k] || !reachable[in->targets[k]->index])
-         continue;
-      struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
-      if (!e) {
-         loop_carried = true;
-         continue;
-      }
-      if (!choosable_texture(e->data))
-         return false;
-      if (!first)
-         first = e->data;
-      else
-         differ |= !same_ptr(&first->ptr, &((struct air_val *)e->data)->ptr);
-   }
-   if (!first)
-      return false;
-   if (!differ && !loop_carried) {
-      air_set(c, &in->base, first);
-      return true;
-   }
-   nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
-   nir_def *reg = nir_decl_reg(&entry, 1, 32, 0);
-   struct air_ptr p = first->ptr;
-   p.binding = 0;
-   p.offset = nir_load_reg(&c->b, reg);
-   _mesa_hash_table_insert(c->phi_regs, in, reg);
-   air_set(c, &in->base, air_val_ptr(c, p));
-   return true;
-}
-
-/* A phi of POINTERS, resolved rather than carried in a register.
- *
- * A pointer here is *(which resource, which byte offset)* decided while
- * translating, so it has no bits to put in a register and a phi of two of them
- * is not a value NIR can hold. It need not be: LLVM duplicates a
- * `getelementptr` onto two paths and phis the copies back, so both operands
- * name the same member -- 207 of the pointer phis in Resident Evil 4's library
- * are exactly that, and not one names two different members.
- *
- * Operands in one buffer at different offsets get a register for the offset, the
- * way a loop-carried pointer does (CoreAnimation's path vertex shaders leave a
- * binary search over their segment buffer with such a phi). Operands in different
- * resources are refused, textures excepted (resolve_texture_phi above). That COULD
- * go through the AIR_VAL_PTR_SELECT machinery that already loads both sides and
- * selects the values, but nothing in reach needs it, a sampler is not a value that
- * path can load, and an untested path is worse than a refusal.
- *
- * `reachable` decides which edges count: the blocks are walked in reverse post
- * order, so an operand coming in over a BACK edge has not been translated yet.
- * Such a pointer is carried round the loop: its offset gets a register, and the
- * pointer that comes back over the edge has to name the same resource. An edge
- * the entry cannot reach at all is passed over.
- */
-static bool
-resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
-{
-   if (resolve_texture_phi(c, in, reachable))
-      return true;
-
-   struct air_val *first = NULL;
-   bool loop_carried = false, offsets_differ = false;
-   for (unsigned k = 0; k < in->num_operands; k++) {
-      if (!in->targets[k] || !reachable[in->targets[k]->index])
-         continue;
-      struct hash_entry *e = _mesa_hash_table_search(c->values, in->operands[k]);
-      if (!e) {
-         loop_carried = true;
-         continue;
-      }
-      struct air_val *v = e->data;
-      if (!v || v->kind != AIR_VAL_PTR)
-         return air_error(c, "instruction: a phi of pointers one of whose operands is "
-                             "%s", v && v->kind == AIR_VAL_PTR_SELECT
-                                      ? "itself a pointer chosen at run time"
-                                      : "not a resolved pointer");
-      if (!first)
-         first = v;
-      else if (!same_resource(&first->ptr, &v->ptr) ||
-               (!same_ptr(&first->ptr, &v->ptr) && !offset_is_value(v->ptr.class) &&
-                !loop_carried))
-         return air_error(c, "instruction: a phi between pointers that name different "
-                             "places, which would have to be chosen at run time");
-      else
-         offsets_differ |= !same_ptr(&first->ptr, &v->ptr);
-   }
-   if (!first)
-      return air_error(c, "instruction: a phi of pointers with no reachable operand");
-   if (!loop_carried && !offsets_differ) {
-      air_set(c, &in->base, first);
-      return true;
-   }
-   /* A pointer carried round a loop, or one buffer at two offsets: the resource is
-    * fixed and only the byte offset changes, so the offset gets a register like any
-    * other phi, and the store pass at the end of translate_body checks that every
-    * incoming pointer names the same resource before it stores that pointer's offset.
-    */
-   nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
-   nir_def *reg = nir_decl_reg(&entry, 1, 32, 0);
-   struct air_ptr p = first->ptr;
-   p.offset = nir_load_reg(&c->b, reg);
-   _mesa_hash_table_insert(c->phi_regs, in, reg);
-   air_set(c, &in->base, air_val_ptr(c, p));
-   return true;
-}
+#include "air_ptr_phi.inc"
 
 static bool
 translate_body(struct air_ctx *c)
@@ -2986,11 +2876,24 @@ translate_body(struct air_ctx *c)
             c->b.cursor = *(nir_cursor *)ce->data;
             nir_def *val;
             if (in->base.type->kind == AIR_TYPE_POINTER) {
-               /* a loop-carried pointer (resolve_pointer_phi): store its offset */
                struct hash_entry *pe = _mesa_hash_table_search(c->values, &in->base);
                struct hash_entry *oe = _mesa_hash_table_search(c->values, in->operands[k]);
                struct air_val *phi = pe ? pe->data : NULL, *from = oe ? oe->data : NULL;
-               if (choosable_texture(phi) && choosable_texture(from)) {
+               if (phi && phi->kind == AIR_VAL_PTR_SELECT) {
+                  struct air_ptr_phi_reg *r = re->data;
+                  nir_def *idx_def = NULL, *off_def = NULL;
+                  if (phi_find_place_and_offset(c, r, from, &idx_def, &off_def)) {
+                     nir_store_reg(&c->b, idx_def, r->idx_reg);
+                     nir_store_reg(&c->b, off_def, r->reg);
+                  }
+                  *(nir_cursor *)ce->data = c->b.cursor;
+                  continue;
+               }
+               bool phi_is_tex = choosable_texture(phi) ||
+                  (phi && phi->kind == AIR_VAL_PTR && phi->ptr.class == AIR_PTR_TEXTURE);
+               bool from_is_tex = choosable_texture(from) ||
+                  (from && from->kind == AIR_VAL_PTR && from->ptr.class == AIR_PTR_TEXTURE && from->ptr.is_null);
+               if (phi_is_tex && from_is_tex) {
                   val = texture_slot(c, &from->ptr);   /* resolve_texture_phi */
                } else {
                   if (!phi || !from || from->kind != AIR_VAL_PTR ||
