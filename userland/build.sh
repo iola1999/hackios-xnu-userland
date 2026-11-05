@@ -107,6 +107,12 @@ case $IOS in
 *ios26) CACHE=$IOS/23G90__iPhone18,3 DSC=dyld_shared_cache_arm64e V=26 ;;
 *) CACHE=$IOS/20F66__iPhone10,3_6 DSC=dyld_shared_cache_arm64 V= ;;
 esac
+# The 26 line's processes are arm64e, and only Apple's clang emits arm64e with pointer authentication
+# (the architecture check below), so on macOS its dynamic programs and libraries are built with
+# Xcode's clang and iPhoneOS SDK. The static ones (CC) keep xnu-clang, which links with Xcode's ld there.
+if [ "$V" = 26 ] && [ "$(uname -s)" = Darwin ]; then
+	DYN="/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -O1"
+fi
 # ios165/rootfs and ios165/cryptex must be this copy's own directories of hard links, the way
 # tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
 # cp -a does not follow one, and then every rm -rf and mv below edits the shared extraction in place. That
@@ -172,7 +178,7 @@ INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd cont
 /redwood/lib/libredwood-fairplay.dylib fairplayd.H2"
 mkdir -p obj
 
-if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
+if [ -z "$PREBUILT" ] && [ "$(uname -s)" != Darwin ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
 if [ -n "$PREBUILT" ]; then
 	echo "build.sh: not compiling, using the programs in prebuilt/userland"
 	for f in ../prebuilt/userland/*; do
@@ -203,7 +209,7 @@ if [ "$V" = 26 ]; then
 			/usr/bin/codesign --force --sign - --entitlements src/input26_service.entitlements obj/input26-service
 			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
 				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os -Wall -Wextra -Werror \
-				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c -o obj/libredwood-sb26.dylib
+				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
 			/usr/bin/codesign --force --sign - obj/libredwood-sb26.dylib
 			# Metal device registration in SpringBoard and backboardd, and the compression
 			# preference the driver needs set before QuartzCore picks a format: it imports
@@ -230,7 +236,7 @@ if [ "$V" = 26 ]; then
 			${LDID:-ldid} -Ssrc/input26_service.entitlements obj/input26-service
 			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
 				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os \
-				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c -o obj/libredwood-sb26.dylib
+				-framework CoreFoundation -framework Metal -lobjc src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
 			${LDID:-ldid} -S obj/libredwood-sb26.dylib
 			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
 				-dynamiclib -install_name /redwood/lib/libredwood-sbmetal-experiment.dylib \
@@ -609,8 +615,11 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# src/redwoodmetal.m without a compiler: no shader is ever translated, the GPU takes no
 	# submission, and the desktop ran at 9-11 frames a second where the same image with an arm64e
 	# library reached 60. Only the kernel log says any of that, so the build stops here instead.
-	# AIR_DYLIB names another library to install.
-	air_lib=${AIR_DYLIB:-obj/libredwoodair.dylib}
+	# AIR_DYLIB names another library to install. The 26 line's is the arm64e one
+	# tools/k90auto/build-air.py builds and signs on the host, which package.py installs as well.
+	air_default=obj/libredwoodair.dylib
+	[ "$V" = 26 ] && air_default=../out/ios26-resume/bbmetal-device/libredwoodair.dylib
+	air_lib=${AIR_DYLIB:-$air_default}
 	if [ -f "$air_lib" ]; then
 		air_want=arm64; [ "$V" = 26 ] && air_want=arm64e
 		case " $(lipo -archs "$air_lib" 2>/dev/null) " in

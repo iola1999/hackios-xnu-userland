@@ -90,8 +90,8 @@ fault(int sig, siginfo_t *info, void *uap)
 	uintptr_t slide = cache_slide(), pc = 0, lr = 0;
 
 	if (uc != NULL && uc->uc_mcontext != NULL) {
-		pc = (uintptr_t)uc->uc_mcontext->__ss.__pc;
-		lr = (uintptr_t)uc->uc_mcontext->__ss.__lr;
+		pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(uc->uc_mcontext->__ss);
+		lr = (uintptr_t)__darwin_arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
 	}
 	printf("stubdev: signal %d at %p after %u questions\n", sig,
 	       info != NULL ? info->si_addr : NULL, asked);

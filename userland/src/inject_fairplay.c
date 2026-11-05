@@ -192,8 +192,8 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 	char frames[10 * 20 + 1] = "";
 
 	if (context != NULL && context->uc_mcontext != NULL) {
-		pc = (uintptr_t)context->uc_mcontext->__ss.__pc;
-		fp = (uintptr_t)context->uc_mcontext->__ss.__fp;
+		pc = (uintptr_t)__darwin_arm_thread_state64_get_pc(context->uc_mcontext->__ss);
+		fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(context->uc_mcontext->__ss);
 	}
 	frames_from(fp, frames, sizeof(frames));
 	say("redwood: fairplayd: signal %d at %p, pc %#lx, called from%s (unslid)\n", signal_number,
