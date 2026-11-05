@@ -1,0 +1,48 @@
+--- a/src/freedreno/drm/freedreno_bo_heap.c
++++ b/src/freedreno/drm/freedreno_bo_heap.c
+@@ -221,6 +221,10 @@
+    }
+ 
+    struct sa_bo *s = calloc(1, sizeof(*s));
++   if (!s) {
++      simple_mtx_unlock(&heap->lock);
++      return NULL;
++   }
+ 
+    s->heap = heap;
+    s->offset = offset;
+@@ -232,12 +236,24 @@
+       heap->blocks[idx] = fd_bo_new(
+             heap->dev, FD_BO_HEAP_BLOCK_SIZE, heap->flags | _FD_BO_HINT_HEAP,
+             "heap-%x-block-%u", heap->flags, idx);
++      if (!heap->blocks[idx]) {
++         simple_mtx_unlock(&heap->lock);
++         free(s);
++         return NULL;
++      }
+       if (heap->flags == RING_FLAGS)
+          fd_bo_mark_for_dump(heap->blocks[idx]);
+    }
+    /* Take a reference to the backing obj: */
+    fd_bo_ref(heap->blocks[idx]);
+    simple_mtx_unlock(&heap->lock);
+ 
++   uint8_t *block_map = fd_bo_map(heap->blocks[idx]);
++   if (!block_map) {
++      fd_bo_del(heap->blocks[idx]);
++      free(s);
++      return NULL;
++   }
++
+    struct fd_bo *bo = &s->base;
+ 
+    bo->size = size;
+@@ -246,7 +262,7 @@
+    bo->alloc_flags = flags;
+ 
+    /* Pre-initialize mmap ptr, to avoid trying to os_mmap() */
+-   bo->map = ((uint8_t *)fd_bo_map(heap->blocks[idx])) + block_offset(s);
++   bo->map = block_map + block_offset(s);
+ 
+    fd_bo_init_common(bo, heap->dev);
+ 

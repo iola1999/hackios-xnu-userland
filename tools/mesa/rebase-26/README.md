@@ -17,6 +17,7 @@
 13. `0012-fd-shadow-guard-probes.patch`：诊断用。`freedreno_resource.c` 统计 shadow 的调用、拒绝与换 bo 次数，第一次拒绝、第一次换 bo 和进程退出时各打一行 `rwa shadow:`；`u_format.c`、`u_surface.c`、`u_transfer.c` 和 `freedreno_resource.c` 的拷贝与映射处调用 `tools/mesa/air/air_metal.c` 的 `rwa_*_guard`，指针不可能是地址时打一行，拷贝记录写进 AIR 库的环形缓冲，进程收到 SIGSEGV 时打印。
 14. `0013-fd-transfer-stride-after-shadow.patch`：`fd_resource_transfer_map` 在 shadow 成功后按新布局重取 `stride` 与 `layer_stride`。传输的 stride 在调用 shadow 之前就从旧布局取好了，不重取时映射偏移和调用方逐行拷贝用的是两套布局。
 15. `0014-perf-probes-26.x.patch`：旧的 `draw-perf*.patch`、`fd-*.patch`、`fd6-*.patch`、`perf-*.patch` 在 26.2.5 上部分 hunk 失败，这个补丁补齐真机库里的状态：`fd_bo_cpu_prep` 与 `fd_perf_us` 只在 `FD_PERF_DRAW=1` 时计时；`fd6_draw.cc` 按段计时，超过 50 ms 的段打 `fd draw seg slow`；批次切分计数；定义旧补丁只声明的 `fd_perf_cache_misses`（缺了它库链接不过）；去掉 `ir3_cache.c` 里重复的一次未命中计数。
+16. `0015-fd-bo-heap-null-check.patch`：`fd_bo_heap_alloc` 在 `calloc`、`fd_bo_new` 或 `fd_bo_map` 返回 `NULL` 时释放已持有的锁与引用并返回 `NULL`，防止分配或映射失败时解引用空指针。
 
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，改的文件互不重叠。打完这一层的源码树，加上 `tools/mesa/redwood-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只做到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 

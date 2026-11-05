@@ -969,8 +969,8 @@ mount_writable(void)
  * What the last boot left in /private/var, back out of the phone's flash (var_store=1): the
  * memory filesystem is empty at every boot, so everything iOS writes -- the home screen's layout,
  * the applications' own data, the snapshots and the baked wallpaper -- would otherwise be new
- * again every time. userland/src/var_store.c keeps a copy in the partition darwin, past the iOS
- * volume and the cryptexes, and puts it back here, over the skeleton: a name the skeleton has and
+ * again every time. userland/src/var_store.c keeps a copy at the end of the DSU slot, past the
+ * system image, and puts it back here, over the skeleton: a name the skeleton has and
  * the store has too comes out as the store has it. A store that is not there or does not check
  * out leaves what the skeleton made, and the boot goes on either way -- so a bad store cannot
  * keep the phone from starting.

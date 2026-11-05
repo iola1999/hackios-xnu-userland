@@ -7,9 +7,11 @@
  * there outlives the boot that wrote it: no home screen layout, no application data, no baked
  * wallpaper. The kernel's APFS driver reads and does not write, and writing APFS is not the point
  * here -- what is needed is that the bytes come back. So the tree is packed into a plain archive
- * and the archive is written into the one place on the phone's flash this port owns and nothing of
- * it uses: the partition darwin, past the iOS volume and both cryptexes. The kernel takes those
- * writes on /dev/rufs_darwin alone and refuses anything else (bsd/dev/redwood_ufs.c, ufs_write=1).
+ * and the archive is written into the one place on the phone's flash this port owns: the last
+ * 4 GiB of the slot Android's DSU installer keeps the iOS system image in, past the image. The
+ * loader lists it as a partition of its own (xnuloader/loader_dsu.inc), and the kernel takes
+ * writes on /dev/rufs_dsu_store alone and refuses anything else (bsd/dev/redwood_ufs.c,
+ * ufs_write=1). Installing the DSU again (tools/k90auto/dsu.py install) zeroes the store.
  *
  *   var_store save          pack /private/var into the store
  *   var_store load          unpack the newest good store into /private/var (init, at boot)
@@ -20,10 +22,11 @@
  *   var_store stamp PATH    write a line into PATH saying when: a marker for a run
  *
  * save, load and show take a FILE after them to use a file in the flash's place: one slot, its
- * header at the start of the file. `load` without one takes etc/var.seed from its own image when
- * that exists, and then never reads the flash: a seed is what `save FILE` packed at the end of an
- * earlier boot (tools/k90auto/package.py SEED=...), so the boot starts with the LaunchServices
- * database, the icon cache and PosterBoard's data that boot spent its first minutes building.
+ * header at the start of the file. `load` without one reads the flash first, and when that holds
+ * no good archive takes etc/var.seed from its own image: a seed is what `save FILE` packed at the
+ * end of an earlier boot (tools/k90auto/package.py SEED=...), so even a first boot starts with the
+ * LaunchServices database, the icon cache and PosterBoard's data that boot spent its first
+ * minutes building.
  *
  * Nobody has to remember to save. `watch` registers with the kernel (kern.redwood.var_save), and
  * on the orderly way back to the loader -- the run's time up, or "xl stop" -- the kernel asks it
@@ -54,10 +57,10 @@
 
 #define BLOCK           4096
 #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
-#define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
-#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
+#define STORE_AT        0LL
+#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots (xnuloader/loader_dsu.inc DSU_STORE_SLOT) */
 #define SLOTS           2
-#define DEVICE          "/dev/rufs_darwin"
+#define DEVICE          "/dev/rufs_dsu_store"
 #define ROOT            "/private/var"
 #define MAX_PATH        1024
 #define MAX_DEPTH       32
@@ -1244,103 +1247,7 @@ erase(void)
 	return 1;
 }
 
-/*
- * Stay and save by itself. The kernel is told there is a saver, and then this waits: for the
- * kernel to ask (the run is ending, and it waits for the answer before it goes), and, if seconds
- * is given, for that long to pass between saves of its own accord. A save that fails is said so
- * and the waiting goes on -- the one at the end of the run still gets its chance.
- */
-static int
-save_once(void)
-{
-	int ok;
-
-	/*
-	 * The device is opened for the save and closed again, not held: while a write is in flight
-	 * this kernel's own transfer list is out of the controller, and it goes back in when the
-	 * device is closed (bsd/dev/redwood_ufs.c, ufs_cclose). A watcher that kept the device open
-	 * would leave iOS reading the flash through the loader for the rest of the run.
-	 */
-	fd = open(DEVICE, O_RDWR, 0);
-	if (fd < 0) {
-		printf("var_store: %s: %s\n", DEVICE, strerror(errno));
-		return 0;
-	}
-	ok = claim() && save();
-	release();
-	close(fd);
-	fd = -1;
-	return ok;
-}
-
-static int
-watch(int seconds)
-{
-	uint64_t last = 0;
-	int asked = 0;
-
-	fd = open(DEVICE, O_RDWR, 0);
-	if (fd < 0) {
-		printf("var_store: %s cannot be written (%s): nothing would be saved\n", DEVICE,
-		    strerror(errno));
-		return 0;
-	}
-	close(fd);
-	fd = -1;
-	if (sysctl_set_int("kern.redwood.var_save", VAR_SAVE_IDLE) != 0) {
-		printf("var_store: this kernel does not keep the data volume (%s)\n", strerror(errno));
-		return 0;
-	}
-	printf("var_store: watching: the volume is saved when the run ends%s\n",
-	    seconds > 0 ? ", and in between" : "");
-	{
-		struct timeval tv = { 0, 0 };
-
-		gettimeofday(&tv, NULL);
-		last = (uint64_t)tv.tv_sec;
-	}
-	for (;;) {
-		struct timeval tv = { 0, 0 };
-		int state = VAR_SAVE_NONE;
-
-		if (sysctl_int("kern.redwood.var_save", &state) == 0 && state == VAR_SAVE_WANTED) {
-			asked = 1;
-		}
-		gettimeofday(&tv, NULL);
-		if (asked || (seconds > 0 && (uint64_t)tv.tv_sec - last >= (uint64_t)seconds)) {
-			int ok = save_once();
-
-			if (!ok) {
-				printf("var_store: this save came to nothing; the store keeps what it had\n");
-			}
-			last = (uint64_t)tv.tv_sec;
-			if (asked) {
-				/* answered either way: the kernel is waiting on this to go back to the loader */
-				(void)sysctl_set_int("kern.redwood.var_save", VAR_SAVE_DONE);
-				return ok;
-			}
-		}
-		usleep(100000);
-	}
-}
-
 #include "var_store_stamp.inc"
-
-/* etc/var.seed of the image this program was started from (argv[0] ends in bin/var_store), or NULL */
-static const char *
-seed(const char *self)
-{
-	static char at[MAX_PATH];
-	size_t n = strlen(self), tail = strlen("bin/var_store");
-	struct stat st;
-
-	if (n < tail || n - tail + sizeof("etc/var.seed") > sizeof(at) || strcmp(self + n - tail, "bin/var_store") != 0) {
-		return NULL;
-	}
-	memcpy(at, self, n - tail);
-	strcpy(at + n - tail, "etc/var.seed");
-	return stat(at, &st) == 0 ? at : NULL;
-}
 
 int
 main(int argc, char **argv, char **envp)
@@ -1370,6 +1277,21 @@ main(int argc, char **argv, char **envp)
 			return 0;
 		}
 		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
+	}
+	if (argc == 2 && strcmp(what, "load") == 0 && seed(argv[0]) != NULL) {
+		struct head h;
+
+		fd = open(store, O_RDONLY, 0);
+		if (fd >= 0 && newest(&h) >= 0) {
+			ok = load();
+			close(fd);
+			if (ok && made_files + made_dirs != 0) {
+				return 0;
+			}
+			printf("var_store: the flash gave nothing: the seed instead\n");
+		} else if (fd >= 0) {
+			close(fd);
+		}
 	}
 	if ((argc > 2 && strcmp(what, "erase") != 0) || (strcmp(what, "load") == 0 && seed(argv[0]) != NULL)) {
 		store = argc > 2 ? argv[2] : seed(argv[0]);

@@ -134,7 +134,11 @@ TRIMMED_FONTS = ('System/Library/Fonts/CoreAddition/AppleColorEmoji-160px.ttc',
 # 61 MB, taken whole. Its 32 faces share the glyph tables (59 MB of the 61), so keeping fewer faces would
 # save almost nothing. Without it Safari and the Wi-Fi list drew Chinese as boxes with a question mark
 # (kernel-12377-cmd82-wd31).
-WHOLE_FONTS = ('System/Library/PrivateFrameworks/FontServices.framework/CorePrivate/PingFangUI.ttc',)
+# AppleSDGothicNeo is the Korean system font, 41 MB; without it Korean fell back to LastResort boxes
+# (docs/progress/2026-11-01-wifi-ath12k-driver.md).
+WHOLE_FONTS = ('System/Library/PrivateFrameworks/FontServices.framework/CorePrivate/PingFangUI.ttc',
+               'System/Library/Fonts/Core/AppleSDGothicNeo.ttc',
+               'System/Library/Fonts/LanguageSupport/AppleSDGothicNeo.ttc')
 # string tables hold every language; the biggest (Shortcuts' actions, Home) are 5-12 MB
 MAX_STRING_TABLE = 16 << 20
 # applications waiting here to be installed by the first boot go to /Applications instead
@@ -151,6 +155,8 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
+# ... but for these: bluetoothd, 11.6 MB (docs/analysis/2026-11-02-bluetooth-bringup.md)
+BIG_PROGRAMS_KEPT = ('usr/sbin/bluetoothd',)
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
 # system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.
@@ -204,14 +210,14 @@ def wanted_file(path, size):
         return not path.startswith(SKIP_AUDIO) and '.espresso.' not in path
     if path.startswith(SKIP_PREFIX):
         return False
-    if path.startswith('System/Library/Fonts/'):
-        return size <= MAX_FONT or path in TRIMMED_FONTS
     if path in WHOLE_FONTS:
         return True
+    if path.startswith('System/Library/Fonts/'):
+        return size <= MAX_FONT or path in TRIMMED_FONTS
     if path.startswith(ALL_PICTURES) and path.lower().endswith('.png'):
         return True
     if path.startswith(('usr/libexec/', 'usr/sbin/')):
-        return size <= BIG_PROGRAM
+        return size <= BIG_PROGRAM or path in BIG_PROGRAMS_KEPT
     if path.startswith(('Applications/', HEALTH)):
         return not path.lower().endswith(SKIP_APP_EXT) and '.mlmodelc/' not in path
     if path.startswith(FRAMEWORKS):
