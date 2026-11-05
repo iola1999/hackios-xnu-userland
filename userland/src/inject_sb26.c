@@ -455,28 +455,35 @@ bar_background_image_callback(const struct mach_header *header, intptr_t slide)
  */
 extern CFTypeRef MGCopyAnswer(CFStringRef property);
 
+static void
+sb26_query_capacities(int64_t *total_disk, int64_t *total_sys, int64_t *total_data, int64_t *avail_val)
+{
+    uint64_t sys_b = 0, data_b = 0, used_b = 0;
+    size_t sz = sizeof(uint64_t);
+    struct statfs st;
+
+    (void)sysctlbyname("kern.redwood.darwin_bytes", &sys_b, &sz, NULL, 0);
+    sz = sizeof(uint64_t);
+    (void)sysctlbyname("kern.redwood.darwin_var_bytes", &data_b, &sz, NULL, 0);
+    if (sys_b == 0) sys_b = 8ULL << 30;
+    if (data_b == 0) data_b = 112ULL << 30;
+    if (statfs("/private/var", &st) == 0 && st.f_blocks > st.f_bavail) {
+        used_b = (uint64_t)(st.f_blocks - st.f_bavail) * (uint64_t)st.f_bsize;
+    }
+    *total_sys  = (int64_t)sys_b;
+    *total_data = (int64_t)data_b;
+    *total_disk = (int64_t)(sys_b + data_b);
+    *avail_val  = (int64_t)(data_b > used_b ? data_b - used_b : data_b);
+}
+
 static CFTypeRef
 sb26_hook_MGCopyAnswer(CFStringRef property)
 {
     const char *prog = getprogname();
     if (property && prog && (strcmp(prog, "Preferences") == 0 || strcmp(prog, "SpringBoard") == 0)) {
+        int64_t total_disk = 0, total_sys = 0, total_data = 0, avail_val = 0;
         if (CFEqual(property, CFSTR("DiskUsage"))) {
-            struct statfs st;
-            uint64_t avail_bytes = 0;
-            if (statfs("/private/var", &st) == 0) {
-                avail_bytes = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
-            }
-            if (avail_bytes == 0 && statfs("/", &st) == 0) {
-                avail_bytes = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
-            }
-            if (avail_bytes == 0) {
-                avail_bytes = 2400000000ULL;
-            }
-
-            int64_t total_disk = 256000000000LL;
-            int64_t total_sys  = 15000000000LL;
-            int64_t total_data = 241000000000LL;
-            int64_t avail_val  = (int64_t)avail_bytes;
+            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
 
             CFNumberRef num_total_disk = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_disk);
             CFNumberRef num_total_sys  = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_sys);
@@ -516,33 +523,22 @@ sb26_hook_MGCopyAnswer(CFStringRef property)
         }
 
         if (CFEqual(property, CFSTR("TotalDiskCapacity"))) {
-            int64_t total_disk = 256000000000LL;
+            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_disk);
         }
 
         if (CFEqual(property, CFSTR("TotalSystemCapacity"))) {
-            int64_t total_sys = 15000000000LL;
+            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_sys);
         }
 
         if (CFEqual(property, CFSTR("TotalDataCapacity"))) {
-            int64_t total_data = 241000000000LL;
+            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_data);
         }
 
         if (CFEqual(property, CFSTR("TotalDataAvailable")) || CFEqual(property, CFSTR("AmountDataAvailable"))) {
-            struct statfs st;
-            uint64_t avail_bytes = 0;
-            if (statfs("/private/var", &st) == 0) {
-                avail_bytes = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
-            }
-            if (avail_bytes == 0 && statfs("/", &st) == 0) {
-                avail_bytes = (uint64_t)st.f_bavail * (uint64_t)st.f_bsize;
-            }
-            if (avail_bytes == 0) {
-                avail_bytes = 2400000000ULL;
-            }
-            int64_t avail_val = (int64_t)avail_bytes;
+            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &avail_val);
         }
     }

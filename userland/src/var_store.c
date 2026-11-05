@@ -62,7 +62,9 @@
 #define DELTA_OFFSET    0xFB000000LL
 #define DELTA_BYTES     (64u << 20)
 #define SLOTS           2
-#define DEVICE          "/dev/rufs_dsu_store"
+#define DEVICE_DARWIN_VAR "/dev/rufs_darwin_var"
+#define DEVICE_DSU      "/dev/rufs_dsu_store"
+#define DEVICE          (default_device())
 #define ROOT            "/private/var"
 #define MAX_PATH        1024
 #define MAX_DEPTH       32
@@ -232,9 +234,22 @@ head_checksum(const struct head *h)
 /* ---- the store, as a stream of bytes in one slot ---- */
 
 static int fd = -1;
-static const char *store = DEVICE;      /* or a FILE: see the top */
+static const char *store = DEVICE_DARWIN_VAR;   /* or a FILE: see the top */
 static off_t store_at = STORE_AT;
 static int slots = SLOTS;
+
+static const char *
+default_device(void)
+{
+	struct stat st;
+	if (stat(DEVICE_DSU, &st) == 0) {
+		return DEVICE_DSU;
+	}
+	if (stat(DEVICE_DARWIN_VAR, &st) == 0) {
+		return DEVICE_DARWIN_VAR;
+	}
+	return DEVICE_DSU;
+}
 static uint8_t *buffer;
 static uint8_t *already;                /* what the slot holds there now, to not write it again */
 static uint64_t skipped_blocks, written_blocks;
@@ -936,9 +951,10 @@ int
 main(int argc, char **argv, char **envp)
 {
 	const char *what = argc > 1 ? argv[1] : "show";
-	int ok;
+	int ok, is_file = 0;
 
 	(void)envp;
+	store = default_device();
 	crc_init();
 	if (strcmp(what, "stamp") == 0) {
 		return stamp(argc > 2 ? argv[2] : "/private/var/redwood-stamp") ? 0 : 1;
@@ -981,14 +997,15 @@ main(int argc, char **argv, char **envp)
 		store_at = 0;
 		slots = 1;
 		already = NULL;         /* a new file holds nothing to compare with */
+		is_file = 1;
 	}
 	fd = open(store, strcmp(what, "load") == 0 || strcmp(what, "show") == 0 ? O_RDONLY :
-	    store_at == 0 ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR, 0644);
+	    is_file ? O_RDWR | O_CREAT | O_TRUNC : O_RDWR, 0644);
 	if (fd < 0) {
 		printf("var_store: %s: %s (the kernel takes writes with ufs_write=1)\n", store, strerror(errno));
 		return 1;
 	}
-	if (strcmp(what, "save") == 0 && store_at == 0) {
+	if (strcmp(what, "save") == 0 && is_file) {
 		/* a zeroed header first, so that the empty file reads as holding no archive */
 		ok = device_write(0, buffer, BLOCK) && save();
 	} else if (strcmp(what, "save") == 0) {
