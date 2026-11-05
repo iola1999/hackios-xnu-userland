@@ -118,8 +118,10 @@ DATA_FRAMEWORKS = tuple(f'System/Library/{name}.framework/' for name in (
 # never from applications: their sound, video and 3D content
 SKIP_APP_EXT = ('.mov', '.mp4', '.m4a', '.caf', '.wav', '.heic', '.aiff', '.metallib', '.scnz', '.usdz')
 # pictures the user interface is drawn with: small images, and asset catalogs up to this size
-# (the one with all the SF Symbols alone is 170 MB and is left out)
-MAX_ASSET_CATALOG = 4 << 20
+# (the one with all the SF Symbols alone is 170 MB and is left out). 32 MB rather than 4: Messages
+# aborts at launch without ChatKit's 30.5 MB catalog ("Trying to create an LPImage with nil data",
+# kernel-12377-cmd49-bo44); the 24 catalogs between the two limits add 291 MB.
+MAX_ASSET_CATALOG = 32 << 20
 # fonts: all but the very big ones; those two -- the colour emoji, 130 MB, and PingFang, the Chinese faces, 74 MB --
 # are taken and made smaller after extraction (fetch.sh, ../tools/font_trim.py): the emoji without their biggest
 # bitmaps (59 MB), PingFang with the regular and semibold faces for simplified, traditional and Hong Kong Chinese,
@@ -215,8 +217,11 @@ def wanted_file(path, size):
     if path.startswith(FRAMEWORKS):
         if path in KEEP_METALLIB or (path.endswith('.metallib') and size <= MAX_METALLIB) or path.startswith(KEEP_MODELS):
             return True
-        if re.search(r'/(XPCServices|Support|Helpers)/', path):
-            return size <= 32 << 20 and not path.lower().endswith(('.png', '.car', '.loctable', '.caml'))
+        # the services' string tables and pictures follow the framework rules below (1.9 MB in all):
+        # without them BackgroundShortcutRunner and Safari's history service aborted on bo44, a
+        # missing localized value being the suspected cause, not a confirmed one
+        if re.search(r'/(XPCServices|Support|Helpers)/', path) and not path.lower().endswith(('.png', '.car', '.loctable')):
+            return size <= 32 << 20 and not path.lower().endswith('.caml')
         if path.endswith('.car'):
             return size <= MAX_ASSET_CATALOG or path.startswith(BIG_CATALOGS)
         if path.endswith('.loctable'):

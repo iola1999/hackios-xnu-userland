@@ -23,6 +23,8 @@
 #   libredwoodair.dylib  the same path as a library (tools/mesa/air/air_metal.h), install name
 #                        /redwood/lib/libredwoodair.dylib, which is what userland's Metal driver
 #                        links against to compile a function Metal hands it
+# With PREPARE=1 nothing is built: the script stops once mesa-$VERSION is unpacked, patched and has
+# src/redwood-drm and src/compiler/air copied in.
 # and with TURNIP=1 (26.x only, REBASE=26), Mesa's Vulkan driver for the Adreno instead of all of the above:
 #   libvulkan_freedreno.dylib
 #                        Turnip on its msm backend, through tools/mesa/redwood-drm like freedreno
@@ -150,6 +152,12 @@ cp -r "$ROOT/tools/mesa/redwood-drm" mesa-$VERSION/src/redwood-drm
 # reaches it. Copied rather than linked, because this tree is cross-built.
 rm -rf mesa-$VERSION/src/compiler/air
 cp -r "$ROOT/tools/mesa/air" mesa-$VERSION/src/compiler/air
+# PREPARE=1 stops here: the patched source tree is what the arm64e build of the iOS 26 AIR
+# library starts from (tools/k90auto/setup-mesa-arm64e.py in the top-level workspace copies it).
+if [ "${PREPARE:-}" = 1 ]; then
+	echo "mk-mesa.sh: patched source in $B/mesa-$VERSION"
+	exit 0
+fi
 if [ ! -x venv/bin/python3 ]; then
 	python3 -m venv venv
 	# meson is pinned, not apt's: 26.x meson.build requires >= 1.4 and Ubuntu noble ships 1.3,

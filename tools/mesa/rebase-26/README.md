@@ -13,7 +13,11 @@
 9. `0008-u-trace-redwood-pass-times.patch`：任务环境变量 `REDWOOD_PASS_TIMES=1` 打开 Mesa 的 GPU 时间戳，按 pass 种类（画布尺寸、GMEM bin 数、颜色附件数、深度／模板格式）每 5 秒汇总一行 `pass times`；`fd_trace_read_ts` 去掉 `FD_BO_PREP_NOSYNC` 加 10 ms 睡眠的轮询，直接阻塞等待，这一处对所有打开 u_trace 的用法生效。读法见顶层 `docs/analysis/2026-11-02-120hz-after-gpu-clock.md` §6。
 10. `0009-fd-resource-contents-undefined.patch`：新增 `fd_resource_contents_undefined()`，把资源标为内容无效，下一个画进它的 batch 不再把它读回 GMEM；上一个写它的 batch 照样写回。AIR 在 Metal pass 的第一次绘制前，对 `MTLLoadActionDontCare` 的颜色附件调用它。CoreAnimation 整屏 pass 的第二个 RGBA16Float 附件属于这种情况，此前每个 bin 都读回，见顶层 `docs/analysis/2026-11-02-120hz-after-gpu-clock.md` §6。
 11. `0010-fd-no-store-of-masked-cbufs.patch`：batch 结束时不写回绑定的混合状态写不到的颜色附件（`colormask` 为 0）。混合状态变化也触发附件的读写登记，写不到的附件按读入登记。CoreAnimation 整屏 pass 的颜色 1 由管线的 `writeMask 0` 关掉，此前每个 bin 都写回。`kernel-12377-rate8-ns1` 对 r8a：tile store 合计 3.33 → 2.76 s，整屏 pass 每次 808 → 787 µs，手势帧率在轮次间波动范围内，截图无差异，见顶层 `docs/progress/2026-11-05-defaults-and-charging.md`。
+12. `0011-fd-shared-no-shadow.patch`：freedreno 不再对导入的资源（`fd_resource_from_handle` 置 `is_shared` 的那些）做 shadow。shadow 会换掉资源的 bo 并在批次结束后释放旧 bo，而 AIR 对导入的缓冲只在创建时映射一次，换 bo 之后它写的是驱动要释放的内存；`util_copy_rect` 行拷贝里的 SIGSEGV 由此而来，补丁说明记了两轮的崩溃地址与拷贝长度。
+13. `0012-fd-shadow-guard-probes.patch`：诊断用。`freedreno_resource.c` 统计 shadow 的调用、拒绝与换 bo 次数，第一次拒绝、第一次换 bo 和进程退出时各打一行 `rwa shadow:`；`u_format.c`、`u_surface.c`、`u_transfer.c` 和 `freedreno_resource.c` 的拷贝与映射处调用 `tools/mesa/air/air_metal.c` 的 `rwa_*_guard`，指针不可能是地址时打一行，拷贝记录写进 AIR 库的环形缓冲，进程收到 SIGSEGV 时打印。
+14. `0013-fd-transfer-stride-after-shadow.patch`：`fd_resource_transfer_map` 在 shadow 成功后按新布局重取 `stride` 与 `layer_stride`。传输的 stride 在调用 shadow 之前就从旧布局取好了，不重取时映射偏移和调用方逐行拷贝用的是两套布局。
+15. `0014-perf-probes-26.x.patch`：旧的 `draw-perf*.patch`、`fd-*.patch`、`fd6-*.patch`、`perf-*.patch` 在 26.2.5 上部分 hunk 失败，这个补丁补齐真机库里的状态：`fd_bo_cpu_prep` 与 `fd_perf_us` 只在 `FD_PERF_DRAW=1` 时计时；`fd6_draw.cc` 按段计时，超过 50 ms 的段打 `fd draw seg slow`；批次切分计数；定义旧补丁只声明的 `fd_perf_cache_misses`（缺了它库链接不过）；去掉 `ir3_cache.c` 里重复的一次未命中计数。
 
-`rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，改的文件互不重叠。
+`rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，改的文件互不重叠。打完这一层的源码树，加上 `tools/mesa/redwood-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只做到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 
 `smoke-osmesa.c` / `smoke-osmesa-es.c` 是构建后冒烟测试，在 macOS 主机上编译运行，见顶层 `docs/analysis/mesa-rebase-2026-10.md` 第 3 节。

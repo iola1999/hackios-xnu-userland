@@ -28,11 +28,5 @@
     "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/LICENSES/NOTICE.qcom",
     "bytes": 23966,
     "sha256": "fa43e1b9a13b341a07adca9dbe73d0f9072d7966fdfe811c01f0dd2872d7309a"
-  },
-  {
-    "file": "qcom/sm8750/gen80000_zap.mbn",
-    "url": "https://kernel.googlesource.com/pub/scm/linux/kernel/git/firmware/linux-firmware.git/+/5c57d4817ebded2730ef20b3f2dd0f844b16dd0e/qcom/sm8750/gen80000_zap.mbn",
-    "bytes": 12088,
-    "sha256": "0e3ae03f7dd3170621e7b231802639535410bbc2a1c3ba0829c15ab4cf3996cf"
   }
 ]

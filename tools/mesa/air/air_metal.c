@@ -321,7 +321,7 @@ rwa_write_record_entry(const void *texture, unsigned level, unsigned layer, cons
 }
 
 /* Called from util_copy_rect, which is Mesa's file
- * (tools/mesa-patches/fixguard6-shadow-counters.patch) and holds no state of its own. Hidden so the
+ * (tools/mesa/rebase-26/0012-fd-shadow-guard-probes.patch) and holds no state of its own. Hidden so the
  * library's exported symbols stay the ones air_metal.h declares; the other translation unit in this
  * library resolves it at link time like any other internal call.
  */

@@ -18,7 +18,7 @@ diff --color -ru a/src/gallium/drivers/freedreno/freedreno_context.c b/src/galli
 diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
 --- a/src/util/perf/u_trace.c	2026-11-02 01:47:10
 +++ b/src/util/perf/u_trace.c	2026-11-02 01:47:10
-@@ -29,6 +29,12 @@
+@@ -29,6 +29,13 @@
  #include "util/u_call_once.h"
  #include "util/u_debug.h"
  #include "util/u_vector.h"
@@ -28,10 +28,11 @@ diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
 +#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
++#include <strings.h>
  
  #define __NEEDS_TRACE_PRIV
  #include "u_trace_priv.h"
-@@ -303,6 +309,176 @@
+@@ -303,6 +310,188 @@
     .event = &print_json_event,
  };
  
@@ -45,7 +46,7 @@ diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
 + */
 +#define PASS_KINDS 32
 +#define PASS_DEPTH 8
-+#define PASS_KEY 48
++#define PASS_KEY 64
 +
 +struct pass_open {
 +   unsigned depth;
@@ -74,7 +75,8 @@ diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
 +{
 +   const char *name = evt->tp->name;
 +   char text[256] = "";
-+   unsigned width = 0, height = 0, samples = 0, nbins = 0;
++   unsigned width = 0, height = 0, samples = 0, nbins = 0, mrts = 0;
++   char zs[16] = "";
 +   const char *at;
 +
 +   if (strncmp(name, "start_", 6) == 0)
@@ -96,8 +98,18 @@ diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
 +      sscanf(at, "samples=%u", &samples);
 +   if ((at = strstr(text, "nbins=")))
 +      sscanf(at, "nbins=%u", &nbins);
-+   snprintf(key, PASS_KEY, "pass %ux%u %s%s", width, height, nbins ? "gmem" : "sysmem",
-+            samples > 1 ? " msaa" : "");
++   if ((at = strstr(text, "mrts=")))
++      sscanf(at, "mrts=%u", &mrts);
++   if ((at = strstr(text, "zs_format=")))
++      sscanf(at, "zs_format=%15[^,; ]", zs);
++   bool has_zs = zs[0] && strcasecmp(zs, "none") != 0;
++   char where[16];
++   if (nbins)
++      snprintf(where, sizeof(where), "gmem %u bins", nbins);
++   else
++      snprintf(where, sizeof(where), "sysmem");
++   snprintf(key, PASS_KEY, "pass %ux%u %s %u rt%s%s%s", width, height, where, mrts, has_zs ? " zs " : "",
++            has_zs ? zs : "", samples > 1 ? " msaa" : "");
 +}
 +
 +static void
@@ -113,6 +125,7 @@ diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
 +         snprintf(pass_times.kind[i].key, PASS_KEY, "other");
 +      } else {
 +         pass_times.kinds++;
++         memset(&pass_times.kind[i], 0, sizeof(pass_times.kind[i]));
 +         snprintf(pass_times.kind[i].key, PASS_KEY, "%s", key);
 +      }
 +   }
@@ -208,7 +221,7 @@ diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
  static const struct debug_named_value config_control[] = {
     { "print", U_TRACE_TYPE_PRINT, "Enable print" },
     { "print_csv", U_TRACE_TYPE_PRINT_CSV, "Enable print in CSV" },
-@@ -330,6 +506,8 @@
+@@ -330,6 +519,8 @@
  {
     u_trace_state.enabled_traces =
        debug_get_flags_option("MESA_GPU_TRACES", config_control, 0);
@@ -217,7 +230,7 @@ diff --color -ru a/src/util/perf/u_trace.c b/src/util/perf/u_trace.c
     const char *tracefile_name = debug_get_option_trace_file();
     if (tracefile_name && __normal_user()) {
        u_trace_state.trace_file = fopen(tracefile_name, "w");
-@@ -444,7 +622,10 @@
+@@ -444,7 +635,10 @@
     if (utctx->enabled_traces & U_TRACE_TYPE_PRINT) {
        utctx->out = u_trace_state.trace_file;
  

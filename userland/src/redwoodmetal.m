@@ -1,8 +1,8 @@
 /*
- * This copy serves the iOS 16.5 line only: it is the snapshot the open-source release was made from.
- * The authoritative copy for iOS 26 is hackios-xnu-kernel/tools/userland-driver/redwoodmetal.m, which is
- * what package.py builds (DRIVER_SOURCES). The two files carry the same name and each builds a library
- * called libredwoodmetal.dylib, so work on iOS 26 belongs in the kernel side of the workspace.
+ * This copy serves the iOS 16.5 line; userland/build.sh builds it into root.apfs. The copy that
+ * iOS 26 runs is hackios-xnu-kernel/tools/userland-driver/redwoodmetal.m: package.py builds it
+ * (DRIVER_SOURCES) under the same install name, /redwood/lib/libredwoodmetal.dylib, so work on
+ * iOS 26 belongs in the kernel repository.
  *
  * The device object of a Metal driver for this port, as a real library.
  *
@@ -85,8 +85,8 @@
  * `device` one the GPU cannot fetch from is refused by name, because the shader may write
  * it and a copy would lose the writes.
  *
- * What is NOT here, and is not pretended: heaps, blit encoders, events, multisample
- * resolve, and the rectangle half of a viewport -- the rest of docs/metal.md 10.8.
+ * Heaps, events, multisample resolve and viewport rectangles remain unimplemented
+ * (docs/metal.md 10.8). Blit currently supports buffer and matching-format 2D copies.
  *
  * Every line this file writes carries the PROCESS it was written by
  * (`redwoodmetal[progname pid]:`, see rw_print): a driver is a library, four or five
@@ -99,6 +99,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
+#include <mach/mach_time.h>
 #include <dlfcn.h>
 
 #include "redwood_drawable.h"
@@ -312,6 +313,14 @@ struct rwa_draw {
 	unsigned vertex_buffer_table_count;
 	const struct rwa_buffer_bind *fragment_buffer_table;
 	unsigned fragment_buffer_table_count;
+	/* { originX, originY, width, height }, or NULL for the whole attachment. Appended
+	 * here for the same reason it is appended in air_metal.h. */
+	const float *viewport;
+	/* { x, y, width, height }, or NULL for no clip. Appended with it. */
+	const unsigned *scissor;
+	/* the resolveTexture of each colour attachment, or NULL where there is none.
+	 * Appended with the two above: air_metal.h says what the library does with one. */
+	struct rwa_texture *const *resolve;
 };
 
 /*
@@ -476,130 +485,101 @@ rw_print(const char *fmt, ...)
 	fflush(stdout);
 }
 
-static struct {
-	void *handle;
-	struct rwa_device *(*device_open)(char *, size_t);
-	void (*device_close)(struct rwa_device *);
-	const char *(*device_name)(struct rwa_device *);
-	struct rwa_buffer *(*buffer_create)(struct rwa_device *, size_t, char *, size_t);
-	void *(*buffer_map)(struct rwa_buffer *);
-	size_t (*buffer_size)(struct rwa_buffer *);
-	void (*buffer_destroy)(struct rwa_buffer *);
-	struct rwa_compute *(*compute_create)(struct rwa_device *, const void *, size_t,
-					      const char *, struct rwa_compute_info *, char *,
-					      size_t);
-	void (*compute_destroy)(struct rwa_compute *);
-	struct rwa_texture *(*texture_create)(struct rwa_device *,
-					      const struct rwa_texture_shape *, char *, size_t);
-	int (*texture_write)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
-			     const unsigned[3], const void *, size_t, char *, size_t);
-	int (*texture_read)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
-			    const unsigned[3], void *, size_t, char *, size_t);
-	int (*depth_read)(struct rwa_texture *, unsigned, unsigned, const unsigned[3],
-			  const unsigned[3], float *, uint8_t *, char *, size_t);
-	void (*texture_destroy)(struct rwa_texture *);
-	struct rwa_sampler *(*sampler_create)(struct rwa_device *,
-					      const struct rwa_sampler_state *, char *, size_t);
-	void (*sampler_destroy)(struct rwa_sampler *);
-	int (*dispatch)(struct rwa_compute *, const struct rwa_bindings *,
-			const unsigned[3], const unsigned[3], char *, size_t);
-	int (*dispatch_buffers)(struct rwa_compute *, const struct rwa_bindings *,
-				const struct rwa_buffer_bind *, unsigned, const unsigned[3],
-				const unsigned[3], char *, size_t);
-	int (*module_argbufs)(struct rwa_device *, const void *, size_t, const char *,
-			      struct rwa_argbuf_layout *, unsigned, unsigned *, char *,
-			      size_t);
-	int (*argbuf_encode_buffer)(struct rwa_buffer *, size_t, unsigned,
-				    struct rwa_buffer *, size_t, char *, size_t);
-	int (*argbuf_encode_texture)(struct rwa_buffer *, size_t, unsigned,
-				     struct rwa_texture *, char *, size_t);
-	int (*argbuf_encode_sampler)(struct rwa_buffer *, size_t, unsigned,
-				     struct rwa_sampler *, char *, size_t);
-	unsigned (*argbuf_encoded_members)(const struct rwa_buffer *, size_t);
-	struct rwa_render *(*render_create)(struct rwa_device *, const void *, size_t,
-					    const char *, const void *, size_t, const char *,
-					    const struct rwa_render_shape *,
-					    struct rwa_render_info *, char *, size_t);
-	void (*render_destroy)(struct rwa_render *);
-	int (*render_draw)(struct rwa_render *, const struct rwa_draw *, char *, size_t);
-	struct rwa_depth_stencil *(*depth_stencil_create)(struct rwa_device *,
-							  const struct rwa_depth_stencil_state *,
-							  char *, size_t);
-	void (*depth_stencil_destroy)(struct rwa_depth_stencil *);
-	int (*finish)(struct rwa_device *, char *, size_t);
-} mesa;
+/*
+ * Which pipeline state drew into what, as a table with one row per (pipeline, pass shape),
+ * printed with the command buffer statistics.
+ *
+ * Two classes of layer carry a rounded corner here, and one of them shows a line where its
+ * corner is tessellated while the other does not. Whether a multisample resolve would fix
+ * both or only one depends on whether the two are drawn by the same pipeline state, and that
+ * is a fact about a table rather than about any single draw. The handle is Metal's own object
+ * pointer, stable for the life of the process, and the pass shape is the colour attachment's
+ * size with the count of attachments and whether a depth one is bound -- enough for a reader
+ * to tell a layer-sized pass from a screen-sized one without knowing which layer it was.
+ *
+ * The rows are counted per window and cleared after each print, so a row's draws are the
+ * draws since the last line rather than since the process started.
+ */
+struct rw_pipeline_row {
+	const void *pipeline;
+	unsigned long draws;
+	unsigned width, height;
+	unsigned color_count, depth, sample_count;
+};
 
-/* Loaded once, and its absence is an answer rather than a crash: without the GPU there is
- * no library worth loading, and the device object still has to exist. */
-static bool
-mesa_available(void)
+#define RW_PIPELINE_ROWS 96
+
+static struct rw_pipeline_row rw_pipeline_rows[RW_PIPELINE_ROWS];
+static unsigned rw_pipeline_row_count;
+
+static void
+rw_pipeline_note(const void *pipeline, unsigned color_count, unsigned depth,
+                 unsigned width, unsigned height, unsigned sample_count)
 {
-	static bool tried;
+	unsigned i;
 
-	if (tried) {
-		return mesa.handle != NULL;
+	if (pipeline == NULL) {
+		return;
 	}
-	tried = true;
-	mesa.handle = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW);
-	if (mesa.handle == NULL) {
-		rw_print("no compiler library: %s\n", dlerror());
-		return false;
+	for (i = 0; i < rw_pipeline_row_count; i++) {
+		struct rw_pipeline_row *row = &rw_pipeline_rows[i];
+
+		if (row->pipeline == pipeline && row->width == width && row->height == height &&
+		    row->color_count == color_count && row->depth == depth) {
+			row->draws++;
+			return;
+		}
 	}
-	*(void **)&mesa.device_open = dlsym(mesa.handle, "rwa_device_open");
-	*(void **)&mesa.device_close = dlsym(mesa.handle, "rwa_device_close");
-	*(void **)&mesa.device_name = dlsym(mesa.handle, "rwa_device_name");
-	*(void **)&mesa.buffer_create = dlsym(mesa.handle, "rwa_buffer_create");
-	*(void **)&mesa.buffer_map = dlsym(mesa.handle, "rwa_buffer_map");
-	*(void **)&mesa.buffer_size = dlsym(mesa.handle, "rwa_buffer_size");
-	*(void **)&mesa.buffer_destroy = dlsym(mesa.handle, "rwa_buffer_destroy");
-	*(void **)&mesa.compute_create = dlsym(mesa.handle, "rwa_compute_create");
-	*(void **)&mesa.compute_destroy = dlsym(mesa.handle, "rwa_compute_destroy");
-	*(void **)&mesa.texture_create = dlsym(mesa.handle, "rwa_texture_create");
-	*(void **)&mesa.texture_write = dlsym(mesa.handle, "rwa_texture_write");
-	*(void **)&mesa.texture_read = dlsym(mesa.handle, "rwa_texture_read");
-	*(void **)&mesa.depth_read = dlsym(mesa.handle, "rwa_depth_read");
-	*(void **)&mesa.texture_destroy = dlsym(mesa.handle, "rwa_texture_destroy");
-	*(void **)&mesa.sampler_create = dlsym(mesa.handle, "rwa_sampler_create");
-	*(void **)&mesa.sampler_destroy = dlsym(mesa.handle, "rwa_sampler_destroy");
-	*(void **)&mesa.dispatch = dlsym(mesa.handle, "rwa_dispatch");
-	/* The argument-buffer calls, looked up but NOT required, for the reason drawing is
-	 * not required: a library without them is a real state of this work, and the
-	 * encoder says so when an application asks for one rather than the driver refusing
-	 * to load. What must not happen is answering an encoder and then binding nothing,
-	 * so -newArgumentEncoder... checks for these before it makes one. */
-	*(void **)&mesa.dispatch_buffers = dlsym(mesa.handle, "rwa_dispatch_buffers");
-	*(void **)&mesa.module_argbufs = dlsym(mesa.handle, "rwa_module_argbufs");
-	*(void **)&mesa.argbuf_encode_buffer = dlsym(mesa.handle, "rwa_argbuf_encode_buffer");
-	*(void **)&mesa.argbuf_encode_texture = dlsym(mesa.handle, "rwa_argbuf_encode_texture");
-	*(void **)&mesa.argbuf_encode_sampler = dlsym(mesa.handle, "rwa_argbuf_encode_sampler");
-	*(void **)&mesa.argbuf_encoded_members = dlsym(mesa.handle,
-						       "rwa_argbuf_encoded_members");
-	/* Drawing is looked up but not required: a compiler library that can compute and not
-	 * yet draw is a real state of this work, and the driver says so when asked to draw
-	 * rather than refusing to exist. */
-	*(void **)&mesa.render_create = dlsym(mesa.handle, "rwa_render_create");
-	*(void **)&mesa.render_destroy = dlsym(mesa.handle, "rwa_render_destroy");
-	*(void **)&mesa.render_draw = dlsym(mesa.handle, "rwa_render_draw");
-	/* Depth likewise: a library that can draw and not test depth is a real state of
-	 * this work, and -newDepthStencilStateWithDescriptor: says so when it is asked
-	 * rather than the driver refusing to load. */
-	*(void **)&mesa.depth_stencil_create = dlsym(mesa.handle, "rwa_depth_stencil_create");
-	*(void **)&mesa.depth_stencil_destroy = dlsym(mesa.handle, "rwa_depth_stencil_destroy");
-	*(void **)&mesa.finish = dlsym(mesa.handle, "rwa_finish");
-	if (mesa.device_open == NULL || mesa.compute_create == NULL || mesa.dispatch == NULL ||
-	    mesa.texture_create == NULL || mesa.sampler_create == NULL) {
-		/* rwa_dispatch's arguments changed when textures were added to the contract, so
-		 * an older library would be called with the wrong shape of argument and do
-		 * something arbitrary. Refusing it outright is the only safe reading of a
-		 * missing rwa_texture_create. */
-		rw_print("the compiler library is missing calls the contract names, "
-		         "so it is older than this driver and will not be used\n");
-		dlclose(mesa.handle);
-		mesa.handle = NULL;
-		return false;
+	if (rw_pipeline_row_count == RW_PIPELINE_ROWS) {
+		return;
 	}
-	return true;
+	rw_pipeline_rows[rw_pipeline_row_count].pipeline = pipeline;
+	rw_pipeline_rows[rw_pipeline_row_count].draws = 1;
+	rw_pipeline_rows[rw_pipeline_row_count].width = width;
+	rw_pipeline_rows[rw_pipeline_row_count].height = height;
+	rw_pipeline_rows[rw_pipeline_row_count].color_count = color_count;
+	rw_pipeline_rows[rw_pipeline_row_count].depth = depth;
+	rw_pipeline_rows[rw_pipeline_row_count].sample_count = sample_count;
+	rw_pipeline_row_count++;
+	/* Said once, when the shape is first drawn: a handle and the attachment it went into,
+	 * which is the pair the reader needs and the one thing that cannot be recovered later
+	 * from a count. Bounded by RW_PIPELINE_ROWS lines for the life of the process. */
+	rw_print("pipeline seen: %p attachment %ux%u colour %u depth %u samples %u\n", pipeline,
+	         width, height, color_count, depth, sample_count);
 }
+
+static void
+rw_pipeline_dump(void)
+{
+	unsigned i, j, shown;
+
+	if (rw_pipeline_row_count == 0) {
+		return;
+	}
+	/* the busiest first: a row with one draw in it is noise beside one with a thousand */
+	for (i = 1; i < rw_pipeline_row_count; i++) {
+		struct rw_pipeline_row held = rw_pipeline_rows[i];
+
+		for (j = i; j > 0 && rw_pipeline_rows[j - 1].draws < held.draws; j--) {
+			rw_pipeline_rows[j] = rw_pipeline_rows[j - 1];
+		}
+		rw_pipeline_rows[j] = held;
+	}
+	shown = rw_pipeline_row_count < 24 ? rw_pipeline_row_count : 24;
+	rw_print("pipelines: %u in this window, %u shown (state, attachment, draws, colours, "
+	         "depth, samples)\n", rw_pipeline_row_count, shown);
+	for (i = 0; i < shown; i++) {
+		const struct rw_pipeline_row *row = &rw_pipeline_rows[i];
+
+		rw_print("  %p %ux%u draws %lu colour %u depth %u samples %u\n", row->pipeline,
+		         row->width, row->height, row->draws, row->color_count, row->depth,
+		         row->sample_count);
+	}
+	rw_pipeline_row_count = 0;
+	memset(rw_pipeline_rows, 0, sizeof(rw_pipeline_rows));
+}
+
+#include "redwoodmetal_mesa.inc"
 
 /*
  * Say a thing once, per place that says it.
@@ -651,6 +631,68 @@ mesa_available(void)
 			}						\
 		}							\
 	} while (0)
+
+/*
+ * The refused module itself, for the first four that fail. The refusal names the construct the
+ * frontend declined and, since the stage is in the sentence, which module declined it; fixing the
+ * frontend needs the bytes, and the only road out of a running daemon is this log, which the loader
+ * holds and the host pulls every 20 s. Base64 in 72-character lines, 16 KB a module, four modules
+ * a boot: the loader keeps the first 256 KB and the last megabyte, a run writes about 21 KB a
+ * second, and a diagnostic that evicts the frames it explains is a worse instrument than a quiet
+ * one. tools/mesa/air/airfail-extract.py reads these lines back into .metallib files.
+ */
+#define AIR_DUMP_MAX 4
+#define AIR_DUMP_BYTES (16 * 1024)
+static void
+air_fail_dump(const void *bytes, NSUInteger length, const char *stage, const char *name)
+{
+	static const char b64[] =
+	    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	static unsigned dumped;
+	static unsigned seen[8];
+	const unsigned char *p = bytes;
+	unsigned hash = 2166136261u;
+
+	if (bytes == NULL || length == 0 || dumped >= AIR_DUMP_MAX) {
+		return;
+	}
+	for (NSUInteger i = 0; i < length; i++) {
+		hash = (hash ^ p[i]) * 16777619u;
+	}
+	for (unsigned i = 0; i < sizeof(seen) / sizeof(seen[0]); i++) {
+		if (seen[i] == hash) {
+			return;
+		}
+		if (seen[i] == 0) {
+			seen[i] = hash;
+			break;
+		}
+	}
+	if (length > AIR_DUMP_BYTES) {
+		rw_print("AIRFAIL over-cap %s %s %lu bytes, the cap is %d\n", stage, name,
+		    (unsigned long)length, AIR_DUMP_BYTES);
+		return;
+	}
+	dumped++;
+	rw_print("AIRFAIL begin %s %s %lu bytes fnv=%08x\n", stage, name,
+	    (unsigned long)length, hash);
+	for (NSUInteger at = 0; at < length; at += 54) {
+		char line[76];
+		unsigned n = (unsigned)MIN(length - at, 54u), o = 0;
+		for (unsigned i = 0; i < n; i += 3) {
+			unsigned v = (unsigned)p[at + i] << 16 |
+			    (i + 1 < n ? (unsigned)p[at + i + 1] : 0) << 8 |
+			    (i + 2 < n ? (unsigned)p[at + i + 2] : 0);
+			line[o++] = b64[v >> 18 & 63];
+			line[o++] = b64[v >> 12 & 63];
+			line[o++] = i + 1 < n ? b64[v >> 6 & 63] : '=';
+			line[o++] = i + 2 < n ? b64[v & 63] : '=';
+		}
+		line[o] = '\0';
+		rw_print("AIRFAIL %s\n", line);
+	}
+	rw_print("AIRFAIL end %s %s\n", stage, name);
+}
 
 /*
  * A BLEND LINE, deduplicated the way a repeated refusal is -- but on the CONTENT and not on
@@ -936,7 +978,7 @@ struct gem_new   { uint64_t size; uint32_t flags, handle; };
 struct gem_info  { uint32_t handle, info; uint64_t value; uint32_t len, pad; };
 struct gem_close { uint32_t handle, pad; };
 
-#define RW_MAX_BUFFERS 32
+#include "redwoodmetal_work_private.h"
 
 @class RedwoodMetalCommandQueue;
 @class RedwoodMetalWork;
@@ -1020,58 +1062,17 @@ struct gem_close { uint32_t handle, pad; };
 - (unsigned)vertexElementAttribute:(unsigned)index;
 @end
 
-@interface RedwoodMetalWork : NSObject {
-@public
-	RedwoodMetalComputePipeline *pipeline;
-	RedwoodMetalRenderPipeline *render;      /* set instead for a draw */
-	id color[8];
-	unsigned colorCount;
-	float clearColor[4];
-	BOOL clears;
-	/* the depth/stencil attachment of the pass, its two load actions and the state
-	 * bound when the draw was encoded. Separate flags per aspect because Metal keeps
-	 * two attachment descriptors over one texture and a pass that clears the depth and
-	 * keeps the stencil is ordinary. */
-	id depth;
-	id depthStencilState;
-	float clearDepth;
-	unsigned clearStencil;
-	BOOL clearsDepth, clearsStencil;
-	unsigned stencilReference[2];
-	float depthRange[2];
-	BOOL hasDepthRange;
-	unsigned primitive, vertexStart, vertexCount;
-	/* the index buffer of an indexed draw and the three numbers that come with it in
-	 * the same Metal call; indexBuffer nil is -drawPrimitives:, and then vertexCount
-	 * counts vertices rather than indices */
-	id indexBuffer;
-	unsigned indexType;
-	size_t indexBufferOffset;
-	int baseVertex;
-	unsigned instanceCount, baseInstance;
-	id vertexBuffers[RW_MAX_BUFFERS];
-	size_t vertexBufferOffsets[RW_MAX_BUFFERS];
-	unsigned vertexBufferCount;
-	id buffers[RW_MAX_BUFFERS];
-	/* Metal's own `offset:` for each of them, which until argument buffers existed was
-	 * refused at the encoder as unimplemented. It is RECORDED here and judged at the
-	 * draw instead, because which indices may carry one is the pipeline's answer: a
-	 * member of an argument buffer has its own offset and a buffer argument still has
-	 * none. */
-	size_t bufferOffsets[RW_MAX_BUFFERS];
-	id textures[RW_MAX_BUFFERS];
-	id samplers[RW_MAX_BUFFERS];
-	unsigned count, textureCount, samplerCount;
-	unsigned groups[3], size[3];
-}
-@end
-
 @interface RedwoodMetalTexture : _MTLResource {
 	RedwoodMetalDevice *_owner;
 	struct rwa_texture *_texture;
 	struct rwa_texture_shape _shape;
+	CFTypeRef _iosurface;
+	NSUInteger _iosurfacePlane;
 	int _responsibleProcess;   /* as on the buffer: accounting, not behaviour */
 }
+- (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
+	texture:(struct rwa_texture *)texture shape:(const struct rwa_texture_shape *)shape
+	iosurface:(CFTypeRef)surface plane:(NSUInteger)plane;
 @property (readonly) struct rwa_texture *mesaTexture;
 /* Not part of MTLTexture: the depth or stencil aspect of this texture, one float and one
  * byte per texel. Metal's own -getBytes: has no aspect to name and the compiler library
@@ -1125,11 +1126,18 @@ struct gem_close { uint32_t handle, pad; };
 	NSUInteger _length;
 	struct rwa_buffer *_mesa; /* set instead when the memory came from Mesa */
 	int _responsibleProcess;  /* what <MTLResourceSPI> calls the owner, for accounting */
+	void (^_callerDeallocator)(void *, NSUInteger); /* copied: CoreAnimation's is on its stack */
+	void *_callerBytes;       /* what that block expects back, not what we allocated */
 }
 @property (readonly) struct rwa_buffer *mesaBuffer;
 - (instancetype)initWithDevice:(RedwoodMetalDevice *)device
 			   gpu:(io_connect_t)gpu
 			length:(NSUInteger)length;
+- (instancetype)initWithDevice:(RedwoodMetalDevice *)device
+			   gpu:(io_connect_t)gpu
+			 bytes:(const void *)bytes
+			length:(NSUInteger)length
+		   deallocator:(void (^)(void *, NSUInteger))deallocator;
 @end
 
 @implementation RedwoodMetalDevice
@@ -1137,6 +1145,20 @@ struct gem_close { uint32_t handle, pad; };
 + (void)load
 {
 	ensure_spi(self);
+	/*
+	 * Diagnostic only, paired with the kernel's `redwood: <comm> bad access at ... pc ...` line
+	 * (e933479): without this address the pc cannot be attributed to an image, because the dylib is
+	 * position independent and its slide differs per process. Kept while the nil-buffer line is
+	 * suspended -- docs/plan/2026-10-28-widget-stall-control-round.md section 3.80.
+	 *
+	 * Behind REDWOOD_DIAG like every other print that exists only for one investigation: with the
+	 * variable unset the load prints nothing, so turning a diagnostic on does not change the library
+	 * the round's baseline describes. package.py puts the variable in these processes' environment
+	 * and records it in the manifest.
+	 */
+	if (getenv("REDWOOD_DIAG") != NULL) {
+		rw_print("rwa metal: driver code at %p\n", (void *)&rw_print);
+	}
 }
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
@@ -1488,14 +1510,55 @@ struct gem_close { uint32_t handle, pad; };
 
 	char why[512] = { 0 };
 	struct rwa_render_info info = { 0 };
+	/* A cache keyed by the descriptor -- both modules, both names, the whole
+	 * rwa_render_shape -- was tried here because CoreAnimation asks for ten pipelines a
+	 * second while the Control Center animates. It never hit once in a 360-second run:
+	 * the descriptors that repeat a blend configuration do not repeat it exactly, so
+	 * each one is a compile. Removed rather than left as code that runs on every
+	 * pipeline and never answers.
+	 */
+
+	/* How long a compile takes, and how many there have been: CoreAnimation builds these
+	 * while it animates -- ten a second in one Control Center pull -- and if that is where
+	 * a frame's time goes, the answer is a pipeline it can reuse rather than a faster one. */
+	uint64_t compile_began = mach_absolute_time();
 	struct rwa_render *render = mesa.render_create(_mesa,
 	    vertex_air != nil ? [vertex_air bytes] : NULL,
 	    vertex_air != nil ? [vertex_air length] : 0,
 	    vertex != nil ? [[vertex name] UTF8String] : NULL,
 	    [fragment_air bytes], [fragment_air length], [[fragment name] UTF8String],
 	    &shape, &info, why, sizeof(why));
+	{
+		static unsigned long built;
+		struct mach_timebase_info tb;
+		uint64_t us;
+
+		mach_timebase_info(&tb);
+		us = (mach_absolute_time() - compile_began) * tb.numer / tb.denom / 1000;
+		if (++built == 1 || us >= 1000) {
+			/* The entry names are here because a picture that is wrong needs to be
+			 * traced back to the pipeline that drew it, and Apple's own names for the
+			 * compiler library's functions are the only handle this process has on
+			 * them: "air.fragment.blur" says what an address does not.
+			 */
+			rw_print("render pipelines: %lu built, this one %llu us (%s) vertex %s "
+			         "fragment %s\n", built, us,
+			         render != NULL ? "ok" : "refused",
+			         vertex != nil ? [[vertex name] UTF8String] : "(none)",
+			         [[fragment name] UTF8String]);
+		}
+	}
 
 	if (render == NULL) {
+		/* Both modules go out, whichever of them the sentence names: the driver cannot
+		 * tell from here which stage the frontend gave up on, and a dump of the wrong
+		 * one is a boot spent learning nothing. */
+		air_fail_dump([fragment_air bytes], [fragment_air length], "fragment",
+		    [[fragment name] UTF8String]);
+		if (vertex_air != nil) {
+			air_fail_dump([vertex_air bytes], [vertex_air length], "vertex",
+			    [[vertex name] UTF8String]);
+		}
 		/* PRINTED as well as returned, and RW_AGAIN because the same specification
 		 * is asked for over and over: -fail: puts the sentence in an NSError and
 		 * nothing more, and whether anyone ever sees it is then the caller's
@@ -1514,10 +1577,12 @@ struct gem_close { uint32_t handle, pad; };
 	if (shape.color_count > 0) {
 		rw_blend_result(info.blend_enabled_mask, info.color_write_masks);
 	}
-	return [[RedwoodMetalRenderPipeline alloc] initWithRedwoodDevice:self
-								 render:render
-								   info:&info
-							     descriptor:descriptor];
+	{
+		return [[RedwoodMetalRenderPipeline alloc] initWithRedwoodDevice:self
+									  render:render
+									    info:&info
+								      descriptor:descriptor];
+	}
 }
 
 - (id)newRenderPipelineStateWithDescriptor:(id)descriptor
@@ -1572,12 +1637,8 @@ struct gem_close { uint32_t handle, pad; };
 	[state release];
 }
 
-/*
- * The mesh forms are the opposite hazard: they are NOT routed through the compiler, they ask
- * the mesh descriptor for a plain render pipeline descriptor and re-enter one of the four
- * forms above on self (0x181aabf60 and its three neighbours). Inherited, they would hand a
- * mesh pipeline to a vertex-and-fragment builder and produce something built wrong instead of
- * a refusal. Mesh shaders are an A14-and-later feature and nothing here implements them.
+/* The inherited mesh methods convert the descriptor into a regular render
+ * pipeline descriptor. Reject them until this driver implements mesh shaders.
  */
 - (id)newRenderPipelineStateWithMeshDescriptor:(id)descriptor
 				       options:(NSUInteger)options
@@ -1605,35 +1666,16 @@ struct gem_close { uint32_t handle, pad; };
 	}
 }
 
-/* A texture is Metal's descriptor handed through to the compiler library in Metal's own
- * terms; a pixel format it cannot translate is refused by name, because a format that is
- * almost right computes a wrong picture instead of failing. */
-/*
- * THE SELECTORS THE PROTOCOLS DO NOT LIST, and this is the second time one of them has killed a
- * process. owes.py counts what the protocols require and found nothing missing; these are
- * declared on Apple's counterpart CLASSES -- AGXA11FamilyDevice and IOGPUMetalDevice -- which our
- * device does not descend from, so nothing in the chain answers them and no protocol says so.
- * tools/metal/owesclass.py counts that other list: 343 such selectors, 72 of which something in
- * this image actually sends, and NONE of the 72 behind a -respondsToSelector:. QuartzCore does not
- * ask, it sends. So every one of them is terminate(), not a composite that merely looks wrong --
- * which is what setProtectionOptions: did to the window server and what the first of these just
- * did to mediaserverd.
- *
- * A texture LAYOUT answers bytes-per-row, image stride, size and alignment for a descriptor
- * without allocating anything, so CoreAnimation can size an IOSurface before it has a texture.
- * nil is the honest answer rather than a measured one: CA::Render::new_mtl_texture_layout hands
- * our result straight back to its own caller, and that caller is in no other image of this cache,
- * so whether a nil is tolerated is unknown. If the log says it is not, the next step is a small
- * object over the arithmetic -newTextureWithDescriptor: below already does.
+/* QuartzCore's texture-layout object requires initialization, copy and finalization.
+ * Return nil until those operations are implemented along with size/alignment.
  */
 - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)descriptor
 			isHeapOrBufferBacked:(BOOL)backed
 {
 	(void)descriptor;
 	(void)backed;
-	RW_ONCE("redwoodmetal: a texture layout was asked for and this driver has none to give; "
-		"CoreAnimation sizes a surface with it before any texture exists, and nil is the "
-		"answer until a boot says nil is not tolerated\n");
+	RW_ONCE("redwoodmetal: texture-layout initialization/copy/finalization unsupported; "
+		"newTextureLayoutWithDescriptor returns nil\n");
 	return nil;
 }
 
@@ -1719,7 +1761,7 @@ struct gem_close { uint32_t handle, pad; };
 	}
 	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
 							 texture:texture
-							   shape:&shape];
+							   shape:&shape iosurface:NULL plane:0];
 }
 
 /* The sampler's own base class exists and owes its protocol nothing, so this is the cheapest
@@ -2214,31 +2256,37 @@ struct gem_close { uint32_t handle, pad; };
 - (BOOL)isDepth24Stencil8PixelFormatSupported { return NO; }
 
 /*
- * One sample, STILL -- and this one needs its reason written down, because it is now the
- * narrower statement of the two this driver could make.
+ * One sample by default, and four when REDWOOD_MSAA asks for it -- the switch exists
+ * because the answer changes what every application that asks it does.
  *
- * The compiler library does make multisample textures since docs/metal.md 10.34: the
- * Adreno gives 2 and 4 samples, a render pass of that count fills one, and a shader reads
- * one with read(coord, sample). So "count == 1" is no longer what this device CAN do with
- * a multisample texture.
+ * The compiler library makes multisample textures since docs/metal.md 10.34: the Adreno
+ * gives 2 and 4 samples, a render pass of that count fills one, and a shader reads one
+ * with read(coord, sample). What an application then asks for is the result in a
+ * one-sample texture -- MTLStoreActionMultisampleResolve, or
+ * MTLRenderPassColorAttachmentDescriptor.resolveTexture -- and the resolve is done now,
+ * as a blit from the multisample attachment at the end of every draw that names one
+ * (struct rwa_draw.resolve). That is what makes a yes here honest.
  *
- * It is what this device can do with one for an APPLICATION, and that is what the
- * selector asks. An application that is told four samples makes a four-sample attachment
- * and then asks for its result in a one-sample texture -- MTLStoreActionMultisampleResolve,
- * or MTLRenderPassColorAttachmentDescriptor.resolveTexture -- and this driver has neither:
- * the contract stores what it has and resolves nothing. AppleMetalGLRenderer is exactly
- * such an application (its own six multisample fragment shaders are the ones 10.34 is
- * about), and a GL context given an MSAA config it cannot resolve is worse off than one
- * given none. So the yes waits for the resolve, and the measurement of the texture does
- * not wait for the yes: a test binds one without asking.
+ * Four and not two: four is what CoreAnimation and the GL path ask for, the Adreno takes
+ * both, and two would be a second path nobody has asked to measure. Eight is declined by
+ * the back end itself (a6xx/fd6_screen.cc, valid_sample_count).
  *
- * Note also that -supportsTextureSampleCount: is not a second answer to keep in step. It
- * is one instruction in _MTLDevice (0x181a17890) that tail-calls -supportsSampleCount:,
- * which _MTLDevice itself does not implement at all -- so this method is the whole of
- * both, and without it that forward would die on an unrecognized selector naming OUR
- * class (docs/metal.md 10.1's trap).
+ * The variable is read here on every call rather than cached: this is one getenv in a
+ * selector that applications call a handful of times at startup.
+ *
+ * -supportsTextureSampleCount: is not a second answer to keep in step. It is one
+ * instruction in _MTLDevice (0x181a17890) that tail-calls -supportsSampleCount:, which
+ * _MTLDevice itself does not implement at all -- so this method is the whole of both, and
+ * without it that forward would die on an unrecognized selector naming OUR class
+ * (docs/metal.md 10.1's trap).
  */
-- (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1; }
+- (BOOL)supportsSampleCount:(NSUInteger)count
+{
+	if (count == 1) {
+		return YES;
+	}
+	return count == 4 && getenv("REDWOOD_MSAA") != NULL;
+}
 - (MTLSize)sparseTileSizeWithTextureType:(NSUInteger)type
 			     pixelFormat:(NSUInteger)format
 			     sampleCount:(NSUInteger)samples
@@ -2262,10 +2310,33 @@ struct gem_close { uint32_t handle, pad; };
 - (uint64_t)halfFPConfig   { return 0; }
 - (uint64_t)doubleFPConfig { return 0; }
 
+/* fdl6_layout_image requires max(64 bytes, 16 pixels) for explicit linear
+ * rows. Keep superclass validation and any stronger alignment it returns.
+ */
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	static unsigned calls;
+	NSUInteger alignment = [super minimumLinearTextureAlignmentForPixelFormat:format];
+	switch (format) {
+	case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float:
+	case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRGBA16Snorm:
+	case MTLPixelFormatRGBA16Uint: case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float:
+		alignment = MAX(alignment, 128); break;
+	case MTLPixelFormatRGBA32Uint: case MTLPixelFormatRGBA32Sint: case MTLPixelFormatRGBA32Float:
+		alignment = MAX(alignment, 256); break;
+	default: break;
+	}
+	if (__sync_fetch_and_add(&calls, 1) < 64)
+		rw_print("linear alignment query: format=%lu alignment=%lu\n", (unsigned long)format, (unsigned long)alignment);
+	return alignment;
+}
+
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format
 {
-	(void)format;
-	return 16;   /* a placeholder: the real figure is per format and belongs to Mesa */
+	static unsigned calls;
+	if (__sync_fetch_and_add(&calls, 1) < 64)
+		rw_print("texture-buffer alignment query: format=%lu alignment=16 (buffer textures unsupported)\n", (unsigned long)format);
+	return 16;
 }
 
 /* Heaps are suballocation of one big allocation, and nothing here suballocates yet. Metal's
@@ -2328,7 +2399,7 @@ struct gem_close { uint32_t handle, pad; };
 	}
 	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:self
 							 texture:texture
-							   shape:&shape];
+							   shape:&shape iosurface:s plane:p];
 }
 - (id)newBufferWithIOSurface:(void *)surface        { (void)surface; return nil; }
 - (id)newBufferWithBytesNoCopy:(void *)bytes
@@ -2336,8 +2407,24 @@ struct gem_close { uint32_t handle, pad; };
 		       options:(NSUInteger)options
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-	(void)bytes; (void)length; (void)options; (void)deallocator;
-	return nil;   /* wrapping the caller's own pages needs the kernel to map them: not yet */
+	/* Only the small buffers for now: roundb's 109 deduplicated copy requests all fell at or under
+	 * this limit, 94 of them at 32 KiB, so a copy of that size says whether the nil return is what
+	 * stops the compositor without paying for a 1 MiB copy on every one of the others. */
+	enum { NOCOPY_LIMIT = 0x10000 };
+
+	(void)options;
+	if (bytes == NULL || length == 0 || length > NOCOPY_LIMIT) {
+		if (length > NOCOPY_LIMIT) {
+			rw_print("rwa buffer: %lu bytes left nil, over the %u this path copies\n",
+				 (unsigned long)length, (unsigned)NOCOPY_LIMIT);
+		}
+		return nil;
+	}
+	return [[RedwoodMetalBuffer alloc] initWithDevice:self
+						    gpu:_gpu
+						   bytes:bytes
+						  length:length
+					     deallocator:deallocator];
 }
 - (id)newIndirectCommandBufferWithDescriptor:(id)d
 			      maxCommandCount:(NSUInteger)count
@@ -2418,88 +2505,7 @@ struct gem_close { uint32_t handle, pad; };
 	return @"Adreno (Redwood; the GPU is not started)";
 }
 
-/*
- * The answer that could not be "nothing", and the first place in this driver where that is
- * true. logs/210311-run.log is backboardd dying every ten seconds on
- *
- *   signal 11 at 0x10, pc 0x181a3ca3c, called from 0x18847f6dc
- *
- * which is MTLPipelineLibraryBuilder::newLibraryWithFile + 836, reached from
- * CA::OGL::new_metal_context + 1808 -- QuartzCore asking this device for the precompiled
- * pipelines of its own default.pipelinelib. Nothing of ours is on that stack:
- * -[_MTLDevice newPipelineLibraryWithFilePath:error:] is three instructions (0x181a3d9b0,
- * `mov x1, x0; ldr x0, [x0, #0x180]; b`) that hand the device and its own builder ivar to
- * Apple's C++, which gets as far as parsing pipelines.desc out of the image and then asks us
- * one question. The three instructions that matter:
- *
- *   0x181a3c9ec  objc_opt_respondsToSelector(device, "targetDeviceInfo")   -> YES
- *   0x181a3c9f8  objc_msgSend$targetDeviceInfo                             -> NULL
- *   0x181a3ca3c  ldr x8, [x23, #0x10]                                      -> 0x10
- *
- * Both halves of that are Apple's. `_MTLDevice` HAS an entry for -targetDeviceInfo and its
- * body is `mov x0, #0; ret` (0x181aa8d98 -- tools/metal/absmeth.py calls that a nil-stub),
- * so the runtime answers the question YES on our behalf and the pointer is NULL; and the
- * caller treats a YES as a promise and dereferences what comes back. Declining is therefore
- * not on the table: returning nil IS what crashes, and the only way to make the runtime say
- * NO would be to lie in -respondsToSelector:, which would also lie to every caller that
- * does not ask first. Of the eight objc_opt_respondsToSelector sites in all of
- * Metal.framework this is the only one whose answer is a raw pointer rather than a scalar or
- * an object -- the other seven ask about -shaderDebugInfoCaching, -maximumComputeSubstreams
- * (twice), -presentWithOptions: (twice), -boolValue and one selector held in a register.
- *
- * The shape can recur, and the population is counted rather than feared: of `_MTLDevice`'s
- * 522 instance methods 74 are nil-stubs, and 14 of those are declared to return a raw
- * pointer (absmeth.py joined to protometh.py by implementation address). Thirteen of the
- * fourteen are the pipeline-cache key family -- `*FunctionKeyWith...:keySize:` and
- * `get*FunctionId:compilerOptions:compilerOptionsSize:` -- which is reached only once a
- * pipeline cache actually holds something; this is the fourteenth, and the first one
- * anything asked for.
- *
- * So the struct is real, and its contents are the ones Apple's own code writes in the branch
- * it takes for a device that does not respond (0x181a3ca04): zero, zero, and the device's
- * -name with the spaces removed. Its shape is known twice over, from two sources that agree
- * -- that branch, which builds one on its own stack, and the type MTLDeviceSPI records for
- * this method, `r^{MTLTargetDeviceArch=QI*}16@0:8`. Each field by its reader:
- *
- *   +0x00  nobody on this path reads it, and Apple's branch writes 0.
- *   +0x08  read by -[_MTLPipelineCache initWithFilePath:readOnly:deviceInfo:] (0x181a3b720),
- *          which pairs it with 1 into an MTLCompilerCache::Version for
- *          MTLCompilerCache::createPipelineDataCache. That version decides whether a cache
- *          FILE is stale; this cache is opened read-only (w3=1 at 0x181a3ca64) over a file
- *          no image here has, so there is nothing for it to invalidate, and 0 is the number
- *          Apple's own branch uses. It becomes a real question the day this driver WRITES a
- *          pipeline cache, and not before.
- *   +0x10  formatted into "%s/pipelines.%s" (0x181a3ca48) -- the per-GPU cache file inside
- *          QuartzCore.framework/default.pipelinelib. It must be a C string and not NULL:
- *          Metal's second cache, the one for `functions`, it builds with a zeroed struct and
- *          an EMPTY name itself (0x181a3ca7c), which is the measurement that says a zeroed
- *          struct is acceptable to _MTLPipelineCache.
- *
- * What this buys is a refusal with a reason instead of a crash, and the refusal is the
- * honest one: that image ships `functions` and `pipelines.desc` and no pipelines.* for any
- * GPU at all (not even the A11 this phone was born with), so the cache comes back nil,
- * Metal fills the NSError with "Could not open pipeline cache file: %s" (code 6,
- * 0x181a3cb2c), and QuartzCore logs "Metal failed to load pipeline library: %s" and carries
- * on -- 0x18847f6f0 is a `cbnz`, not an assert. Nothing is lost by it: a precompiled
- * pipeline in that cache would be A11 machine code, which this driver could not run anyway.
- * The pipelines CoreAnimation needs get compiled the ordinary way, through
- * -newRenderPipelineStateWithDescriptor: and AIR.
- */
-- (const struct MTLTargetDeviceArch *)targetDeviceInfo
-{
-	/* The whole point of this method is that a NULL here is fatal, so it must not depend on
-	 * an initialiser having run: an object built with plain -init rather than Metal's
-	 * -initWithAcceleratorPort: has a zeroed ivar, and an empty name is what Apple's own
-	 * second cache passes for itself anyway. The array is zeroed by the runtime, so it
-	 * already spells "". */
-	if (_target.name == NULL) {
-		_target.name = _targetName;
-	}
-	RW_ONCE("Metal asked for targetDeviceInfo (pipelines.%s); it is answered "
-		"with a real struct because Apple's own answer here is a NULL this driver does "
-		"not get to decline\n", _target.name);
-	return &_target;
-}
+#include "redwoodmetal_archive.inc"
 
 /* The two buffer entry points of MTLDevice that nothing in the chain answers. Anything
  * Metal would ask about storage modes is answered by the buffer itself. */
@@ -2616,8 +2622,45 @@ struct gem_close { uint32_t handle, pad; };
 	return _mesa;
 }
 
+/* Memory the caller owns, copied once: our buffer has to outlive the call and the caller's pages
+ * cannot be mapped into the GPU's address space yet. The cost is the copy; the behaviour that
+ * differs from Metal is that writing through -contents no longer lands in the caller's memory, so
+ * this is a way to get the drawing done, not a finished no-copy buffer. */
+- (instancetype)initWithDevice:(RedwoodMetalDevice *)device
+			   gpu:(io_connect_t)gpu
+			 bytes:(const void *)bytes
+			length:(NSUInteger)length
+		   deallocator:(void (^)(void *, NSUInteger))deallocator
+{
+	self = [self initWithDevice:device gpu:gpu length:length];
+	if (self == nil) {
+		return nil;
+	}
+	if (bytes != NULL && _contents != NULL) {
+		memcpy(_contents, bytes, length);
+	}
+	_callerBytes = (void *)bytes;
+	if (deallocator != NULL) {
+		_callerDeallocator = [deallocator copy];
+	}
+	rw_print("rwa buffer: copied %p of %lu bytes, buffer at %p\n", bytes, (unsigned long)length,
+		 _contents);
+	return self;
+}
+
 - (void)dealloc
 {
+	/* The caller handed us its own memory and an expectation to be told when we are done with it.
+	 * That moment is now: the buffer is going away, so the deallocator runs once, before the
+	 * memory it describes is released. _callerBytes is what the block was given, not _contents,
+	 * which is our copy. */
+	if (_callerDeallocator != NULL) {
+		void (^block)(void *, NSUInteger) = _callerDeallocator;
+
+		_callerDeallocator = NULL;
+		block(_callerBytes, _length);
+		[block release];
+	}
 	if (_mesa != NULL) {
 		mesa.buffer_destroy(_mesa);
 		[super dealloc];
@@ -2710,18 +2753,44 @@ struct gem_close { uint32_t handle, pad; };
 }
 - (void)setResponsibleProcess:(int)pid { _responsibleProcess = pid; }
 /*
- * A texture laid over this buffer's memory. Textures exist now -- the comment here used to say
- * they did not -- but the contract still has no call that lays one over a buffer we already own,
- * so this is nil with a reason rather than nil with a stale excuse.
+ * A texture laid over this buffer's memory, which CoreAnimation asks for: 120x120 RGBA8 at
+ * 512 bytes a row, once per process.
+ *
+ * The bytes are copied into a texture of its own rather than shared, because Gallium cannot
+ * lay one resource over another's memory. The copies happen when the texture is made and
+ * again at every -commit (rwa_buffer_textures_refresh), since the processor may have written
+ * the buffer in between and nothing tells this driver when.
  */
 - (id)newTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
 		   bytesPerRow:(NSUInteger)bytesPerRow
 {
-	(void)descriptor; (void)offset; (void)bytesPerRow;
-	RW_ONCE("redwoodmetal: a texture over a buffer was asked for; the contract lays a texture "
-		"over an IOSurface and over memory of its own, but not over a buffer this driver "
-		"already holds\n");
-	return nil;
+	char why[512] = { 0 };
+	struct rwa_texture_shape shape;
+	struct rwa_texture *texture;
+
+	if (_mesa == NULL || mesa.texture_from_buffer == NULL) {
+		rw_print("a texture over a buffer needs a buffer the compiler library made\n");
+		return nil;
+	}
+	memset(&shape, 0, sizeof(shape));
+	shape.pixel_format = (unsigned)[descriptor pixelFormat];
+	shape.type = (unsigned)[descriptor textureType];
+	shape.width = (unsigned)[descriptor width];
+	shape.height = (unsigned)[descriptor height];
+	shape.depth = (unsigned)[descriptor depth];
+	shape.array_length = (unsigned)[descriptor arrayLength];
+	shape.mip_levels = (unsigned)[descriptor mipmapLevelCount];
+	shape.sample_count = (unsigned)[descriptor sampleCount];
+	shape.usage = (unsigned)[descriptor usage];
+	texture = mesa.texture_from_buffer([_owner mesaDevice], &shape, _mesa, offset,
+					   (unsigned)bytesPerRow, why, sizeof(why));
+	if (texture == NULL) {
+		rw_print("%s\n", why);
+		return nil;
+	}
+	return [[RedwoodMetalTexture alloc] initWithRedwoodDevice:_owner
+							 texture:texture
+							   shape:&shape iosurface:NULL plane:0];
 }
 
 - (id)newLinearTextureWithDescriptor:(id)descriptor offset:(NSUInteger)offset
@@ -2736,301 +2805,7 @@ struct gem_close { uint32_t handle, pad; };
 
 @end
 
-@implementation RedwoodMetalTexture
-
-+ (void)load
-{
-	/* MTLTexture is what an application sees. MTLTextureImplementation is what Metal
-	 * itself checks: -[MTLRenderPassColorAttachmentDescriptorInternal setTexture:]
-	 * (0x181a350a0) asks conformsToProtocol: for it and reports "texture is not a
-	 * MTLTextureImplementation." Only the conformance is tested on that path -- nothing
-	 * sends its 68 members -- so declaring it is honest and is what lets a texture of ours
-	 * be a render target at all. */
-	const char *names[] = { "MTLTexture", "MTLTextureImplementation" };
-
-	for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-		Protocol *p = objc_getProtocol(names[i]);
-
-		if (p == NULL) {
-			continue;
-		}
-		if (!class_conformsToProtocol(self, p) && !class_addProtocol(self, p)) {
-			rw_print("class_addProtocol(%s) refused\n", names[i]);
-		}
-	}
-}
-
-- (instancetype)initWithRedwoodDevice:(RedwoodMetalDevice *)device
-			      texture:(struct rwa_texture *)texture
-				shape:(const struct rwa_texture_shape *)shape
-{
-	self = [super init];
-	if (self == nil) {
-		mesa.texture_destroy(texture);
-		return nil;
-	}
-	_owner = device;
-	_texture = texture;
-	_shape = *shape;
-	return self;
-}
-
-- (void)dealloc
-{
-	if (_texture != NULL) {
-		mesa.texture_destroy(_texture);
-	}
-	[super dealloc];
-}
-
-- (struct rwa_texture *)mesaTexture { return _texture; }
-
-- (id)device                       { return _owner; }
-- (NSUInteger)width                { return _shape.width; }
-- (NSUInteger)height               { return _shape.height; }
-- (NSUInteger)depth                { return _shape.depth; }
-- (NSUInteger)mipmapLevelCount     { return _shape.mip_levels; }
-- (NSUInteger)arrayLength          { return _shape.array_length; }
-- (NSUInteger)sampleCount          { return _shape.sample_count; }
-- (NSUInteger)pixelFormat          { return _shape.pixel_format; }
-- (NSUInteger)textureType          { return _shape.type; }
-- (NSUInteger)usage                { return _shape.usage; }
-- (BOOL)isFramebufferOnly          { return NO; }
-- (BOOL)allowGPUOptimizedContents  { return NO; }
-- (id)parentTexture                { return nil; }
-- (NSUInteger)parentRelativeLevel  { return 0; }
-- (NSUInteger)parentRelativeSlice  { return 0; }
-- (id)buffer                       { return nil; }
-- (NSUInteger)bufferOffset         { return 0; }
-- (NSUInteger)bufferBytesPerRow    { return 0; }
-- (id)iosurface                    { return nil; }
-- (NSUInteger)iosurfacePlane       { return 0; }
-/* MTLStorageModeShared, except for a multisample texture, which Metal does not allow to be
- * one: "MTLTextureDescriptor: Multisample textures cannot be allocated with
- * MTLStorageModeShared on this device" is Metal's own sentence, in the framework's own
- * __cstring and not in the validation layer. Answering Private for one is not bookkeeping
- * -- Shared is what makes -replaceRegion: and -getBytes: legal, and those are exactly the
- * two calls the compiler library refuses on a multisample texture (and refuses because
- * neither side can give the samples of a texel a defined order through a map). So the
- * storage mode this reports and the calls that work on it say the same thing. */
-- (NSUInteger)storageMode
-{
-	return _shape.sample_count > 1 ? 2 : 0;   /* MTLStorageModePrivate : Shared */
-}
-- (NSUInteger)cpuCacheMode         { return 1; }
-- (NSUInteger)resourceOptions      { return 0; }
-- (NSUInteger)hazardTrackingMode   { return 0; }
-- (NSUInteger)allocatedSize        { return 0; }   /* not accounted for yet, and says so */
-/* MTLPurgeableStateNonVolatile, for the reason written over the buffer's own: a texture of
- * the compiler library's is held until it is destroyed, so there is no volatile state to
- * report and zero was not a state at all. */
-- (NSUInteger)setPurgeableState:(NSUInteger)state { (void)state; return 2; }
-- (id)heap                         { return nil; }
-- (NSUInteger)heapOffset           { return 0; }
-- (BOOL)isAliasable                { return NO; }
-- (void)makeAliasable              { }
-
-- (void)replaceRegion:(MTLRegion)region
-	  mipmapLevel:(NSUInteger)level
-		slice:(NSUInteger)slice
-	    withBytes:(const void *)bytes
-	  bytesPerRow:(NSUInteger)stride
-	bytesPerImage:(NSUInteger)image
-{
-	char why[256] = { 0 };
-	unsigned origin[3] = { (unsigned)region.origin.x, (unsigned)region.origin.y,
-			       (unsigned)region.origin.z };
-	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
-			     (unsigned)region.size.depth };
-
-	(void)image;
-	if (mesa.texture_write(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
-			       stride, why, sizeof(why)) != 0) {
-		rw_print("writing texels: %s\n", why);
-	}
-}
-
-- (void)replaceRegion:(MTLRegion)region
-	  mipmapLevel:(NSUInteger)level
-	    withBytes:(const void *)bytes
-	  bytesPerRow:(NSUInteger)stride
-{
-	[self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:stride
-	      bytesPerImage:0];
-}
-
-- (void)getBytes:(void *)bytes
-     bytesPerRow:(NSUInteger)stride
-   bytesPerImage:(NSUInteger)image
-      fromRegion:(MTLRegion)region
-     mipmapLevel:(NSUInteger)level
-	   slice:(NSUInteger)slice
-{
-	char why[256] = { 0 };
-	unsigned origin[3] = { (unsigned)region.origin.x, (unsigned)region.origin.y,
-			       (unsigned)region.origin.z };
-	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
-			     (unsigned)region.size.depth };
-
-	(void)image;
-	if (mesa.texture_read(_texture, (unsigned)level, (unsigned)slice, origin, size, bytes,
-			      stride, why, sizeof(why)) != 0) {
-		rw_print("reading texels: %s\n", why);
-	}
-}
-
-- (void)getBytes:(void *)bytes
-     bytesPerRow:(NSUInteger)stride
-      fromRegion:(MTLRegion)region
-     mipmapLevel:(NSUInteger)level
-{
-	[self getBytes:bytes bytesPerRow:stride bytesPerImage:0 fromRegion:region
-	   mipmapLevel:level slice:0];
-}
-
-- (BOOL)redwoodReadDepth:(float *)depth
-		 stencil:(uint8_t *)stencil
-	      fromRegion:(MTLRegion)region
-{
-	char why[256] = { 0 };
-	unsigned origin[3] = { (unsigned)region.origin.x, (unsigned)region.origin.y,
-			       (unsigned)region.origin.z };
-	unsigned size[3] = { (unsigned)region.size.width, (unsigned)region.size.height,
-			     (unsigned)region.size.depth };
-
-	if (mesa.depth_read == NULL) {
-		rw_print("this compiler library has no rwa_depth_read, so it is "
-		         "older than this driver and cannot say what a depth buffer holds\n");
-		return NO;
-	}
-	if (mesa.depth_read(_texture, 0, 0, origin, size, depth, stencil, why,
-			    sizeof(why)) != 0) {
-		rw_print("reading the depth of a texture: %s\n", why);
-		return NO;
-	}
-	return YES;
-}
-
-/* A view of a texture is another texture over the same memory, and the compiler library has
- * no call for that yet; nil is the honest answer, and it is better than a view that aliases
- * nothing. */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format { (void)format; return nil; }
-
-/*
- * THE REST OF WHAT <MTLTexture>, <MTLTextureSPI>, <MTLResource> AND <MTLResourceSPI>
- * REQUIRE: 27 methods with no answer anywhere in this chain before this section. The same
- * three kinds as everywhere else -- served, true by construction, or refused out loud.
- *
- * The two view calls are the only ones here that hand nothing back, and they say so: a view
- * is a second texture over the first one's memory, and rwa has no call that makes one. A
- * view that aliased nothing would be found much later, by a picture that did not change.
- */
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format
-			textureType:(NSUInteger)type
-			     levels:(NSRange)levels
-			     slices:(NSRange)slices
-{
-	(void)format; (void)type; (void)levels; (void)slices;
-	RW_ONCE("a texture view is not implemented (the compiler library has no "
-		"call that makes a second texture over the same memory); nil\n");
-	return nil;
-}
-- (id)newTextureViewWithPixelFormat:(NSUInteger)format
-			textureType:(NSUInteger)type
-			     levels:(NSRange)levels
-			     slices:(NSRange)slices
-			    swizzle:(MTLTextureSwizzleChannels)swizzle
-{
-	(void)swizzle;
-	return [self newTextureViewWithPixelFormat:format textureType:type levels:levels
-					    slices:slices];
-}
-- (id)newSharedTextureHandle { return nil; }   /* nothing here is shared between processes */
-
-/* Served out of the shape this texture was made with, which is the only place that
- * knowledge exists: a cube is six faces (MTLTextureTypeCube is 3, CubeArray is 4),
- * everything else is one. */
-- (NSUInteger)numFaces
-{
-	return (_shape.type == 3 || _shape.type == 4) ? 6 : 1;
-}
-/* The identity swizzle, and it is the truth rather than a default: a texture of this driver
- * is made from a descriptor's format alone and nothing reorders its channels, so red reads
- * as red. MTLTextureSwizzleChannelsDefault is that same quadruple. */
-- (MTLTextureSwizzleChannels)swizzle
-{
-	return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen,
-					     MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
-}
-- (unsigned int)swizzleKey { return 0; }   /* the key of "nothing is swizzled" */
-/* Nothing here is a view, so every texture is its own root, and nil is what Apple's own
- * resource answers for one that was allocated rather than derived. */
-- (id)rootResource { return nil; }
-
-/*
- * True by construction, and each is a sentence about this driver rather than a shrug:
- *
- *   - nothing aliases: each texture is its own allocation of the compiler library's, there
- *     are no heaps, and -makeAliasable does nothing, so "does this overlap that" is NO for
- *     every pair, for certain;
- *   - nothing is compressed: the library allocates surfaces with no lossless-compression
- *     metadata, so there is no compression and nothing to feed back;
- *   - nothing is sparse: there is no tail, so its size and its first mipmap are zero;
- *   - nothing is a drawable: a texture of this driver never comes from a CAMetalLayer, it is
- *     the attachment a pass draws into and -getBytes: reads back;
- *   - nothing is purgeable or incomplete, for the reason written over the buffer's pair.
- */
-- (BOOL)doesAliasResource:(id)resource { (void)resource; return NO; }
-- (BOOL)doesAliasAnyResources:(const id *)resources count:(NSUInteger)count
-{
-	(void)resources; (void)count;
-	return NO;
-}
-- (BOOL)doesAliasAllResources:(const id *)resources count:(NSUInteger)count
-{
-	(void)resources; (void)count;
-	return NO;
-}
-- (BOOL)isCompressed             { return NO; }
-- (NSInteger)compressionFeedback { return 0; }
-- (BOOL)isSparse                 { return NO; }
-- (NSUInteger)firstMipmapInTail  { return 0; }
-- (NSUInteger)tailSizeInBytes    { return 0; }
-- (BOOL)isShareable              { return NO; }
-- (BOOL)isDrawable               { return NO; }
-- (BOOL)isComplete               { return YES; }
-- (void)waitUntilComplete        { }
-- (BOOL)isPurgeable              { return NO; }
-- (NSUInteger)protectionOptions  { return 0; }
-- (NSUInteger)unfilteredResourceOptions { return [self resourceOptions]; }
-/* Zero is "not rotated": this texture is not a rotated view of a display surface, which is
- * the only thing in Metal that sets this. */
-- (NSUInteger)rotation { return 0; }
-/*
- * The identifier an argument buffer would hold for this texture. This driver has no
- * argument buffers -- the device answers no to every tier of them -- and the compiler
- * library hands out no bindless handle, so there is no identifier to give; zero is the one
- * value that cannot be mistaken for a resource, and it is said once because a caller that
- * asks is a caller that was about to write it into a buffer a shader reads.
- */
-- (MTLResourceID)gpuResourceID
-{
-	MTLResourceID resourceID = { 0 };
-
-	RW_ONCE("a GPU resource ID was asked of a texture; this driver has no "
-		"argument buffers and no bindless handles, so it answers zero\n");
-	return resourceID;
-}
-- (NSUInteger)gpuHandle { return 0; }
-/* Whose allocation this is for the kernel's accounting. We never tell the kernel, so the
- * true answer is this process until somebody says otherwise, and then it is what they said. */
-- (int)responsibleProcess
-{
-	return _responsibleProcess != 0 ? _responsibleProcess : getpid();
-}
-- (void)setResponsibleProcess:(int)pid { _responsibleProcess = pid; }
-
-@end
+#include "redwoodmetal_texture.inc"
 
 @implementation RedwoodMetalSampler
 
@@ -3265,8 +3040,8 @@ struct gem_close { uint32_t handle, pad; };
 
 @end
 
-@implementation RedwoodMetalWork
-@end
+#include "redwoodmetal_work.inc"
+#include "redwoodmetal_blit.inc"
 
 /*
  * THE SLOT EVERY COMMAND BUFFER TAKES FROM THE QUEUE, AND WHY IT HAS TO BE GIVEN BACK.
@@ -3613,558 +3388,14 @@ enum {
 	RW_CB_ERROR        = 5,
 };
 
-@implementation RedwoodMetalCommandBuffer {
-	RedwoodMetalCommandQueue *_queue;
-	NSMutableArray *_work;
-	NSError *_error;
-	NSUInteger _status;
-	BOOL _owesSlot;                 /* this buffer holds one of the queue's slots */
-	NSMutableArray *_scheduled, *_completed;   /* handler blocks, copied to the heap */
-	NSUInteger _protectionOptions;  /* what the window server asked for; see -setProtectionOptions: */
-}
-
-/*
- * The window server sends this to every command buffer it makes, and until it was answered the
- * boot of 22 October 01:51 ended it 78 times with
- *
- *   NSInvalidArgumentException: -[RedwoodMetalCommandBuffer setProtectionOptions:]:
- *   unrecognized selector sent to instance
- *
- * -- an uncaught Objective-C exception out of CA::WindowServer::IOMFBServer::thread_body, which
- * is terminate() and not a refusal we could read.
- *
- * It was missed by owes.py for a reason worth keeping: that tool counts what the PROTOCOLS
- * require, and this pair is declared on a CLASS -- IOGPUMetalCommandBuffer, whose own
- * _protectionOptions ivar it is. Our command buffer descends from _MTLCommandBuffer and not
- * from IOGPU's, so nothing in the chain answers it and nothing in the protocol lists says it is
- * missing. Every selector Apple's own counterpart class declares is a selector a caller may
- * send, and the protocols are only part of that list.
- *
- * The value is kept and not honoured. Protected content means memory the GPU can read and the
- * processor cannot, which this port has nothing to provide: a buffer of ours is ordinary memory
- * on both sides. So a non-zero request says so once rather than being refused -- the window
- * server asks for it on buffers that carry no protected content at all, and refusing would stop
- * a composite that is in no danger.
- */
-- (void)setProtectionOptions:(NSUInteger)options
-{
-	if (options != 0 && _protectionOptions != options) {
-		RW_ONCE("a command buffer was asked for protection options %lu, and this "
-			"driver has no protected memory to give: the request is kept and not honoured, "
-			"because nothing it would protect is protected here either\n",
-			(unsigned long)options);
-	}
-	_protectionOptions = options;
-}
-
-- (NSUInteger)protectionOptions
-{
-	return _protectionOptions;
-}
-
-- (instancetype)initWithRedwoodQueue:(RedwoodMetalCommandQueue *)queue
-{
-	/* what IOGPUMetalCommandBuffer sends to super, retained references and no debug mode.
-	 * THIS CALL BLOCKS when the queue's semaphore is empty -- see the long note above
-	 * RedwoodMetalCommandQueue -- so by the time it returns, a slot is held and owed. */
-	self = [super initWithQueue:queue retainedReferences:YES synchronousDebugMode:NO];
-	if (self == nil) {
-		return nil;
-	}
-	_queue = [queue retain];
-	_work = [[NSMutableArray alloc] init];
-	/* The numbering this log is written in, said once per process and printed out of the
-	 * constants that answer -status: a log that does NOT carry this line was written before
-	 * the numbers became Metal's, and says committed 3, scheduled 4, completed 6 (see the
-	 * note above this class). */
-	RW_ONCE("MTLCommandBufferStatus: committed %u, scheduled %u, completed %u, "
-		"error %u -- Metal's own numbers; a log without this line was written by the old "
-		"ones (committed 3, scheduled 4, completed 6)\n",
-		(unsigned)RW_CB_COMMITTED, (unsigned)RW_CB_SCHEDULED,
-		(unsigned)RW_CB_COMPLETED, (unsigned)RW_CB_ERROR);
-	_status = RW_CB_ENQUEUED;   /* nothing is pending yet */
-	_owesSlot = YES;
-	[queue redwoodTookSlot];
-	return self;
-}
-
-/*
- * Give the queue's slot back, exactly once. Called at the end of -commit, where this
- * driver's work is already done, and at -dealloc for a buffer that was never committed --
- * which is the case Apple's _needsCommandBufferSemaphoreSignal exists for and the one that
- * would otherwise lose a slot for the life of the process.
- */
-- (void)redwoodReturnSlot
-{
-	dispatch_semaphore_t semaphore;
-
-	if (!_owesSlot) {
-		return;
-	}
-	_owesSlot = NO;
-	redwood_clear_semaphore_debt(self);
-	[_queue redwoodReturnedSlot];
-	semaphore = redwood_queue_semaphore(_queue);
-	if (semaphore != nil) {
-		dispatch_semaphore_signal(semaphore);
-	}
-}
-
-- (void)dealloc
-{
-	[self redwoodReturnSlot];
-	[_work release];
-	[_error release];
-	[_scheduled release];
-	[_completed release];
-	[_queue release];
-	[super dealloc];
-}
-
-- (id)device       { return [_queue device]; }
-- (id)commandQueue { return _queue; }
-- (NSUInteger)status { return _status; }
-- (NSError *)error { return _error; }
-- (BOOL)retainedReferences { return YES; }
-
-- (id)computeCommandEncoder
-{
-	return [[[RedwoodMetalComputeEncoder alloc] initWithRedwoodCommandBuffer:self]
-		   autorelease];
-}
-
-- (id)renderCommandEncoderWithDescriptor:(id)descriptor
-{
-	if (descriptor == nil) {
-		rw_print("a render pass needs a descriptor\n");
-		return nil;
-	}
-	return [[[RedwoodMetalRenderEncoder alloc] initWithRedwoodCommandBuffer:self
-								    descriptor:descriptor]
-		   autorelease];
-}
-
-- (id)parallelRenderCommandEncoderWithDescriptor:(id)descriptor
-{
-	(void)descriptor;
-	return nil;   /* one encoder at a time here; a parallel pass needs the split */
-}
-
-/* The rest of what MTLCommandBuffer requires of a driver. Each declines rather than being
- * absent, for the reason the device's own 44 were answered: a missing selector aborts the
- * caller, and these are the four that were still missing. */
-- (id)blitCommandEncoder          { return nil; }
-- (id)resourceStateCommandEncoder { return nil; }
-- (id)accelerationStructureCommandEncoder { return nil; }
-- (void)encodeSignalEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
-- (void)encodeWaitForEvent:(id)event value:(uint64_t)value { (void)event; (void)value; }
-
-- (id)computeCommandEncoderWithDispatchType:(NSUInteger)type
-{
-	(void)type;   /* serial and concurrent dispatch are the same here: one queue, in order */
-	return [self computeCommandEncoder];
-}
-
-- (void)recordWork:(RedwoodMetalWork *)work
-{
-	[_work addObject:work];
-}
-
-- (void)enqueue { }
-
-/* Metal's own rule, kept: the recorded dispatches run here and not when they were encoded. */
-- (void)commit
-{
-	char why[512] = { 0 };
-
-	_status = RW_CB_COMMITTED;
-	for (RedwoodMetalWork *work in _work) {
-		if (work->render != nil) {
-			if (![self runDraw:work why:why size:sizeof(why)]) {
-				goto done;
-			}
-			continue;
-		}
-		struct rwa_buffer *buffers[RW_MAX_BUFFERS] = { NULL };
-		struct rwa_texture *textures[RW_MAX_BUFFERS] = { NULL };
-		struct rwa_sampler *samplers[RW_MAX_BUFFERS] = { NULL };
-		/* Metal's one [[buffer(n)]] table, passed BOTH ways: `buffers` is what is
-		 * bound at each index, `table` is the same thing with Metal's own offset
-		 * beside it, and the library takes from each side what that side owns -- an
-		 * argument buffer's encoding offset and a buffer argument's own offset come
-		 * from the table, and which an index is nobody but the shader knows. */
-		struct rwa_buffer_bind table[RW_MAX_BUFFERS] = { { NULL, 0 } };
-
-		for (unsigned i = 0; i < work->count; i++) {
-			buffers[i] = [work->buffers[i] mesaBuffer];
-			table[i].buffer = buffers[i];
-			table[i].offset = work->bufferOffsets[i];
-			if (buffers[i] == NULL && work->buffers[i] != nil) {
-				rw_print("buffer %u of this dispatch did not come "
-				         "from the compiler library, so it cannot be bound\n", i);
-			}
-		}
-		for (unsigned i = 0; i < work->textureCount; i++) {
-			textures[i] = [work->textures[i] mesaTexture];
-		}
-		for (unsigned i = 0; i < work->samplerCount; i++) {
-			samplers[i] = [work->samplers[i] mesaSampler];
-		}
-		struct rwa_bindings bindings = {
-			.buffers = buffers, .buffer_count = work->count,
-			.textures = textures, .texture_count = work->textureCount,
-			.samplers = samplers, .sampler_count = work->samplerCount,
-		};
-
-		/* rwa_dispatch_buffers when the library has it, which is the same call with
-		 * Metal's offsets passed as well; a library too old to have it is used
-		 * through rwa_dispatch, and then a kernel with a set is refused by name
-		 * there and every offset is read as zero -- which is what an older library
-		 * did with one in any case, out loud. */
-		int rc = mesa.dispatch_buffers != NULL
-			    ? mesa.dispatch_buffers([work->pipeline compute], &bindings,
-						    table, work->count, work->groups,
-						    work->size, why, sizeof(why))
-			    : mesa.dispatch([work->pipeline compute], &bindings, work->groups,
-					    work->size, why, sizeof(why));
-		if (rc != 0) {
-			rw_print("the dispatch failed: %s\n", why);
-			_error = [[NSError errorWithDomain:@"RedwoodMetal" code:2
-						  userInfo:@{ NSLocalizedDescriptionKey:
-							      [NSString stringWithUTF8String:why] }]
-				     retain];
-			_status = RW_CB_ERROR;
-			goto done;
-		}
-	}
-	_status = RW_CB_SCHEDULED;   /* submitted; the fence below is what makes it completed */
-done:
-	/* The queue's slot goes back here and on every way out of this method, a failed draw
-	 * included: a buffer that errored is as finished as one that drew, and a slot kept
-	 * because of an error would turn one bad draw into a queue that blocks for ever. */
-	[self redwoodReturnSlot];
-	/* and only then the handlers, so that a handler which makes the next command buffer
-	 * is not waiting for a slot this one still holds */
-	[self redwoodDeliverHandlers];
-}
-
-/* A draw, built out of what the encoder recorded. Separate from the dispatch loop because the
- * two have different bindings -- a draw has them per stage -- and folding them together would
- * mean a struct whose fields mean different things depending on a flag. */
-- (BOOL)runDraw:(RedwoodMetalWork *)work why:(char *)why size:(size_t)size
-{
-	struct rwa_texture *color[8] = { NULL };
-	struct rwa_buffer *vertex_buffers[RW_MAX_BUFFERS] = { NULL };
-	struct rwa_vertex_stream vertex_streams[RW_MAX_BUFFERS] = { { NULL, 0 } };
-	struct rwa_buffer *fragment_buffers[RW_MAX_BUFFERS] = { NULL };
-	struct rwa_texture *fragment_textures[RW_MAX_BUFFERS] = { NULL };
-	struct rwa_sampler *fragment_samplers[RW_MAX_BUFFERS] = { NULL };
-	/* and Metal's own table for each stage: the same entries as the arrays above with
-	 * the OFFSET beside each, which rwa_bindings has nowhere to put. One array for
-	 * both of the things an offset means -- which encoding of an argument buffer, and
-	 * which block of a buffer argument -- because Metal has one call behind both. */
-	struct rwa_buffer_bind vertex_table[RW_MAX_BUFFERS] = { { NULL, 0 } };
-	struct rwa_buffer_bind fragment_table[RW_MAX_BUFFERS] = { { NULL, 0 } };
-
-	if (mesa.render_draw == NULL) {
-		snprintf(why, size, "this compiler library can compute but not yet draw");
-		[self failWith:why];
-		return NO;
-	}
-	for (unsigned i = 0; i < work->colorCount; i++) {
-		color[i] = [work->color[i] mesaTexture];
-	}
-	/*
-	 * Metal's one vertex buffer table, split in two by the pipeline's own mask: an index
-	 * the vertex descriptor fetches attributes from is a STREAM, with its offset, and
-	 * every other index is a [[buffer(n)]] ARGUMENT of the vertex stage. The library
-	 * refuses a descriptor that claims an index the module also reads as a buffer
-	 * (air_metal.h), so the two sets cannot overlap and this split cannot drop a
-	 * binding.
-	 *
-	 * The offset is honoured on the stream side and still unimplemented on the argument
-	 * side, and that asymmetry is said out loud rather than left in a comment: the
-	 * library takes a stream's offset as Metal's own `offset:` and rwa_bindings has
-	 * nowhere to put one.
-	 */
-	unsigned stream_mask = [work->render vertexStreamMask];
-
-	for (unsigned i = 0; i < work->vertexBufferCount; i++) {
-		/* Metal's own offset, for whichever of the other two things index i is: an
-		 * argument buffer (which encoding to read) or a buffer argument (which
-		 * block). The library takes it from here and judges it there, where the
-		 * shader's own address space is in hand; a stream's offset is the stream
-		 * array's below and an index is never both. */
-		if (!(stream_mask & (1u << i))) {
-			vertex_table[i].buffer = [work->vertexBuffers[i] mesaBuffer];
-			vertex_table[i].offset = work->vertexBufferOffsets[i];
-		}
-		if (i < RWA_MAX_VERTEX_BUFFERS && (stream_mask & (1u << i))) {
-			vertex_streams[i].buffer = [work->vertexBuffers[i] mesaBuffer];
-			vertex_streams[i].offset = work->vertexBufferOffsets[i];
-			if (work->vertexBuffers[i] != nil &&
-			    vertex_streams[i].buffer == NULL) {
-				snprintf(why, size, "the buffer bound as vertex stream %u did "
-						    "not come from the compiler library, so "
-						    "there is nothing to fetch vertices out "
-						    "of", i);
-				[self failWith:why];
-				return NO;
-			}
-			continue;
-		}
-		vertex_buffers[i] = [work->vertexBuffers[i] mesaBuffer];
-	}
-	if ([work->render vertexStreamCount] > RW_MAX_BUFFERS) {
-		snprintf(why, size, "this pipeline fetches from %u vertex stream slots and "
-				    "this driver's table holds %u", [work->render
-				    vertexStreamCount], RW_MAX_BUFFERS);
-		[self failWith:why];
-		return NO;
-	}
-	for (unsigned i = 0; i < work->count; i++) {
-		fragment_buffers[i] = [work->buffers[i] mesaBuffer];
-		fragment_table[i].buffer = fragment_buffers[i];
-		fragment_table[i].offset = work->bufferOffsets[i];
-		if (work->buffers[i] != nil && fragment_buffers[i] == NULL) {
-			snprintf(why, size, "the buffer bound at fragment buffer index %u did "
-					    "not come from the compiler library, so there is "
-					    "nothing to bind", i);
-			[self failWith:why];
-			return NO;
-		}
-	}
-	for (unsigned i = 0; i < work->textureCount; i++) {
-		fragment_textures[i] = [work->textures[i] mesaTexture];
-	}
-	for (unsigned i = 0; i < work->samplerCount; i++) {
-		fragment_samplers[i] = [work->samplers[i] mesaSampler];
-	}
-	struct rwa_draw draw = {
-		.color = color,
-		.color_count = work->colorCount,
-		.clear_color = work->clears ? work->clearColor : NULL,
-		/* The depth attachment, its two load actions, the state that was bound and
-		 * the depth range of the viewport -- which is where the quad's own depth
-		 * comes from, the generated vertex stage putting every corner at clip z = 0
-		 * (-setViewport: has the whole of it). Without a viewport the contract's
-		 * default [0, 1] applies and the quad sits at 0, the near plane. */
-		.depth = [work->depth mesaTexture],
-		.clear_depth = work->clearsDepth ? &work->clearDepth : NULL,
-		.clear_stencil = work->clearsStencil ? &work->clearStencil : NULL,
-		.depth_stencil = [work->depthStencilState mesaDepthStencil],
-		.stencil_reference = { work->stencilReference[0], work->stencilReference[1] },
-		.depth_range = work->hasDepthRange ? work->depthRange : NULL,
-		.vertex = { .buffers = vertex_buffers, .buffer_count = work->vertexBufferCount },
-		/* and the streams the layout fetches from, at Metal's own indices with
-		 * Metal's own offsets; the count is what the library needs covered, which
-		 * is the highest index the pipeline fetches from plus one. */
-		.vertex_streams = vertex_streams,
-		.vertex_stream_count = [work->render vertexStreamCount],
-		.fragment = {
-			.buffers = fragment_buffers, .buffer_count = work->count,
-			.textures = fragment_textures, .texture_count = work->textureCount,
-			.samplers = fragment_samplers, .sampler_count = work->samplerCount,
-		},
-		.primitive = work->primitive,
-		.vertex_start = work->vertexStart,
-		.vertex_count = work->vertexCount,
-		/* The index buffer, by the same rule as every other resource here: it has to
-		 * be one of ours, because what the library needs is the Gallium resource
-		 * behind it and a buffer from the kernel path (or from another driver) has
-		 * none. -mesaBuffer is nil for such a buffer, and nil here would be a draw
-		 * the library reads as non-indexed -- the vertices in the wrong order, which
-		 * is the one outcome worse than an error. So it is caught where the mapping
-		 * fails and not left to the library, which has no way to tell the two apart. */
-		.index_buffer = [work->indexBuffer mesaBuffer],
-		.index_type = work->indexType,
-		.index_buffer_offset = work->indexBufferOffset,
-		.base_vertex = work->baseVertex,
-		.instance_count = work->instanceCount,
-		.base_instance = work->baseInstance,
-		/* Metal's own table for each stage, at Metal's own indices: the offsets the
-		 * arrays above have nowhere to put. The library takes an argument buffer's
-		 * whole binding from here and a buffer argument's offset only, so the two
-		 * readings cannot disagree -- and where both name a buffer it checks that
-		 * they name the same one. */
-		.vertex_buffer_table = vertex_table,
-		.vertex_buffer_table_count = work->vertexBufferCount,
-		.fragment_buffer_table = fragment_table,
-		.fragment_buffer_table_count = work->count,
-	};
-
-	if (work->indexBuffer != nil && draw.index_buffer == NULL) {
-		snprintf(why, size, "the index buffer of this draw did not come from the "
-		         "compiler library, so there is nothing to read the indices out of");
-		[self failWith:why];
-		return NO;
-	}
-
-	if (mesa.render_draw([work->render render], &draw, why, size) != 0) {
-		rw_print("the draw failed: %s\n", why);
-		[self failWith:why];
-		return NO;
-	}
-	return YES;
-}
-
-- (void)failWith:(const char *)reason
-{
-	_error = [[NSError errorWithDomain:@"RedwoodMetal" code:4
-				  userInfo:@{ NSLocalizedDescriptionKey:
-					      [NSString stringWithUTF8String:reason] }] retain];
-	_status = RW_CB_ERROR;
-}
-
-/* The fence is the whole point: a dispatch that the GPU does not finish must not read as a
- * result. air_run learned that the expensive way (docs/air.md section 5). */
-- (void)waitUntilCompleted
-{
-	char why[512] = { 0 };
-
-	if (_status == RW_CB_ERROR) {
-		return;
-	}
-	if (mesa.finish([[_queue device] mesaDevice], why, sizeof(why)) != 0) {
-		rw_print("THE GPU DID NOT FINISH: %s\n", why);
-		_error = [[NSError errorWithDomain:@"RedwoodMetal" code:3
-					  userInfo:@{ NSLocalizedDescriptionKey:
-						      [NSString stringWithUTF8String:why] }] retain];
-		_status = RW_CB_ERROR;
-		return;
-	}
-	_status = RW_CB_COMPLETED;   /* the fence has been paid, and only now */
-}
-
-- (void)waitUntilScheduled { }
-
-/*
- * HANDLERS, AND WHERE THEY RUN.
- *
- * Both of these used to call the block the moment it was added -- which is before the work
- * the block is about, on whichever thread encoded it. That was defensible while the only
- * caller was this port's own test; it is not once backboardd is the caller, and it is the
- * other half of why the system sends -[MTLCommandQueueSPI setCompletionQueue:]: a daemon
- * says WHERE its completion handlers may run precisely because it must not have them on its
- * own thread.
- *
- * So handlers are kept and delivered where the work happens: -commit. A scheduled handler
- * is delivered as soon as the recorded work has been submitted, a completed handler after
- * the GPU fence has been paid for -- the fence is only taken when somebody is actually
- * waiting on one, because this driver's -commit is otherwise asynchronous and a fence
- * nobody asked for would cost every frame. A handler added after the fact is delivered at
- * once rather than dropped: Metal calls that undefined, and losing it would be the kind of
- * silence this driver is trying to stop having.
- */
-- (void)redwoodDeliver:(void (^)(id))handler
-{
-	dispatch_queue_t queue = [_queue redwoodCompletionQueue];
-
-	if (queue != nil) {
-		/* dispatch_async copies the block, which retains both this buffer and the
-		 * handler it carries, so the buffer outlives its own completion. */
-		dispatch_async(queue, ^{ handler(self); });
-		return;
-	}
-	handler(self);
-}
-
-- (void)addScheduledHandler:(void (^)(id))handler
-{
-	if (handler == NULL) {
-		return;
-	}
-	/* scheduled or further, an error included (3, 4, 5): the work this handler is about has
-	 * already run, so it is delivered rather than kept */
-	if (_status >= RW_CB_SCHEDULED) {
-		[self redwoodDeliver:handler];
-		return;
-	}
-	if (_scheduled == nil) {
-		_scheduled = [[NSMutableArray alloc] init];
-	}
-	[_scheduled addObject:[[handler copy] autorelease]];
-}
-
-- (void)addCompletedHandler:(void (^)(id))handler
-{
-	if (handler == NULL) {
-		return;
-	}
-	if (_status >= RW_CB_SCHEDULED) {
-		[self redwoodDeliver:handler];
-		return;
-	}
-	if (_completed == nil) {
-		_completed = [[NSMutableArray alloc] init];
-	}
-	[_completed addObject:[[handler copy] autorelease]];
-}
-
-/* Called from the one place the work is done. The order is Metal's: scheduled first, then
- * the fence, then completed. */
-- (void)redwoodDeliverHandlers
-{
-	NSArray *scheduled = _scheduled;
-	NSArray *completed = _completed;
-
-	_scheduled = nil;
-	_completed = nil;
-	for (id handler in scheduled) {
-		[self redwoodDeliver:(void (^)(id))handler];
-	}
-	if ([completed count] > 0 && _status != RW_CB_ERROR) {
-		/* A completed handler is a promise about the GPU, so it is made true before it
-		 * is kept: -waitUntilCompleted is this driver's fence and sets the status the
-		 * handler will read. */
-		[self waitUntilCompleted];
-	}
-	for (id handler in completed) {
-		[self redwoodDeliver:(void (^)(id))handler];
-	}
-	[scheduled release];
-	[completed release];
-}
-
-/* -commitWithDeadline: is an abstract entry of _MTLCommandBuffer, so inheriting it aborts
- * rather than defaulting. The deadline is for work that is worthless if it is late (a frame
- * that misses its vsync); Apple's drivers hand it to the GPU's scheduler. There is one
- * scheduler here and one priority, so the deadline cannot be honoured -- but the COMMIT
- * must happen, and a deadline that is merely unmet is a late frame while a commit that
- * never happens is a daemon waiting for ever. */
-- (void)commitWithDeadline:(NSUInteger)deadline
-{
-	(void)deadline;
-	RW_ONCE("a command buffer was committed with a deadline; this driver "
-		"has one ring and no scheduler to tell, so the work is committed and the "
-		"deadline is not promised\n");
-	[self commit];
-}
-
-- (void)addPurgedResource:(id)resource { (void)resource; [self redwoodPurgedNote]; }
-- (void)addPurgedHeap:(id)heap         { (void)heap; [self redwoodPurgedNote]; }
-
-/* Metal records on a command buffer every resource of its that was purged while the buffer
- * referenced it, so that -commit can fail the buffer instead of reading pages that are
- * gone. Nothing of this driver's is ever volatile -- -setPurgeableState: answers
- * MTLPurgeableStateNonVolatile for every resource, which is what they are -- so a report
- * here means Metal and this driver disagree about a resource, and that is worth a line
- * rather than a silent buffer that fails later for no stated reason. */
-- (void)redwoodPurgedNote
-{
-	RW_ONCE("Metal reported a purged resource on a command buffer, but "
-		"nothing this driver allocates is volatile; the report is noted and the "
-		"buffer is not failed\n");
-}
-
-
-@end
+#include "redwoodmetal_commandbuffer.inc"
 
 @implementation RedwoodMetalRenderEncoder {
 	RedwoodMetalCommandBuffer *_commandBuffer;   /* not retained: it owns the encoder */
 	RedwoodMetalRenderPipeline *_pipeline;
 	id _color[8];
 	unsigned _colorCount;
+	id _resolve[8];   /* the resolveTexture of each colour attachment, or nil */
 	float _clearColor[4];
 	BOOL _clears;
 	id _depth;
@@ -4175,6 +3406,10 @@ done:
 	unsigned _stencilReference[2];
 	float _depthRange[2];
 	BOOL _hasDepthRange;
+	float _viewportRect[4];
+	BOOL _hasViewportRect;
+	unsigned _scissorRect[4];
+	BOOL _hasScissorRect;
 	id _vertexBuffers[RW_MAX_BUFFERS];
 	NSUInteger _vertexBufferOffsets[RW_MAX_BUFFERS];
 	id _fragmentBuffers[RW_MAX_BUFFERS];
@@ -4208,27 +3443,26 @@ done:
 		_color[i] = texture;
 		_colorCount = i + 1;
 		/*
-		 * A resolve is the one thing a multisample pass asks for that this driver
-		 * cannot do, and it is said out loud rather than ignored. The compiler
-		 * library makes multisample attachments and renders into them
-		 * (docs/metal.md 10.34), but it stores what it has and resolves nothing --
-		 * so for an application the one-sample texture it means to READ is the
-		 * resolveTexture, and that one would come back holding whatever it held
-		 * before. Silence here would read as a pass that drew nothing. The same
-		 * goes for MTLStoreActionMultisampleResolve on the depth attachment, which
-		 * nothing has asked for yet.
+		 * The resolve target, handed to the compiler library, which does the resolve as
+		 * a blit from the multisample attachment at the end of every draw that names one
+		 * (struct rwa_draw.resolve says why per draw rather than per pass).
+		 *
+		 * The depth aspect is not resolved: MTLStoreActionMultisampleResolve on a depth
+		 * attachment names the same one-sample depth texture through
+		 * -resolveTexture of MTLRenderPassDepthAttachmentDescriptor, and nothing has
+		 * asked for one yet. It is still said out loud rather than ignored, because the
+		 * alternative is a depth texture that reads as whatever it held before.
 		 */
+		_resolve[i] = [attachment resolveTexture];
 		NSUInteger store = [attachment storeAction];
 
-		if (store == MTLStoreActionMultisampleResolve ||
-		    store == MTLStoreActionStoreAndMultisampleResolve ||
-		    [attachment resolveTexture] != nil) {
-			rw_print("colour attachment %u asks for a multisample "
-			         "resolve (storeAction %lu%s) and this driver resolves nothing: "
-			         "the attachment itself is stored and the resolve texture is "
-			         "left as it was\n", i, (unsigned long)store,
-			         [attachment resolveTexture] != nil ? ", with a resolveTexture"
-								  : "");
+		if ((store == MTLStoreActionMultisampleResolve ||
+		     store == MTLStoreActionStoreAndMultisampleResolve) &&
+		    _resolve[i] == nil) {
+			rw_print("colour attachment %u asks for storeAction %lu with no "
+			         "resolveTexture: Metal's own rule is that the two come "
+			         "together, so the attachment is stored and nothing is "
+			         "resolved\n", i, (unsigned long)store);
 		}
 		if (i == 0 && [attachment loadAction] == MTLLoadActionClear) {
 			MTLClearColor c = [attachment clearColor];
@@ -4374,38 +3608,43 @@ done:
 }
 
 /*
- * The viewport, of which exactly one half is served and the other half is declined, and the
- * split is the contract's: rwa_draw carries znear and zfar and carries no rectangle, because
- * the library's draw always covers the whole attachment.
+ * The viewport: the rectangle and the depth range, both recorded here and both applied by the
+ * library's draw.
  *
- * The depth range half is not a convenience either. It is the only thing in Metal that moves
- * a quad in z through this driver -- the generated vertex stage puts all four corners at
- * clip z = 0, and Metal's NDC z starts at 0 on the near plane, so the window depth of what
- * is drawn is znear exactly. Without it every draw here would be at depth 0 and no depth
- * test could ever be measured on the device.
+ * The rectangle is what places a layer's content. CoreAnimation renders a layer into an
+ * attachment larger than the layer and puts the layer in it with this rectangle; a draw that
+ * covers the whole attachment instead puts the content at the wrong size and position. The
+ * encoder does not check the rectangle against the attachment -- the library clamps it, since
+ * the attachment it needs is the one the draw is bound to at commit time.
  *
- * The rectangle half says so once, as it did before: a viewport silently ignored draws the
- * right triangle in the wrong place.
+ * The depth range is the only thing in Metal that moves a quad in z through this driver -- the
+ * generated vertex stage puts all four corners at clip z = 0, and Metal's NDC z starts at 0 on
+ * the near plane, so the window depth of what is drawn is znear exactly. Without it every draw
+ * here would be at depth 0 and no depth test could ever be measured on the device.
  */
 - (void)setViewport:(MTLViewport)viewport
 {
-	id first = _colorCount > 0 ? _color[0] : _depth;
-	NSUInteger w = [first width], h = [first height];
-
-	if ((viewport.originX != 0.0 || viewport.originY != 0.0 ||
-	     (NSUInteger)viewport.width != w || (NSUInteger)viewport.height != h) &&
-	    !_complained) {
-		rw_print("a viewport rectangle is not implemented (asked for "
-		         "%gx%g at %g,%g of a %lux%lu attachment); the draw covers the whole "
-		         "attachment\n", viewport.width, viewport.height, viewport.originX,
-		         viewport.originY, (unsigned long)w, (unsigned long)h);
-		_complained = YES;
-	}
+	_viewportRect[0] = (float)viewport.originX;
+	_viewportRect[1] = (float)viewport.originY;
+	_viewportRect[2] = (float)viewport.width;
+	_viewportRect[3] = (float)viewport.height;
+	_hasViewportRect = YES;
 	_depthRange[0] = (float)viewport.znear;
 	_depthRange[1] = (float)viewport.zfar;
 	_hasDepthRange = YES;
 }
-- (void)setScissorRect:(MTLScissorRect)rect           { (void)rect; }
+/* Metal's clip rectangle, recorded like the viewport. A pass that never sets one has no
+ * clip, which is Metal's default; the library turns the rectangle into the rasterizer
+ * state's scissor and the same pixels from the same corner.
+ */
+- (void)setScissorRect:(MTLScissorRect)rect
+{
+	_scissorRect[0] = (unsigned)rect.x;
+	_scissorRect[1] = (unsigned)rect.y;
+	_scissorRect[2] = (unsigned)rect.width;
+	_scissorRect[3] = (unsigned)rect.height;
+	_hasScissorRect = YES;
+}
 - (void)setCullMode:(NSUInteger)mode                  { (void)mode; }
 - (void)setFrontFacingWinding:(NSUInteger)winding     { (void)winding; }
 - (void)setTriangleFillMode:(NSUInteger)mode          { (void)mode; }
@@ -4477,6 +3716,7 @@ done:
 	work->colorCount = _colorCount;
 	for (unsigned i = 0; i < _colorCount; i++) {
 		work->color[i] = _color[i];
+		work->resolve[i] = _resolve[i];
 	}
 	work->clears = _clears;
 	for (unsigned i = 0; i < 4; i++) {
@@ -4488,11 +3728,38 @@ done:
 	work->clearStencil = _clearStencil;
 	work->clearsDepth = _clearsDepth;
 	work->clearsStencil = _clearsStencil;
+	/*
+	 * A clear belongs to the PASS and not to the draw, and it is spent here on the first
+	 * draw that carries it.
+	 *
+	 * MTLLoadActionClear is a property of the render pass: it is read once, when the
+	 * encoder is made, and Metal performs it before the first draw. This encoder records
+	 * every draw of the pass with the same three flags, so the compiler library was
+	 * clearing the whole attachment once per draw -- measured at 151.8 us a draw against
+	 * 3 us of draw_vbo, an 11.6 MB write per draw at 1152x2510 and 31 draws a frame.
+	 *
+	 * Clearing once is the equivalent picture because nothing can re-clear mid-pass:
+	 * -setColorAttachmentDescriptor: is not a call Metal has, the load actions are fixed
+	 * when the encoder is created, and a pass that wants its target cleared again ends
+	 * this encoder and makes another. That new encoder has its own copy of these three
+	 * flags, so it clears.
+	 */
+	_clears = NO;
+	_clearsDepth = NO;
+	_clearsStencil = NO;
 	work->stencilReference[0] = _stencilReference[0];
 	work->stencilReference[1] = _stencilReference[1];
 	work->depthRange[0] = _depthRange[0];
 	work->depthRange[1] = _depthRange[1];
 	work->hasDepthRange = _hasDepthRange;
+	for (unsigned i = 0; i < 4; i++) {
+		work->viewportRect[i] = _viewportRect[i];
+	}
+	work->hasViewportRect = _hasViewportRect;
+	for (unsigned i = 0; i < 4; i++) {
+		work->scissorRect[i] = _scissorRect[i];
+	}
+	work->hasScissorRect = _hasScissorRect;
 	work->primitive = (unsigned)primitive;
 	work->vertexStart = (unsigned)start;
 	work->vertexCount = (unsigned)count;
@@ -4520,6 +3787,10 @@ done:
 	for (unsigned i = 0; i < _fragmentSamplerCount; i++) {
 		work->samplers[i] = _fragmentSamplers[i];
 	}
+	rw_pipeline_note(_pipeline, _colorCount, _depth != nil ? 1u : 0u,
+	                 _colorCount > 0 ? (unsigned)[_color[0] width] : 0u,
+	                 _colorCount > 0 ? (unsigned)[_color[0] height] : 0u,
+	                 _colorCount > 0 ? (unsigned)[_color[0] sampleCount] : 0u);
 	[_commandBuffer recordWork:work];
 	[work release];
 }

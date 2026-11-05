@@ -59,4 +59,3 @@ __pycache__/
 !/firmware-gen8/gen80000-manifest.json
 !/firmware-gen8/gen80000_*.fw
 !/firmware-gen8/gen80000_gmu.bin
-!/firmware-gen8/gen80000_zap.mbn

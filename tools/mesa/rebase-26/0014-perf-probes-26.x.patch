@@ -1,0 +1,314 @@
+--- a/src/freedreno/drm/freedreno_bo.c	2026-11-05 01:38:50.037347941 +0000
++++ b/src/freedreno/drm/freedreno_bo.c	2026-10-31 01:41:42.452586609 +0000
+@@ -8,6 +8,7 @@
+ 
+ #include "util/os_mman.h"
+ #include "util/os_time.h"
++#include <unistd.h>
+ #include <mach/mach.h>
+ #include <pthread.h>
+ 
+@@ -817,10 +818,23 @@
+ 
+ /* The one call on the draw path that waits inside the kernel with a timeout: kMsmGemCpuPrep via
+  * fd_fence_wait, and flush_streamout reaches it through the same map. Timed in real microseconds
+- * (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us). */
++ * (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us), and only with
++ * FD_PERF_DRAW=1 as the draw stamps are (util/perf_draw.h): most calls return without a wait,
++ * and the two clock reads were most of what they cost. The kernel's "tl: f cpu-prep" lines time
++ * the waits themselves. */
+ int
+ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
++   static int timed = -1;
++
++   if (timed < 0) {
++      const char *wanted = getenv("FD_PERF_DRAW");
++
++      timed = wanted && wanted[0] == '1';
++   }
++   if (!timed)
++      return fd_bo_cpu_prep_body(bo, pipe, op);
++
+    uint64_t began = os_time_get_nano() / 1000;
+    int rc = fd_bo_cpu_prep_body(bo, pipe, op);
+    uint64_t took = os_time_get_nano() / 1000 - began;
+--- a/src/gallium/auxiliary/util/perf_draw.h	2026-11-05 01:38:50.041991699 +0000
++++ b/src/gallium/auxiliary/util/perf_draw.h	2026-10-31 01:41:31.452432594 +0000
+@@ -28,13 +28,18 @@
+ 
+ #include <mach/mach_time.h>
+ 
++static inline int fd_perf_on(void);
++
+ /* mach_absolute_time returns ticks, and one tick is 52.08 ns here (numer 625, denom 12), so dividing
+- * by 1000 alone gives 19.2 times the microseconds. The same conversion as the shim's device_us(). */
++ * by 1000 alone gives 19.2 times the microseconds. The same conversion as the shim's device_us().
++ * 0 while the timing is off. */
+ static inline uint64_t
+ fd_perf_us(void)
+ {
+    static mach_timebase_info_data_t base;
+ 
++   if (!fd_perf_on())
++      return 0;
+    if (base.denom == 0)
+       mach_timebase_info(&base);
+    return mach_absolute_time() * base.numer / base.denom / 1000;
+@@ -78,7 +83,8 @@
+    uint64_t sync, max_sync;                  /* tc_sync_msg: waiting for the driver thread */
+    uint64_t pass, max_pass;                  /* the rest of tc_flush before fd_context_flush */
+    uint64_t calls, calls_cond, calls_multi;  /* calls reaching fd_draw_vbo and the early returns */
+-   uint64_t prog_calls, prog_lookups, prog_misses;   /* get_program_state, cache lookups, builds */
++   uint64_t prog_calls, prog_variants;       /* get_program_state calls and cache lookups */
++   uint64_t prog_builds;                     /* ir3_cache_lookup's misses: the ones it built */
+    uint64_t client, max_client;              /* the client's tc_draw_vbo, summed */
+ };
+ 
+@@ -86,8 +92,8 @@
+ extern struct fd_perf_draw fd_perf_current;   /* the driver thread's draw in flight */
+ extern struct fd_perf_window fd_perf_win;
+ extern unsigned fd_perf_progs, fd_perf_variants;   /* get_program_state calls and cache lookups */
+-/* ir3_cache_lookup's miss path: the variants it had to build. Lookups minus misses is how often
+- * the cache answered, which is the reuse question; a lookup counter alone answers nothing. */
++/* ir3_cache_lookup's miss path. Lookups minus misses is how often the cache answered, which is
++ * the reuse question; the number of lookups alone answers nothing. */
+ extern unsigned fd_perf_cache_misses;
+ 
+ /* The slow-frame threshold, settable with FD_PERF_SLOW_US. A value past any frame silences the
+@@ -111,9 +117,8 @@
+       on = wanted && wanted[0] == '1';
+       {
+          const char *slow = getenv("FD_PERF_SLOW_US");
+-         int value = slow ? atoi(slow) : 0;
+ 
+-         fd_perf_slow_us = value > 0 ? (unsigned)value : FD_PERF_SLOW_US;
++         fd_perf_slow_us = slow && atoi(slow) > 0 ? (unsigned)atoi(slow) : FD_PERF_SLOW_US;
+       }
+       if (on) {
+          printf("perf draw: timing on, frames over %u us are printed, %d frames per summary\n",
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc	2026-11-05 01:38:50.045162942 +0000
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc	2026-10-31 00:02:06.305992747 +0000
+@@ -367,6 +367,31 @@
+    }
+ }
+ 
++/* Segments of draw_vbos<>, read with the wall clock only. Each stamp used to read this thread's CPU
++ * time (thread_info) and the process's fault count (getrusage) as well, eight of each per draw, and
++ * those calls cost more than the draw (kernel-12377-cmd36-bo10). */
++struct fd_draw_stamp {
++   uint64_t wall;
++};
++
++static struct fd_draw_stamp
++fd_draw_stamp_take(void)
++{
++   return (struct fd_draw_stamp){ fd_perf_us() };
++}
++
++static void
++fd_draw_seg_say(const char *what, const struct fd_draw_stamp *began, const struct fd_draw_stamp *ended)
++{
++   uint64_t wall = ended->wall - began->wall;
++
++   /* 50,000 microseconds of the clock fd_perf_us reads, now real microseconds. */
++   if (wall > 50000) {
++      printf("fd draw seg slow: %s wall %llu us\n", what, (unsigned long long) wall);
++      fflush(stdout);
++   }
++}
++
+ template <chip CHIP, fd6_pipeline_type PIPELINE, draw_type DRAW>
+ static void
+ draw_vbos(struct fd_context *ctx, const struct pipe_draw_info *info,
+@@ -393,18 +418,15 @@
+     * those are follows the code rather than a list written here, so a branch that changes the count
+     * changes the line and not the probe. Wall clock only: cpu and flt already ride on the state
+     * line, and eight of each would bury the number that matters. */
+-   struct fd_draw_state_seg {
+-      const char *name;
+-      uint64_t us;
+-   };
+-   struct fd_draw_state_seg segs[8];
++   struct fd_draw_state_seg segs[20];
+    unsigned seg_count = 0;
+    uint64_t cursor = entry.wall;
++   struct fd_draw_seg_recorder rec = { segs, &seg_count, &cursor };
+ 
+    auto mark = [&](const char *name) {
+       uint64_t now = fd_perf_us();
+ 
+-      if (seg_count < 8) {
++      if (seg_count < 20) {
+          segs[seg_count].name = name;
+          segs[seg_count].us = now - cursor;
+          seg_count++;
+@@ -644,7 +666,20 @@
+          draw_emit_indirect<DRAW>(cs, &draw0, info, indirect, index_offset, dst_offset_dp);
+       }
+    } else {
+-      draw_emit<DRAW>(cs, &draw0, info, &draws[0], index_offset);
++      if (!state_said) {
++         struct fd_draw_stamp now = fd_draw_stamp_take();
++
++         say_state();
++         fd_draw_seg_say("state", &entry, &now);
++         state_said = true;
++      }
++      {
++         struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
++
++         draw_emit<DRAW>(cs, &draw0, info, &draws[0], index_offset);
++         ended = fd_draw_stamp_take();
++         fd_draw_seg_say("emit", &began, &ended);
++      }
+ 
+       if (unlikely(num_draws > 1)) {
+ 
+@@ -683,7 +718,20 @@
+ 
+             assert(!index_offset); /* handled by util_draw_multi() */
+ 
+-            draw_emit<DRAW>(cs, &draw0, info, &draws[i], 0);
++            if (!state_said) {
++               struct fd_draw_stamp now = fd_draw_stamp_take();
++
++               say_state();
++               fd_draw_seg_say("state", &entry, &now);
++               state_said = true;
++            }
++            {
++               struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
++
++               draw_emit<DRAW>(cs, &draw0, info, &draws[i], 0);
++               ended = fd_draw_stamp_take();
++               fd_draw_seg_say("emit", &began, &ended);
++            }
+          }
+ 
+          ctx->last.index_start = last_index_start;
+@@ -693,9 +741,21 @@
+    if (fd_perf_on())
+       fd_perf_current.draw = fd_perf_us();
+ 
+-   flush_streamout<CHIP>(ctx, cs, &emit);
++   {
++      struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
++
++      flush_streamout<CHIP>(ctx, cs, &emit);
++      ended = fd_draw_stamp_take();
++      fd_draw_seg_say("streamout", &began, &ended);
++   }
++
++   {
++      struct fd_draw_stamp began = fd_draw_stamp_take(), ended;
+ 
+-   fd_context_all_clean(ctx);
++      fd_context_all_clean(ctx);
++      ended = fd_draw_stamp_take();
++      fd_draw_seg_say("allclean", &began, &ended);
++   }
+ }
+ 
+ template <chip CHIP, fd6_pipeline_type PIPELINE>
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c	2026-11-05 01:38:50.026242156 +0000
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c	2026-10-27 18:48:53.408013141 +0000
+@@ -625,12 +625,15 @@
+    const unsigned limit_bits = 8 * 8 * 1024 * 1024;
+    if ((batch->prim_strm_bits > limit_bits) ||
+        (batch->draw_strm_bits > limit_bits)) {
++      fd_perf_batch_cuts++;
+       fd_batch_flush(batch);
+       return;
+    }
+ 
+-   if (!fd_ringbuffer_check_size(batch->draw))
++   if (!fd_ringbuffer_check_size(batch->draw)) {
++      fd_perf_batch_cuts++;
+       fd_batch_flush(batch);
++   }
+ }
+ 
+ /* emit a WAIT_FOR_IDLE only if needed, ie. if there has not already
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c	2026-11-05 01:38:50.050761877 +0000
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c	2026-11-04 17:49:20.539629026 +0000
+@@ -530,6 +530,7 @@
+ struct fd_perf_draw fd_perf_current;
+ struct fd_perf_window fd_perf_win;
+ unsigned fd_perf_progs, fd_perf_variants;
++unsigned fd_perf_cache_misses;
+ unsigned fd_perf_slow_us = FD_PERF_SLOW_US;
+ uint64_t fd_perf_checks_sum, fd_perf_checks_seen, fd_perf_checks_worst;
+ 
+@@ -556,7 +557,7 @@
+    {
+       static unsigned seen_in, seen_cond, seen_multi;
+ 
+-      static unsigned seen_progs, seen_lookups, seen_misses;
++      static unsigned seen_progs, seen_variants, seen_misses;
+ 
+       w->calls += fd_perf_entry_calls - seen_in;
+       w->calls_cond += fd_perf_entry_cond - seen_cond;
+@@ -564,14 +565,13 @@
+       seen_in = fd_perf_entry_calls;
+       seen_cond = fd_perf_entry_cond;
+       seen_multi = fd_perf_entry_multi;
+-      /* Calls, lookups and the builds the cache had to do. Lookups close to calls means every call
+-       * reaches the cache; builds far below lookups means it answered, and the cost sits in the
+-       * key and the search rather than in building a variant. */
++      /* Calls against variant creations is the reuse question: as many variants as calls means the
++       * cache never answers twice, far fewer means it does and the cost is the lookup. */
+       w->prog_calls += fd_perf_progs - seen_progs;
+-      w->prog_lookups += fd_perf_variants - seen_lookups;
+-      w->prog_misses += fd_perf_cache_misses - seen_misses;
++      w->prog_variants += fd_perf_variants - seen_variants;
++      w->prog_builds += fd_perf_cache_misses - seen_misses;
+       seen_progs = fd_perf_progs;
+-      seen_lookups = fd_perf_variants;
++      seen_variants = fd_perf_variants;
+       seen_misses = fd_perf_cache_misses;
+    }
+    w->frames++;
+@@ -619,8 +619,7 @@
+           "driver %llu max %llu; "
+           "own %llu (track %llu prog %llu emit %llu draw %llu); submit %llu max %llu; "
+           "client %llu max %llu; sync %llu max %llu, pass %llu max %llu; calls %llu in "
+-          "(condition %llu, multi %llu); prog_calls %llu prog_lookups %llu prog_builds "
+-          "%llu us\n",
++          "(condition %llu, multi %llu); prog_calls %llu prog_variants %llu prog_builds %llu us\n",
+           w->frames, (unsigned long long) (w->interval / w->frames),
+           (unsigned long long) w->max_interval,
+           (unsigned long long) (w->draws / w->frames),
+@@ -638,8 +637,8 @@
+           (unsigned long long) (w->calls_cond / w->frames),
+           (unsigned long long) (w->calls_multi / w->frames),
+           (unsigned long long) (w->prog_calls / w->frames),
+-          (unsigned long long) (w->prog_lookups / w->frames),
+-          (unsigned long long) (w->prog_misses / w->frames));
++          (unsigned long long) (w->prog_variants / w->frames),
++          (unsigned long long) (w->prog_builds / w->frames));
+    fflush(stdout);
+    memset(w, 0, sizeof(*w));
+    /* The window resets its counters; the time of the last close has to survive, or the first gap
+--- a/src/gallium/drivers/freedreno/ir3/ir3_cache.c	2026-11-05 01:38:50.042591914 +0000
++++ b/src/gallium/drivers/freedreno/ir3/ir3_cache.c	2026-10-29 13:44:12.999417009 +0000
+@@ -14,7 +14,6 @@
+ 
+ #include "ir3_cache.h"
+ #include "ir3_gallium.h"
+-#include "util/perf_draw.h"
+ 
+ /* Defined in fd6_draw.cc: marks the draw's state cursor when a recorder is active, and does
+  * nothing on every other draw. */
+@@ -88,11 +87,6 @@
+       return entry->data;
+    }
+ 
+-   /* Past this point a variant is built. Counted here rather than at the caller, because the
+-    * caller's counter runs on hits too and would read as "no reuse" whatever the cache does. */
+-   if (fd_perf_on())
+-      fd_perf_cache_misses++;
+-
+    /* Past this point the cache has not answered and a program is built for the key. */
+    if (fd_perf_on())
+       fd_perf_cache_misses++;
