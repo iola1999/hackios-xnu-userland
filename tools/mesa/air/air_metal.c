@@ -6642,8 +6642,6 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    state_framebuffer(device, &fb);
    /* rwa_draw.discard: preserve rsc->valid; marking undefined drops GMEM tile resolve
     * when writeMask is 0 and corrupts multi-pass offscreen widget rendering. */
-   (void)draw->discard;
-
    /* The viewport, and now its z as well. Gallium's window depth is
     * clip_z/w * scale[2] + translate[2], and with clip_halfz (the rasterizer state
     * above) the depth range [znear, zfar] is scale = zfar - znear, translate = znear --
@@ -6798,7 +6796,6 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                   &draw->vertex, draw->vertex_buffer_table, draw->vertex_buffer_table_count, vname,
                   &vbound, why, why_size) != 0)
       goto unbind;
-
    draw_phase_add(2, mark);
    mark = draw_mark();
    /* clear_color NULL is MTLLoadActionLoad: keep what the attachment holds. A pointer
@@ -6813,12 +6810,17 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     * of Load and the case where this does nothing.
     */
    {
-      union pipe_color_union clear;
+      union pipe_color_union clear = { 0 };
       unsigned mask = 0;
-      for (unsigned c = 0; c < 4; c++)
-         clear.f[c] = draw->clear_color ? draw->clear_color[c] : 0.0f;
-      if (draw->clear_color)
-         mask |= PIPE_CLEAR_COLOR0;
+      if (draw->clear_color) {
+         unsigned clear_mask = (draw->discard >> 8) & 0xffu;
+         mask |= clear_mask ? 0 : PIPE_CLEAR_COLOR0;
+         for (unsigned i = 0; clear_mask && i < 8; i++)
+            if (clear_mask & (1u << i))
+               mask |= (PIPE_CLEAR_COLOR0 << i);
+         for (unsigned c = 0; c < 4; c++)
+            clear.f[c] = draw->clear_color[c];
+      }
       /* An aspect is cleared only if the attachment has it: clearing the stencil of a
        * Depth32Float buffer is a caller's mistake, but Gallium's clear would either
        * ignore it or touch a plane that is not there, and neither is worth finding out
@@ -6841,7 +6843,6 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
    draw_phase_add(3, mark);
    mark = draw_mark();
-
    {
       /*
        * The one call both forms go through, which is Gallium's shape and not two of
@@ -6881,14 +6882,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
        * time sits in fd_draw_vbo outside that function. The address decides which. */
       {
          uint64_t call_began = draw_mark(), call_took;
-
          pipe->draw_vbo(pipe, &info, 0, NULL, &sc, 1);
          call_took = draw_mark() - call_began;
          if (call_took > 20000) {
             Dl_info where = { 0 };
             const char *what = dladdr((void *)pipe->draw_vbo, &where) != 0 && where.dli_sname != NULL
                                ? where.dli_sname : "?";
-
             printf("rwa draw call: pipe %p draw_vbo %p wall %llu us (%s)\n", (void *)pipe,
                    (void *)pipe->draw_vbo, (unsigned long long)call_took, what);
             fflush(stdout);

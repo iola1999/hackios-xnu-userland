@@ -94,9 +94,8 @@ software_bitmap_selection(id self, SEL selector)
      * Always force bitmap rasterization for home screen icons on iOS 26.
      * When shouldForceBitmapImages returns NO, SpringBoard requests dynamic
      * Glass icon layers from iconservicesagent. iconservicesagent then compiles
-     * 258+ Metal pipelines simultaneously, hitting the queue semaphore limit (64)
-     * and causing all desktop icons to stay blank for ~1 minute while blocking
-     * SpringBoard main thread.
+     * 258+ Metal pipelines simultaneously, hitting queue semaphore limits, while
+     * [ISImage ICRIconLayer] returns nil leaving CALayer.contents empty and icons transparent.
      * Forcing bitmap images allows SBIconImageView to immediately load pre-rendered
      * asset catalog / LaunchServices cached icons (from seed-icons.bin), giving instant
      * desktop icon display on boot with zero pipeline contention and zero freezes.

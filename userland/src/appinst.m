@@ -75,8 +75,9 @@ void archive_entry_set_pathname(struct archive_entry *, const char *);
 @end
 
 static NSString *const BUNDLES = @"/private/var/containers/Bundle/Application";
-/* where tools/k90auto/install-ipa.py writes an .ipa over USB, in pieces (rwsh "pull PATH OFFSET") */
-static NSString *const INBOX = @"/private/var/tmp/ipa";
+/* where tools/k90auto/install-ipa.py writes an .ipa over USB */
+static NSString *const INBOX = @"/private/var/db/appinst-inbox";
+static NSString *const LEGACY_INBOX = @"/private/var/tmp/ipa";
 
 /* the entries under Payload/ of the archive, into DEST (Payload/ taken off); NO and said why otherwise */
 static BOOL
@@ -563,36 +564,88 @@ install(NSString *source)
 	return status;
 }
 
-static void
-add_dirs_in(NSMutableArray<NSString *> *dirs, NSString *parent, NSString *below)
+/*
+ * Registers a pre-installed system application (such as RedwoodInstaller.app) into LaunchServices.
+ * Creates an AppData container if necessary and sets ApplicationType = System.
+ */
+static int
+register_system_app(NSString *appPath)
 {
-	for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:parent error:nil]) {
-		NSString *dir = below ? [NSString pathWithComponents:@[ parent, name, below ]] : [parent stringByAppendingPathComponent:name];
-		BOOL is_dir = NO;
+	NSFileManager *fm = NSFileManager.defaultManager;
+	NSString *app = appPath;
+	BOOL isDir = NO;
 
-		if ([NSFileManager.defaultManager fileExistsAtPath:dir isDirectory:&is_dir] && is_dir) {
-			[dirs addObject:dir];
+	if (![fm fileExistsAtPath:app isDirectory:&isDir] || !isDir) {
+		NSString *fallback = [@"/Applications" stringByAppendingPathComponent:appPath.lastPathComponent];
+		if ([fm fileExistsAtPath:fallback isDirectory:&isDir] && isDir) {
+			app = fallback;
+		} else {
+			fprintf(stderr, "appinst: system app not found at %s (or %s)\n", appPath.UTF8String, fallback.UTF8String);
+			return 1;
 		}
 	}
+
+	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
+	if (info[@"CFBundleIdentifier"] == nil || info[@"CFBundleExecutable"] == nil) {
+		fprintf(stderr, "appinst: %s missing CFBundleIdentifier or CFBundleExecutable\n", app.UTF8String);
+		return 1;
+	}
+	NSString *identifier = info[@"CFBundleIdentifier"];
+	NSString *execPath = [app stringByAppendingPathComponent:info[@"CFBundleExecutable"]];
+	chmod(execPath.fileSystemRepresentation, 0755);
+
+	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+	NSError *error = nil;
+	MCMContainer *data = [NSClassFromString(@"MCMAppDataContainer") containerWithIdentifier:identifier createIfNecessary:YES
+	                                                                               existed:NULL error:&error];
+	NSString *home = data.url.path ?: @"/private/var/mobile";
+
+	sign_all_machos(app, nil);
+
+	NSDictionary *record = @{
+		@"ApplicationType": @"System",
+		@"CFBundleIdentifier": identifier,
+		@"CodeInfoIdentifier": identifier,
+		@"CompatibilityState": @0,
+		@"Container": home,
+		@"IsContainerized": @YES,
+		@"EnvironmentVariables": @{ @"CFFIXED_USER_HOME": home, @"HOME": home, @"TMPDIR": [home stringByAppendingPathComponent:@"tmp"] },
+		@"IsDeletable": @NO,
+		@"Path": app,
+		@"IsAdHocSigned": @YES,
+		@"LSInstallType": @1,
+		@"HasMIDBasedSINF": @0,
+		@"MissingSINF": @0,
+		@"FamilyID": @0,
+		@"IsOnDemandInstallCapable": @0,
+		@"SignerOrganization": @"Apple Inc.",
+		@"SignatureVersion": @132352,
+		@"SignerIdentity": @"Apple iPhone OS Application Signing",
+		@"CFBundleIconFile": @"AppIcon60x60",
+		@"CFBundleIconFiles": @[ @"AppIcon60x60" ],
+		@"_LSBundlePlugins": plugins_of(app, nil),
+	};
+	if (![[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] registerApplicationDictionary:record]) {
+		fprintf(stderr, "appinst: LaunchServices refused system app %s\n", identifier.UTF8String);
+		return 1;
+	}
+	printf("appinst: %s registered as system app at %s (data in %s)\n", identifier.UTF8String, app.UTF8String, home.UTF8String);
+	notify_post("com.redwood.var_save");
+	return 0;
 }
 
 /*
- * Safari saves to "On My iPhone > Downloads", which is File Provider Storage/Downloads in the app group
- * of the FileProvider local storage; the group's directory has a new UUID on every data volume. On this
- * system that folder is never made (kernel-12377-rate8-app1), and the download stays in a directory of
- * its own under Library/Safari/Downloads of Safari's data container, so those are watched as well.
+ * Watch INBOX (/private/var/db/appinst-inbox) and legacy USB transfer directory (/private/var/tmp/ipa).
+ * Auto-polling of Safari Downloads and AppGroup Downloads has been removed per §8.1 item 8
+ * to prevent repeated app decompression, re-signing, and installation on boot.
  */
 static NSArray<NSString *> *
 download_dirs(void)
 {
 	NSMutableArray<NSString *> *dirs = [NSMutableArray array];
-	MCMContainer *safari = [NSClassFromString(@"MCMAppDataContainer") containerWithIdentifier:@"com.apple.mobilesafari"
-	                                                                         createIfNecessary:NO existed:NULL error:NULL];
-
 	[dirs addObject:INBOX];
-	add_dirs_in(dirs, @"/private/var/mobile/Containers/Shared/AppGroup", @"File Provider Storage/Downloads");
-	if (safari.url != nil) {
-		add_dirs_in(dirs, [safari.url.path stringByAppendingPathComponent:@"Library/Safari/Downloads"], nil);
+	if (![INBOX isEqualToString:LEGACY_INBOX]) {
+		[dirs addObject:LEGACY_INBOX];
 	}
 	return dirs;
 }
@@ -616,9 +669,8 @@ zip_whole(NSString *path, unsigned long long size)
 }
 
 /*
- * Every second, each .ipa in the download folders that is a whole zip archive is copied out and
- * installed from the copy, once for each size and time it has: Safari gives up on a download it
- * cannot hand to the FileProvider storage and may remove it at any time.
+ * Every second, each .ipa in the INBOX that is a whole zip archive is copied out,
+ * installed, and removed upon success.
  */
 static int
 watch(void)
@@ -630,6 +682,11 @@ watch(void)
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
 	[fm createDirectoryAtPath:INBOX withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0777 } error:nil];
+	[fm createDirectoryAtPath:LEGACY_INBOX withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0777 } error:nil];
+
+	/* Ensure RedwoodInstaller.app is registered in LaunchServices so it appears on home screen even with existing darwin_var */
+	register_system_app(@"/redwood/Applications/RedwoodInstaller.app");
+
 	for (;;) {
 		@autoreleasepool {
 			NSArray<NSString *> *dirs = download_dirs();
@@ -657,8 +714,13 @@ watch(void)
 						continue;
 					}
 					printf("appinst: installing %s (%llu bytes) from %s\n", name.UTF8String, size, dir.UTF8String);
-					printf("appinst: %s\n", install(copy) == 0 ? "installed" : "NOT INSTALLED");
+					int install_status = install(copy);
+					printf("appinst: %s\n", install_status == 0 ? "installed" : "NOT INSTALLED");
 					[fm removeItemAtPath:copy error:nil];
+					if (install_status == 0) {
+						/* Remove source file after successful installation to save ramfs space and avoid re-install */
+						[fm removeItemAtPath:path error:nil];
+					}
 				}
 			}
 		}
@@ -731,6 +793,9 @@ is_test_app_identifier(NSString *identifier)
 	if ([identifier isEqualToString:@"com.redwood.hello"] ||
 	    [identifier hasPrefix:@"com.example."] ||
 	    [identifier hasPrefix:@"com.test."] ||
+	    [identifier hasPrefix:@"com.nssurge."] ||
+	    [identifier isEqualToString:@"cilicili"] ||
+	    [identifier isEqualToString:@"Kumone"] ||
 	    [identifier rangeOfString:@"test" options:NSCaseInsensitiveSearch].location != NSNotFound ||
 	    [identifier rangeOfString:@"demo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
 	    [identifier rangeOfString:@"sample" options:NSCaseInsensitiveSearch].location != NSNotFound) {
@@ -811,7 +876,11 @@ main(int argc, char **argv)
 		if (argc == 2 && strcmp(argv[1], "watch") == 0) {
 			return watch();
 		}
-		fprintf(stderr, "usage: appinst install FILE.ipa|DIR.app | remove BUNDLE-ID | list | open BUNDLE-ID | url URL | clean | watch\n");
+		if ((argc == 2 || argc == 3) && (strcmp(argv[1], "register-system") == 0 || strcmp(argv[1], "register") == 0)) {
+			NSString *target = (argc == 3) ? @(argv[2]) : @"/redwood/Applications/RedwoodInstaller.app";
+			return register_system_app(target);
+		}
+		fprintf(stderr, "usage: appinst install FILE.ipa|DIR.app | remove BUNDLE-ID | list | open BUNDLE-ID | url URL | clean | watch | register-system [APP_PATH]\n");
 		return 2;
 	}
 }

@@ -860,6 +860,14 @@ if [ "$V" = 26 ]; then
 	done
 fi
 [ -d root/lib/RedwoodAudio.driver ] && ln -sf /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
+if [ -f src/build_installer.sh ]; then
+	bash src/build_installer.sh
+fi
+if [ -d obj/RedwoodInstaller.app ]; then
+	mkdir -p root/Applications
+	rm -rf root/Applications/RedwoodInstaller.app
+	cp -a obj/RedwoodInstaller.app root/Applications/
+fi
 # The 26 image runs where the dyld shared cache has an arm64e slice and no other (ios26/23G90__iPhone18,3
 # holds dyld_shared_cache_arm64e alone), so every program in it that reaches dyld has to be an arm64e
 # slice, and one Apple's clang made: a slice whose cpusubtype lacks the LIB64 bit comes from a compiler
