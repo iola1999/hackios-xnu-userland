@@ -164,6 +164,8 @@ lock_screen_manager(void)
 }
 
 /* 1: locked, an unlock was asked for; 0: not locked; -1: no lock screen manager to ask. */
+static void sb26_schedule_stepped_refresh(void);
+
 static int
 unlock_once(const char *why)
 {
@@ -185,11 +187,143 @@ unlock_once(const char *why)
     fprintf(stderr, "sb26: unlock %s: answer=%d locked_after=%d\n", why, answer, locked_after);
     if (!locked_after) {
         notify_post("com.redwood.wallpaper.suspend");
+        sb26_schedule_stepped_refresh();
     }
     return 1;
 }
 
 static int boot_unlock_seen_locked;
+
+static void
+refresh_view_recursive(id view, int depth)
+{
+    if (!view || depth > 32) return;
+
+    SEL layout_sel = sel_registerName("setNeedsLayout");
+    SEL display_sel = sel_registerName("setNeedsDisplay");
+    SEL layer_sel = sel_registerName("layer");
+    SEL subviews_sel = sel_registerName("subviews");
+    SEL count_sel = sel_registerName("count");
+    SEL obj_at_idx = sel_registerName("objectAtIndex:");
+
+    if (class_respondsToSelector(object_getClass(view), layout_sel)) {
+        ((void (*)(id, SEL))objc_msgSend)(view, layout_sel);
+    }
+    if (class_respondsToSelector(object_getClass(view), display_sel)) {
+        ((void (*)(id, SEL))objc_msgSend)(view, display_sel);
+    }
+
+    if (class_respondsToSelector(object_getClass(view), layer_sel)) {
+        id layer = ((id (*)(id, SEL))objc_msgSend)(view, layer_sel);
+        if (layer) {
+            if (class_respondsToSelector(object_getClass(layer), layout_sel)) {
+                ((void (*)(id, SEL))objc_msgSend)(layer, layout_sel);
+            }
+            if (class_respondsToSelector(object_getClass(layer), display_sel)) {
+                ((void (*)(id, SEL))objc_msgSend)(layer, display_sel);
+            }
+        }
+    }
+
+    if (class_respondsToSelector(object_getClass(view), subviews_sel)) {
+        id subviews = ((id (*)(id, SEL))objc_msgSend)(view, subviews_sel);
+        if (subviews && class_respondsToSelector(object_getClass(subviews), count_sel)) {
+            unsigned long count = ((unsigned long (*)(id, SEL))objc_msgSend)(subviews, count_sel);
+            for (unsigned long i = 0; i < count; i++) {
+                id child = ((id (*)(id, SEL, unsigned long))objc_msgSend)(subviews, obj_at_idx, i);
+                refresh_view_recursive(child, depth + 1);
+            }
+        }
+    }
+}
+
+static void
+refresh_windows_array(id windows_array)
+{
+    if (!windows_array) return;
+    SEL count_sel = sel_registerName("count");
+    SEL obj_at_idx = sel_registerName("objectAtIndex:");
+    if (!class_respondsToSelector(object_getClass(windows_array), count_sel) ||
+        !class_respondsToSelector(object_getClass(windows_array), obj_at_idx)) {
+        return;
+    }
+    unsigned long win_count = ((unsigned long (*)(id, SEL))objc_msgSend)(windows_array, count_sel);
+    for (unsigned long i = 0; i < win_count; i++) {
+        id window = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows_array, obj_at_idx, i);
+        if (window) {
+            refresh_view_recursive(window, 0);
+        }
+    }
+}
+
+static void
+sb26_stepped_refresh_step(void *context)
+{
+    uintptr_t step_idx = (uintptr_t)context;
+    fprintf(stderr, "sb26: stepped icon refresh step %lu executing on main thread\n", (unsigned long)step_idx);
+
+    Class app_class = objc_getClass("UIApplication");
+    Class window_class = objc_getClass("UIWindow");
+    Class catrans_class = objc_getClass("CATransaction");
+
+    SEL all_win_sel = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
+    if (window_class && class_respondsToSelector(object_getClass((id)window_class), all_win_sel)) {
+        id internal_windows = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)window_class, all_win_sel, YES, NO);
+        refresh_windows_array(internal_windows);
+    }
+
+    if (app_class) {
+        SEL shared_sel = sel_registerName("sharedApplication");
+        if (class_respondsToSelector(object_getClass((id)app_class), shared_sel)) {
+            id app = ((id (*)(id, SEL))objc_msgSend)((id)app_class, shared_sel);
+            if (app) {
+                SEL win_sel = sel_registerName("windows");
+                if (class_respondsToSelector(object_getClass(app), win_sel)) {
+                    id app_windows = ((id (*)(id, SEL))objc_msgSend)(app, win_sel);
+                    refresh_windows_array(app_windows);
+                }
+            }
+        }
+    }
+
+    if (catrans_class) {
+        SEL flush_sel = sel_registerName("flush");
+        SEL commit_sel = sel_registerName("commit");
+        if (class_respondsToSelector(object_getClass((id)catrans_class), flush_sel)) {
+            ((void (*)(id, SEL))objc_msgSend)((id)catrans_class, flush_sel);
+        }
+        if (class_respondsToSelector(object_getClass((id)catrans_class), commit_sel)) {
+            ((void (*)(id, SEL))objc_msgSend)((id)catrans_class, commit_sel);
+        }
+        if (class_respondsToSelector(object_getClass((id)catrans_class), flush_sel)) {
+            ((void (*)(id, SEL))objc_msgSend)((id)catrans_class, flush_sel);
+        }
+    }
+
+    fprintf(stderr, "sb26: stepped icon refresh step %lu completed\n", (unsigned long)step_idx);
+}
+
+static void
+sb26_schedule_stepped_refresh(void)
+{
+    static int scheduled = 0;
+    if (scheduled) return;
+    scheduled = 1;
+
+    static const int delays[] = { 3, 6, 10, 15, 22, 30, 45 };
+    const size_t num_delays = sizeof(delays) / sizeof(delays[0]);
+
+    fprintf(stderr, "sb26: scheduling stepped icon refresh after unlock (%zu steps: +3s..+45s)\n", num_delays);
+
+    for (size_t i = 0; i < num_delays; i++) {
+        dispatch_after_f(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)delays[i] * NSEC_PER_SEC),
+            dispatch_get_main_queue(),
+            (void *)(uintptr_t)(i + 1),
+            sb26_stepped_refresh_step
+        );
+    }
+}
 
 static void
 boot_unlock(void *context)
@@ -200,6 +334,7 @@ boot_unlock(void *context)
     if (state == 0 && boot_unlock_seen_locked) {
         fprintf(stderr, "sb26: boot unlock done after %lu attempts\n", (unsigned long)attempt);
         notify_post("com.redwood.wallpaper.suspend");
+        sb26_schedule_stepped_refresh();
         return;
     }
     if (attempt >= UNLOCK_ATTEMPTS) {
@@ -219,6 +354,7 @@ sb26_hook_unlock_ui(id self, SEL cmd, long source, id options)
     SEL locked = sel_registerName("isUILocked");
     if (!((BOOL (*)(id, SEL))objc_msgSend)(self, locked)) {
         notify_post("com.redwood.wallpaper.suspend");
+        sb26_schedule_stepped_refresh();
     }
     return ans;
 }
@@ -244,6 +380,7 @@ install_unlock(void)
         if (unlock_once("notification") == 0) {
             fprintf(stderr, "sb26: unlock notification: not locked\n");
             notify_post("com.redwood.wallpaper.suspend");
+            sb26_schedule_stepped_refresh();
         }
     });
 

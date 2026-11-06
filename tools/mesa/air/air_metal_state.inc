@@ -79,6 +79,19 @@ state_framebuffer(struct rwa_device *device, const struct pipe_framebuffer_state
    if (b->fb_set && util_framebuffer_state_equal(&b->fb, fb))
       return;
    state_count.fb++;
+   if (b->fb_set) {
+      if (device->pipe->texture_barrier)
+         device->pipe->texture_barrier(device->pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
+      for (unsigned s = 0; s < 2; s++) {
+         if (b->num_views[s])
+            device->pipe->set_sampler_views(device->pipe,
+                                            s ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT, 0, 0,
+                                            b->num_views[s], NULL);
+         b->num_views[s] = 0;
+         memset(b->views[s], 0, sizeof(b->views[s]));
+      }
+      device->pipe->flush(device->pipe, NULL, 0);
+   }
    device->pipe->set_framebuffer_state(device->pipe, fb);
    util_copy_framebuffer_state(&b->fb, fb);
    b->fb_set = true;

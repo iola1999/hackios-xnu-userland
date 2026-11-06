@@ -6640,11 +6640,11 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       fb.zsbuf = zsurf;
    }
    state_framebuffer(device, &fb);
-   /* rwa_draw.discard. pipe->invalidate_resource would also drop the stores of the batch that wrote
-    * the attachment last, which a batch recorded since may still sample. CoreAnimation's full-screen
-    * pass has a second, RGBA16Float attachment loaded with MTLLoadActionDontCare, which freedreno
+   /* rwa_draw.discard: aux only (i > 0); attachment 0 preserves rsc->valid for GMEM resolve.
+    * Avoids pipe->invalidate_resource dropping prior stores. CoreAnimation's full-screen pass
+    * has a second RGBA16Float attachment loaded with MTLLoadActionDontCare, which freedreno
     * read back into GMEM in every bin (kernel-12377-rate7-c7). */
-   for (unsigned i = 0; i < draw->color_count && !device->software; i++) {
+   for (unsigned i = 1; i < draw->color_count && !device->software; i++) {
       if (draw->discard & (1u << i))
          fd_resource_contents_undefined(pipe, draw->color[i]->res);
    }
