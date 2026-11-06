@@ -266,11 +266,8 @@ rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
 cp obj/child root/bin/child
-# The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
-# ends: the program and its job together, away from the iOS job list below, which several working
-# copies are editing at once.
+# The data volume seed / snapshot helper (src/var_store.c).
 [ -f obj/var_store ] && cp obj/var_store root/bin/
-cp com.redwood.varstore.plist root/LaunchDaemons/
 if [ "$V" = 26 ]; then
 	cp obj/input26-service root/bin/
 	cp com.redwood.input26.plist root/LaunchDaemons/

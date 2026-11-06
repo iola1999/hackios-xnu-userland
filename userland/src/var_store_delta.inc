@@ -107,32 +107,6 @@ delta_reset(uint64_t new_base_generation)
 	return 1;
 }
 
-static int
-delta_is_near_full(void)
-{
-	struct delta_head dh;
-	int temp_open = 0, near = 0;
-
-	if (slots <= 1) {
-		return 0;
-	}
-	if (fd < 0) {
-		fd = open(DEVICE, O_RDONLY, 0);
-		if (fd < 0) {
-			return 0;
-		}
-		temp_open = 1;
-	}
-	if (delta_read_head(&dh) && dh.flags == 0) {
-		near = dh.bytes >= (DELTA_SLOT_BYTES - (4u << 20)); /* within 4 MiB of 32 MiB slot limit */
-	}
-	if (temp_open) {
-		close(fd);
-		fd = -1;
-	}
-	return near;
-}
-
 static void
 stream_start_delta_slot(int dslot, uint64_t bytes)
 {

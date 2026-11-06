@@ -15,8 +15,6 @@
  *
  *   var_store save          pack /private/var into the store
  *   var_store load          unpack the newest good store into /private/var (init, at boot)
- *   var_store watch [SECS]  stay and save by itself: when the kernel says the run is ending, and
- *                           every SECS seconds besides (a launchd job of ours does this)
  *   var_store show          what the store holds, both slots
  *   var_store erase         forget both slots (the next boot starts empty again)
  *   var_store stamp PATH    write a line into PATH saying when: a marker for a run
@@ -27,13 +25,6 @@
  * end of an earlier boot (tools/k90auto/package.py SEED=...), so even a first boot starts with the
  * LaunchServices database, the icon cache and PosterBoard's data that boot spent its first
  * minutes building.
- *
- * Nobody has to remember to save. `watch` registers with the kernel (kern.redwood.var_save), and
- * on the orderly way back to the loader -- the run's time up, or "xl stop" -- the kernel asks it
- * for the volume and waits, bounded, before it goes (bsd/dev/redwood_ufs.c,
- * redwood_var_save_on_return). A save every SECS seconds is there as well but is not the default:
- * one costs seconds of the run and a hundred-odd megabytes of flash, and while it runs the
- * storage is read through the loader rather than through this kernel's own driver.
  *
  * One saver at a time: a write to the store is refused unless the writer holds the claim
  * (kern.redwood.var_busy), so two of them cannot interleave into one slot. Even if they did, the
@@ -119,57 +110,7 @@ struct entry {
 	uint64_t size;                  /* a file's contents, a link's target, a hard link's first name */
 };
 
-/* ---- the kernel's side of it: the boot-arg, the handshake, the claim ---- */
-
-#define VAR_SAVE_NONE   0
-#define VAR_SAVE_IDLE   1
-#define VAR_SAVE_WANTED 2
-#define VAR_SAVE_DONE   3
-
-/* Is NAME=VALUE among the kernel's arguments? (as init.c reads them) */
-static int
-boot_arg_is(const char *name, const char *value)
-{
-	static char args[1024];
-	size_t len = sizeof(args) - 1, n = strlen(name), v = strlen(value);
-
-	if (sysctlbyname("kern.bootargs", args, &len, NULL, 0) != 0) {
-		return 0;
-	}
-	args[len < sizeof(args) ? len : sizeof(args) - 1] = 0;
-	for (char *p = args; *p;) {
-		while (*p == ' ') {
-			p++;
-		}
-		if (strncmp(p, name, n) == 0 && p[n] == '=' && strncmp(p + n + 1, value, v) == 0 &&
-		    (p[n + 1 + v] == 0 || p[n + 1 + v] == ' ')) {
-			return 1;
-		}
-		while (*p && *p != ' ') {
-			p++;
-		}
-	}
-	return 0;
-}
-
-static long
-parse_number(const char *text)
-{
-	long value = 0;
-
-	for (; *text >= '0' && *text <= '9'; text++) {
-		value = value * 10 + (*text - '0');
-	}
-	return value;
-}
-
-static int
-sysctl_int(const char *name, int *value)
-{
-	size_t len = sizeof(*value);
-
-	return sysctlbyname(name, value, &len, NULL, 0);
-}
+/* ---- the kernel's side of it: the claim ---- */
 
 static int
 sysctl_set_int(const char *name, int value)
@@ -971,13 +912,6 @@ main(int argc, char **argv, char **envp)
 	already = mmap(NULL, BUFFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (already == MAP_FAILED) {
 		already = NULL;
-	}
-	if (strcmp(what, "watch") == 0) {
-		if (!boot_arg_is("var_store", "1")) {
-			printf("var_store: not asked to keep the data volume (var_store=1): nothing to watch\n");
-			return 0;
-		}
-		return watch(argc > 2 ? (int)parse_number(argv[2]) : 0) ? 0 : 1;
 	}
 	if (argc == 2 && strcmp(what, "load") == 0 && seed(argv[0]) != NULL) {
 		struct head h;
