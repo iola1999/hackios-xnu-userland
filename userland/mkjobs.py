@@ -233,6 +233,11 @@ assert not any(word in 'com.apple.cameracaptured' for word in DENY), "cameracapt
 assert not any(word in 'com.apple.fontservicesd' for word in DENY), "fontservicesd must not be in DENY"
 assert not any(word in 'com.apple.locationd' for word in DENY), "locationd must not be in DENY"
 assert not any(word in 'com.apple.weatherd' for word in DENY), "weatherd must not be in DENY"
+assert not any(word in 'com.apple.timed' for word in DENY), "timed must not be in DENY"
+assert not any(word in 'com.apple.geod' for word in DENY), "geod must not be in DENY"
+assert not any(word in 'com.apple.fairplaydeviceidentityd' for word in DENY), "fairplaydeviceidentityd must not be in DENY"
+assert not any(word in 'com.apple.nsurlsessiond' for word in DENY), "nsurlsessiond must not be in DENY"
+assert not any(word in 'com.apple.akd' for word in DENY), "akd must not be in DENY"
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
@@ -246,6 +251,12 @@ if '--root-volume' in args:
     del args[i:i + 2]
 args = [a for a in args if a != '--rest']
 src_root, dest, labels = args[0], args[1], args[2:]
+if not root_volume:
+    possible_slt = os.path.join(os.path.dirname(os.path.abspath(src_root)), 'rootfs.slt')
+    if os.path.isfile(possible_slt):
+        root_volume = possible_slt
+    elif os.path.isfile(src_root + '.slt'):
+        root_volume = src_root + '.slt'
 oslog = os.environ.get('OSLOG', '').split()
 src = f'{src_root}/System/Library/LaunchDaemons'
 # A program in a cryptex -- on a device a volume of its own, grafted at /System/Cryptexes/NAME (eight of
@@ -333,6 +344,9 @@ if rest:
             continue
         for key in startup_triggers:
             job.pop(key, None)
+        if label == 'com.apple.timed':
+            job['RunAtLoad'] = True
+            job['KeepAlive'] = {'SuccessfulExit': False}
         job['StandardErrorPath'] = '/dev/console'
         job['StandardOutPath'] = '/dev/console'
         # One experiment at a time, carried to every job because the thing being measured is what

@@ -115,6 +115,7 @@ install_airdrop_hooks(Class cls)
 /* --- Screen Mirroring Asynchronous Discovery Implementation --- */
 
 static id cached_output_devices = NULL;
+static dispatch_once_t cached_dev_once;
 static id (*orig_mru_available_devices)(id self, SEL cmd);
 static id (*orig_av_available_devices)(id self, SEL cmd);
 static void (*orig_mru_start_discovery)(id self, SEL cmd);
@@ -122,85 +123,57 @@ static void (*orig_mru_start_discovery)(id self, SEL cmd);
 static void
 sb26_update_cached_devices(void)
 {
-    Class arr_cls = objc_getClass("NSArray");
-    if (!arr_cls) return;
-    if (cached_output_devices == NULL) {
-        id empty = ((id (*)(Class, SEL))objc_msgSend)(arr_cls, sel_registerName("array"));
-        if (empty) {
-            cached_output_devices = ((id (*)(id, SEL))objc_msgSend)(empty, sel_registerName("retain"));
+    dispatch_once(&cached_dev_once, ^{
+        Class arr_cls = objc_getClass("NSArray");
+        if (arr_cls) {
+            id empty = ((id (*)(Class, SEL))objc_msgSend)(arr_cls, sel_registerName("array"));
+            if (empty) {
+                cached_output_devices = ((id (*)(id, SEL))objc_msgSend)(empty, sel_registerName("retain"));
+            }
         }
-    }
+    });
 }
 
 static id
 sb26_output_available_devices(id self, SEL cmd)
 {
-    /*
-     * When called on the main thread, immediately return the cached device list
-     * (or empty array) without blocking for 10 seconds in mediaserverd Bonjour/AWDL scans.
-     */
-    Class thread_cls = objc_getClass("NSThread");
-    BOOL on_main = thread_cls ? ((BOOL (*)(Class, SEL))objc_msgSend)(thread_cls, sel_registerName("isMainThread")) : YES;
-
-    if (on_main) {
-        if (cached_output_devices) {
-            return cached_output_devices;
-        }
-        Class arr_cls = objc_getClass("NSArray");
-        if (arr_cls) {
-            return ((id (*)(Class, SEL))objc_msgSend)(arr_cls, sel_registerName("array"));
-        }
-        return NULL;
-    }
-
-    /* Background thread: query real devices if underlying implementation exists */
-    if (orig_mru_available_devices) {
-        id devs = orig_mru_available_devices(self, cmd);
-        if (devs) {
-            if (cached_output_devices) {
-                ((void (*)(id, SEL))objc_msgSend)(cached_output_devices, sel_registerName("release"));
-            }
-            cached_output_devices = ((id (*)(id, SEL))objc_msgSend)(devs, sel_registerName("retain"));
-            return devs;
-        }
-    }
-    if (orig_av_available_devices) {
-        id devs = orig_av_available_devices(self, cmd);
-        if (devs) {
-            if (cached_output_devices) {
-                ((void (*)(id, SEL))objc_msgSend)(cached_output_devices, sel_registerName("release"));
-            }
-            cached_output_devices = ((id (*)(id, SEL))objc_msgSend)(devs, sel_registerName("retain"));
-            return devs;
-        }
-    }
-
-    if (cached_output_devices) {
-        return cached_output_devices;
-    }
-    Class arr_cls = objc_getClass("NSArray");
-    return arr_cls ? ((id (*)(Class, SEL))objc_msgSend)(arr_cls, sel_registerName("array")) : NULL;
+    (void)self;
+    (void)cmd;
+    sb26_update_cached_devices();
+    return cached_output_devices;
 }
 
 static void
 sb26_mru_start_detailed_discovery(id self, SEL cmd)
 {
     /*
-     * Run discovery trigger asynchronously in a global background queue
-     * so that SpringBoard main thread is never stalled.
+     * MediaRemoteUI / MRUMirroringController must execute on the main thread
+     * so that its delegate callbacks (-[MRUMirroringViewController mirroringController:...])
+     * remain on the main thread, avoiding UIKit multithreading assertions.
      */
-    if (self) {
-        ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("retain"));
-    }
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        if (orig_mru_start_discovery) {
-            orig_mru_start_discovery(self, cmd);
-        }
-        sb26_update_cached_devices();
+    Class thread_cls = objc_getClass("NSThread");
+    BOOL on_main = thread_cls ? ((BOOL (*)(Class, SEL))objc_msgSend)(thread_cls, sel_registerName("isMainThread")) : YES;
+
+    if (!on_main) {
         if (self) {
-            ((void (*)(id, SEL))objc_msgSend)(self, sel_registerName("release"));
+            ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("retain"));
         }
-    });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (orig_mru_start_discovery) {
+                orig_mru_start_discovery(self, cmd);
+            }
+            sb26_update_cached_devices();
+            if (self) {
+                ((void (*)(id, SEL))objc_msgSend)(self, sel_registerName("release"));
+            }
+        });
+        return;
+    }
+
+    if (orig_mru_start_discovery) {
+        orig_mru_start_discovery(self, cmd);
+    }
+    sb26_update_cached_devices();
 }
 
 static void
@@ -237,9 +210,7 @@ sb26_routes_changed_cf_callback(CFNotificationCenterRef center, void *observer,
     (void)name;
     (void)object;
     (void)userInfo;
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
-        sb26_update_cached_devices();
-    });
+    sb26_update_cached_devices();
 }
 
 static void
@@ -266,7 +237,7 @@ install_screen_mirroring_hooks(Class cls)
         method_setImplementation(m_presence, (IMP)sb26_output_device_presence_detected);
     }
 
-    /* Register notifications to drive background route updates via CFNotificationCenter */
+    /* Register notifications to drive route updates via CFNotificationCenter */
     CFNotificationCenterRef local = CFNotificationCenterGetLocalCenter();
     if (local) {
         CFNotificationCenterAddObserver(local, NULL, sb26_routes_changed_cf_callback,
@@ -304,10 +275,22 @@ install_mru_mirroring_hooks(Class cls)
 
 /* --- Calendar Dynamic Icon Fallback Implementation --- */
 
-static id (*orig_calendar_layer)(id self, SEL cmd, void *info, id tc, unsigned long opts);
+/*
+ * SBIconImageInfo is an ARM64 Homogeneous Floating-point Aggregate (HFA) consisting
+ * of 4 doubles: CGSize size (width, height), double scale, double continuousCornerRadius.
+ * AAPCS64 passes it in d0..d3 floating-point registers. traitCollection is in x2 and options is in x3.
+ */
+struct SBIconImageInfo {
+    CGSize size;
+    double scale;
+    double continuousCornerRadius;
+};
+typedef struct SBIconImageInfo SBIconImageInfo;
+
+static id (*orig_calendar_layer)(id self, SEL cmd, SBIconImageInfo info, id tc, unsigned long opts);
 
 static id
-sb26_calendar_icon_layer_fallback(id self, SEL _cmd, void *info, id tc, unsigned long opts)
+sb26_calendar_icon_layer_fallback(id self, SEL _cmd, SBIconImageInfo info, id tc, unsigned long opts)
 {
     id layer = NULL;
     if (orig_calendar_layer) {
@@ -325,7 +308,8 @@ sb26_calendar_icon_layer_fallback(id self, SEL _cmd, void *info, id tc, unsigned
     Class self_cls = object_getClass(self);
     Method m_img = self_cls ? class_getInstanceMethod(self_cls, img_sel) : NULL;
     if (m_img) {
-        id (*img_fn)(id, SEL, void *, id, unsigned long) = (id (*)(id, SEL, void *, id, unsigned long))method_getImplementation(m_img);
+        id (*img_fn)(id, SEL, SBIconImageInfo, id, unsigned long) =
+            (id (*)(id, SEL, SBIconImageInfo, id, unsigned long))method_getImplementation(m_img);
         id image = img_fn(self, img_sel, info, tc, opts);
         if (image != NULL) {
             SEL cg_sel = sel_registerName("CGImage");
@@ -335,11 +319,24 @@ sb26_calendar_icon_layer_fallback(id self, SEL _cmd, void *info, id tc, unsigned
                 if (cg_img != NULL) {
                     Class layer_cls = objc_getClass("CALayer");
                     if (layer_cls) {
+                        /*
+                         * Wrap CALayer creation and property modification with an explicit
+                         * CATransaction so CA_ASSERT_MAIN_THREAD_TRANSACTIONS assertion
+                         * (which aborts on implicit transactions on background threads) is avoided.
+                         */
+                        Class tx_cls = objc_getClass("CATransaction");
+                        if (tx_cls) {
+                            ((void (*)(Class, SEL))objc_msgSend)(tx_cls, sel_registerName("begin"));
+                            ((void (*)(Class, SEL, BOOL))objc_msgSend)(tx_cls, sel_registerName("setDisableActions:"), YES);
+                        }
                         id new_layer = ((id (*)(Class, SEL))objc_msgSend)(layer_cls, sel_registerName("layer"));
                         if (new_layer != NULL) {
                             ((void (*)(id, SEL, id))objc_msgSend)(new_layer, sel_registerName("setContents:"), cg_img);
-                            return new_layer;
                         }
+                        if (tx_cls) {
+                            ((void (*)(Class, SEL))objc_msgSend)(tx_cls, sel_registerName("commit"));
+                        }
+                        return new_layer;
                     }
                 }
             }
@@ -357,7 +354,7 @@ install_calendar_icon_hooks(Class cls)
 
     Method m_layer = class_getInstanceMethod(cls, sel_registerName("iconLayerWithInfo:traitCollection:options:"));
     if (m_layer) {
-        orig_calendar_layer = (id (*)(id, SEL, void *, id, unsigned long))method_getImplementation(m_layer);
+        orig_calendar_layer = (id (*)(id, SEL, SBIconImageInfo, id, unsigned long))method_getImplementation(m_layer);
         method_setImplementation(m_layer, (IMP)sb26_calendar_icon_layer_fallback);
         cal_done = 1;
         fprintf(stderr, "sb26: SBCalendarIconImageProvider fallback hook installed\n");

@@ -81,7 +81,7 @@ state_framebuffer(struct rwa_device *device, const struct pipe_framebuffer_state
    state_count.fb++;
    if (b->fb_set) {
       if (device->pipe->texture_barrier)
-         device->pipe->texture_barrier(device->pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER);
+         device->pipe->texture_barrier(device->pipe, PIPE_TEXTURE_BARRIER_FRAMEBUFFER | PIPE_TEXTURE_BARRIER_SAMPLER);
       for (unsigned s = 0; s < 2; s++) {
          if (b->num_views[s])
             device->pipe->set_sampler_views(device->pipe,

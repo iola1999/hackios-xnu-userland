@@ -526,7 +526,7 @@ install_into(NSString *source, NSString *bundle)
 		@"GroupContainers": groupContainers,
 		@"IsContainerized": @YES,
 		@"EnvironmentVariables": @{ @"CFFIXED_USER_HOME": home, @"HOME": home, @"TMPDIR": [home stringByAppendingPathComponent:@"tmp"] },
-		@"IsDeletable": @NO,
+		@"IsDeletable": @YES,
 		@"Path": app,
 		@"IsAdHocSigned": @YES,
 		@"LSInstallType": @1,
@@ -669,15 +669,97 @@ watch(void)
 static int
 remove_app(NSString *identifier)
 {
+	NSFileManager *fm = NSFileManager.defaultManager;
 	LSApplicationProxy *proxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:identifier];
+	BOOL found = NO;
 
-	if (proxy.bundleURL == nil || ![proxy.bundleURL.path hasPrefix:BUNDLES]) {
-		fprintf(stderr, "appinst: %s was not installed by appinst\n", identifier.UTF8String);
+	if (proxy != nil && proxy.bundleURL != nil && [proxy.bundleURL.path hasPrefix:BUNDLES]) {
+		[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] unregisterApplication:proxy.bundleURL];
+		NSString *bundleContainer = proxy.bundleURL.path.stringByDeletingLastPathComponent;
+		[fm removeItemAtPath:bundleContainer error:nil];
+		found = YES;
+	}
+
+	for (NSString *uuid in [fm contentsOfDirectoryAtPath:BUNDLES error:nil]) {
+		NSString *dir = [BUNDLES stringByAppendingPathComponent:uuid];
+		NSString *app = app_in(dir);
+		if (app != nil) {
+			NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
+			if ([info[@"CFBundleIdentifier"] isEqualToString:identifier]) {
+				[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] unregisterApplication:[NSURL fileURLWithPath:app]];
+				[fm removeItemAtPath:dir error:nil];
+				found = YES;
+			}
+		}
+	}
+
+	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+	Class mcmClass = NSClassFromString(@"MCMAppDataContainer");
+	if (mcmClass != Nil) {
+		MCMContainer *data = [mcmClass containerWithIdentifier:identifier createIfNecessary:NO existed:NULL error:NULL];
+		if (data != nil && data.url != nil) {
+			[fm removeItemAtPath:data.url.path error:nil];
+		}
+	}
+
+	NSString *dataRoot = @"/private/var/mobile/Containers/Data/Application";
+	for (NSString *duuid in [fm contentsOfDirectoryAtPath:dataRoot error:nil]) {
+		NSString *dpath = [dataRoot stringByAppendingPathComponent:duuid];
+		NSString *meta = [dpath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+		NSDictionary *mdict = [NSDictionary dictionaryWithContentsOfFile:meta];
+		if ([mdict[@"MCMMetadataIdentifier"] isEqualToString:identifier]) {
+			[fm removeItemAtPath:dpath error:nil];
+		}
+	}
+
+	notify_post("com.redwood.var_save");
+	if (found) {
+		printf("appinst: %s removed (posted com.redwood.var_save)\n", identifier.UTF8String);
+		return 0;
+	} else {
+		fprintf(stderr, "appinst: %s was not found in bundle containers (cleaned any data containers)\n", identifier.UTF8String);
 		return 1;
 	}
-	[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] unregisterApplication:proxy.bundleURL];
-	[NSFileManager.defaultManager removeItemAtPath:proxy.bundleURL.path.stringByDeletingLastPathComponent error:nil];
-	printf("appinst: %s removed\n", identifier.UTF8String);
+}
+
+static BOOL
+is_test_app_identifier(NSString *identifier)
+{
+	if ([identifier isEqualToString:@"com.redwood.installer"]) {
+		return NO;
+	}
+	if ([identifier isEqualToString:@"com.redwood.hello"] ||
+	    [identifier hasPrefix:@"com.example."] ||
+	    [identifier hasPrefix:@"com.test."] ||
+	    [identifier rangeOfString:@"test" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+	    [identifier rangeOfString:@"demo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+	    [identifier rangeOfString:@"sample" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+		return YES;
+	}
+	return NO;
+}
+
+static int
+clean_test_apps(void)
+{
+	int cleaned_count = 0;
+	NSFileManager *fm = NSFileManager.defaultManager;
+	NSArray<NSString *> *uuids = [fm contentsOfDirectoryAtPath:BUNDLES error:nil];
+	for (NSString *uuid in uuids) {
+		NSString *bundle_dir = [BUNDLES stringByAppendingPathComponent:uuid];
+		NSString *app = app_in(bundle_dir);
+		if (app == nil) {
+			continue;
+		}
+		NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
+		NSString *bid = info[@"CFBundleIdentifier"];
+		if (bid != nil && is_test_app_identifier(bid)) {
+			printf("appinst: cleaning leftover test app %s (%s)...\n", bid.UTF8String, app.UTF8String);
+			remove_app(bid);
+			cleaned_count++;
+		}
+	}
+	printf("appinst: cleaned %d leftover test app(s)\n", cleaned_count);
 	return 0;
 }
 
@@ -710,6 +792,9 @@ main(int argc, char **argv)
 		if (argc == 3 && strcmp(argv[1], "remove") == 0) {
 			return remove_app(@(argv[2]));
 		}
+		if (argc == 2 && (strcmp(argv[1], "clean") == 0 || strcmp(argv[1], "cleanup") == 0)) {
+			return clean_test_apps();
+		}
 		if (argc == 2 && strcmp(argv[1], "list") == 0) {
 			return list();
 		}
@@ -726,7 +811,7 @@ main(int argc, char **argv)
 		if (argc == 2 && strcmp(argv[1], "watch") == 0) {
 			return watch();
 		}
-		fprintf(stderr, "usage: appinst install FILE.ipa|DIR.app | remove BUNDLE-ID | list | open BUNDLE-ID | url URL | watch\n");
+		fprintf(stderr, "usage: appinst install FILE.ipa|DIR.app | remove BUNDLE-ID | list | open BUNDLE-ID | url URL | clean | watch\n");
 		return 2;
 	}
 }

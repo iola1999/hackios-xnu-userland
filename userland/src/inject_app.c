@@ -22,7 +22,14 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+#include <mach/mach.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
@@ -366,6 +373,10 @@ setup_app_container_env(const char *name)
 			uuid = "5BF8A0AF-C8E6-4B1A-9D2E-2C3D4E5F6A71";
 		} else if (strcmp(name, "MobileCal") == 0) {
 			uuid = "7DFA02CB-E0A8-4D3C-BF40-4E5F6A7B8C93";
+		} else if (strcmp(name, "Weather") == 0) {
+			uuid = "8E5B1A2C-3D4E-4F5A-9B6C-7D8E9F0A1B2C";
+		} else if (strcmp(name, "Maps") == 0) {
+			uuid = "9F6C2B3D-4E5F-4A6B-8C7D-8E9F0A1B2C3D";
 		}
 		if (uuid != NULL) {
 			char home[256], tmp[256];
@@ -389,6 +400,11 @@ setup_app_container_env(const char *name)
 			(void)mkdir("/private/var/mobile/Containers", 0755);
 			(void)mkdir("/private/var/mobile/Containers/Data", 0755);
 			(void)mkdir("/private/var/mobile/Containers/Data/Application", 0755);
+			(void)mkdir("/private/var/mobile/Containers/Shared", 0755);
+			(void)mkdir("/private/var/mobile/Containers/Shared/AppGroup", 0755);
+			(void)mkdir("/private/var/mobile/Containers/Shared/AppGroup/group.com.apple.weather", 0755);
+			(void)mkdir("/private/var/mobile/Library/Caches/com.apple.weather", 0755);
+			(void)mkdir("/private/var/mobile/Library/Caches/com.apple.Maps", 0755);
 			for (unsigned i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
 				snprintf(path, sizeof(path), "%s%s", home, subdirs[i]);
 				(void)mkdir(path, 0755);
@@ -485,11 +501,218 @@ app_enable_webkit_vp9(void)
 	}
 }
 
+typedef int nw_path_status_t;
+typedef uint32_t SCNetworkReachabilityFlags;
+typedef unsigned char Boolean;
+
+static nw_path_status_t (*orig_nw_path_get_status)(void *path) = NULL;
+static Boolean (*orig_sc_reach_get_flags)(void *target, SCNetworkReachabilityFlags *flags) = NULL;
+
+static bool
+en0_has_ipv4(void)
+{
+	static time_t last_check = 0;
+	static bool cached = false;
+	time_t now = time(NULL);
+
+	if (now - last_check < 2 && last_check != 0) {
+		return cached;
+	}
+	last_check = now;
+	struct ifaddrs *list = NULL;
+	if (getifaddrs(&list) == 0) {
+		bool ok = false;
+		for (struct ifaddrs *ifa = list; ifa != NULL; ifa = ifa->ifa_next) {
+			if (ifa->ifa_name && strcmp(ifa->ifa_name, "en0") == 0 &&
+			    ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET) {
+				ok = true;
+				break;
+			}
+		}
+		freeifaddrs(list);
+		cached = ok;
+		return ok;
+	}
+	return cached;
+}
+
+static nw_path_status_t
+hooked_nw_path_get_status(void *path)
+{
+	nw_path_status_t s = orig_nw_path_get_status ? orig_nw_path_get_status(path) : 1;
+	if (s != 1 && en0_has_ipv4()) {
+		return 1; /* nw_path_status_satisfied */
+	}
+	return s;
+}
+
+static Boolean
+hooked_sc_reach_get_flags(void *target, SCNetworkReachabilityFlags *flags)
+{
+	Boolean ok = orig_sc_reach_get_flags ? orig_sc_reach_get_flags(target, flags) : 1;
+	if (flags != NULL && en0_has_ipv4()) {
+		*flags |= 0x00020002; /* kSCNetworkReachabilityFlagsReachable | kSCNetworkReachabilityFlagsIsDirect */
+		*flags &= ~(1u << 2); /* clear ConnectionRequired */
+	}
+	return ok;
+}
+
+/* ObjC hooks for Network.framework and GeoServices */
+static IMP orig_geo_is_net_reachable;
+static IMP orig_geo_is_wifi_reachable;
+static IMP orig_nwpath_status;
+static IMP orig_nwpath_is_satisfied;
+static IMP orig_nwpath_is_expensive;
+static IMP orig_nwpath_is_constrained;
+
+static signed char
+hooked_geo_is_net_reachable(id self, SEL cmd)
+{
+	if (en0_has_ipv4()) {
+		return 1;
+	}
+	return orig_geo_is_net_reachable ? ((signed char (*)(id, SEL))orig_geo_is_net_reachable)(self, cmd) : 1;
+}
+
+static signed char
+hooked_geo_is_wifi_reachable(id self, SEL cmd)
+{
+	if (en0_has_ipv4()) {
+		return 1;
+	}
+	return orig_geo_is_wifi_reachable ? ((signed char (*)(id, SEL))orig_geo_is_wifi_reachable)(self, cmd) : 1;
+}
+
+static int
+hooked_nwpath_status(id self, SEL cmd)
+{
+	int s = orig_nwpath_status ? ((int (*)(id, SEL))orig_nwpath_status)(self, cmd) : 1;
+	if (s != 1 && en0_has_ipv4()) {
+		return 1; /* nw_path_status_satisfied */
+	}
+	return s;
+}
+
+static signed char
+hooked_nwpath_is_satisfied(id self, SEL cmd)
+{
+	if (en0_has_ipv4()) {
+		return 1;
+	}
+	return orig_nwpath_is_satisfied ? ((signed char (*)(id, SEL))orig_nwpath_is_satisfied)(self, cmd) : 1;
+}
+
+static signed char
+hooked_nwpath_is_expensive(id self, SEL cmd)
+{
+	if (en0_has_ipv4()) {
+		return 0;
+	}
+	return orig_nwpath_is_expensive ? ((signed char (*)(id, SEL))orig_nwpath_is_expensive)(self, cmd) : 0;
+}
+
+static signed char
+hooked_nwpath_is_constrained(id self, SEL cmd)
+{
+	if (en0_has_ipv4()) {
+		return 0;
+	}
+	return orig_nwpath_is_constrained ? ((signed char (*)(id, SEL))orig_nwpath_is_constrained)(self, cmd) : 0;
+}
+
+struct app_symbol_rebind {
+	const char *name;
+	void *replacement;
+	void **original;
+};
+
+static void
+rebind_image_symbols(const struct mach_header *header, intptr_t slide_val)
+{
+	const struct mach_header_64 *mh = (const struct mach_header_64 *)header;
+	if (mh->magic != MH_MAGIC_64) {
+		return;
+	}
+	const struct load_command *lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
+	uintptr_t linkedit_base = 0;
+	const struct symtab_command *symtab = NULL;
+	const struct dysymtab_command *dysymtab = NULL;
+
+	for (uint32_t i = 0; i < mh->ncmds; i++) {
+		if (lc->cmd == LC_SEGMENT_64) {
+			const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+			if (strcmp(seg->segname, "__LINKEDIT") == 0) {
+				linkedit_base = (uintptr_t)slide_val + seg->vmaddr - seg->fileoff;
+			}
+		} else if (lc->cmd == LC_SYMTAB) {
+			symtab = (const struct symtab_command *)lc;
+		} else if (lc->cmd == LC_DYSYMTAB) {
+			dysymtab = (const struct dysymtab_command *)lc;
+		}
+		lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
+	}
+	if (!linkedit_base || !symtab || !dysymtab) {
+		return;
+	}
+
+	const struct nlist_64 *symList = (const struct nlist_64 *)(linkedit_base + symtab->symoff);
+	const char *strTab = (const char *)(linkedit_base + symtab->stroff);
+	const uint32_t *indirectSyms = (const uint32_t *)(linkedit_base + dysymtab->indirectsymoff);
+
+	static struct app_symbol_rebind target_rebinds[] = {
+		{ "_nw_path_get_status", (void *)hooked_nw_path_get_status, (void **)&orig_nw_path_get_status },
+		{ "_SCNetworkReachabilityGetFlags", (void *)hooked_sc_reach_get_flags, (void **)&orig_sc_reach_get_flags },
+	};
+	const size_t num_rebinds = sizeof(target_rebinds) / sizeof(target_rebinds[0]);
+
+	lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
+	for (uint32_t i = 0; i < mh->ncmds; i++) {
+		if (lc->cmd == LC_SEGMENT_64) {
+			const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+			if (strncmp(seg->segname, "__DATA", 6) == 0) {
+				const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
+				for (uint32_t j = 0; j < seg->nsects; j++) {
+					uint8_t type = sec[j].flags & SECTION_TYPE;
+					if (type == S_NON_LAZY_SYMBOL_POINTERS || type == S_LAZY_SYMBOL_POINTERS) {
+						uint32_t sec_indirect_offset = sec[j].reserved1;
+						void **pointers = (void **)((uintptr_t)slide_val + sec[j].addr);
+						size_t entry_count = sec[j].size / sizeof(void *);
+
+						for (size_t k = 0; k < entry_count; k++) {
+							uint32_t symIndex = indirectSyms[sec_indirect_offset + k];
+							if (symIndex == INDIRECT_SYMBOL_LOCAL || symIndex == INDIRECT_SYMBOL_ABS) {
+								continue;
+							}
+							uint32_t strOffset = symList[symIndex].n_un.n_strx;
+							if (strOffset == 0) continue;
+							const char *symbol_name = strTab + strOffset;
+							for (size_t r = 0; r < num_rebinds; r++) {
+								if (strcmp(symbol_name, target_rebinds[r].name) == 0) {
+									if (target_rebinds[r].original != NULL && *target_rebinds[r].original == NULL) {
+										*target_rebinds[r].original = pointers[k];
+									}
+									vm_prot_t orig_prot = VM_PROT_READ | VM_PROT_WRITE;
+									vm_address_t page_addr = (vm_address_t)&pointers[k] & ~PAGE_MASK;
+									vm_size_t page_size = PAGE_SIZE;
+									vm_protect(mach_task_self(), page_addr, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+									pointers[k] = target_rebinds[r].replacement;
+									vm_protect(mach_task_self(), page_addr, page_size, FALSE, orig_prot);
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+		lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
+	}
+}
+
 static void
 app_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
 {
-	(void)mh;
-	(void)vmaddr_slide;
+	rebind_image_symbols(mh, vmaddr_slide);
 	if (!app_vp9_hook_installed) {
 		app_enable_webkit_vp9();
 	}
@@ -539,6 +762,15 @@ redwood_app_init(void)
 	watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
 	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
 	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
+
+	watch("GEONetworkObserver", "isNetworkReachable", (IMP)hooked_geo_is_net_reachable, &orig_geo_is_net_reachable);
+	watch("GEONetworkObserver", "isWiFiReachable", (IMP)hooked_geo_is_wifi_reachable, &orig_geo_is_wifi_reachable);
+	watch("NWPath", "status", (IMP)hooked_nwpath_status, &orig_nwpath_status);
+	watch("NWPath", "isSatisfied", (IMP)hooked_nwpath_is_satisfied, &orig_nwpath_is_satisfied);
+	watch("NWPath", "isExpensive", (IMP)hooked_nwpath_is_expensive, &orig_nwpath_is_expensive);
+	watch("NWPath", "isConstrained", (IMP)hooked_nwpath_is_constrained, &orig_nwpath_is_constrained);
+	watch("NWConcrete_nw_path", "status", (IMP)hooked_nwpath_status, &orig_nwpath_status);
+	watch("NWConcrete_nw_path", "isSatisfied", (IMP)hooked_nwpath_is_satisfied, &orig_nwpath_is_satisfied);
 
 	app_enable_webkit_vp9();
 	_dyld_register_func_for_add_image(app_dyld_image_added);

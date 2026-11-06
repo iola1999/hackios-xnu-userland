@@ -83,31 +83,25 @@ query_metal_device(void *context)
 static BOOL
 software_bitmap_selection(id self, SEL selector)
 {
-    BOOL original = ((BOOL (*)(id, SEL))original_bitmap_selection)(self, selector);
-    if (original) return original;
+    (void)self;
+    (void)selector;
+    (void)original_bitmap_selection;
+    (void)appearance_selector;
+    (void)glass_selector;
+    dispatch_once_f(&metal_device_once, NULL, query_metal_device);
 
     /*
-     * If the current icon view carries a Calendar icon (e.g. SBHCalendarApplicationIcon),
-     * force bitmap rasterization. In iOS 26 with Liquid Glass enabled, SBCalendarIconImageProvider
-     * attempts to invoke [ISImage ICRIconLayer], which is unimplemented and returns nil,
-     * leaving CALayer.contents empty and making the icon transparent.
+     * Always force bitmap rasterization for home screen icons on iOS 26.
+     * When shouldForceBitmapImages returns NO, SpringBoard requests dynamic
+     * Glass icon layers from iconservicesagent. iconservicesagent then compiles
+     * 258+ Metal pipelines simultaneously, hitting the queue semaphore limit (64)
+     * and causing all desktop icons to stay blank for ~1 minute while blocking
+     * SpringBoard main thread.
+     * Forcing bitmap images allows SBIconImageView to immediately load pre-rendered
+     * asset catalog / LaunchServices cached icons (from seed-icons.bin), giving instant
+     * desktop icon display on boot with zero pipeline contention and zero freezes.
      */
-    id icon = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("icon"));
-    if (icon != nil) {
-        const char *icon_class = object_getClassName(icon);
-        if (icon_class && strstr(icon_class, "Calendar") != NULL) {
-            return YES;
-        }
-    }
-
-    Method appearance_method = class_getInstanceMethod(object_getClass(self), appearance_selector);
-    if (!method_encoding_matches(appearance_method, "@16@0:8")) return original;
-    id appearance = ((id (*)(id, SEL))objc_msgSend)(self, appearance_selector);
-    Method glass = appearance ? class_getInstanceMethod(object_getClass(appearance), glass_selector) : NULL;
-    if (!method_encoding_matches(glass, "B16@0:8")) return original;
-    if (((BOOL (*)(id, SEL))objc_msgSend)(appearance, glass_selector)) return original;
-    dispatch_once_f(&metal_device_once, NULL, query_metal_device);
-    return has_metal_device ? original : YES;
+    return YES;
 }
 
 static void
@@ -197,35 +191,33 @@ static int boot_unlock_seen_locked;
 static void
 refresh_view_recursive(id view, int depth)
 {
-    if (!view || depth > 32) return;
+    if (!view || depth > 8) return;
 
     SEL layout_sel = sel_registerName("setNeedsLayout");
-    SEL display_sel = sel_registerName("setNeedsDisplay");
-    SEL layer_sel = sel_registerName("layer");
+    SEL update_img_anim = sel_registerName("updateImageAnimated:");
+    SEL update_icon_img_anim = sel_registerName("updateIconImageViewAnimated:");
+    SEL update_img = sel_registerName("updateImage");
     SEL subviews_sel = sel_registerName("subviews");
     SEL count_sel = sel_registerName("count");
     SEL obj_at_idx = sel_registerName("objectAtIndex:");
 
-    if (class_respondsToSelector(object_getClass(view), layout_sel)) {
-        ((void (*)(id, SEL))objc_msgSend)(view, layout_sel);
-    }
-    if (class_respondsToSelector(object_getClass(view), display_sel)) {
-        ((void (*)(id, SEL))objc_msgSend)(view, display_sel);
-    }
+    Class view_cls = object_getClass(view);
+    const char *cls_name = class_getName(view_cls);
 
-    if (class_respondsToSelector(object_getClass(view), layer_sel)) {
-        id layer = ((id (*)(id, SEL))objc_msgSend)(view, layer_sel);
-        if (layer) {
-            if (class_respondsToSelector(object_getClass(layer), layout_sel)) {
-                ((void (*)(id, SEL))objc_msgSend)(layer, layout_sel);
-            }
-            if (class_respondsToSelector(object_getClass(layer), display_sel)) {
-                ((void (*)(id, SEL))objc_msgSend)(layer, display_sel);
-            }
+    if (cls_name && (strstr(cls_name, "Icon") != NULL)) {
+        if (class_respondsToSelector(view_cls, update_img_anim)) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(view, update_img_anim, NO);
+        } else if (class_respondsToSelector(view_cls, update_icon_img_anim)) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(view, update_icon_img_anim, NO);
+        } else if (class_respondsToSelector(view_cls, update_img)) {
+            ((void (*)(id, SEL))objc_msgSend)(view, update_img);
+        }
+        if (class_respondsToSelector(view_cls, layout_sel)) {
+            ((void (*)(id, SEL))objc_msgSend)(view, layout_sel);
         }
     }
 
-    if (class_respondsToSelector(object_getClass(view), subviews_sel)) {
+    if (class_respondsToSelector(view_cls, subviews_sel)) {
         id subviews = ((id (*)(id, SEL))objc_msgSend)(view, subviews_sel);
         if (subviews && class_respondsToSelector(object_getClass(subviews), count_sel)) {
             unsigned long count = ((unsigned long (*)(id, SEL))objc_msgSend)(subviews, count_sel);
@@ -266,13 +258,12 @@ sb26_stepped_refresh_step(void *context)
     Class window_class = objc_getClass("UIWindow");
     Class catrans_class = objc_getClass("CATransaction");
 
+    /* Only refresh VISIBLE windows and do NOT recurse into hidden internal touch windows */
     SEL all_win_sel = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
     if (window_class && class_respondsToSelector(object_getClass((id)window_class), all_win_sel)) {
-        id internal_windows = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)window_class, all_win_sel, YES, NO);
-        refresh_windows_array(internal_windows);
-    }
-
-    if (app_class) {
+        id visible_windows = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)window_class, all_win_sel, NO, YES);
+        refresh_windows_array(visible_windows);
+    } else if (app_class) {
         SEL shared_sel = sel_registerName("sharedApplication");
         if (class_respondsToSelector(object_getClass((id)app_class), shared_sel)) {
             id app = ((id (*)(id, SEL))objc_msgSend)((id)app_class, shared_sel);
@@ -287,16 +278,9 @@ sb26_stepped_refresh_step(void *context)
     }
 
     if (catrans_class) {
-        SEL flush_sel = sel_registerName("flush");
         SEL commit_sel = sel_registerName("commit");
-        if (class_respondsToSelector(object_getClass((id)catrans_class), flush_sel)) {
-            ((void (*)(id, SEL))objc_msgSend)((id)catrans_class, flush_sel);
-        }
         if (class_respondsToSelector(object_getClass((id)catrans_class), commit_sel)) {
             ((void (*)(id, SEL))objc_msgSend)((id)catrans_class, commit_sel);
-        }
-        if (class_respondsToSelector(object_getClass((id)catrans_class), flush_sel)) {
-            ((void (*)(id, SEL))objc_msgSend)((id)catrans_class, flush_sel);
         }
     }
 
@@ -825,6 +809,7 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
 };
 
 #include "inject_sb26_airdrop.inc"
+#include "inject_sb26_uninstall.inc"
 
 static void
 sb26_trigger_poweroff(id self, SEL _cmd, id arg1, id arg2)
@@ -882,6 +867,8 @@ discovery_image_callback(const struct mach_header *header, intptr_t slide)
 
     Class cal = objc_getClass("SBCalendarIconImageProvider");
     if (cal) install_calendar_icon_hooks(cal);
+
+    install_uninstall_hooks();
 }
 
 __attribute__((constructor)) static void
@@ -937,4 +924,6 @@ install_sb26(void)
     if (mru_cls) install_mru_mirroring_hooks(mru_cls);
     Class cal_cls = objc_getClass("SBCalendarIconImageProvider");
     if (cal_cls) install_calendar_icon_hooks(cal_cls);
+
+    install_uninstall_hooks();
 }
