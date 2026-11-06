@@ -9,6 +9,7 @@
  * which `ipsw dyld a2s <cache> <address>` turns back into names.
  */
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <objc/message.h>
@@ -396,6 +397,104 @@ setup_app_container_env(const char *name)
 	}
 }
 
+/*
+ * WebKit VP9 software decoding preference injection:
+ * WebKit gates libvpx VP9 software decoding behind the internal debug feature
+ * 'SWVPDecodersAlwaysEnabled'. Hook -[WKPreferences init] to enable this feature
+ * on preferences instances, register libwebrtc VP9 decoder if present,
+ * and configure user defaults. Pure C implementation using ObjC runtime.
+ */
+static IMP orig_wkpref_init;
+static int app_vp9_hook_installed;
+
+static id
+app_swizzled_wkpref_init(id self, SEL _cmd)
+{
+	self = ((id (*)(id, SEL))orig_wkpref_init)(self, _cmd);
+	if (self != NULL) {
+		Class cls = object_getClass(self);
+		SEL featuresSel = sel_registerName("_internalDebugFeatures");
+		if (cls && class_getInstanceMethod(cls, featuresSel)) {
+			id features = ((id (*)(id, SEL))objc_msgSend)((id)cls, featuresSel);
+			if (features != NULL) {
+				SEL countSel = sel_registerName("count");
+				SEL objAtSel = sel_registerName("objectAtIndexedSubscript:");
+				SEL keySel = sel_registerName("key");
+				SEL setEnabledSel = sel_registerName("_setEnabled:forInternalDebugFeature:");
+				unsigned long count = ((unsigned long (*)(id, SEL))objc_msgSend)(features, countSel);
+				for (unsigned long i = 0; i < count; i++) {
+					id feat = ((id (*)(id, SEL, unsigned long))objc_msgSend)(features, objAtSel, i);
+					if (feat != NULL) {
+						id key = ((id (*)(id, SEL))objc_msgSend)(feat, keySel);
+						if (key != NULL) {
+							const char *cstr = ((const char * (*)(id, SEL))objc_msgSend)(key, sel_registerName("UTF8String"));
+							if (cstr && strcmp(cstr, "SWVPDecodersAlwaysEnabled") == 0) {
+								if (class_getInstanceMethod(cls, setEnabledSel)) {
+									((void (*)(id, SEL, BOOL, id))objc_msgSend)(self, setEnabledSel, YES, feat);
+									fprintf(stderr, "redwood-app: enabled SWVPDecodersAlwaysEnabled on WKPreferences %p\n", (void *)self);
+								}
+								break;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return self;
+}
+
+static void
+app_enable_webkit_vp9(void)
+{
+	if (app_vp9_hook_installed) {
+		return;
+	}
+	Class wkPrefClass = objc_getClass("WKPreferences");
+	if (wkPrefClass != NULL) {
+		SEL initSel = sel_registerName("init");
+		Method m = class_getInstanceMethod(wkPrefClass, initSel);
+		if (m != NULL) {
+			orig_wkpref_init = method_getImplementation(m);
+			method_setImplementation(m, (IMP)app_swizzled_wkpref_init);
+			app_vp9_hook_installed = 1;
+			fprintf(stderr, "redwood-app: installed WKPreferences init hook for SWVPDecodersAlwaysEnabled\n");
+		}
+	}
+	/* Also invoke libwebrtc registerWebKitVP9Decoder directly if loaded in this process */
+	void (*reg_vp9)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "_ZN6webrtc26registerWebKitVP9DecoderEv");
+	if (reg_vp9 != NULL) {
+		reg_vp9();
+		fprintf(stderr, "redwood-app: registered libwebrtc VP9 decoder\n");
+	}
+	/* Set user defaults keys via NSUserDefaults */
+	Class defsCls = objc_getClass("NSUserDefaults");
+	if (defsCls != NULL) {
+		id defs = ((id (*)(Class, SEL))objc_msgSend)(defsCls, sel_registerName("standardUserDefaults"));
+		if (defs != NULL) {
+			Class strCls = objc_getClass("NSString");
+			SEL setBoolSel = sel_registerName("setBool:forKey:");
+			SEL strSel = sel_registerName("stringWithUTF8String:");
+			if (strCls && class_getInstanceMethod(object_getClass(defs), setBoolSel)) {
+				id k1 = ((id (*)(Class, SEL, const char *))objc_msgSend)(strCls, strSel, "SWVPDecodersAlwaysEnabled");
+				id k2 = ((id (*)(Class, SEL, const char *))objc_msgSend)(strCls, strSel, "WebKitSWVPDecodersAlwaysEnabled");
+				((void (*)(id, SEL, BOOL, id))objc_msgSend)(defs, setBoolSel, YES, k1);
+				((void (*)(id, SEL, BOOL, id))objc_msgSend)(defs, setBoolSel, YES, k2);
+			}
+		}
+	}
+}
+
+static void
+app_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
+{
+	(void)mh;
+	(void)vmaddr_slide;
+	if (!app_vp9_hook_installed) {
+		app_enable_webkit_vp9();
+	}
+}
+
 __attribute__((constructor))
 static void
 redwood_app_init(void)
@@ -440,6 +539,10 @@ redwood_app_init(void)
 	watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
 	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
 	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
+
+	app_enable_webkit_vp9();
+	_dyld_register_func_for_add_image(app_dyld_image_added);
+
 	n = snprintf(line, sizeof(line), "redwood: %s: started as uid %d (effective %d), watching for what kills it\n",
 	    name, (int)getuid(), (int)geteuid());
 	say(line, (size_t)(n > 0 ? n : 0));

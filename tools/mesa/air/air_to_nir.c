@@ -1506,24 +1506,24 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       c->nir->info.fs.fbfetch_coherent = true;
       c->info->fbfetch_targets |= 1u << n;
 
-      /* The layer the fetch reads is not this frontend's to choose, and it is
-       * not safe by default, so it goes in the log rather than only in a
-       * document. nir_lower_fb_read builds the coordinate as (x, y, layer)
-       * with the layer from nir_load_layer_id, which ir3_nir_lower_layer_id
-       * turns into a flat varying read of VARYING_SLOT_LAYER. If the pipeline's
-       * vertex stage writes air.render_target_array_index, ir3_link_shaders
-       * finds it by slot and the fetch reads the right layer; if nothing wrote
-       * it, ir3_link_add skips the entry (regid(63, 0)) and the varying holds
-       * whatever the VPC location held. Which of the two it is cannot be known
-       * from this module -- the fragment shader is identical either way -- so
-       * the condition is stated for whoever builds the pipeline.
+      /* For 2D single-layer render targets, framebuffer fetch must use constant
+       * layer 0 rather than uninitialized VPC registers. nir_lower_fb_read checks
+       * whether VARYING_SLOT_LAYER is present in inputs_read: for 2D pipelines
+       * where the vertex shader does not declare gl_Layer, it binds layer to
+       * nir_imm_int(b, 0) instead of nir_load_layer_id(b). This prevents
+       * ir3_nir_lower_layer_id from generating an unlinked load_input that reads
+       * dirty VPC register r1.z, which would fail hardware array bounds checks
+       * on Adreno A830 (array_size=1) and cause widgets to render as pure black.
+       * For layered render targets, the vertex stage writes VARYING_SLOT_LAYER
+       * and the true layer ID is preserved.
+       *
+       * Keep inputs_read consistent so that lower_fb_read defaults cleanly to 0
+       * for single-layer targets without creating varying input linkage.
        */
-      air_note(c, "the framebuffer fetch reads its layer from VARYING_SLOT_LAYER, which "
-                  "nir_lower_fb_read asks for and this module cannot write: for a LAYERED "
-                  "render target the pipeline's vertex stage must write "
-                  "air.render_target_array_index, or the fetch reads an undefined layer. "
-                  "A single-layer target is unaffected -- there is no second layer in the "
-                  "descriptor to reach");
+      air_note(c, "framebuffer fetch: default layer is constant 0 for 2D targets, "
+                  "preserving VARYING_SLOT_LAYER for layered render targets");
+      if (!(c->nir->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_LAYER)))
+         c->nir->info.inputs_read &= ~BITFIELD64_BIT(VARYING_SLOT_LAYER);
 
       c->params[param] = air_val_ssa(c, fetched);
       return true;

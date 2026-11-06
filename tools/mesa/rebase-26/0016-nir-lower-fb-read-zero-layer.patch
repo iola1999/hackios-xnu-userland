@@ -1,0 +1,12 @@
+--- a/src/compiler/nir/nir_lower_fb_read.c
++++ b/src/compiler/nir/nir_lower_fb_read.c
+@@ -57,7 +57,9 @@ nir_lower_fb_read_instr(nir_builder *b, nir_intrinsic_instr *intr,
+
+    nir_def *fragcoord = nir_build_frag_coord(b, 2);
+    nir_def *sampid = nir_load_sample_id(b);
+-   nir_def *layer = nir_load_layer_id(b);
++   nir_def *layer = (b->shader->info.inputs_read & BITFIELD64_BIT(VARYING_SLOT_LAYER)) ?
++                    nir_load_layer_id(b) : nir_imm_int(b, 0);
+    fragcoord = nir_f2i32(b, fragcoord);
+
+    nir_tex_instr *tex = nir_tex_instr_create(b->shader, 3);

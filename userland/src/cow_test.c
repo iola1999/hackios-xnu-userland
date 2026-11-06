@@ -19,6 +19,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <sys/mman.h>
+#include <sys/clonefile.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -348,6 +349,24 @@ five(const char *what, const char *path, size_t offset, size_t size, int touch, 
 }
 
 static void
+test_clone(void)
+{
+	const char *src = "/private/var/tmp/cow_clone_src.data";
+	const char *dst = "/private/var/tmp/cow_clone_dst.data";
+	int fd = open(src, O_CREAT | O_RDWR | O_TRUNC, 0666);
+	if (fd >= 0) {
+		char buf[128] = "clonefile test payload\n";
+		(void)write(fd, buf, sizeof(buf));
+		close(fd);
+		unlink(dst);
+		int rc = clonefile(src, dst, 0);
+		printf("cow_test: clonefile(%s, %s) = %d (errno=%d)\n", src, dst, rc, rc != 0 ? errno : 0);
+		unlink(src);
+		unlink(dst);
+	}
+}
+
+static void
 files(size_t size)
 {
 	five("mapped, nothing read, then written", "/private/var/tmp/cow_test.data", 4224, size, 0, 0, 0);
@@ -357,6 +376,7 @@ files(size_t size)
 	five("written, read through the mapping, written again (aligned)", "/private/var/tmp/cow_test.data", 0, size, 0, 1, 0);
 	five("mapped, wired, then written", "/private/var/tmp/cow_test.data", 4224, size, 2, 0, 1);
 	five("written, read, wired, written again", "/private/var/tmp/cow_test.data", 4224, size, 0, 1, 1);
+	test_clone();
 }
 
 int

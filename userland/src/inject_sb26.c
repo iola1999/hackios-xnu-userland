@@ -85,6 +85,21 @@ software_bitmap_selection(id self, SEL selector)
 {
     BOOL original = ((BOOL (*)(id, SEL))original_bitmap_selection)(self, selector);
     if (original) return original;
+
+    /*
+     * If the current icon view carries a Calendar icon (e.g. SBHCalendarApplicationIcon),
+     * force bitmap rasterization. In iOS 26 with Liquid Glass enabled, SBCalendarIconImageProvider
+     * attempts to invoke [ISImage ICRIconLayer], which is unimplemented and returns nil,
+     * leaving CALayer.contents empty and making the icon transparent.
+     */
+    id icon = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("icon"));
+    if (icon != nil) {
+        const char *icon_class = object_getClassName(icon);
+        if (icon_class && strstr(icon_class, "Calendar") != NULL) {
+            return YES;
+        }
+    }
+
     Method appearance_method = class_getInstanceMethod(object_getClass(self), appearance_selector);
     if (!method_encoding_matches(appearance_method, "@16@0:8")) return original;
     id appearance = ((id (*)(id, SEL))objc_msgSend)(self, appearance_selector);
@@ -466,6 +481,10 @@ sb26_hook_MGCopyAnswer(CFStringRef property)
             sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
             return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &avail_val);
         }
+
+        if (CFEqual(property, CFSTR("airdrop-p2p")) || CFEqual(property, CFSTR("airdrop"))) {
+            return kCFBooleanFalse;
+        }
     }
 
     return MGCopyAnswer(property);
@@ -668,120 +687,7 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
     { (const void *)sb26_hook_CFBundleCopyBundleLocalizations, (const void *)CFBundleCopyBundleLocalizations },
 };
 
-/*
- * AirDrop and Screen Mirroring non-blocking interception:
- * Control Center AirDrop invokes sharingd which hangs waiting for missing awdl0.
- * Screen Mirroring invokes AVOutputDeviceDiscoverySession which hangs in Bonjour
- * discovery for 10+ seconds.
- * We intercept these discovery methods to return immediate non-blocking answers.
- */
-static BOOL
-sb26_airdrop_is_available(id self, SEL cmd)
-{
-    (void)self;
-    (void)cmd;
-    return NO;
-}
-
-static void
-sb26_airdrop_set_discoverable_mode(id self, SEL cmd, long long mode)
-{
-    (void)self;
-    (void)cmd;
-    (void)mode;
-}
-
-static long long
-sb26_airdrop_discoverable_mode(id self, SEL cmd)
-{
-    (void)self;
-    (void)cmd;
-    return 0;
-}
-
-static void
-install_airdrop_hooks(Class cls)
-{
-    static int airdrop_done;
-    if (airdrop_done || !cls) return;
-
-    Method m_avail = class_getInstanceMethod(cls, sel_registerName("isAirDropAvailable"));
-    if (m_avail) {
-        method_setImplementation(m_avail, (IMP)sb26_airdrop_is_available);
-    }
-    Method m_set_mode = class_getInstanceMethod(cls, sel_registerName("setDiscoverableMode:"));
-    if (m_set_mode) {
-        method_setImplementation(m_set_mode, (IMP)sb26_airdrop_set_discoverable_mode);
-    }
-    Method m_get_mode = class_getInstanceMethod(cls, sel_registerName("discoverableMode"));
-    if (m_get_mode) {
-        method_setImplementation(m_get_mode, (IMP)sb26_airdrop_discoverable_mode);
-    }
-    airdrop_done = 1;
-    fprintf(stderr, "sb26: SFAirDropDiscoveryController interception installed\n");
-}
-
-static id
-sb26_output_available_devices(id self, SEL cmd)
-{
-    (void)self;
-    (void)cmd;
-    Class arr_cls = objc_getClass("NSArray");
-    if (arr_cls) {
-        return ((id (*)(Class, SEL))objc_msgSend)(arr_cls, sel_registerName("array"));
-    }
-    return nil;
-}
-
-static void
-sb26_output_set_discovery_mode(id self, SEL cmd, long long mode)
-{
-    (void)self;
-    (void)cmd;
-    (void)mode;
-}
-
-static long long
-sb26_output_discovery_mode(id self, SEL cmd)
-{
-    (void)self;
-    (void)cmd;
-    return 0;
-}
-
-static BOOL
-sb26_output_device_presence_detected(id self, SEL cmd)
-{
-    (void)self;
-    (void)cmd;
-    return NO;
-}
-
-static void
-install_screen_mirroring_hooks(Class cls)
-{
-    static int mirroring_done;
-    if (mirroring_done || !cls) return;
-
-    Method m_devs = class_getInstanceMethod(cls, sel_registerName("availableOutputDevices"));
-    if (m_devs) {
-        method_setImplementation(m_devs, (IMP)sb26_output_available_devices);
-    }
-    Method m_set_mode = class_getInstanceMethod(cls, sel_registerName("setDiscoveryMode:"));
-    if (m_set_mode) {
-        method_setImplementation(m_set_mode, (IMP)sb26_output_set_discovery_mode);
-    }
-    Method m_get_mode = class_getInstanceMethod(cls, sel_registerName("discoveryMode"));
-    if (m_get_mode) {
-        method_setImplementation(m_get_mode, (IMP)sb26_output_discovery_mode);
-    }
-    Method m_presence = class_getInstanceMethod(cls, sel_registerName("devicePresenceDetected"));
-    if (m_presence) {
-        method_setImplementation(m_presence, (IMP)sb26_output_device_presence_detected);
-    }
-    mirroring_done = 1;
-    fprintf(stderr, "sb26: AVOutputDeviceDiscoverySession interception installed\n");
-}
+#include "inject_sb26_airdrop.inc"
 
 static void
 sb26_trigger_poweroff(id self, SEL _cmd, id arg1, id arg2)
@@ -833,6 +739,12 @@ discovery_image_callback(const struct mach_header *header, intptr_t slide)
 
     Class session = objc_getClass("AVOutputDeviceDiscoverySession");
     if (session) install_screen_mirroring_hooks(session);
+
+    Class mru = objc_getClass("MRUMirroringController");
+    if (mru) install_mru_mirroring_hooks(mru);
+
+    Class cal = objc_getClass("SBCalendarIconImageProvider");
+    if (cal) install_calendar_icon_hooks(cal);
 }
 
 __attribute__((constructor)) static void
@@ -884,4 +796,8 @@ install_sb26(void)
     if (airdrop_cls) install_airdrop_hooks(airdrop_cls);
     Class session_cls = objc_getClass("AVOutputDeviceDiscoverySession");
     if (session_cls) install_screen_mirroring_hooks(session_cls);
+    Class mru_cls = objc_getClass("MRUMirroringController");
+    if (mru_cls) install_mru_mirroring_hooks(mru_cls);
+    Class cal_cls = objc_getClass("SBCalendarIconImageProvider");
+    if (cal_cls) install_calendar_icon_hooks(cal_cls);
 }

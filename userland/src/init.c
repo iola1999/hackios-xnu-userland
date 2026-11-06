@@ -960,14 +960,55 @@ run_rc(const char *path)
 }
 
 static void
+setup_disk_dev_nodes(void)
+{
+	static const struct {
+		const char *name;
+		const char *target;
+	} k_nodes[] = {
+		{ "/dev/disk0", "/dev/ufs_sda" },
+		{ "/dev/rdisk0", "/dev/rufs_sda" },
+		{ "/dev/disk0s1", "/dev/ufs_darwin" },
+		{ "/dev/rdisk0s1", "/dev/rufs_darwin" },
+		{ "/dev/disk1", "/dev/ufs_darwin" },
+		{ "/dev/rdisk1", "/dev/rufs_darwin" },
+		{ "/dev/disk1s1", "/dev/ufs_darwin" },
+		{ "/dev/rdisk1s1", "/dev/rufs_darwin" },
+		{ "/dev/disk1s2", "/dev/ufs_darwin_var" },
+		{ "/dev/rdisk1s2", "/dev/rufs_darwin_var" },
+		{ "/dev/disk1s3", "/dev/ufs_darwin" },
+		{ "/dev/rdisk1s3", "/dev/rufs_darwin" },
+		{ "/dev/disk2", "/dev/ufs_darwin" },
+		{ "/dev/rdisk2", "/dev/rufs_darwin" },
+		{ "/dev/disk2s1", "/dev/ufs_darwin" },
+		{ "/dev/rdisk2s1", "/dev/rufs_darwin" },
+		{ "/dev/disk3", "/dev/ufs_darwin" },
+		{ "/dev/rdisk3", "/dev/rufs_darwin" },
+		{ "/dev/disk3s1", "/dev/ufs_darwin" },
+		{ "/dev/rdisk3s1", "/dev/rufs_darwin" },
+	};
+	struct stat st;
+	for (size_t i = 0; i < sizeof(k_nodes) / sizeof(k_nodes[0]); i++) {
+		if (lstat(k_nodes[i].name, &st) != 0) {
+			if (lstat(k_nodes[i].target, &st) == 0) {
+				(void)symlink(k_nodes[i].target, k_nodes[i].name);
+			}
+		}
+	}
+}
+
+static void
 test_devices(void)
 {
 	unsigned char buf[16];
 	unsigned sum = 0;
 	int fd, good;
+	struct stat st;
 
 	printf("\n-- devices --\n");
 	check(list_tree("/dev", 0) > 3, "devfs is mounted on /dev");
+	setup_disk_dev_nodes();
+	check(lstat("/dev/disk1s1", &st) == 0 && lstat("/dev/disk1s2", &st) == 0, "/dev/disk1s1 and /dev/disk1s2 exist");
 
 	fd = open("/dev/zero", O_RDONLY, 0);
 	memset(buf, 0xff, sizeof(buf));
@@ -1099,6 +1140,7 @@ main(int argc, char **argv, char **envp)
 	}
 
 	printf("\n=== init: process %d, started as %s ===\n", getpid(), argc > 0 ? argv[0] : "?");
+	setup_disk_dev_nodes();
 	{
 		const char *dev = boot_arg("root_apfs");
 		if (dev != NULL)

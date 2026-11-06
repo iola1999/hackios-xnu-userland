@@ -894,6 +894,8 @@ rwd_enable_webkit_vp9(void)
 	}
 }
 
+#include "redwooddrawable_420v.inc"
+
 static void
 rwd_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
 {
@@ -902,6 +904,7 @@ rwd_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
 	if (!vp9_hook_installed) {
 		rwd_enable_webkit_vp9();
 	}
+	rwd_install_420v_hooks();
 }
 
 __attribute__((constructor))
@@ -909,5 +912,6 @@ static void
 rwd_module_init(void)
 {
 	rwd_enable_webkit_vp9();
+	rwd_install_420v_hooks();
 	_dyld_register_func_for_add_image(rwd_dyld_image_added);
 }

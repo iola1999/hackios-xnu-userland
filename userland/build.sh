@@ -138,6 +138,8 @@ IOS_JOBS=${JOBS-"
 if [ "$V" = 26 ] && [ "${JOBS+x}" != x ]; then
 	# iOS 26 publishes SystemStatus through its separate daemon.
 	IOS_JOBS="$IOS_JOBS com.apple.systemstatusd"
+	# Font registration daemon for WebKit / Safari and YouTube custom fonts
+	IOS_JOBS="$IOS_JOBS com.apple.fontservicesd"
 fi
 # iOS's own Wi-Fi daemon, for Settings to have a Wi-Fi to show: the kernel answers it in
 # bsd/dev/redwood_apple80211.c. With the radio (wifi=1) Settings then shows Wi-Fi on, the network joined and the
@@ -722,6 +724,10 @@ PY
 		python3 -c 'import plistlib, sys; sys.stdout.buffer.write(plistlib.dumps({"CAEnableMedina": False},
 			fmt=plistlib.FMT_BINARY))' > root/var/mobile/Library/Preferences/com.apple.coreanimation.plist
 		printf 'f\t644\t501\t501\t/private/var/mobile/Library/Preferences/com.apple.coreanimation.plist\t/var/mobile/Library/Preferences/com.apple.coreanimation.plist\n' >> root/etc/var.skel
+		# WebKit / YouTube custom font registration directory
+		mkdir -p root/var/db/fontconfig
+		chmod 0755 root/var/db/fontconfig
+		printf 'd\t755\t0\t0\t/private/var/db/fontconfig\n' >> root/etc/var.skel
 	fi
 	# A key of ours for root, when there is one: ssh/authorized_keys, never in the repository (like
 	# fw-*). dropbear from the package manager's prefix reads it and lets us in over the phone's
