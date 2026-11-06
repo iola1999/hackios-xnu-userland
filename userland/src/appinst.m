@@ -57,8 +57,11 @@ void archive_entry_set_pathname(struct archive_entry *, const char *);
 + (instancetype)defaultWorkspace;
 - (BOOL)registerApplicationDictionary:(NSDictionary *)dictionary;
 - (BOOL)unregisterApplication:(NSURL *)url;
+- (BOOL)uninstallApplication:(NSString *)bundleIdentifier withOptions:(NSDictionary *)options;
 - (BOOL)openApplicationWithBundleID:(NSString *)identifier;
 - (BOOL)openURL:(NSURL *)url;
+- (NSArray *)allApplications;
+- (NSArray *)allInstalledApplications;
 @end
 
 @interface LSApplicationProxy : NSObject
@@ -518,7 +521,7 @@ install_into(NSString *source, NSString *bundle)
 	]);
 	sign_all_machos(app, nil);
 
-	NSDictionary *record = @{
+	NSMutableDictionary *record = [NSMutableDictionary dictionaryWithDictionary:@{
 		@"ApplicationType": @"System",
 		@"CFBundleIdentifier": identifier,
 		@"CodeInfoIdentifier": identifier,
@@ -539,13 +542,24 @@ install_into(NSString *source, NSString *bundle)
 		@"SignatureVersion": @132352,
 		@"SignerIdentity": @"Apple iPhone OS Application Signing",
 		@"_LSBundlePlugins": plugins_of(app, groupContainers),
-	};
+	}];
+	if (info[@"CFBundleName"]) record[@"CFBundleName"] = info[@"CFBundleName"];
+	if (info[@"CFBundleDisplayName"]) record[@"CFBundleDisplayName"] = info[@"CFBundleDisplayName"];
+	if (info[@"CFBundlePackageType"]) record[@"CFBundlePackageType"] = info[@"CFBundlePackageType"];
+	if (info[@"CFBundleShortVersionString"]) record[@"CFBundleShortVersionString"] = info[@"CFBundleShortVersionString"];
+	if (info[@"CFBundleVersion"]) record[@"CFBundleVersion"] = info[@"CFBundleVersion"];
+	if (info[@"CFBundleIcons"]) record[@"CFBundleIcons"] = info[@"CFBundleIcons"];
+	if (info[@"CFBundleIcons~ipad"]) record[@"CFBundleIcons~ipad"] = info[@"CFBundleIcons~ipad"];
+	if (info[@"CFBundleIconFiles"]) record[@"CFBundleIconFiles"] = info[@"CFBundleIconFiles"];
+	if (info[@"CFBundleIconFile"]) record[@"CFBundleIconFile"] = info[@"CFBundleIconFile"];
 	if (![[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] registerApplicationDictionary:record]) {
 		fprintf(stderr, "appinst: LaunchServices refused %s\n", identifier.UTF8String);
 		return 1;
 	}
 	printf("appinst: %s installed at %s, data in %s\n", identifier.UTF8String, app.UTF8String, home.UTF8String);
 
+	notify_post("com.apple.LaunchServices.ApplicationsChanged");
+	notify_post("com.apple.LaunchServices.applicationRegistered");
 	notify_post("com.redwood.var_save");
 	printf("appinst: posted com.redwood.var_save for %s\n", identifier.UTF8String);
 	return 0;
@@ -602,7 +616,14 @@ register_system_app(NSString *appPath)
 
 	sign_all_machos(app, nil);
 
-	NSDictionary *record = @{
+	/* Unregister existing stale LaunchServices proxy if present to force fresh registration */
+	LSApplicationWorkspace *ws = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
+	LSApplicationProxy *old = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:identifier];
+	if (old != nil && old.bundleURL != nil) {
+		[ws unregisterApplication:old.bundleURL];
+	}
+
+	NSMutableDictionary *record = [NSMutableDictionary dictionaryWithDictionary:@{
 		@"ApplicationType": @"System",
 		@"CFBundleIdentifier": identifier,
 		@"CodeInfoIdentifier": identifier,
@@ -621,15 +642,52 @@ register_system_app(NSString *appPath)
 		@"SignerOrganization": @"Apple Inc.",
 		@"SignatureVersion": @132352,
 		@"SignerIdentity": @"Apple iPhone OS Application Signing",
-		@"CFBundleIconFile": @"AppIcon60x60",
-		@"CFBundleIconFiles": @[ @"AppIcon60x60" ],
+		@"CFBundleName": info[@"CFBundleName"] ?: @"RedwoodInstaller",
+		@"CFBundleDisplayName": info[@"CFBundleDisplayName"] ?: @"IPA 管理器",
+		@"CFBundlePackageType": info[@"CFBundlePackageType"] ?: @"APPL",
+		@"CFBundleShortVersionString": info[@"CFBundleShortVersionString"] ?: @"1.0",
+		@"CFBundleVersion": info[@"CFBundleVersion"] ?: @"1",
 		@"_LSBundlePlugins": plugins_of(app, nil),
-	};
-	if (![[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] registerApplicationDictionary:record]) {
+	}];
+
+	if (info[@"CFBundleIcons"]) {
+		record[@"CFBundleIcons"] = info[@"CFBundleIcons"];
+	} else {
+		record[@"CFBundleIcons"] = @{
+			@"CFBundlePrimaryIcon": @{
+				@"CFBundleIconFiles": @[ @"AppIcon60x60", @"AppIcon29x29", @"AppIcon40x40" ],
+				@"CFBundleIconName": @"AppIcon"
+			}
+		};
+	}
+	if (info[@"CFBundleIcons~ipad"]) {
+		record[@"CFBundleIcons~ipad"] = info[@"CFBundleIcons~ipad"];
+	} else {
+		record[@"CFBundleIcons~ipad"] = @{
+			@"CFBundlePrimaryIcon": @{
+				@"CFBundleIconFiles": @[ @"AppIcon60x60", @"AppIcon29x29", @"AppIcon40x40", @"AppIcon76x76", @"AppIcon83.5x83.5" ],
+				@"CFBundleIconName": @"AppIcon"
+			}
+		};
+	}
+	if (info[@"CFBundleIconFiles"]) {
+		record[@"CFBundleIconFiles"] = info[@"CFBundleIconFiles"];
+	} else {
+		record[@"CFBundleIconFiles"] = @[ @"AppIcon60x60", @"AppIcon29x29", @"AppIcon40x40" ];
+	}
+	if (info[@"CFBundleIconFile"]) {
+		record[@"CFBundleIconFile"] = info[@"CFBundleIconFile"];
+	} else {
+		record[@"CFBundleIconFile"] = @"AppIcon60x60";
+	}
+
+	if (![ws registerApplicationDictionary:record]) {
 		fprintf(stderr, "appinst: LaunchServices refused system app %s\n", identifier.UTF8String);
 		return 1;
 	}
 	printf("appinst: %s registered as system app at %s (data in %s)\n", identifier.UTF8String, app.UTF8String, home.UTF8String);
+	notify_post("com.apple.LaunchServices.ApplicationsChanged");
+	notify_post("com.apple.LaunchServices.applicationRegistered");
 	notify_post("com.redwood.var_save");
 	return 0;
 }
@@ -732,29 +790,41 @@ static int
 remove_app(NSString *identifier)
 {
 	NSFileManager *fm = NSFileManager.defaultManager;
+	LSApplicationWorkspace *ws = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
 	LSApplicationProxy *proxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:identifier];
 	BOOL found = NO;
 
-	if (proxy != nil && proxy.bundleURL != nil && [proxy.bundleURL.path hasPrefix:BUNDLES]) {
-		[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] unregisterApplication:proxy.bundleURL];
-		NSString *bundleContainer = proxy.bundleURL.path.stringByDeletingLastPathComponent;
-		[fm removeItemAtPath:bundleContainer error:nil];
-		found = YES;
+	/* 1. Explicit uninstallation via LaunchServices API */
+	if ([ws respondsToSelector:sel_registerName("uninstallApplication:withOptions:")]) {
+		if ([ws uninstallApplication:identifier withOptions:nil]) {
+			found = YES;
+		}
 	}
 
+	if (proxy != nil && proxy.bundleURL != nil) {
+		[ws unregisterApplication:proxy.bundleURL];
+		if ([proxy.bundleURL.path hasPrefix:BUNDLES]) {
+			NSString *bundleContainer = proxy.bundleURL.path.stringByDeletingLastPathComponent;
+			[fm removeItemAtPath:bundleContainer error:nil];
+			found = YES;
+		}
+	}
+
+	/* 2. Remove bundle container directory */
 	for (NSString *uuid in [fm contentsOfDirectoryAtPath:BUNDLES error:nil]) {
 		NSString *dir = [BUNDLES stringByAppendingPathComponent:uuid];
 		NSString *app = app_in(dir);
 		if (app != nil) {
 			NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
 			if ([info[@"CFBundleIdentifier"] isEqualToString:identifier]) {
-				[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] unregisterApplication:[NSURL fileURLWithPath:app]];
+				[ws unregisterApplication:[NSURL fileURLWithPath:app]];
 				[fm removeItemAtPath:dir error:nil];
 				found = YES;
 			}
 		}
 	}
 
+	/* 3. Remove data container */
 	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
 	Class mcmClass = NSClassFromString(@"MCMAppDataContainer");
 	if (mcmClass != Nil) {
@@ -774,6 +844,7 @@ remove_app(NSString *identifier)
 		}
 	}
 
+	notify_post("com.apple.LaunchServices.ApplicationsChanged");
 	notify_post("com.redwood.var_save");
 	if (found) {
 		printf("appinst: %s removed (posted com.redwood.var_save)\n", identifier.UTF8String);
@@ -794,8 +865,14 @@ is_test_app_identifier(NSString *identifier)
 	    [identifier hasPrefix:@"com.example."] ||
 	    [identifier hasPrefix:@"com.test."] ||
 	    [identifier hasPrefix:@"com.nssurge."] ||
+	    [identifier hasPrefix:@"com.sina.weibo"] ||
 	    [identifier isEqualToString:@"cilicili"] ||
 	    [identifier isEqualToString:@"Kumone"] ||
+	    [identifier isEqualToString:@"weibo"] ||
+	    [identifier rangeOfString:@"weibo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+	    [identifier rangeOfString:@"surge" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+	    [identifier rangeOfString:@"cilicili" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+	    [identifier rangeOfString:@"kumone" options:NSCaseInsensitiveSearch].location != NSNotFound ||
 	    [identifier rangeOfString:@"test" options:NSCaseInsensitiveSearch].location != NSNotFound ||
 	    [identifier rangeOfString:@"demo" options:NSCaseInsensitiveSearch].location != NSNotFound ||
 	    [identifier rangeOfString:@"sample" options:NSCaseInsensitiveSearch].location != NSNotFound) {
@@ -809,22 +886,71 @@ clean_test_apps(void)
 {
 	int cleaned_count = 0;
 	NSFileManager *fm = NSFileManager.defaultManager;
+	LSApplicationWorkspace *ws = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
+
+	/* 1. Explicitly uninstall via LaunchServices workspace for any registered test applications */
+	if ([ws respondsToSelector:sel_registerName("allApplications")]) {
+		NSArray *all = [ws allApplications];
+		for (id proxy in all) {
+			NSString *bid = [proxy respondsToSelector:sel_registerName("applicationIdentifier")] ?
+				[proxy applicationIdentifier] : nil;
+			if (bid != nil && is_test_app_identifier(bid)) {
+				printf("appinst: uninstalling registered test app %s via LaunchServices...\n", bid.UTF8String);
+				remove_app(bid);
+				cleaned_count++;
+			}
+		}
+	}
+	if ([ws respondsToSelector:sel_registerName("allInstalledApplications")]) {
+		NSArray *all = [ws allInstalledApplications];
+		for (id proxy in all) {
+			NSString *bid = [proxy respondsToSelector:sel_registerName("applicationIdentifier")] ?
+				[proxy applicationIdentifier] : nil;
+			if (bid != nil && is_test_app_identifier(bid)) {
+				printf("appinst: uninstalling installed test app %s via LaunchServices...\n", bid.UTF8String);
+				remove_app(bid);
+				cleaned_count++;
+			}
+		}
+	}
+
+	/* 2. Scan and remove any bundle directories under /private/var/containers/Bundle/Application */
 	NSArray<NSString *> *uuids = [fm contentsOfDirectoryAtPath:BUNDLES error:nil];
 	for (NSString *uuid in uuids) {
 		NSString *bundle_dir = [BUNDLES stringByAppendingPathComponent:uuid];
 		NSString *app = app_in(bundle_dir);
 		if (app == nil) {
+			[fm removeItemAtPath:bundle_dir error:nil];
 			continue;
 		}
 		NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
 		NSString *bid = info[@"CFBundleIdentifier"];
 		if (bid != nil && is_test_app_identifier(bid)) {
-			printf("appinst: cleaning leftover test app %s (%s)...\n", bid.UTF8String, app.UTF8String);
+			printf("appinst: cleaning leftover test app bundle %s (%s)...\n", bid.UTF8String, app.UTF8String);
 			remove_app(bid);
 			cleaned_count++;
 		}
 	}
-	printf("appinst: cleaned %d leftover test app(s)\n", cleaned_count);
+
+	/* 3. Clean LaunchServices & Icons caches */
+	NSString *cachesDir = @"/private/var/mobile/Library/Caches";
+	NSArray<NSString *> *cacheItems = [fm contentsOfDirectoryAtPath:cachesDir error:nil];
+	for (NSString *item in cacheItems) {
+		if ([item hasPrefix:@"com.apple.LaunchServices"] ||
+		    [item hasPrefix:@"com.apple.IconsCache"]) {
+			NSString *p = [cachesDir stringByAppendingPathComponent:item];
+			printf("appinst: removing cache %s\n", p.UTF8String);
+			[fm removeItemAtPath:p error:nil];
+		}
+	}
+
+	/* 4. Ensure RedwoodInstaller is registered cleanly with LaunchServices */
+	register_system_app(@"/redwood/Applications/RedwoodInstaller.app");
+
+	notify_post("com.apple.LaunchServices.ApplicationsChanged");
+	notify_post("com.redwood.var_save");
+
+	printf("appinst: cleaned %d test app(s) and cleared LaunchServices/Icons caches\n", cleaned_count);
 	return 0;
 }
 

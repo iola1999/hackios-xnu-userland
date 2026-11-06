@@ -83,24 +83,40 @@ query_metal_device(void *context)
 static BOOL
 software_bitmap_selection(id self, SEL selector)
 {
-    (void)self;
-    (void)selector;
-    (void)original_bitmap_selection;
-    (void)appearance_selector;
-    (void)glass_selector;
-    dispatch_once_f(&metal_device_once, NULL, query_metal_device);
+	BOOL original = ((BOOL (*)(id, SEL))original_bitmap_selection)(self, selector);
+	if (original) {
+		return original;
+	}
 
-    /*
-     * Always force bitmap rasterization for home screen icons on iOS 26.
-     * When shouldForceBitmapImages returns NO, SpringBoard requests dynamic
-     * Glass icon layers from iconservicesagent. iconservicesagent then compiles
-     * 258+ Metal pipelines simultaneously, hitting queue semaphore limits, while
-     * [ISImage ICRIconLayer] returns nil leaving CALayer.contents empty and icons transparent.
-     * Forcing bitmap images allows SBIconImageView to immediately load pre-rendered
-     * asset catalog / LaunchServices cached icons (from seed-icons.bin), giving instant
-     * desktop icon display on boot with zero pipeline contention and zero freezes.
-     */
-    return YES;
+	/*
+	 * If the current icon view carries a Calendar icon (e.g. SBHCalendarApplicationIcon),
+	 * force bitmap rasterization. In iOS 26 with Liquid Glass enabled, SBCalendarIconImageProvider
+	 * attempts to invoke [ISImage ICRIconLayer], which is unimplemented and returns nil,
+	 * leaving CALayer.contents empty and making the icon transparent.
+	 */
+	id icon = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("icon"));
+	if (icon != nil) {
+		const char *icon_class = object_getClassName(icon);
+		if (icon_class && strstr(icon_class, "Calendar") != NULL) {
+			return YES;
+		}
+	}
+
+	Method appearance_method = class_getInstanceMethod(object_getClass(self), appearance_selector);
+	if (!method_encoding_matches(appearance_method, "@16@0:8")) {
+		return original;
+	}
+	id appearance = ((id (*)(id, SEL))objc_msgSend)(self, appearance_selector);
+	Method glass = appearance ? class_getInstanceMethod(object_getClass(appearance), glass_selector) : NULL;
+	if (!method_encoding_matches(glass, "B16@0:8")) {
+		return original;
+	}
+	if (((BOOL (*)(id, SEL))objc_msgSend)(appearance, glass_selector)) {
+		return original;
+	}
+
+	dispatch_once_f(&metal_device_once, NULL, query_metal_device);
+	return has_metal_device ? original : YES;
 }
 
 static void
