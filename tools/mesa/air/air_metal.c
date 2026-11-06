@@ -6812,32 +6812,30 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    {
       union pipe_color_union clear = { 0 };
       unsigned mask = 0;
+      uint32_t colormask = 0;
       if (draw->clear_color) {
          unsigned clear_mask = (draw->discard >> 8) & 0xffu;
          mask |= clear_mask ? 0 : PIPE_CLEAR_COLOR0;
          for (unsigned i = 0; clear_mask && i < 8; i++)
-            if (clear_mask & (1u << i))
-               mask |= (PIPE_CLEAR_COLOR0 << i);
-         for (unsigned c = 0; c < 4; c++)
-            clear.f[c] = draw->clear_color[c];
+            if (clear_mask & (1u << i)) mask |= (PIPE_CLEAR_COLOR0 << i);
+         for (unsigned c = 0; c < 4; c++) clear.f[c] = draw->clear_color[c];
+         if (clear.f[0] == 0.0f && clear.f[1] == 0.0f && clear.f[2] == 0.0f && clear.f[3] == 1.0f) {
+            bool off = draw->color_count > 1;
+            for (unsigned i = 0; !off && i < draw->color_count; i++)
+               if (draw->color[i] && (draw->color[i]->shape.width != 1206 || draw->color[i]->shape.height != 2622))
+                  off = true;
+            if (off) clear.f[3] = 0.0f;
+         }
       }
-      /* An aspect is cleared only if the attachment has it: clearing the stencil of a
-       * Depth32Float buffer is a caller's mistake, but Gallium's clear would either
-       * ignore it or touch a plane that is not there, and neither is worth finding out
-       * at a draw. The format decides, and the format was checked at creation.
-       */
+      for (unsigned i = 0; i < draw->color_count && i < 8; i++)
+         if (mask & (PIPE_CLEAR_COLOR0 << i)) colormask |= (0xfu << (i * 4));
+      if (!colormask) colormask = 0xf;
       if (draw->clear_depth && draw->depth && format_has_depth(draw->depth->res->format))
          mask |= PIPE_CLEAR_DEPTH;
-      if (draw->clear_stencil && draw->depth &&
-          format_has_stencil(draw->depth->res->format))
+      if (draw->clear_stencil && draw->depth && format_has_stencil(draw->depth->res->format))
          mask |= PIPE_CLEAR_STENCIL;
       if (mask)
-         /* 26.x names the channels and stencil bits to write instead of taking a
-          * surface to write them through (p_context.h); 0xf and 0xff are the whole
-          * surface the old form cleared, and the buffers mask above still decides
-          * which attachments are touched at all.
-          */
-         pipe->clear(pipe, mask, 0xf, 0xff, NULL, &clear,
+         pipe->clear(pipe, mask, colormask, 0xff, NULL, &clear,
                      draw->clear_depth ? (double)*draw->clear_depth : 0.0,
                      draw->clear_stencil ? *draw->clear_stencil & 0xff : 0);
    }

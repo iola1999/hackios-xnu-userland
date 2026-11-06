@@ -234,6 +234,7 @@ assert not any(word in 'com.apple.fontservicesd' for word in DENY), "fontservice
 assert not any(word in 'com.apple.locationd' for word in DENY), "locationd must not be in DENY"
 assert not any(word in 'com.apple.weatherd' for word in DENY), "weatherd must not be in DENY"
 assert not any(word in 'com.apple.timed' for word in DENY), "timed must not be in DENY"
+assert not any(word in 'com.apple.mDNSResponder' for word in DENY), "mDNSResponder must not be in DENY"
 assert not any(word in 'com.apple.geod' for word in DENY), "geod must not be in DENY"
 assert not any(word in 'com.apple.fairplaydeviceidentityd' for word in DENY), "fairplaydeviceidentityd must not be in DENY"
 assert not any(word in 'com.apple.nsurlsessiond' for word in DENY), "nsurlsessiond must not be in DENY"
@@ -321,6 +322,9 @@ for label in labels:
     job.pop('_LimitLoadToDeviceTree', None)
     if 'all' in oslog or label in oslog:
         job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
+    if label == 'com.apple.timed':
+        job['RunAtLoad'] = True
+        job['KeepAlive'] = {'SuccessfulExit': False}
     with open(f'{dest}/{label}.plist', 'wb') as f:
         plistlib.dump(job, f, fmt=plistlib.FMT_BINARY)
     program = job.get('Program') or job['ProgramArguments'][0]
