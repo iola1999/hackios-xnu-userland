@@ -150,27 +150,38 @@ accessibility_on(void)
 	}
 }
 
+/*
+ * System applications whose custom BulletinBoard data-provider plugin bundle is not in the ramdisk
+ * (e.g. com.apple.mobilecal's CalendarNotification.bundle) have useDefaultDataProvider=NO in their
+ * UNCNotificationSourceDescription, causing UNSDefaultDataProviderFactory inside SpringBoard to skip
+ * creating a data provider and reject authorization requests with UNErrorDomain Code=1. Falling back
+ * to the default data provider lets UserNotificationsServer persist the user's choice in BulletinBoard.
+ */
 static void
-ax_suppress_notification_prompt(void)
+ax_enable_default_notification_provider(void)
 {
-	dlopen("/System/Library/Frameworks/UserNotifications.framework/UserNotifications", RTLD_LAZY);
-	Class cls = objc_getClass("UNUserNotificationCenter");
+	dlopen("/System/Library/PrivateFrameworks/UserNotificationsCore.framework/UserNotificationsCore", RTLD_LAZY);
+	Class cls = objc_getClass("UNCNotificationSourceDescription");
 	if (cls == nil) {
 		return;
 	}
-	SEL req_sel = sel_registerName("requestAuthorizationWithOptions:completionHandler:");
-	Method req_m = class_getInstanceMethod(cls, req_sel);
-	if (req_m != NULL) {
-		IMP imp = imp_implementationWithBlock(^(id _self, NSUInteger options, void (^handler)(BOOL, NSError *)) {
+	Method use_m = class_getInstanceMethod(cls, sel_registerName("useDefaultDataProvider"));
+	if (use_m != NULL) {
+		method_setImplementation(use_m, imp_implementationWithBlock(^BOOL(id _self) {
 			(void)_self;
-			(void)options;
-			if (handler != nil) {
-				dispatch_async(dispatch_get_main_queue(), ^{
-					handler(YES, nil);
-				});
+			return YES;
+		}));
+	}
+	SEL topics_sel = sel_registerName("defaultTopics");
+	Method req_m = class_getInstanceMethod(cls, sel_registerName("requiresTopics"));
+	if (req_m != NULL) {
+		method_setImplementation(req_m, imp_implementationWithBlock(^BOOL(id _self) {
+			if ([_self respondsToSelector:topics_sel]) {
+				NSArray *topics = ((id(*)(id, SEL))objc_msgSend)(_self, topics_sel);
+				return topics != nil && topics.count > 0;
 			}
-		});
-		method_setImplementation(req_m, imp);
+			return NO;
+		}));
 	}
 }
 
@@ -186,8 +197,8 @@ ax_start(void)
 		setenv("HOME", home, 0);
 		setenv("TMPDIR", "/private/var/mobile/Containers/Data/Application/7DFA02CB-E0A8-4D3C-BF40-4E5F6A7B8C93/tmp", 0);
 	}
-	if (prog != NULL && strcmp(prog, "SpringBoard") != 0) {
-		ax_suppress_notification_prompt();
+	if (prog != NULL && strcmp(prog, "SpringBoard") == 0) {
+		ax_enable_default_notification_provider();
 	}
 
 	notify_register_dispatch("com.redwood.ax.on", &token, dispatch_get_main_queue(), ^(int t) {

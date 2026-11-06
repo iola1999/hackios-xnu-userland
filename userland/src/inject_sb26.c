@@ -784,6 +784,46 @@ install_screen_mirroring_hooks(Class cls)
 }
 
 static void
+sb26_trigger_poweroff(id self, SEL _cmd, id arg1, id arg2)
+{
+    (void)self;
+    (void)_cmd;
+    (void)arg1;
+    (void)arg2;
+    int one = 1;
+    fprintf(stderr, "sb26: poweroff requested via %s, syncing and halting\n",
+        _cmd ? sel_getName(_cmd) : "unknown");
+    sync();
+    sysctlbyname("kern.redwood.halt", NULL, NULL, &one, sizeof(one));
+}
+
+static void
+install_powerdown_hooks(void)
+{
+    static const struct {
+        const char *cls;
+        const char *sel;
+    } targets[] = {
+        { "SBPowerDownViewController", "powerDownViewRequestPowerDown:" },
+        { "SBMainWorkspace", "powerDownViewControllerRequestsPowerDown:" },
+        { "SBRestartManager", "shutdownForReason:" },
+        { "SBRestartManager", "shutdownWithContext:" },
+        { "FBSystemService", "shutdownWithOptions:" },
+        { "FBSystemService", "shutdownWithOptions:origin:" },
+    };
+    unsigned patched = 0;
+    for (unsigned i = 0; i < sizeof(targets) / sizeof(targets[0]); i++) {
+        Class cls = objc_getClass(targets[i].cls);
+        if (!cls) continue;
+        Method m = class_getInstanceMethod(cls, sel_registerName(targets[i].sel));
+        if (!m) continue;
+        method_setImplementation(m, (IMP)sb26_trigger_poweroff);
+        patched++;
+    }
+    fprintf(stderr, "sb26: powerdown hooks installed (%u methods)\n", patched);
+}
+
+static void
 discovery_image_callback(const struct mach_header *header, intptr_t slide)
 {
     (void)header;
@@ -831,6 +871,7 @@ install_sb26(void)
     install_unlock();
     sb26_install_layer_dump();
     sb26_install_rate(slide);
+    install_powerdown_hooks();
 
     _dyld_register_func_for_add_image(haptic_image_callback);
     Class engine_cls = objc_getClass("CHHapticEngine");
