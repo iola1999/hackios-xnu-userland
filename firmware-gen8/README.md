@@ -7,7 +7,7 @@ K90 的 GPU 需要四个固件文件：`gen80000_gmu.bin`、`gen80000_sqe.fw`、
 
 ## 1. 放进根盘
 
-内核从内存盘里根盘的 `/fw/` 读取这四个文件。`userland/build.sh` 构建根盘时把 `hackios-xnu-kernel/fw-gpu/` 里的文件复制到 `/fw/`。在顶层工作区执行：
+内核从内存盘里根盘的 `/fw/` 读取这四个文件。`userland/build.sh` 构建根盘时把 `hackios-xnu-kernel/fw-gpu/` 里的文件复制到 `/fw/`。在顶层工作区执行（若仅经 `common/setup.sh` 将用户态检出到 `hackios-xnu-kernel/`，可将下方的 `hackios-xnu-userland/firmware-gen8/` 换为 `hackios-xnu-kernel/firmware-gen8/`）：
 
 ```sh
 mkdir -p hackios-xnu-kernel/fw-gpu
