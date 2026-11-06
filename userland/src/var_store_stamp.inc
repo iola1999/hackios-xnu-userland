@@ -96,7 +96,7 @@ watch(int seconds)
 	uint64_t last_saved = 0;
 	uint64_t last_checked = 0;
 	uint64_t last_klog = 0;
-	int interval = seconds > 0 ? seconds : 20;
+	int interval = seconds > 0 ? seconds : 3;
 	int token = 0;
 	int asked = 0;
 
@@ -166,7 +166,7 @@ watch(int seconds)
 			compute_snapshot(&curr_snap);
 
 			if (snapshot_is_dirty(&curr_snap, &prev_snap)) {
-				if ((uint64_t)tv.tv_sec - last_saved >= 10) {
+				if ((uint64_t)tv.tv_sec - last_saved >= 2) {
 					printf("var_store: changes detected in watched paths, performing incremental save\n");
 					int ok = 0;
 					if (delta_is_near_full()) {

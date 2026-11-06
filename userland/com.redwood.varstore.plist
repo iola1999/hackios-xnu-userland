@@ -12,7 +12,7 @@
 	<array>
 		<string>/redwood/bin/var_store</string>
 		<string>watch</string>
-		<string>20</string>
+		<string>3</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>

@@ -10,7 +10,9 @@
 
 #define DELTA_OFFSET        0xFB000000LL
 #define DELTA_BYTES         (64u << 20)
-#define DELTA_PAYLOAD_LIMIT (DELTA_BYTES - BLOCK)
+#define DELTA_SLOTS         2
+#define DELTA_SLOT_BYTES    (DELTA_BYTES / DELTA_SLOTS)
+#define DELTA_PAYLOAD_LIMIT (DELTA_SLOT_BYTES - BLOCK)
 #define DELTA_MAGIC         "RDWDEL\0"
 #define DELTA_VERSION       1
 
@@ -27,6 +29,12 @@ struct delta_head {
 	uint32_t head_crc;         /* CRC-32 of delta_head */
 };
 
+static off_t
+delta_slot_at(int dslot)
+{
+	return DELTA_OFFSET + (off_t)dslot * (off_t)DELTA_SLOT_BYTES;
+}
+
 static uint32_t
 delta_head_checksum(const struct delta_head *dh)
 {
@@ -36,19 +44,45 @@ delta_head_checksum(const struct delta_head *dh)
 }
 
 static int
-delta_read_head(struct delta_head *dh)
+delta_read_head_slot(int dslot, struct delta_head *dh)
 {
 	static uint8_t block[BLOCK];
-	if (!device_read(DELTA_OFFSET, block, BLOCK)) {
+	if (!device_read(delta_slot_at(dslot), block, BLOCK)) {
 		return 0;
 	}
 	memcpy(dh, block, sizeof(*dh));
 	if (memcmp(dh->magic, DELTA_MAGIC, sizeof(dh->magic)) != 0 ||
 	    dh->version != DELTA_VERSION ||
+	    dh->bytes > DELTA_PAYLOAD_LIMIT ||
 	    dh->head_crc != delta_head_checksum(dh)) {
 		return 0;
 	}
 	return 1;
+}
+
+static int
+delta_newest(struct delta_head *out_dh)
+{
+	int best = -1;
+
+	for (int dslot = 0; dslot < DELTA_SLOTS; dslot++) {
+		struct delta_head dh;
+		if (!delta_read_head_slot(dslot, &dh)) {
+			continue;
+		}
+		if (best < 0 || dh.base_generation > out_dh->base_generation ||
+		    (dh.base_generation == out_dh->base_generation && dh.delta_seq > out_dh->delta_seq)) {
+			best = dslot;
+			*out_dh = dh;
+		}
+	}
+	return best;
+}
+
+static int
+delta_read_head(struct delta_head *dh)
+{
+	return delta_newest(dh) >= 0;
 }
 
 static int
@@ -65,7 +99,12 @@ delta_reset(uint64_t new_base_generation)
 	dh->flags = 1; /* inactive / merged */
 	dh->base_generation = new_base_generation;
 	dh->head_crc = delta_head_checksum(dh);
-	return device_write(DELTA_OFFSET, block, BLOCK);
+	for (int dslot = 0; dslot < DELTA_SLOTS; dslot++) {
+		if (!device_write(delta_slot_at(dslot), block, BLOCK)) {
+			return 0;
+		}
+	}
+	return 1;
 }
 
 static int
@@ -85,7 +124,7 @@ delta_is_near_full(void)
 		temp_open = 1;
 	}
 	if (delta_read_head(&dh) && dh.flags == 0) {
-		near = dh.bytes >= (DELTA_BYTES - (4u << 20)); /* within 4 MiB of 64 MiB limit (60 MiB) */
+		near = dh.bytes >= (DELTA_SLOT_BYTES - (4u << 20)); /* within 4 MiB of 32 MiB slot limit */
 	}
 	if (temp_open) {
 		close(fd);
@@ -95,10 +134,11 @@ delta_is_near_full(void)
 }
 
 static void
-stream_start_delta(uint64_t bytes)
+stream_start_delta_slot(int dslot, uint64_t bytes)
 {
-	at = DELTA_OFFSET + BLOCK;
-	stream_limit = bytes != 0 ? at + (off_t)((bytes + BLOCK - 1) / BLOCK * BLOCK) : DELTA_OFFSET + DELTA_BYTES;
+	at = delta_slot_at(dslot) + BLOCK;
+	stream_limit = bytes != 0 ? at + (off_t)((bytes + BLOCK - 1) / BLOCK * BLOCK)
+	                          : delta_slot_at(dslot) + (off_t)DELTA_SLOT_BYTES;
 	buffered = taken = 0;
 	stream_bytes = 0;
 	stream_left = bytes;
@@ -108,6 +148,130 @@ stream_start_delta(uint64_t bytes)
 static int unpack_one(int make);
 static int save(void);
 
+struct base_reader {
+	off_t    at;
+	uint64_t left;
+	uint64_t bytes;
+	uint64_t have;
+	uint64_t taken;
+};
+
+static uint8_t base_read_buf[65536];
+
+static int
+base_in(struct base_reader *br, void *dst, uint64_t n)
+{
+	uint8_t *p = dst;
+
+	if (n > br->left) {
+		return 0;
+	}
+	br->left -= n;
+	br->bytes += n;
+	while (n > 0) {
+		uint64_t avail = br->have - br->taken;
+		if (avail == 0) {
+			uint64_t want = sizeof(base_read_buf);
+			if (want > ((br->left + n + BLOCK - 1) / BLOCK * BLOCK)) {
+				want = (br->left + n + BLOCK - 1) / BLOCK * BLOCK;
+			}
+			if (want == 0 || !device_read(br->at, base_read_buf, want)) {
+				return 0;
+			}
+			br->at += (off_t)want;
+			br->have = want;
+			br->taken = 0;
+			continue;
+		}
+		if (avail > n) {
+			avail = n;
+		}
+		if (p != NULL) {
+			memcpy(p, base_read_buf + br->taken, (size_t)avail);
+			p += avail;
+		}
+		br->taken += avail;
+		n -= avail;
+	}
+	return 1;
+}
+
+static int
+pack_delete_entry(const char *relative, uint32_t pathlen)
+{
+	struct entry de;
+
+	memset(&de, 0, sizeof(de));
+	de.kind = ENT_DELETE;
+	de.pathlen = pathlen;
+	if (!out(&de, sizeof(de)) || !out(relative, pathlen) || !out_pad()) {
+		return 0;
+	}
+	entries++;
+	return 1;
+}
+
+/*
+ * Scan the active Base Slot and emit ENT_DELETE tombstones for any entry that
+ * existed in the base archive and has since been removed from /private/var.
+ * Files and links are emitted at their entry; directories are emitted at
+ * ENT_DIRTIME (post-order, after children have been unlinked).
+ */
+static int
+delta_pack_deletes(int base_slot, const struct head *bh)
+{
+	struct base_reader br;
+	static char rel[MAX_PATH];
+	static char check_path[MAX_PATH];
+
+	br.at = slot_at(base_slot) + BLOCK;
+	br.left = bh->bytes;
+	br.bytes = 0;
+	br.have = br.taken = 0;
+
+	for (uint64_t i = 0; i < bh->entries; i++) {
+		struct entry e;
+		uint64_t over;
+
+		if (!base_in(&br, &e, sizeof(e)) || e.pathlen >= MAX_PATH || e.nxattr > 4096) {
+			return 1;
+		}
+		if (!base_in(&br, rel, e.pathlen)) {
+			return 1;
+		}
+		rel[e.pathlen] = 0;
+		for (uint32_t x = 0; x < e.nxattr; x++) {
+			uint32_t nlen = 0, vlen = 0;
+			if (!base_in(&br, &nlen, sizeof(nlen)) || !base_in(&br, &vlen, sizeof(vlen)) ||
+			    !base_in(&br, NULL, (uint64_t)nlen + (uint64_t)vlen)) {
+				return 1;
+			}
+		}
+		if ((e.kind == ENT_FILE || e.kind == ENT_SYMLINK || e.kind == ENT_HARDLINK) &&
+		    e.size > 0 && !base_in(&br, NULL, e.size)) {
+			return 1;
+		}
+		over = br.bytes % 8;
+		if (over != 0 && !base_in(&br, NULL, 8 - over)) {
+			return 1;
+		}
+		if (e.kind == ENT_FILE || e.kind == ENT_SYMLINK ||
+		    e.kind == ENT_HARDLINK || e.kind == ENT_DIRTIME) {
+			if (e.pathlen > 0 && sizeof(ROOT) + e.pathlen < sizeof(check_path)) {
+				struct stat st;
+				memcpy(check_path, ROOT "/", sizeof(ROOT));
+				memcpy(check_path + sizeof(ROOT), rel, e.pathlen + 1);
+				if (lstat(check_path, &st) != 0) {
+					if (!pack_delete_entry(rel, e.pathlen)) {
+						return 0;
+					}
+				}
+			}
+		}
+	}
+	return 1;
+}
+
 static int
 delta_save(void)
 {
@@ -115,7 +279,7 @@ delta_save(void)
 	struct delta_head prev_dh, dh;
 	static uint8_t block[BLOCK];
 	uint64_t delta_seq = 1;
-	int best;
+	int best, prev_dslot, dslot;
 
 	if (slots <= 1) {
 		return 1;
@@ -128,17 +292,22 @@ delta_save(void)
 		return save();
 	}
 
-	if (delta_read_head(&prev_dh) && prev_dh.base_generation == base_h.generation) {
+	memset(&prev_dh, 0, sizeof(prev_dh));
+	prev_dslot = delta_newest(&prev_dh);
+	if (prev_dslot >= 0 && prev_dh.base_generation == base_h.generation) {
 		delta_seq = prev_dh.delta_seq + 1;
+		dslot = (prev_dslot + 1) % DELTA_SLOTS;
+	} else {
+		dslot = 0;
 	}
 
-	/* Invalidate delta header block before writing new delta payload */
+	/* Invalidate target delta slot header block before writing new delta payload */
 	memset(block, 0, sizeof(block));
-	if (!device_write(DELTA_OFFSET, block, BLOCK)) {
+	if (!device_write(delta_slot_at(dslot), block, BLOCK)) {
 		return 0;
 	}
 
-	stream_start_delta(0);
+	stream_start_delta_slot(dslot, 0);
 	entries = 0;
 	last_saved_at = base_h.seconds;
 	changed_entries = changed_bytes = 0;
@@ -149,7 +318,7 @@ delta_save(void)
 	strcpy(path, ROOT);
 
 	delta_mode = 1;
-	int pack_ok = pack_tree("") && out_flush(1);
+	int pack_ok = pack_tree("") && delta_pack_deletes(best, &base_h) && out_flush(1);
 	delta_mode = 0;
 
 	if (!pack_ok) {
@@ -185,60 +354,64 @@ delta_save(void)
 
 	memset(block, 0, sizeof(block));
 	memcpy(block, &dh, sizeof(dh));
-	if (!device_write(DELTA_OFFSET, block, BLOCK)) {
+	if (!device_write(delta_slot_at(dslot), block, BLOCK)) {
 		return 0;
 	}
 
-	printf("var_store: delta slot saved: seq %llu (base gen %llu), %llu entries, %llu bytes, crc %08x\n",
-	    (unsigned long long)dh.delta_seq, (unsigned long long)dh.base_generation,
+	printf("var_store: delta slot %d saved: seq %llu (base gen %llu), %llu entries, %llu bytes, crc %08x\n",
+	    dslot, (unsigned long long)dh.delta_seq, (unsigned long long)dh.base_generation,
 	    (unsigned long long)dh.entries, (unsigned long long)dh.bytes, dh.crc);
 	klog_flush();
 	return 1;
 }
 
 static int
+delta_verify_slot(int dslot, const struct delta_head *dh)
+{
+	stream_start_delta_slot(dslot, dh->bytes);
+	for (uint64_t i = 0; i < dh->entries; i++) {
+		if (!unpack_one(0)) {
+			return 0;
+		}
+	}
+	return (stream_crc ^ 0xffffffffu) == dh->crc;
+}
+
+static int
 delta_restore(uint64_t base_gen)
 {
 	struct delta_head dh;
+	int dslot;
 
 	if (slots <= 1) {
 		return 1;
 	}
-	if (!delta_read_head(&dh)) {
-		return 1;
-	}
-	if (dh.flags != 0) {
-		return 1;
-	}
-	if (dh.base_generation != base_gen) {
-		printf("var_store: delta base gen %llu != base %llu: skipping delta\n",
-		    (unsigned long long)dh.base_generation, (unsigned long long)base_gen);
-		return 1;
-	}
-	if (dh.bytes == 0 || dh.bytes > DELTA_PAYLOAD_LIMIT) {
+	memset(&dh, 0, sizeof(dh));
+	dslot = delta_newest(&dh);
+	if (dslot < 0 || dh.flags != 0 || dh.base_generation != base_gen ||
+	    dh.bytes == 0 || dh.bytes > DELTA_PAYLOAD_LIMIT) {
 		return 1;
 	}
 
-	printf("var_store: delta slot: seq %llu, %llu entries, %llu bytes, crc %08x\n",
-	    (unsigned long long)dh.delta_seq, (unsigned long long)dh.entries,
-	    (unsigned long long)dh.bytes, dh.crc);
-
-	/* Pass 0: check integrity */
-	stream_start_delta(dh.bytes);
-	for (uint64_t i = 0; i < dh.entries; i++) {
-		if (!unpack_one(0)) {
-			printf("var_store: delta verify failed at entry %llu\n", (unsigned long long)i);
+	if (!delta_verify_slot(dslot, &dh)) {
+		int other = (dslot + 1) % DELTA_SLOTS;
+		struct delta_head other_dh;
+		if (delta_read_head_slot(other, &other_dh) && other_dh.flags == 0 &&
+		    other_dh.base_generation == base_gen && other_dh.bytes > 0 &&
+		    delta_verify_slot(other, &other_dh)) {
+			dslot = other;
+			dh = other_dh;
+		} else {
+			printf("var_store: delta slot %d verify failed\n", dslot);
 			return 0;
 		}
 	}
-	if ((stream_crc ^ 0xffffffffu) != dh.crc) {
-		printf("var_store: delta CRC mismatch (%08x != %08x)\n",
-		    stream_crc ^ 0xffffffffu, dh.crc);
-		return 0;
-	}
 
-	/* Pass 1: apply unpacked entries */
-	stream_start_delta(dh.bytes);
+	printf("var_store: delta slot %d: seq %llu, %llu entries, %llu bytes, crc %08x\n",
+	    dslot, (unsigned long long)dh.delta_seq, (unsigned long long)dh.entries,
+	    (unsigned long long)dh.bytes, dh.crc);
+
+	stream_start_delta_slot(dslot, dh.bytes);
 	for (uint64_t i = 0; i < dh.entries; i++) {
 		if (!unpack_one(1)) {
 			printf("var_store: delta unpack failed at entry %llu\n", (unsigned long long)i);

@@ -1,28 +1,33 @@
 /*
  * Incremental dirty snapshot detection and transient filtering for var_store.
- * Monitors mtime and sizes on key whitelist paths:
- *   /private/var/mobile/Library/SpringBoard
- *   /private/var/mobile/Library/Preferences
- *   /private/var/containers
- *   /private/var/db
+ * Recursively scans /private/var (skipping transient runtime/log/cache directories)
+ * and hashes path, mode, ownership, size, mtime, and ctime into a snapshot digest.
  */
-
-static const char *const WATCH_DIRS[] = {
-	"/private/var/mobile/Library/SpringBoard",
-	"/private/var/mobile/Library/Preferences",
-	"/private/var/mobile/Library/BulletinBoard",
-	"/private/var/mobile/Library/UserNotifications",
-	"/private/var/containers",
-	"/private/var/db",
-	NULL,
-};
 
 struct dir_snapshot {
 	int64_t  max_mtime_sec;
 	uint32_t max_mtime_nsec;
 	uint64_t total_size;
 	uint32_t count;
+	uint64_t tree_hash;
 };
+
+static uint64_t
+fnv1a_bytes(uint64_t h, const void *data, size_t len)
+{
+	const uint8_t *p = (const uint8_t *)data;
+	for (size_t i = 0; i < len; i++) {
+		h ^= (uint64_t)p[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static uint64_t
+fnv1a_u64(uint64_t h, uint64_t v)
+{
+	return fnv1a_bytes(h, &v, sizeof(v));
+}
 
 static const char *
 str_find(const char *haystack, const char *needle)
@@ -119,7 +124,7 @@ static void
 scan_path_snapshot(const char *dir_path, int depth, struct dir_snapshot *snap)
 {
 	char child[MAX_PATH];
-	static char dentry_buf[5][2048];
+	static char dentry_buf[MAX_DEPTH][2048];
 	struct stat st;
 #ifdef MINI_H
 	off_t pos = 0;
@@ -140,8 +145,16 @@ scan_path_snapshot(const char *dir_path, int depth, struct dir_snapshot *snap)
 	}
 	snap->total_size += (uint64_t)st.st_size;
 	snap->count++;
+	snap->tree_hash = fnv1a_bytes(snap->tree_hash, dir_path, strlen(dir_path));
+	snap->tree_hash = fnv1a_u64(snap->tree_hash, (uint64_t)st.st_mode);
+	snap->tree_hash = fnv1a_u64(snap->tree_hash, ((uint64_t)st.st_uid << 32) | (uint32_t)st.st_gid);
+	snap->tree_hash = fnv1a_u64(snap->tree_hash, (uint64_t)st.st_size);
+	snap->tree_hash = fnv1a_u64(snap->tree_hash, (uint64_t)st.st_mtimespec.tv_sec);
+	snap->tree_hash = fnv1a_u64(snap->tree_hash, (uint64_t)st.st_mtimespec.tv_nsec);
+	snap->tree_hash = fnv1a_u64(snap->tree_hash, (uint64_t)st.st_ctimespec.tv_sec);
+	snap->tree_hash = fnv1a_u64(snap->tree_hash, (uint64_t)st.st_ctimespec.tv_nsec);
 
-	if ((st.st_mode & S_IFMT) != S_IFDIR || depth < 0 || depth >= 4) {
+	if ((st.st_mode & S_IFMT) != S_IFDIR || depth < 0 || depth >= MAX_DEPTH) {
 		return;
 	}
 
@@ -175,6 +188,10 @@ scan_path_snapshot(const char *dir_path, int depth, struct dir_snapshot *snap)
 			memcpy(child + base_len + 1, name, name_len);
 			child[base_len + 1 + name_len] = 0;
 
+			if (strncmp(child, ROOT "/", sizeof(ROOT)) == 0 &&
+			    is_transient_path(child + sizeof(ROOT))) {
+				continue;
+			}
 			scan_path_snapshot(child, depth + 1, snap);
 		}
 	}
@@ -185,9 +202,8 @@ static void
 compute_snapshot(struct dir_snapshot *snap)
 {
 	memset(snap, 0, sizeof(*snap));
-	for (int i = 0; WATCH_DIRS[i] != NULL; i++) {
-		scan_path_snapshot(WATCH_DIRS[i], 0, snap);
-	}
+	snap->tree_hash = 14695981039346656037ULL;
+	scan_path_snapshot(ROOT, 0, snap);
 }
 
 static int
@@ -196,7 +212,8 @@ snapshot_is_dirty(const struct dir_snapshot *current, const struct dir_snapshot 
 	if (previous->count == 0 && previous->max_mtime_sec == 0) {
 		return current->count > 0;
 	}
-	return current->max_mtime_sec != previous->max_mtime_sec ||
+	return current->tree_hash != previous->tree_hash ||
+	       current->max_mtime_sec != previous->max_mtime_sec ||
 	       current->max_mtime_nsec != previous->max_mtime_nsec ||
 	       current->total_size != previous->total_size ||
 	       current->count != previous->count;

@@ -376,6 +376,24 @@ setup_app_container_env(const char *name)
 			setenv("TMPDIR", tmp, 0);
 		}
 	}
+	{
+		const char *home = getenv("CFFIXED_USER_HOME");
+
+		if (home != NULL && home[0] == '/') {
+			static const char *const subdirs[] = {
+				"", "/Documents", "/Library", "/Library/Preferences", "/Library/Caches", "/tmp"
+			};
+			char path[320];
+
+			(void)mkdir("/private/var/mobile/Containers", 0755);
+			(void)mkdir("/private/var/mobile/Containers/Data", 0755);
+			(void)mkdir("/private/var/mobile/Containers/Data/Application", 0755);
+			for (unsigned i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
+				snprintf(path, sizeof(path), "%s%s", home, subdirs[i]);
+				(void)mkdir(path, 0755);
+			}
+		}
+	}
 }
 
 __attribute__((constructor))

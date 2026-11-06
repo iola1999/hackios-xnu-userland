@@ -98,6 +98,11 @@ unpack_one(int make)
 				made_files++;
 			}
 			break;
+		case ENT_DELETE:
+			if (unlink(path) != 0) {
+				(void)rmdir(path);
+			}
+			break;
 		default:
 			break;
 		}
@@ -224,6 +229,7 @@ unpack_one(int make)
 		lchown(path, (int)e.uid, (int)e.gid);
 		break;
 	case ENT_HARDLINK:
+	case ENT_DELETE:
 		break;
 	default:
 		chown(path, (int)e.uid, (int)e.gid);

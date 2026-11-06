@@ -182,25 +182,13 @@ logged_necessary_migrations(id self, SEL cmd, id url, BOOL force, id *error)
 
 enum { RESOURCE_LINES = 8 };
 
-/* NSURLFileProtectionKey, looked up because this library does not link Foundation. */
-static id
-without_protection(id values)
-{
-    static id *key;
-    if (!key) key = dlsym(RTLD_DEFAULT, "NSURLFileProtectionKey");
-    if (!values || !key || !*key) return values;
-    id copy = ((id (*)(id, SEL))objc_msgSend)(values, sel_registerName("mutableCopy"));
-    ((void (*)(id, SEL, id))objc_msgSend)(copy, sel_registerName("removeObjectForKey:"), *key);
-    return ((id (*)(id, SEL))objc_msgSend)(copy, sel_registerName("autorelease"));
-}
-
 static BOOL (*reachable_conform)(id, SEL, id, id *), (*conforms)(id, SEL, id, id *);
 static BOOL (*update_values)(id, SEL, id, id *), (*recursive_update)(id, SEL, id, id *);
 
 static BOOL
 resource_call(BOOL (*original)(id, SEL, id, id *), unsigned *calls, id self, SEL cmd, id values, id *error)
 {
-    BOOL ok = original(self, cmd, without_protection(values), error);
+    BOOL ok = original(self, cmd, values, error);
     if ((*calls)++ < RESOURCE_LINES)
         fprintf(stderr, "pb26 %s %s asked %.300s -> %d\n", sel_getName(cmd), text_of(self), text_of(values), ok);
     return ok;

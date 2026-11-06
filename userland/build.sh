@@ -843,6 +843,10 @@ done
 if [ "$V" = 26 ]; then
 	cp $IOS/rootfs/System/Library/xpc/foreground_user_endpoints.plist root/xpc/
 	./mkcache.py $IOS/rootfs/System/Library/xpc/launchd.plist root/LaunchDaemons root/xpc/launchd.plist
+	if [ -d "$IOS/rootfs/System/Library/UserNotifications" ]; then
+		rm -rf root/UserNotifications
+		cp -a "$IOS/rootfs/System/Library/UserNotifications" root/UserNotifications
+	fi
 	# and it panics on a job whose program is not a platform binary; the kernel takes an ad hoc
 	# signed program for one (xnu/files/bsd/kern/kern_minimac.c). macOS's own codesign: the one of
 	# the kernel build's host tools (xnu-deps/host/bin) does nothing.

@@ -90,7 +90,7 @@ static const char *const SKIP[] = {
 	NULL,
 };
 
-enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5 };
+enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5, ENT_DELETE = 6 };
 
 #define HEAD_MAGIC      "RDWVAR\0"
 #define HEAD_VERSION    1
@@ -808,7 +808,8 @@ pack_tree(const char *relative)
 		}
 		int should_pack = 1;
 		if (delta_mode) {
-			should_pack = ((uint64_t)st.st_mtimespec.tv_sec >= last_saved_at);
+			should_pack = ((uint64_t)st.st_mtimespec.tv_sec >= last_saved_at ||
+			               (uint64_t)st.st_ctimespec.tv_sec >= last_saved_at);
 		}
 		if (should_pack && !pack_one(relative, &st)) {
 			return 0;
@@ -859,7 +860,8 @@ pack_tree(const char *relative)
 	depth--;
 	close(dir_fd);
 	if (ok && relative[0] != 0 && lstat(path, &st) == 0) {
-		if (!delta_mode || (uint64_t)st.st_mtimespec.tv_sec >= last_saved_at) {
+		if (!delta_mode || (uint64_t)st.st_mtimespec.tv_sec >= last_saved_at ||
+		    (uint64_t)st.st_ctimespec.tv_sec >= last_saved_at) {
 			ok = pack_dirtime(relative, &st);
 		}
 	}

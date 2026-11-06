@@ -1411,33 +1411,33 @@ int
 main(int argc, char **argv, char **envp)
 {
 	int fd = open("/dev/console", O_RDWR, 0);
+	struct stat un_st;
 
 	dup2(fd, 0);
 	dup2(fd, 1);
 	dup2(fd, 2);
-	if (fd > 2) {
+	if (fd > 2)
 		close(fd);
-	}
-
 	(void)envp;
-	if (argc > 0 && strncmp(argv[0], "/redwood/", 9) == 0) {
+	if (argc > 0 && strncmp(argv[0], "/redwood/", 9) == 0)
 		base = "/redwood";
-	}
 	/* Not process 1: a command runner, "init FILE" (this is how a launchd job runs a list of commands). */
 	if (getpid() != 1) {
-		if (argc > 1) {
+		if (argc > 1)
 			run_rc(argv[1]);
-		}
 		return 0;
 	}
 
 	printf("\n=== init: process %d, started as %s ===\n", getpid(), argc > 0 ? argv[0] : "?");
 	{
 		const char *dev = boot_arg("root_apfs");
-
-		if (dev != NULL) {
+		if (dev != NULL)
 			flash_root(dev);
-		}
+	}
+	if (lstat(in_image("/UserNotifications"), &un_st) == 0 && (un_st.st_mode & S_IFMT) == S_IFDIR) {
+		if (lstat("/System/Library/UserNotifications", &un_st) != 0)
+			(void)synthetic_dir("/System/Library/UserNotifications");
+		(void)bind_dir(in_image("/UserNotifications"), "/System/Library/UserNotifications");
 	}
 
 	show_system();

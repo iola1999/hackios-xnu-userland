@@ -46,7 +46,7 @@ WHOLE = ('usr/libexec/', 'usr/sbin/', 'usr/bin/', 'usr/lib/', 'usr/share/', 'sbi
 SKIP_SYSTEM_LIBRARY = ('PreinstalledAssetsV2', 'NanoTimeKit', 'Audio',
                        'Assistant', 'AccessibilityBundles',
                        'VideoProcessors', 'ScreenReader', 'Photos', 'Carrier Bundles', 'NanoPreferenceBundles',
-                       'ImagingNetworks', 'ProductDocuments', 'AppPlaceholders', 'UserNotifications',
+                       'ImagingNetworks', 'ProductDocuments', 'AppPlaceholders',
                        'Caches')
 FRAMEWORKS = ('System/Library/Frameworks/', 'System/Library/PrivateFrameworks/')
 SMALL = 4 << 20
@@ -217,6 +217,8 @@ def wanted_file(path, size):
         return True
     if path.startswith(AUDIO):
         return not path.startswith(SKIP_AUDIO) and '.espresso.' not in path
+    if path.startswith('System/Library/UserNotifications/'):
+        return not path.lower().endswith(('.car', '.caf'))
     if path.startswith(SKIP_PREFIX):
         return False
     if path in WHOLE_FONTS:
