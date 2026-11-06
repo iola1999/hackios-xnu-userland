@@ -286,24 +286,33 @@ dispatch_input_event(IOHIDServiceClientRef service, IOHIDEventRef event, struct 
 static void
 send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t, uint64_t read_at)
 {
-	uint32_t change = t->type == REDWOOD_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
-	IOHIDEventRef hand, finger;
-	bool any = false;
+	uint32_t type = t->type;
 	unsigned f = t->finger;
-    struct touch_timing timing, *sample = NULL;
 
-	if (f >= MAX_FINGERS || (t->type != REDWOOD_TOUCH_DOWN && !fingers[f].touching)) {
+	if (f >= MAX_FINGERS) {
 		return;
 	}
+	if (!fingers[f].touching) {
+		if (type == REDWOOD_TOUCH_MOVE) {
+			type = REDWOOD_TOUCH_DOWN;
+		} else if (type != REDWOOD_TOUCH_DOWN) {
+			return;
+		}
+	}
+	uint32_t change = type == REDWOOD_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
+	IOHIDEventRef hand, finger;
+	bool any = false;
+    struct touch_timing timing, *sample = NULL;
+
     if (touch_latency && latency_samples < 128) {
         latency_samples++;
         sample = &timing;
         touch_cpu_snapshot(&sample->cpu[0]);
     }
-	fingers[f].touching = t->type != REDWOOD_TOUCH_UP;
+	fingers[f].touching = type != REDWOOD_TOUCH_UP;
 	fingers[f].x = t->x / 65535.0;
 	fingers[f].y = t->y / 65535.0;
-	if (t->type == REDWOOD_TOUCH_DOWN) {
+	if (type == REDWOOD_TOUCH_DOWN) {
 		fingers[f].edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE || fingers[f].y < EDGE_TOP ||
 		    fingers[f].y > 1 - EDGE_BOTTOM;
 	}

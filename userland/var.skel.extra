@@ -12,3 +12,12 @@ d	755	276	276	/private/var/empty/Library/Caches
 d	755	501	501	/private/var/mobile/Containers/Data/Application
 d	755	501	501	/private/var/mobile/Containers/Shared/AppGroup
 d	755	501	501	/private/var/mobile/Library/SafariSafeBrowsing
+d	755	501	501	/private/var/mobile/Library/SyncedPreferences
+d	755	501	501	/private/var/mobile/Library/Weather
+d	755	501	501	/private/var/mobile/Library/WeatherDaemon
+d	755	501	501	/private/var/mobile/Library/Caches/com.apple.weather
+d	755	501	501	/private/var/mobile/Library/Caches/com.apple.weatherd
+d	755	205	205	/private/var/db/locationd
+d	755	501	501	/private/var/mobile/Library/Location
+d	777	0	0	/private/var/db/redwood-aircache
+d	777	0	0	/private/var/db/redwood-ir3cache

@@ -361,34 +361,37 @@ restore_var(void)
 	if (sysctlbyname("kern.redwood.var_disk_loaded", &disk_loaded, &len, NULL, 0) == 0 && disk_loaded != 0) {
 		printf("\n-- the data volume of the last boot --\n");
 		printf("  /private/var loaded directly from persistent disk (RDWFS001)\n");
-		vfd = open("/private/var", O_RDONLY | O_DIRECTORY, 0);
-		if (vfd >= 0) {
-			(void)fsync(vfd);
-			close(vfd);
+	} else if (wanted != NULL && strcmp(wanted, "1") == 0) {
+		printf("\n-- the data volume of the last boot --\n");
+		argv[0] = (char *)in_image("/bin/var_store");
+		argv[1] = (char *)"load";
+		argv[2] = NULL;
+		pid = fork();
+		if (pid == 0) {
+			execve(argv[0], argv, environ);
+			printf("  %s: %s\n", argv[0], strerror(errno));
+			_exit(127);
 		}
-		return;
-	}
-	if (wanted == NULL || strcmp(wanted, "1") != 0) {
-		vfd = open("/private/var", O_RDONLY | O_DIRECTORY, 0);
-		if (vfd >= 0) {
-			(void)fsync(vfd);
-			close(vfd);
+		if (pid < 0 || wait4(pid, &status, 0, NULL) != pid || !WIFEXITED(status)) {
+			printf("  var_store did not run\n");
 		}
-		return;
 	}
-	printf("\n-- the data volume of the last boot --\n");
-	argv[0] = (char *)in_image("/bin/var_store");
-	argv[1] = (char *)"load";
-	argv[2] = NULL;
-	pid = fork();
-	if (pid == 0) {
-		execve(argv[0], argv, environ);
-		printf("  %s: %s\n", argv[0], strerror(errno));
-		_exit(127);
-	}
-	if (pid < 0 || wait4(pid, &status, 0, NULL) != pid || !WIFEXITED(status)) {
-		printf("  var_store did not run\n");
-	}
+
+	/* Ensure essential directories exist even when loaded directly from persistent disk */
+	mkdir("/private/var/mobile/Library/SyncedPreferences", 0755);
+	chown("/private/var/mobile/Library/SyncedPreferences", 501, 501);
+	mkdir("/private/var/mobile/Library/Weather", 0755);
+	chown("/private/var/mobile/Library/Weather", 501, 501);
+	mkdir("/private/var/db/locationd", 0755);
+	chown("/private/var/db/locationd", 205, 205);
+	mkdir("/private/var/db/redwood-aircache", 0777);
+	chmod("/private/var/db/redwood-aircache", 0777);
+	mkdir("/private/var/db/redwood-ir3cache", 0777);
+	chmod("/private/var/db/redwood-ir3cache", 0777);
+
+	int seed_done = 1;
+	(void)sysctlbyname("kern.redwood.var_seed_done", NULL, NULL, &seed_done, sizeof(seed_done));
+
 	vfd = open("/private/var", O_RDONLY | O_DIRECTORY, 0);
 	if (vfd >= 0) {
 		(void)fsync(vfd);

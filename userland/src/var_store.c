@@ -183,13 +183,13 @@ static const char *
 default_device(void)
 {
 	struct stat st;
-	if (stat(DEVICE_DSU, &st) == 0) {
-		return DEVICE_DSU;
-	}
 	if (stat(DEVICE_DARWIN_VAR, &st) == 0) {
 		return DEVICE_DARWIN_VAR;
 	}
-	return DEVICE_DSU;
+	if (stat(DEVICE_DSU, &st) == 0) {
+		return DEVICE_DSU;
+	}
+	return DEVICE_DARWIN_VAR;
 }
 static uint8_t *buffer;
 static uint8_t *already;                /* what the slot holds there now, to not write it again */
@@ -912,6 +912,14 @@ main(int argc, char **argv, char **envp)
 	already = mmap(NULL, BUFFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	if (already == MAP_FAILED) {
 		already = NULL;
+	}
+	if (strcmp(what, "load") == 0) {
+		int disk_loaded = 0;
+		size_t dlen = sizeof(disk_loaded);
+		if (sysctlbyname("kern.redwood.var_disk_loaded", &disk_loaded, &dlen, NULL, 0) == 0 && disk_loaded != 0) {
+			printf("var_store: /private/var already loaded from persistent disk; seed unpack skipped\n");
+			return 0;
+		}
 	}
 	if (argc == 2 && strcmp(what, "load") == 0 && seed(argv[0]) != NULL) {
 		struct head h;

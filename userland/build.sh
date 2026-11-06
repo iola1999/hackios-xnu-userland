@@ -859,7 +859,7 @@ if [ "$V" = 26 ]; then
 		fi
 	done
 fi
-[ -d root/lib/RedwoodAudio.driver ] && ln -s /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
+[ -d root/lib/RedwoodAudio.driver ] && ln -sf /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
 # The 26 image runs where the dyld shared cache has an arm64e slice and no other (ios26/23G90__iPhone18,3
 # holds dyld_shared_cache_arm64e alone), so every program in it that reaches dyld has to be an arm64e
 # slice, and one Apple's clang made: a slice whose cpusubtype lacks the LIB64 bit comes from a compiler
@@ -999,7 +999,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/$DSC ]; then
 		# and what Sileo runs from /bin, for init to put over the iOS volume's /bin (see the system image below)
 		mkdir -p flashboot/jb-bin
 		for c in $SILEO_BIN; do
-			ln -s /var/jb/usr/bin/$c flashboot/jb-bin/$c
+			ln -sf /var/jb/usr/bin/$c flashboot/jb-bin/$c
 		done
 		echo "  the package manager's prefix: $(du -sh flashboot/jb | cut -f1) as /jb of the boot volume"
 	fi
@@ -1041,7 +1041,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 	if [ "$V" = 26 ]; then
 		mkdir sysroot/System/Library/LaunchDaemons    # stage0 binds /redwood/LaunchDaemons onto it (src/stage0.c)
 	else
-		ln -s /redwood/LaunchDaemons sysroot/System/Library/LaunchDaemons
+		ln -sf /redwood/LaunchDaemons sysroot/System/Library/LaunchDaemons
 	fi
 	mkdir -p sysroot/redwood sysroot/sbin
 	# where the kernel mounts the iOS root container off the phone's flash (boot-arg apfs_volume=):
@@ -1112,7 +1112,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 	done
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
-	ln -s /redwood/lib/RedwoodAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
+	ln -sf /redwood/lib/RedwoodAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/RedwoodAudio.driver
 	# ... and our Metal plug-in, at the one path Metal's own discovery can open: step 3 composes
 	# "/System/Library/Extensions/" + MetalPluginName + ".bundle" and opens it with NSBundle
 	# (docs/metal.md 1). Same shape as the audio plug-in above -- a link into /redwood/lib, where
@@ -1125,7 +1125,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 	# own -- a switch here would cost a 2.5 GB system.apfs rebuild and a re-upload every time it
 	# was flipped, and buy nothing a missing boot-arg does not already buy.
 	mkdir -p sysroot/System/Library/Extensions
-	ln -s /redwood/lib/RedwoodMetal.bundle sysroot/System/Library/Extensions/RedwoodMetal.bundle
+	ln -sf /redwood/lib/RedwoodMetal.bundle sysroot/System/Library/Extensions/RedwoodMetal.bundle
 	# the OS cryptex: on a device a separate volume grafted at /System/Cryptexes/OS. It holds the dyld
 	# shared cache (dyld looks there first) and a few libraries and resources outside the cache.
 	mkdir -p sysroot/System/Cryptexes

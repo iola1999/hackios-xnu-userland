@@ -1,0 +1,101 @@
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -28,6 +28,38 @@
+  * for this reason, because binning pass variants share const_state with
+  * their draw-pass counterpart, both variants are serialized together.
+  */
++
++#ifdef __APPLE__
++#include <dlfcn.h>
++#include <mach-o/loader.h>
++#include <sys/stat.h>
++
++#define REDWOOD_IR3_CACHE_DIR "/private/var/db/redwood-ir3cache"
++
++static const uint8_t *
++get_darwin_macho_uuid(const void *addr, unsigned *uuid_len)
++{
++   Dl_info info;
++   if (!dladdr(addr, &info) || !info.dli_fbase)
++      return NULL;
++
++   const struct mach_header_64 *header = (const struct mach_header_64 *)info.dli_fbase;
++   if (header->magic != MH_MAGIC_64)
++      return NULL;
++
++   const uint8_t *cmd_ptr = (const uint8_t *)(header + 1);
++   for (uint32_t i = 0; i < header->ncmds; i++) {
++      const struct load_command *cmd = (const struct load_command *)cmd_ptr;
++      if (cmd->cmd == LC_UUID) {
++         const struct uuid_command *ucmd = (const struct uuid_command *)cmd;
++         *uuid_len = sizeof(ucmd->uuid);
++         return ucmd->uuid;
++      }
++      cmd_ptr += cmd->cmdsize;
++   }
++   return NULL;
++}
++#endif
+ 
+ void
+ ir3_disk_cache_init(struct ir3_compiler *compiler)
+@@ -34,17 +66,37 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+    if (ir3_shader_debug & IR3_DBG_NOCACHE)
+       return;
+ 
+-#ifdef __APPLE__
+-   /* no build id in a Mach-O library to tell one build's shaders from another's: no cache */
+-   return;
+-#else
+    const char *renderer = fd_dev_name(compiler->dev_id);
++   const uint8_t *build_id_bytes = NULL;
++   unsigned build_id_len = 0;
++
++#ifdef __APPLE__
++   build_id_bytes = get_darwin_macho_uuid((const void *)ir3_disk_cache_init, &build_id_len);
++   if (!build_id_bytes || build_id_len == 0)
++      return;
++
++   if (!getenv("MESA_SHADER_CACHE_DIR")) {
++      char uuid_str[37];
++      snprintf(uuid_str, sizeof(uuid_str),
++               "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
++               build_id_bytes[0], build_id_bytes[1], build_id_bytes[2], build_id_bytes[3],
++               build_id_bytes[4], build_id_bytes[5], build_id_bytes[6], build_id_bytes[7],
++               build_id_bytes[8], build_id_bytes[9], build_id_bytes[10], build_id_bytes[11],
++               build_id_bytes[12], build_id_bytes[13], build_id_bytes[14], build_id_bytes[15]);
++      char cache_dir[256];
++      snprintf(cache_dir, sizeof(cache_dir), "%s/%s", REDWOOD_IR3_CACHE_DIR, uuid_str);
++      mkdir(REDWOOD_IR3_CACHE_DIR, 0777);
++      mkdir(cache_dir, 0777);
++      setenv("MESA_SHADER_CACHE_DIR", cache_dir, 1);
++   }
++#else
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+-   unsigned build_id_len = build_id_length(note);
++   build_id_len = build_id_length(note);
+    assert(note && build_id_len == BUILD_ID_EXPECTED_HASH_LENGTH); /* sha1 */
+ 
+-   const uint8_t *id_sha1 = build_id_data(note);
+-   assert(id_sha1);
++   build_id_bytes = build_id_data(note);
++   assert(build_id_bytes);
++#endif
+ 
+    blake3_hasher ctx;
+    uint8_t blake3[BLAKE3_KEY_LEN];
+@@ -52,6 +104,6 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+-   _mesa_blake3_update(&ctx, id_sha1, build_id_len);
++   _mesa_blake3_update(&ctx, build_id_bytes, build_id_len);
+    _mesa_blake3_update(&ctx, &compiler->options.uche_trap_base,
+                      sizeof(compiler->options.uche_trap_base));
+    _mesa_blake3_final(&ctx, blake3);
+ 
+    char timestamp[BLAKE3_HEX_LEN];
+    _mesa_blake3_format(timestamp, blake3);
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+-#endif
+ }

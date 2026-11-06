@@ -157,7 +157,7 @@ SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
 # ... but for these: bluetoothd, 11.6 MB (docs/analysis/2026-11-02-bluetooth-bringup.md)
 # remindd, 11.4 MB (docs/analysis/2026-11-05-app-exits-root-cause-and-fixes.md)
-BIG_PROGRAMS_KEPT = ('usr/sbin/bluetoothd', 'usr/libexec/remindd')
+BIG_PROGRAMS_KEPT = ('usr/sbin/bluetoothd', 'usr/libexec/remindd', 'usr/libexec/locationd')
 # sound, outside the directories above: the virtual audio device, a plug-in that all of mediaserverd's
 # audio goes through, with its tunings (signal processing chains) for this model and for any, and the
 # system's own sounds. Not the neural networks among the tunings, nor the sounds of the watch.

@@ -215,7 +215,7 @@ import sys
 # for ever, see «Sileo» in README.md.)
 # (mediaserverd is not among them, for all that there is neither sound nor a camera:
 # it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.)
-DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'locationd', 'softwareupdate',
+DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'ReportCrash',
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties',
@@ -231,6 +231,8 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
 # - fontservicesd allows WebContent/Safari to register dynamic web fonts (e.g. YouTube icon/web fonts).
 assert not any(word in 'com.apple.cameracaptured' for word in DENY), "cameracaptured must not be in DENY"
 assert not any(word in 'com.apple.fontservicesd' for word in DENY), "fontservicesd must not be in DENY"
+assert not any(word in 'com.apple.locationd' for word in DENY), "locationd must not be in DENY"
+assert not any(word in 'com.apple.weatherd' for word in DENY), "weatherd must not be in DENY"
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
