@@ -1135,7 +1135,6 @@ int
 main(int argc, char **argv, char **envp)
 {
 	int fd = open("/dev/console", O_RDWR, 0);
-	struct stat un_st;
 
 	dup2(fd, 0);
 	dup2(fd, 1);
@@ -1162,13 +1161,6 @@ main(int argc, char **argv, char **envp)
 			return 1;
 		}
 	}
-	if (lstat(in_image("/UserNotifications"), &un_st) == 0 && (un_st.st_mode & S_IFMT) == S_IFDIR &&
-	    lstat("/System/Library/UserNotifications/Bundles/com.apple.mobilecal.bundle", &un_st) != 0) {
-		if (lstat("/System/Library/UserNotifications", &un_st) != 0)
-			(void)synthetic_dir("/System/Library/UserNotifications");
-		(void)bind_dir(in_image("/UserNotifications"), "/System/Library/UserNotifications");
-	}
-
 	show_system();
 	if (!mount_writable()) {
 		printf("init: data volume mount failed; stopping before launchd\n");

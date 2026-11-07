@@ -86,7 +86,7 @@ rwa_unlock_scope(int *unused)
 #include "util/u_sampler.h"
 #include "util/u_debug.h"
 #include "util/macros.h" /* UNREACHABLE(), renamed from the unreachable() that used to arrive with the other headers */
-#include "util/u_math.h" /* CLAMP(), for the viewport rectangle */
+#include "util/u_math.h" /* CLAMP(), for the scissor rectangle */
 #include "util/u_gen_mipmap.h" /* util_gen_mipmap(), for -generateMipmapsForTexture: */
 
 /* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
@@ -6654,18 +6654,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    float znear = draw->depth_range ? draw->depth_range[0] : 0.0f;
    float zfar = draw->depth_range ? draw->depth_range[1] : 1.0f;
-   /* The rectangle the caller asked for inside the attachment, or the whole attachment when
-    * it asked for none. Clamped to the attachment first: Metal requires the viewport to lie
-    * inside the render target, and a rectangle whose origin or size reaches past it would
-    * otherwise move the mapping of every vertex rather than fail. */
+   /* Preserve the viewport transform outside the attachment. The framebuffer and scissor
+    * clip rasterization; clipping this rectangle would rescale the vertex positions. */
    float vx = 0.0f, vy = 0.0f, vw = (float)w, vh = (float)h;
    if (draw->viewport != NULL) {
-      float x0 = draw->viewport[0], y0 = draw->viewport[1];
-      float x1 = x0 + draw->viewport[2], y1 = y0 + draw->viewport[3];
-      vx = CLAMP(x0, 0.0f, (float)w);
-      vy = CLAMP(y0, 0.0f, (float)h);
-      vw = CLAMP(x1, 0.0f, (float)w) - vx;
-      vh = CLAMP(y1, 0.0f, (float)h) - vy;
+      vx = draw->viewport[0];
+      vy = draw->viewport[1];
+      vw = draw->viewport[2];
+      vh = draw->viewport[3];
    }
    state_viewport(device, &(struct pipe_viewport_state){
       /* The y scale is NEGATIVE, and that is Metal's rule rather than a convention picked

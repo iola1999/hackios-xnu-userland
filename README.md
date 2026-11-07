@@ -1,8 +1,8 @@
 # hackios-xnu-userland（REDMI K90 移植分支）
 
-本仓库是 [HackiOS K90 移植](https://github.com/iola1999/hackios-redmi-k90-annibale)的用户态部分：init 与注入库、launchd 任务、APFS 镜像构建、从 IPSW 选取 iOS 文件的脚本、Mesa 补丁与 AIR（Metal IR）前端，以及 Adreno 830 固件。默认分支 `k90-port`。使用方法、当前进展和排查记录都在顶层工作区。
+本仓库是 [HackiOS K90 移植](https://github.com/iola1999/hackios-redmi-k90-annibale)的用户态部分：init 与注入库、launchd 任务、APFS 镜像构建、从 IPSW 提取 iOS 文件的脚本、Mesa 补丁与 AIR（Metal IR）前端，以及 Adreno 830 固件。默认分支 `k90-port`。使用方法、当前进展和排查记录都在顶层工作区。
 
-本仓库 fork 自 OOSEX GANG 的 [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史。上游面向 iOS 16.5 的内容（`ios165/fetch.sh`、`prebuilt/userland/`、16.5 的测试场景）仍在仓库里，本分支不维护这部分；`ios26/fetch.sh` 仍调用 `ios165/` 里的选取脚本。
+本仓库 fork 自 OOSEX GANG 的 [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史。上游面向 iOS 16.5 的内容（`ios165/fetch.sh`、`prebuilt/userland/`、16.5 的测试场景）仍在仓库里，本分支不维护这部分。
 
 ## 1. 获取
 
@@ -20,10 +20,10 @@ common/ugit status        # 在这棵树里操作本仓库
 
 | 路径 | 内容 |
 |---|---|
-| `userland/build.sh` | 构建 APFS 镜像，变量说明在文件开头。iOS 26：在 macOS 上执行 `IOS=../ios26 bash build.sh`（需要 Xcode），得到系统盘 `system26.apfs`；暂存目录 `root/` 是顶层 `package.py` 打根盘的基线 |
+| `userland/build.sh` | 构建用户态程序与 APFS 镜像，变量说明在文件开头。iOS 26：在 `userland/` 执行 `COMPILE_ONLY=1 IOS=../ios26 bash build.sh`（需要 Xcode），生成供顶层 `package.py` 打包辅助盘的 `root/`；系统卷使用 IPSW 中的原版 APFS 容器 |
 | `userland/src/` | `init.c`（1 号进程）、注入 SpringBoard 等进程的库（`inject_sb26*.c` 等）、原生 IPA 管理器应用 `RedwoodInstaller.app`（`installer_app.m`、`build_installer.sh`）与安装工具 `appinst`（`appinst.m`）、触摸与按键服务、OpenGL ES 到 Mesa 的桥接（`eagl.c`）、测试程序 |
 | `userland/var/`、`var.skel.extra` | `/private/var` 的默认内容 |
-| `ios26/` | `fetch.sh` 从 iPhone 17 的 iOS 26.6.2 IPSW 取出文件（IPSW 需另行下载）；哪些文件进系统盘由 `ios165/select-system.py` 决定，`ios26/select-system.py` 是指向它的符号链接 |
+| `ios26/` | `fetch.sh` 完整提取 iPhone 17 的 iOS 26.6.2 `os.dmg`、`systemos.dmg` 与 `appos.dmg`（IPSW 需另行下载），供 helper、launchd 任务生成和框架分析使用；`full-system.py` 生成元数据并校验提取状态 |
 | `tools/mk-mesa.sh`、`tools/mesa/` | Mesa 加本项目补丁。K90 用 26.2.5 与 `REBASE=26`，补丁说明见 [tools/mesa/rebase-26/README.md](tools/mesa/rebase-26/README.md) |
 | `tools/mesa/air/`、`tools/air/` | AIR 前端与它的检查。说明在 [docs/air.md](docs/air.md)（上游，英文），[docs/air-report.md](docs/air-report.md) 是 `tools/air/check.sh` 生成的报告 |
 | `tools/apfs/` | 在电脑上写入和读取 APFS 镜像 |

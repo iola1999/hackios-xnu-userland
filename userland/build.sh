@@ -123,6 +123,10 @@ if [ -n "$FLASHBOOT_ONLY" ]; then
 	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.apfs "Boot=$boot_tree/root"
 	exit 0
 fi
+# Helper jobs are generated from the complete extracted system files.
+if [ "$V" = 26 ]; then
+	python3 "$IOS/full-system.py" check "$IOS" || exit 1
+fi
 # The 26 line's processes are arm64e, and only Apple's clang emits arm64e with pointer authentication
 # (the architecture check below), so on macOS its dynamic programs and libraries are built with
 # Xcode's clang and iPhoneOS SDK. The static ones (CC) keep xnu-clang, which links with Xcode's ld there.
@@ -780,11 +784,8 @@ PY
 	# kernel's log; the daemons keep their own standard error on the console all the same.
 	rm -f root/etc/quiet
 	[ -n "$QUIET" ] && : > root/etc/quiet
-	# the jobs the iOS launchd will see (/System/Library/LaunchDaemons is a symlink to this directory).
-	# With FLASHBOOT=1 the root will be Apple's whole volume on the flash, not the part of it that fits in
-	# the system image, so mkjobs.py judges "is this daemon's program there" by the listing of the volume
-	# and not by what select-system.py extracted here (--root-volume; seven jobs turn on the difference,
-	# fairplayd among them).
+	# init exposes these jobs at /System/Library/LaunchDaemons. FLASHBOOT checks programs against
+	# the original volume listing; other builds check the extracted files (complete for iOS 26).
 	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
@@ -870,10 +871,6 @@ done
 if [ "$V" = 26 ]; then
 	cp $IOS/rootfs/System/Library/xpc/foreground_user_endpoints.plist root/xpc/
 	./mkcache.py $IOS/rootfs/System/Library/xpc/launchd.plist root/LaunchDaemons root/xpc/launchd.plist
-	if [ -d "$IOS/rootfs/System/Library/UserNotifications" ]; then
-		rm -rf root/UserNotifications
-		cp -a "$IOS/rootfs/System/Library/UserNotifications" root/UserNotifications
-	fi
 	# and it panics on a job whose program is not a platform binary; the kernel takes an ad hoc
 	# signed program for one (xnu/files/bsd/kern/kern_minimac.c). macOS's own codesign: the one of
 	# the kernel build's host tools (xnu-deps/host/bin) does nothing.
@@ -1058,11 +1055,12 @@ fi
 # --- the system image -----------------------------------------------------------------------------
 if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 	{ [ ! -f system$V.apfs ] || [ obj/stage0 -nt system$V.apfs ] || [ $IOS/system.manifest -nt system$V.apfs ] ||
-	  [ $IOS/cryptex -nt system$V.apfs ] || [ $IOS/cryptex-app -nt system$V.apfs ] || [ -n "$SYSTEM" ]; }; then
+	  [ $IOS/.done-rootfs -nt system$V.apfs ] || [ $IOS/cryptex -nt system$V.apfs ] ||
+	  [ $IOS/cryptex-app -nt system$V.apfs ] || [ -n "$SYSTEM" ]; }; then
 	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
 	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
 	# speaker and played nothing, though our device was there and the kernel's side worked)
-	if [ -f $IOS/.done-rootfs ] && [ $IOS/select-system.py -nt $IOS/.done-rootfs ]; then
+	if [ "$V" != 26 ] && [ -f $IOS/.done-rootfs ] && [ $IOS/select-system.py -nt $IOS/.done-rootfs ]; then
 		echo "build.sh: ios165/select-system.py has changed since ios165/rootfs was extracted: run KEEP=1 ios165/fetch.sh" >&2
 		exit 1
 	fi
@@ -1080,7 +1078,7 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 	# where the kernel mounts the iOS root container off the phone's flash (boot-arg apfs_volume=):
 	# iOS has no /System/Volumes, and nothing can make a directory in this image once it is built
 	mkdir -p sysroot/System/Volumes/iOS
-	# the applications iOS installs on its first boot are system applications here (see select-system.py)
+	# Staged system applications belong in /Applications in the synthesized volume.
 	if [ -d sysroot/private/var/staged_system_apps ]; then
 		mv sysroot/private/var/staged_system_apps/* sysroot/Applications/
 		rm -rf sysroot/private/var

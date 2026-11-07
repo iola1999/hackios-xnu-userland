@@ -13,19 +13,10 @@ The program itself must be there at run time; a warning is printed if it will no
 If the label has no LaunchDaemons entry, its LaunchAngels entry is used with the same
 on-demand startup rules as --rest.
 
-What "there at run time" means is the recipe, not what happens to be unpacked on this machine, and the
-two recipes differ. With the system image as the root, it is what select-system.py chose, and a daemon it
-left out as too big really is absent. With the iOS volume on the phone's flash as the root (build.sh
-FLASHBOOT=1), the root is Apple's whole volume: --root-volume names the technical listing of its image
-(ios165/rootfs.slt) and a program counts as there if Apple ships it. Seven jobs turn on that --
-fairplayd, identityservicesd, passd, assistantd, callservicesd, lskdd, searchpartyd -- and were being
-refused on a flash boot for a reason true only of the thinned copy here. (fairplayd now runs on the phone
-and is never missed from a lookup again, but it does not stay: it exits 0 the moment it starts, says nothing,
-and KeepAlive brings it back every ten seconds -- 22 times in a session, not one signal. It wants the IOKit
-user client com_apple_driver_FairPlayIOKitUserClient, which this kernel has not got. The empty App Store and
-Weather were never its doing: see the network section of README.md.) Eight more, Safari's and
-AuthenticationServicesAgent, hang on the App cryptex being unpacked beside it at all (see CRYPTEXES
-below); a workspace used to lose those silently, which tools/new-workspace.sh no longer does.
+Programs are checked against IOS_ROOTFS. For iOS 26, fetch.sh extracts the complete original
+root volume. --root-volume uses the paths in a 7z technical listing instead of files under
+IOS_ROOTFS. Programs under /System/Cryptexes/OS and /System/Cryptexes/App are always checked
+against the corresponding extracted cryptex and cryptex-app directories beside IOS_ROOTFS.
 
 With --rest, the other jobs of iOS follow (their standard error on the console as well, their os_log
 only when named in OSLOG), and with them the "launch angels" (System/Library/LaunchAngels: the
@@ -128,7 +119,7 @@ import sys
 # absent, while launchd's "Last log repeated 2312 times" of failed lookups fills the window. So the
 # store's missing bag strings are not evidence that no bag was fetched; they are evidence of nothing.
 # What the console did carry, and what is therefore true, is the opposite of what was written here:
-# THE PHONE'S NETWORK WORKS. en0 is 192.168.9.243, mDNSResponder resolves over TCP to 192.168.9.1:53
+# THE PHONE'S NETWORK WORKS. en0 has an IPv4 address, mDNSResponder resolves over TCP port 53
 # (four queries, answers of 159, 842, 200 and 107 bytes), and trustd, geod, maild, gamed, cloudd,
 # StocksWidget and nsurlsessiond all open TLS to Apple and Akamai (17.248.214.x, 17.253.39.x,
 # 2.16.56.93, 23.11.40.157, 95.100.176.233). "net_test: en0: flags 0x8802" was read 0.1 s into user

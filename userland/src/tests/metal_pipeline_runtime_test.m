@@ -22,6 +22,7 @@
 
 static const char *phase = "arguments";
 static unsigned computes, draws, copies, completed_buffers;
+static BOOL oversized_viewport;
 static const float positions[4][4] = {
     { -1, -1, 0, 1 }, { 1, -1, 0, 1 }, { -1, 1, 0, 1 }, { 1, 1, 0, 1 }
 };
@@ -208,6 +209,7 @@ static void fill_bgra(uint8_t *bytes, size_t pitch, BOOL pattern)
     for (unsigned y = 0; y < 64; y++) {
         for (unsigned x = 0; x < 64; x++) {
             unsigned tx = x / 8, ty = y / 8;
+            if (oversized_viewport) { tx = (x + 32) / 16; ty = (y + 32) / 16; }
             uint8_t pixel[4] = { 255, 0, 255, 255 };
             if (pattern) {
                 pixel[0] = (((tx >> 1) ^ (ty >> 1)) & 1) * 255;
@@ -301,7 +303,8 @@ static BOOL draw_test(id<MTLDevice> device, id<MTLCommandQueue> queue,
     if (!encoder || encoder.device != device) return fail("render encoder creation failed");
     @try {
         [encoder setRenderPipelineState:pipeline];
-        [encoder setViewport:(MTLViewport){ 0, 0, 64, 64, 0, 1 }];
+        [encoder setViewport:sampling && oversized_viewport ?
+            (MTLViewport){ -32, -32, 128, 128, 0, 1 } : (MTLViewport){ 0, 0, 64, 64, 0, 1 }];
         [encoder setCullMode:MTLCullModeNone];
         [encoder setVertexBuffer:position_buffer offset:0 atIndex:sampling ? 0 : 14];
         if (sampling) {
@@ -409,10 +412,18 @@ static BOOL surface_test(id<MTLDevice> device, id<MTLCommandQueue> queue,
                 textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)
                 swizzle:MTLTextureSwizzleChannelsDefault]
         };
-        BOOL refused = YES;
-        for (unsigned i = 0; i < 3; i++) { refused &= views[i] == nil; [views[i] release]; }
-        if (!refused) return fail("texture views unexpectedly accepted");
-        printf("metalpipeline26: IOSurface identity/plane verified; three view forms refused\n");
+        BOOL valid_views = YES;
+        for (unsigned i = 0; i < 3; i++) {
+            id<MTLTexture> view = views[i];
+            BOOL identity = view && view.width == 64 && view.height == Rows &&
+                view.pixelFormat == MTLPixelFormatBGRA8Unorm && view.iosurface == surface &&
+                view.iosurfacePlane == 0 && view.parentTexture == imported;
+            printf("metalpipeline26: IOSurface view=%u identity=%d\n", i, identity);
+            valid_views &= identity && check_bgra(view, NO);
+            [view release];
+        }
+        if (!valid_views) return fail("texture view identity, geometry or pixels mismatch");
+        printf("metalpipeline26: IOSurface identity/plane and pixels verified for three view forms\n");
         CFRelease(surface);
         owns_surface = NO;
         surface = imported.iosurface; /* Borrowed while the owned texture remains alive. */
@@ -465,11 +476,12 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--software")) software = YES;
         else if (!strcmp(argv[i], "--iosurface")) surface_mode = YES;
+        else if (!strcmp(argv[i], "--oversized-viewport")) oversized_viewport = YES;
         else if (!strcmp(argv[i], "--library") && i + 1 < argc) library_path = argv[++i];
         else if (!strcmp(argv[i], "--compute") && i + 1 < argc) compute_path = argv[++i];
         else if (!strcmp(argv[i], "--system-shaders") && i + 1 < argc) system_path = argv[++i];
         else {
-            fprintf(stderr, "usage: %s [--software] [--iosurface] [--library DYLIB] [--compute METALLIB] [--system-shaders METALLIB]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--software] [--iosurface] [--oversized-viewport] [--library DYLIB] [--compute METALLIB] [--system-shaders METALLIB]\n", argv[0]);
             return 2;
         }
     }
@@ -492,8 +504,8 @@ int main(int argc, char **argv)
     @autoreleasepool {
         @try {
             NSDictionary *version = [NSDictionary dictionaryWithContentsOfFile:@"/System/Library/CoreServices/SystemVersion.plist"];
-            printf("metalpipeline26: build=%s mode=%s library=%s\n",
-                [version[@"ProductBuildVersion"] UTF8String] ?: "unknown", software ? "software" : "hardware", library_path);
+            printf("metalpipeline26: build=%s mode=%s library=%s oversized_viewport=%d\n",
+                [version[@"ProductBuildVersion"] UTF8String] ?: "unknown", software ? "software" : "hardware", library_path, oversized_viewport);
             stage("dlopen Metal candidate");
             plugin = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
             if (!plugin) { fail("dlopen: %s", dlerror()); goto finished; }

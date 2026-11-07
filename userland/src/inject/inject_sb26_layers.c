@@ -17,6 +17,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <dispatch/dispatch.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -444,6 +445,74 @@ describe_scene(id view, unsigned depth)
     lines++;
 }
 
+/* SDF getters use the 23G90 signatures; an unavailable value is printed as nan or -1. */
+static SEL
+sdf_getter(id object, const char *name, const char *encoding)
+{
+    SEL selector = sel_registerName(name);
+    Method method = object ? class_getInstanceMethod(object_getClass(object), selector) : NULL;
+    const char *actual = method ? method_getTypeEncoding(method) : NULL;
+    return actual && strcmp(actual, encoding) == 0 ? selector : NULL;
+}
+
+static double
+sdf_number(id object, const char *name)
+{
+    SEL selector = sdf_getter(object, name, "d16@0:8");
+    return selector ? ((double (*)(id, SEL))objc_msgSend)(object, selector) : NAN;
+}
+
+static int
+sdf_flag(id object, const char *name)
+{
+    SEL selector = sdf_getter(object, name, "B16@0:8");
+    return selector ? ((BOOL (*)(id, SEL))objc_msgSend)(object, selector) : -1;
+}
+
+static const char *
+sdf_string(id object, const char *name, char *buffer, size_t size)
+{
+    SEL selector = sdf_getter(object, name, "@16@0:8");
+    id value = selector ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
+    if (!value || CFGetTypeID((CFTypeRef)value) != CFStringGetTypeID() ||
+        !CFStringGetCString((CFStringRef)value, buffer, size, kCFStringEncodingUTF8))
+        snprintf(buffer, size, "unavailable");
+    return buffer;
+}
+
+static void
+describe_sdf(id layer, unsigned depth)
+{
+    BOOL sdf = NO, element = NO;
+    Class sdf_class = objc_getClass("CASDFLayer"), element_class = objc_getClass("CASDFElementLayer");
+    for (Class cls = object_getClass(layer); cls; cls = class_getSuperclass(cls)) {
+        sdf |= cls == sdf_class;
+        element |= cls == element_class;
+    }
+    if (sdf) {
+        SEL selector = sdf_getter(layer, "effect", "@16@0:8");
+        id effect = selector ? ((id (*)(id, SEL))objc_msgSend)(layer, selector) : nil;
+        char color[32] = "unavailable";
+        selector = sdf_getter(effect, "color", "^{CGColor=}16@0:8");
+        if (selector) describe_color(((id (*)(id, SEL))objc_msgSend)(effect, selector), color, sizeof(color));
+        out("sb26 layer %2u sdf effect=%.96s offset=%.6g smoothness=%.6g gaussian=%.6g merge=%d color=%s height=%.6g angle=%.6g curvature=%.6g amount=%.6g spread=%.6g maskOffset=%.6g global=%d\n",
+            depth, name_of(effect), sdf_number(layer, "effectOffset"), sdf_number(layer, "smoothness"),
+            sdf_number(layer, "gaussianRadius"), sdf_flag(layer, "mergeElements"), color,
+            sdf_number(effect, "height"), sdf_number(effect, "angle"), sdf_number(effect, "curvature"),
+            sdf_number(effect, "amount"), sdf_number(effect, "spread"), sdf_number(effect, "maskOffset"),
+            sdf_flag(effect, "global"));
+        lines++;
+    } else if (element) {
+        char mode[48], operation[48];
+        out("sb26 layer %2u sdf-element mode=%s operation=%s zeroDistance=%.6g oneDistance=%.6g ovalization=%.6g hitTestsAsFill=%d\n",
+            depth, sdf_string(layer, "mode", mode, sizeof(mode)),
+            sdf_string(layer, "operation", operation, sizeof(operation)),
+            sdf_number(layer, "contentsZeroValueDistance"), sdf_number(layer, "contentsOneValueDistance"),
+            sdf_number(layer, "gradientOvalization"), sdf_flag(layer, "hitTestsAsFill"));
+        lines++;
+    }
+}
+
 static int
 matches(id layer, const char *filter)
 {
@@ -473,6 +542,8 @@ walk(id layer, unsigned depth, const char *filter, int below, int full)
         describe_image(send(layer, "contents"), depth);
         lines++;
         describe_scene(send(layer, "delegate"), depth);
+        if ((full || (filter && strcmp(filter, "SDF") == 0)) && lines < max_lines)
+            describe_sdf(layer, depth);
     }
     id sublayers = send(layer, "sublayers");
     unsigned long count = sublayers ? ((unsigned long (*)(id, SEL))objc_msgSend)(sublayers,

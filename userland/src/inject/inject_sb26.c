@@ -648,12 +648,9 @@ sb26_hook_MGCopyAnswer(CFStringRef property)
 }
 
 /*
- * CoreFoundation bundle localization fix:
- * In pruned images (select-system.py), zh*.lproj directories are absent,
- * causing CFBundleCopyBundleLocalizations to assume the bundle only supports English.
- * System .loctable files retain Chinese translation entries.
- * We interpose CFBundleCopyBundleLocalizations to append Chinese language identifiers
- * whenever the bundle has localization resources (.loctable or strings).
+ * Append Chinese language identifiers if the reported localizations contain no zh identifier
+ * and the bundle contains localization resource files. This checks resource presence only;
+ * it does not inspect which languages the files contain.
  */
 extern CFArrayRef CFBundleCopyBundleLocalizations(CFBundleRef bundle);
 
