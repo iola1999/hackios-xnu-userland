@@ -519,7 +519,7 @@ install_into(NSString *source, NSString *bundle)
 		@"group.com.SideStore.SideStore",
 		@"group.com.rileytestut.AltStore"
 	]);
-	if (access(execPath.fileSystemRepresentation, W_OK) == 0) {
+	if (access(app.fileSystemRepresentation, W_OK) == 0) {
 		sign_all_machos(app, nil);
 	}
 
@@ -616,7 +616,7 @@ register_system_app(NSString *appPath)
 	                                                                               existed:NULL error:&error];
 	NSString *home = data.url.path ?: @"/private/var/mobile";
 
-	if (access(execPath.fileSystemRepresentation, W_OK) == 0) {
+	if (access(app.fileSystemRepresentation, W_OK) == 0) {
 		sign_all_machos(app, nil);
 	}
 

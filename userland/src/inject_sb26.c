@@ -392,8 +392,8 @@ install_unlock(void)
         }
     }
 
-    if (sb26_boot_arg_present("autounlock=0")) {
-        fprintf(stderr, "sb26: autounlock=0, the lock screen stays until it is swiped away\n");
+    if (!sb26_boot_arg_present("autounlock=1")) {
+        fprintf(stderr, "sb26: autounlock!=1, the lock screen stays until it is swiped away\n");
         return;
     }
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, UNLOCK_FIRST_SECONDS * NSEC_PER_SEC),
