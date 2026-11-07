@@ -7,27 +7,6 @@
 
 #include <sys/sysctl.h>
 
-typedef int nw_path_status_t;
-typedef uint32_t SCNetworkReachabilityFlags;
-typedef unsigned char Boolean;
-typedef long CFIndex;
-typedef const void *CFStringRef;
-typedef void (*sc_reach_callback_t)(void *target, SCNetworkReachabilityFlags flags, void *info);
-typedef struct {
-	CFIndex version;
-	void *info;
-	const void *(*retain)(const void *info);
-	void (*release)(const void *info);
-	CFStringRef (*copyDescription)(const void *info);
-} sc_reach_context_t;
-
-struct sc_target_state {
-	void *target;
-	sc_reach_callback_t callback;
-	void *info;
-	struct sc_target_state *next;
-};
-
 struct redwood_modem_user_status {
 	uint32_t magic;
 	uint32_t state;
@@ -48,19 +27,6 @@ struct redwood_modem_user_status {
 	char     rat[16];
 	char     operator_name[32];
 };
-
-static struct sc_target_state *sc_targets = NULL;
-static nw_path_status_t (*orig_nw_path_get_status)(void *path) = NULL;
-static bool (*orig_nw_path_is_satisfied)(void *path) = NULL;
-static bool (*orig_nw_path_is_expensive)(void *path) = NULL;
-static bool (*orig_nw_path_is_constrained)(void *path) = NULL;
-static bool (*orig_nw_path_has_ipv4)(void *path) = NULL;
-static bool (*orig_nw_path_has_dns)(void *path) = NULL;
-static bool (*orig_nw_path_uses_interface_type)(void *path, int type) = NULL;
-
-static Boolean (*orig_sc_reach_get_flags)(void *target, SCNetworkReachabilityFlags *flags) = NULL;
-static Boolean (*orig_sc_reach_set_cb)(void *target, sc_reach_callback_t cb, sc_reach_context_t *ctx) = NULL;
-static Boolean (*orig_sc_reach_set_dq)(void *target, dispatch_queue_t queue) = NULL;
 
 /* Live kernel cellular state cache (refreshed at most once every 2 seconds). */
 static struct {
@@ -170,131 +136,6 @@ pdp_ip0_active(void)
 {
 	redwood_refresh_cellular_state();
 	return cell_cache.modem_state >= 6;
-}
-
-static nw_path_status_t
-hooked_nw_path_get_status(void *path)
-{
-	nw_path_status_t s = orig_nw_path_get_status ? orig_nw_path_get_status(path) : 1;
-	if (s != 1 && en0_has_ipv4()) {
-		return 1; /* nw_path_status_satisfied */
-	}
-	return s;
-}
-
-static bool
-hooked_nw_path_is_satisfied(void *path)
-{
-	if (orig_nw_path_is_satisfied && orig_nw_path_is_satisfied(path)) {
-		return true;
-	}
-	return en0_has_ipv4();
-}
-
-static bool
-hooked_nw_path_is_expensive(void *path)
-{
-	if (en0_has_ipv4()) {
-		return false;
-	}
-	return orig_nw_path_is_expensive ? orig_nw_path_is_expensive(path) : false;
-}
-
-static bool
-hooked_nw_path_is_constrained(void *path)
-{
-	if (en0_has_ipv4()) {
-		return false;
-	}
-	return orig_nw_path_is_constrained ? orig_nw_path_is_constrained(path) : false;
-}
-
-static bool
-hooked_nw_path_has_ipv4(void *path)
-{
-	if (orig_nw_path_has_ipv4 && orig_nw_path_has_ipv4(path)) {
-		return true;
-	}
-	return en0_has_ipv4();
-}
-
-static bool
-hooked_nw_path_has_dns(void *path)
-{
-	if (orig_nw_path_has_dns && orig_nw_path_has_dns(path)) {
-		return true;
-	}
-	return en0_has_ipv4();
-}
-
-static bool
-hooked_nw_path_uses_interface_type(void *path, int type)
-{
-	if (orig_nw_path_uses_interface_type && orig_nw_path_uses_interface_type(path, type)) {
-		return true;
-	}
-	if (type == 1 /* wifi */ && en0_has_ipv4()) {
-		return true;
-	}
-	if (type == 2 /* cellular */ && pdp_ip0_active()) {
-		return true;
-	}
-	return false;
-}
-
-static Boolean
-hooked_sc_reach_get_flags(void *target, SCNetworkReachabilityFlags *flags)
-{
-	Boolean ok = orig_sc_reach_get_flags ? orig_sc_reach_get_flags(target, flags) : 1;
-	if (flags != NULL && en0_has_ipv4()) {
-		*flags |= 0x00020002; /* kSCNetworkReachabilityFlagsReachable | kSCNetworkReachabilityFlagsIsDirect */
-		*flags &= ~(1u << 2); /* clear ConnectionRequired */
-		*flags &= ~(1u << 4); /* clear InterventionRequired */
-		*flags &= ~(1u << 18); /* clear IsWWAN */
-		return 1;
-	}
-	return ok;
-}
-
-static Boolean
-hooked_sc_reach_set_cb(void *target, sc_reach_callback_t cb, sc_reach_context_t *ctx)
-{
-	Boolean res = orig_sc_reach_set_cb ? orig_sc_reach_set_cb(target, cb, ctx) : 1;
-	if (target != NULL) {
-		struct sc_target_state *cur = sc_targets;
-		while (cur != NULL && cur->target != target) {
-			cur = cur->next;
-		}
-		if (cur == NULL) {
-			cur = calloc(1, sizeof(struct sc_target_state));
-			cur->target = target;
-			cur->next = sc_targets;
-			sc_targets = cur;
-		}
-		cur->callback = cb;
-		cur->info = ctx ? ctx->info : NULL;
-	}
-	return res;
-}
-
-static Boolean
-hooked_sc_reach_set_dq(void *target, dispatch_queue_t queue)
-{
-	Boolean res = orig_sc_reach_set_dq ? orig_sc_reach_set_dq(target, queue) : 1;
-	if (target != NULL && queue != NULL && en0_has_ipv4()) {
-		struct sc_target_state *cur = sc_targets;
-		while (cur != NULL && cur->target != target) {
-			cur = cur->next;
-		}
-		if (cur != NULL && cur->callback != NULL) {
-			sc_reach_callback_t cb = cur->callback;
-			void *cb_info = cur->info;
-			dispatch_async(queue, ^{
-				cb(target, 0x00020002, cb_info);
-			});
-		}
-	}
-	return res;
 }
 
 /* ObjC hooks for Network.framework, GeoServices, CoreTelephony, SystemStatus, and NSFileManager */
@@ -685,109 +526,11 @@ watch_network_classes(void)
 	watch_cellular_classes();
 }
 
-struct app_symbol_rebind {
-	const char *name;
-	void *replacement;
-	void **original;
-};
-
-static void
-rebind_image_symbols(const struct mach_header *header, intptr_t slide_val)
-{
-	const struct mach_header_64 *mh = (const struct mach_header_64 *)header;
-	if (mh->magic != MH_MAGIC_64) {
-		return;
-	}
-	const struct load_command *lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
-	uintptr_t linkedit_base = 0;
-	const struct symtab_command *symtab = NULL;
-	const struct dysymtab_command *dysymtab = NULL;
-
-	for (uint32_t i = 0; i < mh->ncmds; i++) {
-		if (lc->cmd == LC_SEGMENT_64) {
-			const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-			if (strcmp(seg->segname, "__LINKEDIT") == 0) {
-				linkedit_base = (uintptr_t)slide_val + seg->vmaddr - seg->fileoff;
-			}
-		} else if (lc->cmd == LC_SYMTAB) {
-			symtab = (const struct symtab_command *)lc;
-		} else if (lc->cmd == LC_DYSYMTAB) {
-			dysymtab = (const struct dysymtab_command *)lc;
-		}
-		lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
-	}
-	if (!linkedit_base || !symtab || !dysymtab) {
-		return;
-	}
-
-	const struct nlist_64 *symList = (const struct nlist_64 *)(linkedit_base + symtab->symoff);
-	const char *strTab = (const char *)(linkedit_base + symtab->stroff);
-	const uint32_t *indirectSyms = (const uint32_t *)(linkedit_base + dysymtab->indirectsymoff);
-
-	static struct app_symbol_rebind target_rebinds[] = {
-		{ "_nw_path_get_status", (void *)hooked_nw_path_get_status, (void **)&orig_nw_path_get_status },
-		{ "_nw_path_is_satisfied", (void *)hooked_nw_path_is_satisfied, (void **)&orig_nw_path_is_satisfied },
-		{ "_nw_path_is_expensive", (void *)hooked_nw_path_is_expensive, (void **)&orig_nw_path_is_expensive },
-		{ "_nw_path_is_constrained", (void *)hooked_nw_path_is_constrained, (void **)&orig_nw_path_is_constrained },
-		{ "_nw_path_has_ipv4", (void *)hooked_nw_path_has_ipv4, (void **)&orig_nw_path_has_ipv4 },
-		{ "_nw_path_has_dns", (void *)hooked_nw_path_has_dns, (void **)&orig_nw_path_has_dns },
-		{ "_nw_path_uses_interface_type", (void *)hooked_nw_path_uses_interface_type, (void **)&orig_nw_path_uses_interface_type },
-		{ "_SCNetworkReachabilityGetFlags", (void *)hooked_sc_reach_get_flags, (void **)&orig_sc_reach_get_flags },
-		{ "_SCNetworkReachabilitySetCallback", (void *)hooked_sc_reach_set_cb, (void **)&orig_sc_reach_set_cb },
-		{ "_SCNetworkReachabilitySetDispatchQueue", (void *)hooked_sc_reach_set_dq, (void **)&orig_sc_reach_set_dq },
-	};
-	const size_t num_rebinds = sizeof(target_rebinds) / sizeof(target_rebinds[0]);
-
-	lc = (const struct load_command *)((uintptr_t)mh + sizeof(struct mach_header_64));
-	for (uint32_t i = 0; i < mh->ncmds; i++) {
-		if (lc->cmd == LC_SEGMENT_64) {
-			const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-			if (strncmp(seg->segname, "__DATA", 6) == 0 || strncmp(seg->segname, "__AUTH", 6) == 0) {
-				const struct section_64 *sec = (const struct section_64 *)((uintptr_t)seg + sizeof(struct segment_command_64));
-				for (uint32_t j = 0; j < seg->nsects; j++) {
-					uint8_t type = sec[j].flags & SECTION_TYPE;
-					if (type == S_NON_LAZY_SYMBOL_POINTERS || type == S_LAZY_SYMBOL_POINTERS) {
-						uint32_t sec_indirect_offset = sec[j].reserved1;
-						void **pointers = (void **)((uintptr_t)slide_val + sec[j].addr);
-						size_t entry_count = sec[j].size / sizeof(void *);
-
-						for (size_t k = 0; k < entry_count; k++) {
-							uint32_t symIndex = indirectSyms[sec_indirect_offset + k];
-							if (symIndex == INDIRECT_SYMBOL_LOCAL || symIndex == INDIRECT_SYMBOL_ABS) {
-								continue;
-							}
-							uint32_t strOffset = symList[symIndex].n_un.n_strx;
-							if (strOffset == 0) continue;
-							const char *symbol_name = strTab + strOffset;
-							for (size_t r = 0; r < num_rebinds; r++) {
-								if (strcmp(symbol_name, target_rebinds[r].name) == 0) {
-									if (target_rebinds[r].original != NULL && *target_rebinds[r].original == NULL) {
-										*target_rebinds[r].original = pointers[k];
-									}
-									vm_prot_t orig_prot = VM_PROT_READ | VM_PROT_WRITE;
-									vm_address_t page_addr = (vm_address_t)&pointers[k] & ~PAGE_MASK;
-									vm_size_t page_size = PAGE_SIZE;
-									vm_protect(mach_task_self(), page_addr, page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-									pointers[k] = target_rebinds[r].replacement;
-									vm_protect(mach_task_self(), page_addr, page_size, FALSE, orig_prot);
-									break;
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		lc = (const struct load_command *)((uintptr_t)lc + lc->cmdsize);
-	}
-}
-
 static void
 app_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
 {
-	if ((uintptr_t)mh < CACHE_BASE) {
-		rebind_image_symbols(mh, vmaddr_slide);
-	}
+	(void)mh;
+	(void)vmaddr_slide;
 	watch_network_classes();
 	if (!app_vp9_hook_installed) {
 		app_enable_webkit_vp9();
