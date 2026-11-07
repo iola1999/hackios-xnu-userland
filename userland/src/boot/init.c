@@ -2,7 +2,7 @@
  * Process 1 of the Darwin bring-up, until it hands over to the real launchd.
  *
  * It lives in the small image mounted on /redwood (see stage0.c) and
- *   - mounts a memory filesystem on /private/var and creates the directories
+ *   - mounts the writable data volume on /private/var and creates the directories
  *     a system expects there;
  *   - checks what the kernel can do for user space, one line per check;
  *   - runs the commands listed in etc/rc of its image: usually just
@@ -113,28 +113,29 @@ synthetic_dir(const char *path)
 	return ok;
 }
 
+#ifndef ENOENT
+#define ENOENT 2
+#endif
+
+/* Existing mount points must be directories; create missing ones on the read-only APFS volume. */
+static int
+mount_dir(const char *path)
+{
+	struct stat st;
+
+	if (lstat(path, &st) == 0) {
+		return (st.st_mode & S_IFMT) == S_IFDIR;
+	}
+	return errno == ENOENT && synthetic_dir(path);
+}
+
 /*
- * root_apfs=DEV: the root is to be the iOS root volume on /dev/DEV -- the phone's flash, read
- * only.  The kernel has started off the boot volume of flashboot.apfs (the resident image, md0,
- * its first container: stage0, firmware, mount points; the OS cryptex with the dyld shared cache
- * is its second container) and stage0 has mounted this image on /redwood.  What the big system image changes in iOS (userland/build.sh) is put in place on
- * the volume instead, without writing to it:
- *   - our choice of launchd jobs instead of iOS's 500 (this image's LaunchDaemons, and
- *     nothing for NanoLaunchDaemons, LaunchAngels, nor xpc's launchd.plist, which launchd
- *     would read instead of the directory);
- *   - only our audio device among the audio server's plug-ins;
- *   - the applications iOS installs on its first boot (private/var/staged_system_apps)
- *     among the system's own in /Applications: another name for each there (a synthetic
- *     entry of the volume -- not a mount, which whatever registers the system's
- *     applications passed over), made before /private/var is covered by a memory
- *     filesystem.
- * Then the volume becomes the root (sysctl kern.redwood_switch_root) and the boot volume
- * goes to its /private/preboot, the cryptexes onto that volume's Cryptexes/OS and App: the iOS
- * volume's /System/Cryptexes/OS and App point to /private/preboot/Cryptexes/OS and App, and the
- * kernel takes a shared cache from the first.  This
- * image goes along with it, to /private/preboot/redwood, and is bound back on /redwood, a
- * synthetic directory of the volume.  The boot-args stay those of a RAM disk (rd=md0),
- * which is what launchd reads to leave out the boot tasks of a real device.
+ * root_apfs=DEV mounts the read-only iOS volume and binds the boot image's launchd jobs, xpc
+ * cache, HAL plug-ins and Metal bundle over its system paths. Staged applications get synthetic
+ * names in /Applications before /private/var is mounted. No system-volume data is written.
+ * After switching the root, the boot volume moves to /private/preboot, md1 is rebound on /redwood,
+ * and OS/App cryptexes mount beneath /private/preboot/Cryptexes. The kernel uses the OS shared cache.
+ * rd=md0 stays on the command line so launchd skips the real-device boot tasks.
  */
 #ifndef EINVAL
 #define EINVAL 22
@@ -181,7 +182,7 @@ mount_cryptex(const char *name, const char *container, const char *flashdev)
 	check(1, what);
 }
 
-static void
+static int
 flash_root(const char *dev)
 {
 	static char buf[8192];
@@ -189,7 +190,7 @@ flash_root(const char *dev)
 	struct stat fw_st;
 	off_t pos = 0;
 	ssize_t n;
-	int fd, ok, apps = 0, bound = 0;
+	int fd, ok, apps = 0, bound = 0, before = failures;
 
 	printf("\n-- the iOS root volume on /dev/%s as the root --\n", dev);
 	strcpy(devpath, join("/dev/", dev, ""));
@@ -199,15 +200,20 @@ flash_root(const char *dev)
 	}
 	check(ok, "mount the iOS volume read only");
 	if (!ok) {
-		return;
+		return 0;
 	}
-	check(synthetic_dir("/flash/redwood"), "a synthetic /redwood on it, for this image");
-	check(bind_dir(in_image("/LaunchDaemons"), "/flash/System/Library/LaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/NanoLaunchDaemons") &&
-	    bind_dir(in_image("/empty"), "/flash/System/Library/LaunchAngels") &&
-	    bind_dir(in_image("/xpc"), "/flash/System/Library/xpc"), "our launchd jobs, not iOS's");
-	check(bind_dir(in_image("/hal"), "/flash/System/Library/Audio/Plug-Ins/HAL"),
-	    "our audio device, not Apple's plug-ins");
+	check(mount_dir("/flash/redwood"), "prepare /redwood");
+	check(mount_dir("/flash/private/preboot"), "prepare /private/preboot");
+	static const struct { const char *from, *to; } mounts[] = {
+		{ "/LaunchDaemons", "/flash/System/Library/LaunchDaemons" },
+		{ "/empty", "/flash/System/Library/NanoLaunchDaemons" },
+		{ "/empty", "/flash/System/Library/LaunchAngels" },
+		{ "/xpc", "/flash/System/Library/xpc" },
+		{ "/hal", "/flash/System/Library/Audio/Plug-Ins/HAL" },
+	};
+	for (unsigned i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
+		check(mount_dir(mounts[i].to) && bind_dir(in_image(mounts[i].from), mounts[i].to), mounts[i].to);
+	}
 	if (stat(in_image("/lib/RedwoodMetal.bundle"), &fw_st) == 0) {
 		if (lstat("/flash/System/Library/Extensions/RedwoodMetal.bundle", &fw_st) != 0) {
 			(void)synthetic_dir("/flash/System/Library/Extensions/RedwoodMetal.bundle");
@@ -267,13 +273,16 @@ flash_root(const char *dev)
 		    "the system applications in /Applications");
 	}
 
+	if (failures != before) {
+		return 0;
+	}
 	ok = sysctlbyname("kern.redwood_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
 	if (!ok) {
 		printf("  switching the root: %s\n", strerror(errno));
 	}
 	check(ok, "the iOS volume is the root, the RAM part of the boot on /private/preboot");
 	if (!ok) {
-		return;
+		return 0;
 	}
 	chdir("/");
 	/*
@@ -287,7 +296,11 @@ flash_root(const char *dev)
 	mount_cryptex("OS", ",c=1", devpath);
 	mount_cryptex("App", ",c=2", devpath);
 	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
+	if (failures != before) {
+		return 0;
+	}
 	flash_root_mode = 1;
+	return 1;
 }
 
 static void
@@ -1143,8 +1156,11 @@ main(int argc, char **argv, char **envp)
 	setup_disk_dev_nodes();
 	{
 		const char *dev = boot_arg("root_apfs");
-		if (dev != NULL)
-			flash_root(dev);
+		if (dev != NULL && !flash_root(dev)) {
+			printf("init: root setup failed; stopping before launchd\n");
+			reboot(RB_HALT);
+			return 1;
+		}
 	}
 	if (lstat(in_image("/UserNotifications"), &un_st) == 0 && (un_st.st_mode & S_IFMT) == S_IFDIR &&
 	    lstat("/System/Library/UserNotifications/Bundles/com.apple.mobilecal.bundle", &un_st) != 0) {
@@ -1154,7 +1170,11 @@ main(int argc, char **argv, char **envp)
 	}
 
 	show_system();
-	mount_writable();
+	if (!mount_writable()) {
+		printf("init: data volume mount failed; stopping before launchd\n");
+		reboot(RB_HALT);
+		return 1;
+	}
 	restore_var();
 	test_files();
 	test_writable();

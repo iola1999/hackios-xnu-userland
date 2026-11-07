@@ -185,7 +185,7 @@ read_whole(const char *path, char *buf, size_t size)
 	return (ssize_t)got;
 }
 
-static void
+static int
 mount_writable(void)
 {
 	static char skeleton[16384];
@@ -201,6 +201,9 @@ mount_writable(void)
 		printf("  mount: %s\n", strerror(errno));
 	}
 	check(ok, "mount the persistent data volume on /private/var");
+	if (!ok) {
+		return 0;
+	}
 
 	/* the directories of the data volume, as listed in the template that ships with iOS (ios165/mkvarskel.py) */
 	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
@@ -337,6 +340,7 @@ mount_writable(void)
 		    users ? ", users resolvable" : "");
 		check(grafted, "graft the package manager's prefix onto the data volume");
 	}
+	return 1;
 }
 
 /*

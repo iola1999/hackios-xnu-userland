@@ -28,6 +28,7 @@ __pycache__/
 !/tools/air/
 !/tools/mesa/
 !/tools/metal/
+!/tools/tests/
 !/tools/mk-mesa.sh
 !/tools/mesa-stamp.sh
 !/tools/mk-jb.sh

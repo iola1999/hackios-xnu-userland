@@ -62,9 +62,9 @@
 #                    (stage0, the manifest, the cryptex files) are newer, or with SYSTEM=1 (after
 #                    changing the recipe below). HIGHRATE=1 (with SYSTEM=1 to remake an existing image):
 #                    CADisableMinimumFrameDurationOnPhone in every application's Info.plist (mkhighrate.py).
-#   flashboot.apfs   FLASHBOOT=1: the RAM part of a boot whose root is the iOS volume on the phone's
-#                    flash (see below); with CRYPTEXES=flash the boot volume alone, the cryptexes being
-#                    on the flash. FLASHBOOT=1 also decides what goes into root.apfs: the job list is
+#   flashboot.apfs   FLASHBOOT=1: the small boot volume for a boot whose root is the iOS volume on the
+#                    phone's flash (see below); with CRYPTEXES=flash it is the only resident image.
+#                    FLASHBOOT=1 also decides what goes into root.apfs: the job list is
 #                    then made for the whole iOS volume (mkjobs.py --root-volume), so it holds daemons
 #                    -- fairplayd, identityservicesd, passd ... -- that the system image has not got.
 #                    That root.apfs is for a flash boot; a RAM boot wants one built without FLASHBOOT=1,
@@ -79,6 +79,8 @@
 #   COMPILE_ONLY=1   compile into obj/ and stage into root/, then stop before any image is made, so
 #                    root$V.apfs and system$V.apfs keep whatever they are. For proving the toolchain
 #                    works in a container without replacing the image a payload is packed from
+#   FLASHBOOT_ONLY=1 with FLASHBOOT=1 CRYPTEXES=flash, compile stage0 and build a K90 boot volume
+#                    containing only stage0 and mount points. Firmware comes from md1 or modem_a.
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
 source ../xnu-env.sh
@@ -108,6 +110,19 @@ case $IOS in
 *ios26) CACHE=$IOS/23G90__iPhone18,3 DSC=dyld_shared_cache_arm64e V=26 ;;
 *) CACHE=$IOS/20F66__iPhone10,3_6 DSC=dyld_shared_cache_arm64 V= ;;
 esac
+if [ -n "$FLASHBOOT_ONLY" ]; then
+	[ -n "$FLASHBOOT" ] || { echo "build.sh: FLASHBOOT_ONLY=1 requires FLASHBOOT=1" >&2; exit 1; }
+	[ "$CRYPTEXES" = flash ] || { echo "build.sh: FLASHBOOT_ONLY=1 requires CRYPTEXES=flash" >&2; exit 1; }
+	boot_tree=$(mktemp -d .flashboot.XXXXXX)
+	trap 'rm -rf "$boot_tree"' EXIT
+	$CC -Ilibmini -c libmini/mini.c -o "$boot_tree/mini.o"
+	$CC -c libmini/start.S -o "$boot_tree/start.o"
+	mkdir -p "$boot_tree/root"/{sbin,redwood,dev,flash,Cryptexes/OS,Cryptexes/App}
+	$CC -Ilibmini $LD -o "$boot_tree/root/sbin/launchd" src/boot/stage0.c "$boot_tree/mini.o" "$boot_tree/start.o"
+	python3 ../tools/apfs/mkapfs.py -z -o flashboot.apfs "Boot=$boot_tree/root"
+	[ -z "$CHECK" ] || ../tools/apfs/check-image.sh flashboot.apfs "Boot=$boot_tree/root"
+	exit 0
+fi
 # The 26 line's processes are arm64e, and only Apple's clang emits arm64e with pointer authentication
 # (the architecture check below), so on macOS its dynamic programs and libraries are built with
 # Xcode's clang and iPhoneOS SDK. The static ones (CC) keep xnu-clang, which links with Xcode's ld there.
@@ -979,7 +994,7 @@ python3 ../tools/apfs/mkapfs.py -z --plain fw -o root$V.apfs redwood=root | tail
 # CRYPTEXES=flash: the boot volume alone (20 MB) -- the cryptexes are Apple's images as they are on the
 # flash, in darwin right after the iOS volume (../tools/darwin-write.py put them there), and init mounts
 # them from there, the same containers 1 and 2 of the root's own device.
-if [ -n "$FLASHBOOT" ] && [ -f $CACHE/$DSC ]; then
+if [ -n "$FLASHBOOT" ] && [ -f "$CACHE/$DSC" ]; then
 	rm -rf flashboot flashboot.os
 	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
 	cp obj/stage0 flashboot/sbin/launchd

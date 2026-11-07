@@ -1,12 +1,7 @@
 /*
- * /sbin/launchd of the big system image: the first program the kernel runs.
- *
- * The system image (the iOS files and the dyld shared cache) takes a minute
- * and a half to upload to the phone, so nothing that changes often lives in
- * it. All of that - the real init, its tests, the list of launchd jobs - is
- * in the small image that travels with the kernel (the second RAM disk,
- * /dev/md1), an APFS container (tools/apfs/mkapfs.py). This program
- * mounts it on /redwood and hands over.
+ * The first program run from the boot volume or a RAM system image.
+ * The auxiliary APFS image on /dev/md1 contains init and its configuration.
+ * Mount it on /redwood, then run init to prepare the system and start launchd.
  *
  * iOS 26's launchd trusts a job (event streams, _Conclave) only when the plist's
  * resolved path is in /System/Library. Its system image therefore has an empty
