@@ -163,6 +163,9 @@ enum {
 	kAudioDevicePropertySafetyOffset = 'saft', kAudioDevicePropertyNominalSampleRate = 'nsrt',
 	kAudioDevicePropertyAvailableNominalSampleRates = 'nsr#', kAudioDevicePropertyIsHidden = 'hidn',
 	kAudioDevicePropertyPreferredChannelsForStereo = 'dch2', kAudioDevicePropertyZeroTimeStampPeriod = 'ring',
+	kAudioDevicePropertyVolumeScalar = 'volm', kAudioDevicePropertyVolumeDecibels = 'vold',
+	kAudioDevicePropertyVolumeRangeDecibels = 'vdb#', kAudioDevicePropertyMute = 'mute',
+	kAudioDevicePropertyDataSource = 'ssrc', kAudioDevicePropertyDataSources = 'ssc#',
 	kAudioSelectorControlClassID = 'slct', kAudioDataSourceControlClassID = 'dsrc',
 	kAudioSelectorControlPropertyCurrentItem = 'scci', kAudioSelectorControlPropertyAvailableItems = 'scai',
 	kAudioSelectorControlPropertyItemName = 'scin', kAudioSelectorControlPropertyItemKind = 'clkk',
@@ -231,6 +234,8 @@ static struct device devices[] = {
  * is one microphone here, at the bottom: 'imic', the iPhone's internal (bottom) one.
  */
 #define MIC_SOURCE              'imic'
+#define MIC_SOURCE_EXT          'emic'
+#define PROP_VIRTUAL_MASTER_VOL 'vmvc'
 #define MANUFACTURER            CFSTR("redwood")
 /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
 #define TIMESTAMP_PERIOD        16384
@@ -242,6 +247,8 @@ static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
+static UInt32 speaker_muted = 0;        /* explicit mute state on OBJECT_SPEAKER */
+static UInt32 codec_source = MIC_SOURCE;
 
 static void
 say(const char *format, ...)
@@ -279,7 +286,10 @@ db_to_scalar(Float32 db)
 static void
 volume_to_kernel(void)
 {
-	struct redwood_audio_volume v = { (uint32_t)lround(-scalar_to_db(volume) * 8), volume <= 0 };
+	struct redwood_audio_volume v = {
+		(uint32_t)lround(-scalar_to_db(volume) * 8),
+		(speaker_muted != 0 || volume <= 0) ? 1u : 0u
+	};
 
 	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_VOLUME, &v) < 0) {
 		say("redwood: audio: the volume %.3f could not be given to the kernel (%s)\n", volume, strerror(errno));
@@ -350,7 +360,10 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 	host = the_host;
 	mach_timebase_info(&timebase);
 	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / REDWOOD_AUDIO_RATE;
-	sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
+	sink = open(REDWOOD_AUDIO_DEVICE, O_RDWR);
+	if (sink < 0) {
+		sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
+	}
 	say("redwood: audio: the speaker is with the HAL (%s: %s)\n", REDWOOD_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
 	return 0;
 }
@@ -469,12 +482,18 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(0);
 			break;
 		case kAudioSelectorControlPropertyCurrentItem:
+			WORD(codec_source);
+			break;
 		case kAudioSelectorControlPropertyAvailableItems:
-			WORD(MIC_SOURCE);
+			LIST(MIC_SOURCE);
+			LIST(MIC_SOURCE_EXT);
 			break;
 		case kAudioSelectorControlPropertyItemName:
 			if (qualifier_size == sizeof(UInt32) && qualifier != NULL && *(const UInt32 *)qualifier == MIC_SOURCE) {
 				STRING(CFSTR("Bottom"));
+			} else if (qualifier_size == sizeof(UInt32) && qualifier != NULL &&
+			    *(const UInt32 *)qualifier == MIC_SOURCE_EXT) {
+				STRING(CFSTR("MicrophoneBuiltIn"));
 			} else {
 				STRING(CFSTR(""));
 			}
@@ -553,7 +572,41 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioDevicePropertyDeviceCanBeDefaultDevice:
 		case kAudioDevicePropertyDeviceCanBeDefaultSystemDevice:
-			WORD(d->output != 0);
+			WORD(scope == kAudioObjectPropertyScopeInput ? d->input != 0 : d->output != 0);
+			break;
+		case kAudioDevicePropertyVolumeScalar:
+		case PROP_VIRTUAL_MASTER_VOL:
+			if (d->object == OBJECT_SPEAKER) {
+				FLOAT(volume);
+			}
+			break;
+		case kAudioDevicePropertyVolumeDecibels:
+			if (d->object == OBJECT_SPEAKER) {
+				FLOAT(scalar_to_db(volume));
+			}
+			break;
+		case kAudioDevicePropertyVolumeRangeDecibels:
+			if (d->object == OBJECT_SPEAKER) {
+				v.u.range.mMinimum = -VOLUME_RANGE_DB;
+				v.u.range.mMaximum = 0;
+				v.size = sizeof(AudioValueRange);
+			}
+			break;
+		case kAudioDevicePropertyMute:
+			if (d->object == OBJECT_SPEAKER) {
+				WORD(speaker_muted);
+			}
+			break;
+		case kAudioDevicePropertyDataSource:
+			if (d->object == OBJECT_CODEC) {
+				WORD(codec_source);
+			}
+			break;
+		case kAudioDevicePropertyDataSources:
+			if (d->object == OBJECT_CODEC) {
+				LIST(MIC_SOURCE);
+				LIST(MIC_SOURCE_EXT);
+			}
 			break;
 		case kAudioDevicePropertyDeviceIsRunning:
 			WORD(d->running != 0);
@@ -703,7 +756,12 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 	} else if (object == OBJECT_PLUGIN) {
 		*settable = false;
 	} else if (object == d->object) {
-		*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate;
+		*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate ||
+		    (d->object == OBJECT_SPEAKER && (address->mSelector == kAudioDevicePropertyVolumeScalar ||
+		    address->mSelector == PROP_VIRTUAL_MASTER_VOL ||
+		    address->mSelector == kAudioDevicePropertyVolumeDecibels ||
+		    address->mSelector == kAudioDevicePropertyMute)) ||
+		    (d->object == OBJECT_CODEC && address->mSelector == kAudioDevicePropertyDataSource);
 	} else {
 		*settable = address->mSelector == kAudioStreamPropertyIsActive ||
 		    address->mSelector == kAudioStreamPropertyVirtualFormat || address->mSelector == kAudioStreamPropertyPhysicalFormat;
@@ -775,7 +833,10 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	if (!settable) {
 		return kAudioHardwareIllegalOperationError;
 	}
-	if (object == OBJECT_SPEAKER_VOLUME) {
+	if (object == OBJECT_SPEAKER_VOLUME ||
+	    (object == OBJECT_SPEAKER && (address->mSelector == kAudioDevicePropertyVolumeScalar ||
+	    address->mSelector == PROP_VIRTUAL_MASTER_VOL ||
+	    address->mSelector == kAudioDevicePropertyVolumeDecibels))) {
 		AudioObjectPropertyAddress changed[2] = {
 			{ kAudioLevelControlPropertyScalarValue, kAudioObjectPropertyScopeGlobal, 0 },
 			{ kAudioLevelControlPropertyDecibelValue, kAudioObjectPropertyScopeGlobal, 0 },
@@ -786,7 +847,8 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 			return kAudioHardwareBadPropertySizeError;
 		}
 		wanted = *(const Float32 *)data;
-		wanted = address->mSelector == kAudioLevelControlPropertyDecibelValue ? db_to_scalar(wanted) :
+		wanted = (address->mSelector == kAudioLevelControlPropertyDecibelValue ||
+		    address->mSelector == kAudioDevicePropertyVolumeDecibels) ? db_to_scalar(wanted) :
 		    wanted < 0 ? 0 : wanted > 1 ? 1 : wanted;
 		pthread_mutex_lock(&lock);
 		volume = wanted;
@@ -797,10 +859,29 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		}
 		return 0;
 	}
-	if (object == OBJECT_CODEC_SOURCE) {
-		/* the one microphone there is */
-		return size == sizeof(UInt32) ? (*(const UInt32 *)data == MIC_SOURCE ? 0 : kAudioHardwareIllegalOperationError) :
-		       kAudioHardwareBadPropertySizeError;
+	if (object == OBJECT_SPEAKER && address->mSelector == kAudioDevicePropertyMute) {
+		if (size != sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		pthread_mutex_lock(&lock);
+		speaker_muted = *(const UInt32 *)data != 0 ? 1u : 0u;
+		volume_to_kernel();
+		pthread_mutex_unlock(&lock);
+		return 0;
+	}
+	if (object == OBJECT_CODEC_SOURCE ||
+	    (object == OBJECT_CODEC && address->mSelector == kAudioDevicePropertyDataSource)) {
+		if (size != sizeof(UInt32)) {
+			return kAudioHardwareBadPropertySizeError;
+		}
+		UInt32 src = *(const UInt32 *)data;
+		if (src != MIC_SOURCE && src != MIC_SOURCE_EXT) {
+			return kAudioHardwareIllegalOperationError;
+		}
+		pthread_mutex_lock(&lock);
+		codec_source = src;
+		pthread_mutex_unlock(&lock);
+		return 0;
 	}
 	if (address->mSelector == kAudioStreamPropertyIsActive) {
 		if (size != sizeof(UInt32)) {
@@ -838,10 +919,15 @@ static int mic_peak;
 static void
 codec_open(void)
 {
-	mic = open("/dev/redwood-mic", O_RDONLY | O_NONBLOCK);
+	const char *dev_path = "/dev/redwood-mic";
+	mic = open(dev_path, O_RDONLY | O_NONBLOCK);
+	if (mic < 0) {
+		dev_path = REDWOOD_AUDIO_DEVICE;
+		mic = open(dev_path, O_RDONLY | O_NONBLOCK);
+	}
 	mic_frames = mic_heard = mic_short = 0;
 	mic_peak = 0;
-	say("redwood: audio: the microphone is listened to (/dev/redwood-mic: %s)\n", mic < 0 ? strerror(errno) : "open");
+	say("redwood: audio: the microphone is listened to (%s: %s)\n", dev_path, mic < 0 ? strerror(errno) : "open");
 }
 
 static void

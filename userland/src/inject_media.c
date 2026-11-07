@@ -1,38 +1,18 @@
 /*
- * libredwood-media.dylib: code of ours inside mediaserverd (see inject.c for how it gets there).
+ * libredwood-media.dylib: code of ours inside mediaserverd and cameracaptured (see inject.c).
  *
- * mediaserverd is the audio server, and also the camera's: the capture stack of CMCapture lives
- * in the same process. Soon after it starts, that stack "prewarms" the Core Image filters of the
- * portrait mode, for which Core Image wants an OpenGL ES context; there is no GPU, the context
- * has no functions behind it, and the daemon jumps to address 0 -- every time launchd restarts
- * it. Nobody is going to take a portrait here: the prewarming is skipped.
- *
- * What the daemon is wanted for meanwhile is neither sound nor the camera: it is where
- * VideoToolbox decodes for everybody else (the service com.apple.coremedia.decompressionsession),
- * and a HEIC picture is HEVC inside. Without the daemon ImageIO has "no way to decode a HEIC",
- * and the stock wallpaper of iOS 16, whose layers are four such pictures, is its gradient alone.
- * There is no hardware decoder here; VideoToolbox takes its software one (VCPHEVC.videocodec).
+ * On iOS 16.5, mediaserverd hosts both the audio server and CMCapture's capture stack. On iOS 26,
+ * the capture stack runs inside cameracaptured (with mediaserverd also loading CMCapture pieces).
  *
  * The flashlight (only where the kernel has one: torch=3, /dev/redwood-torch): Control Center's
  * button and AVFlashlight reach FigFlashlight in here, which asks the capture stack's device vendor
  * (+[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor]) for the camera device and its back
- * camera's stream, and sets the stream's "TorchLevel" (0 to 1). Without a camera there is no
- * vendor (it is nil), every message to it does nothing, and FigFlashlight says it has set the level
- * when nothing has been. So where there is no vendor, FigFlashlight -- and only FigFlashlight,
- * by where it calls from -- is given one of ours, with a device and a stream whose torch level goes
- * to the kernel (see flashlight_*() below). Everybody else still gets none, as before.
+ * camera's stream, and sets the stream's "TorchLevel" (0 to 1).
  *
- * The camera (only where the kernel has one: cam=5, /dev/redwood-camera): the vendor is made for
- * everybody, with the create function of our capture device (camera_device.c) in place of the
- * one H10ISP.mediacapture would give for the iPhone's ISP; the capture graph is built around it and
- * its frames reach Camera.app's preview (see camera_device.c). Its stream takes the torch level too,
- * so FigFlashlight would need nothing of its own then (not tried yet).
- *
- * What the capture stack asks of hardware this phone has none of is refused here: there is no ISP
- * processing session, so there can be no video stabilization (see video_stabilization_method below).
- *
- * CMCapture is not loaded yet when this library is: the methods are replaced when its image
- * arrives.
+ * The camera (where the kernel has /dev/redwood-camera): the vendor is initialized with the create
+ * function of our capture device (camera_device.c, redwood_camera_device_create) in place of
+ * H10ISP/H16ISP.mediacapture; the capture graph is built around it and its frames reach Camera.app's
+ * preview.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -50,6 +30,12 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
+#if __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#define STRIP_FN(p) ((uintptr_t)ptrauth_strip((void *)(p), ptrauth_key_function_pointer))
+#else
+#define STRIP_FN(p) ((uintptr_t)(p))
+#endif
 
 static void
 say(const char *format, ...)
@@ -79,13 +65,14 @@ prewarm_portrait_filter(__unused id self, __unused SEL selector, __unused int ve
 {
 }
 
-/* ---- the flashlight ------------------------------------------------------------------------------- */
+/* ---- the flashlight & camera vendor --------------------------------------------------------------- */
 
 static int torch = -1;                  /* /dev/redwood-torch */
 static bool camera;                     /* /dev/redwood-camera is there */
 extern int redwood_camera_device_create(const void *allocator, const void *options, void **out);
 static Class vendor_class, device_class, stream_class;
 static IMP original_shared_vendor;
+static IMP original_shared_vendor_with_func;
 static unsigned torch_said;
 
 /*
@@ -96,30 +83,60 @@ static const struct { uintptr_t from, to; } flashlight_code[] = {
 	{ 0x1a1fb0830UL, 0x1a1fb0c5cUL }, { 0x1a1eee5c0UL, 0x1a1eee6e8UL },
 };
 
+/* +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendorWithDefaultDeviceCreateFunction:] (iOS 26) */
+static id
+shared_vendor_with_func(id self, SEL selector, void *func)
+{
+	if (!camera && access("/dev/redwood-camera", F_OK) == 0) {
+		camera = true;
+		say("redwood: media: the kernel has a camera (/dev/redwood-camera)\n");
+	}
+	if (func == NULL && camera) {
+		func = (void *)redwood_camera_device_create;
+		say("redwood: media: supplying redwood_camera_device_create to sharedCaptureDeviceVendor\n");
+	}
+	return ((id (*)(id, SEL, void *))original_shared_vendor_with_func)(self, selector, func);
+}
+
 /* +[BWFigCaptureDeviceVendor sharedCaptureDeviceVendor] */
 static id
 shared_vendor(id self, SEL selector)
 {
-	uintptr_t caller = (uintptr_t)__builtin_return_address(0) - slide;
-	id vendor = ((id (*)(id, SEL))original_shared_vendor)(self, selector);
+	uintptr_t caller = STRIP_FN(__builtin_return_address(0)) - slide;
 	static id ours, camera_vendor;
 	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
+	if (!camera && access("/dev/redwood-camera", F_OK) == 0) {
+		camera = true;          /* (should the kernel have made it after the daemon started) */
+		say("redwood: media: the kernel has a camera (/dev/redwood-camera)\n");
+	}
+	if (camera && original_shared_vendor_with_func != NULL) {
+		return shared_vendor_with_func(self,
+		    sel_registerName("sharedCaptureDeviceVendorWithDefaultDeviceCreateFunction:"),
+		    (void *)redwood_camera_device_create);
+	}
+
+	id vendor = ((id (*)(id, SEL))original_shared_vendor)(self, selector);
 	if (vendor != NULL) {
 		return vendor;
-	}
-	if (!camera && access("/dev/redwood-camera", F_OK) == 0) {
-		camera = true;          /* (should the kernel have made it after mediaserverd started) */
-		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
 	}
 	if (camera) {
 		pthread_mutex_lock(&lock);
 		if (camera_vendor == NULL) {
-			id made = ((id (*)(Class, SEL))objc_msgSend)(objc_getClass("BWFigCaptureDeviceVendor"), sel_registerName("alloc"));
+			Class vcls = objc_getClass("BWFigCaptureDeviceVendor");
+			id made = ((id (*)(Class, SEL))objc_msgSend)(vcls, sel_registerName("alloc"));
 
-			camera_vendor = ((id (*)(id, SEL, void *))objc_msgSend)(made, sel_registerName("initWithDeviceCreateFunction:"),
-			    (void *)redwood_camera_device_create);
-			say("redwood: mediaserverd: the camera's device vendor %s\n", camera_vendor ? "made (camera_device.c)" :
+			if (class_getInstanceMethod(vcls, sel_registerName("initWithDeviceCreateFunction:")) != NULL) {
+				camera_vendor = ((id (*)(id, SEL, void *))objc_msgSend)(made,
+				    sel_registerName("initWithDeviceCreateFunction:"),
+				    (void *)redwood_camera_device_create);
+			} else if (class_getInstanceMethod(vcls,
+			    sel_registerName("initWithDefaultDeviceCreateFunction:cmioExtensionDeviceCreateFunction:")) != NULL) {
+				camera_vendor = ((id (*)(id, SEL, void *, void *))objc_msgSend)(made,
+				    sel_registerName("initWithDefaultDeviceCreateFunction:cmioExtensionDeviceCreateFunction:"),
+				    (void *)redwood_camera_device_create, NULL);
+			}
+			say("redwood: media: the camera's device vendor %s\n", camera_vendor ? "made (camera_device.c)" :
 			    "CANNOT BE MADE");
 		}
 		pthread_mutex_unlock(&lock);
@@ -129,7 +146,7 @@ shared_vendor(id self, SEL selector)
 		if (caller >= flashlight_code[i].from && caller < flashlight_code[i].to) {
 			if (ours == NULL) {
 				ours = class_createInstance(vendor_class, 0);
-				say("redwood: mediaserverd: no camera, so no device vendor: FigFlashlight gets the flashlight's own\n");
+				say("redwood: media: no camera, so no device vendor: FigFlashlight gets the flashlight's own\n");
 			}
 			return ours;
 		}
@@ -213,17 +230,8 @@ flashlight_stream_set(__unused id self, __unused SEL selector, id key, id value)
 }
 
 /*
- * Video stabilization, of which this hardware has none: the capture graph's VIS node
- * (-[FigCaptureVISPipeline _newVISNodeWithUpstreamOutput:...]) is made with the ISP's processing
- * session, and this device has no such session, so the node comes back nil, the VIS pipeline with
- * it, the movie file sink's tail pipeline with that, and captureSession_buildGraphWithConfiguration
- * tears the whole graph down -- the preview too, for all that the preview has nothing to do with
- * stabilizing a recording. The connection's stabilization method is where the whole stack reads the
- * wish from (+[FigVideoCaptureConnectionConfiguration videoStabilizationMethods:includeIris:] ->
- * cspc_getVideoStabilizationType -> the connections' FigCaptureVideoStabilizationType), and 0 there
- * means none: the graph is then built without a VIS pipeline anywhere
- * (+[FigCaptureVISPipeline visPipelineIsRequiredForFigCaptureVideoStabilizationType:] says no to
- * every type but 2 and 3), and recordings are as steady as the hand that holds the phone.
+ * Video stabilization, of which this hardware has none: 0 means kFigCaptureVideoStabilizationType_None,
+ * so the capture graph is built without a VIS pipeline.
  */
 static int
 video_stabilization_method(id self, SEL selector)
@@ -233,12 +241,6 @@ video_stabilization_method(id self, SEL selector)
 	return 0;
 }
 
-/*
- * The type the stack acts on. The connection configuration arrives from the application's
- * AVFoundation with the type in it, which is read straight out of the object and not computed from
- * the method above (-[FigCaptureSessionParsedConfiguration _computeVideoStabilizationTypes] only
- * fills in what the client left out), so the wish has to be refused here as well.
- */
 static int
 video_stabilization_type(id self, SEL selector)
 {
@@ -248,22 +250,8 @@ video_stabilization_type(id self, SEL selector)
 }
 
 /*
- * The microphone, which the capture stack has none of here. A capture session's sound comes through
- * CoreMedia's own capture audio session -- BWAudioSourceNode's start sets its properties and reads
- * its pull format, all of it through a brokered plug-in of the audio HAL -- and that plug-in is not
- * on this phone: the node's start comes back with 'nope', the HAL's word for "no such thing".
- *
- * Camera.app's session has an audio input in it, because it is a session for photographs and for
- * video both. The graph starts its source nodes late (startDeferredSourceNodesIfNeeded) and takes
- * the first error it gets for the whole graph's, so the session reported AVCaptureSessionRuntimeError
- * to the application, which took the session down and built it again, two seconds later, for ever:
- * the camera's preview came in bursts of five frames with the sensor powering down in between.
- *
- * The node is told that it started. It then produces no sound -- which is all a phone with no
- * capture audio has to offer -- and the rest of the graph, the preview and the photograph, runs.
- * Only that one error is swallowed: a microphone that is there and fails for another reason still
- * takes the session down, as it should. (The kernel's own microphone, adsp=1 mic=4, is a different
- * path: AVAudioRecorder and Voice Memos record through it, and nothing here touches it.)
+ * The microphone, when the capture audio HAL plug-in is absent ('nope'): swallow that error so the
+ * camera preview and photo graph continue running.
  */
 #define ERROR_NO_SUCH_THING     1852797029      /* 'nope' */
 
@@ -289,15 +277,7 @@ audio_source_start(id self, SEL selector, id *error)
 }
 
 /*
- * A photograph's quality prioritization, "speed" at the most. Asked for "balanced" (Camera.app's) or
- * "quality", the capture device takes a scene for a low-light one whenever a frame was exposed at
- * least as long as the sensor's still image stabilization threshold
- * (-[BWFigVideoCaptureDevice _isLowLightSceneUsingFrameStatisticsByPortType:]) -- a threshold from
- * the sensor's tuning in CameraSetup.plist, 0 for a sensor it has no tuning for, as ours -- and
- * then asks the stream for a bracket of four frames for SIS fusion (captureType 4, BWSISNode), which
- * this port has nothing to fuse with: the photograph never came. With "speed" it asks for one frame
- * (-_resolveStillImageCaptureTypeFromStatisticsByPortType:..., captureType 1), which the stream
- * gives (camera_device.c, StillImageCaptureNow).
+ * A photograph's quality prioritization, "speed" at the most (one frame, no SIS bracket).
  */
 static IMP original_quality_prioritization;
 
@@ -316,11 +296,7 @@ quality_prioritization(id self, SEL selector)
 }
 
 /*
- * A photograph's noise reduction (BWGNRNode, between the still image coordinator and the photo
- * encoder) is a FigSampleBufferProcessor of the iPhone's, which is handed the picture and never
- * hands one back here: the photograph stopped there, with no error, and the request with it (the
- * shutter's second press asked for nothing more). The picture goes past it to the node's output as
- * it came, as with no noise reduction to do.
+ * A photograph's noise reduction (BWGNRNode): pass the sample buffer straight to the node's output.
  */
 static void
 gnr_render(id self, SEL selector, void *sample_buffer, id input)
@@ -378,12 +354,7 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
 }
 
 /*
- * A node's output given no sample buffer at all, which no node takes: the session's audio source
- * (-[BWAudioSourceNode _generateSamples]), whose audio unit never started here (see audio_source_start
- * above), fills the silence by a timer with buffers it fails to make and emits them all the same --
- * NULL. Live Photo's staging node added that to an array (-[BWIrisStagingNode renderSampleBuffer:forInput:])
- * and mediaserverd died of the NSInvalidArgumentException, every half a minute with Live Photo on, the
- * preview black for a second each time. A NULL is not passed on.
+ * A node's output given no sample buffer at all: drop NULL sample buffers before they reach downstream nodes.
  */
 static IMP original_emit_sample_buffer;
 
@@ -404,14 +375,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 }
 
 /*
- * The photograph's encoder. Camera.app asks for HEIC -- HEVC inside a HEIF file, which CMPhoto makes
- * through VideoToolbox -- and VideoToolbox here has no HEVC encoder but the iPhone's hardware ones
- * (com.apple.videotoolbox.videoencoder.hevc and .hevc.gva, behind its AVE): the photo encoder node
- * failed with kVTCouldNotFindVideoEncoderErr (-12908). Apple's software HEVC codec is in the system
- * all the same, VCPHEVC.videocodec, whose decoder VideoToolbox takes here for every HEIC picture (see
- * the top), and there is an encoder in it, HEVCVideoEncoder_CreateInstance, that iOS never registers:
- * the codec's VCPHEVCRegisterEncoder is an empty function. It is registered here, as the codec
- * registers its decoder (VTRegisterVideoDecoderWithInfo, not hardware accelerated).
+ * Register Apple's software HEVC encoder in VCPHEVC.videocodec with VideoToolbox so CMPhoto can encode HEIC.
  */
 static void
 register_hevc_encoder(void)
@@ -480,9 +444,8 @@ flashlight_classes(void)
 
 /*
  * The class methods replaced, each as soon as its class exists. `expected` is the unslid address
- * of the code in iOS 16.5 (20F66): a method that is not what it was is left alone. `original`, where
- * there is one, keeps what was there (the vendor's: given as it is wherever there is one, and where
- * there is none, ours only with the kernel's camera or flashlight).
+ * of the code in iOS 16.5 (20F66); on iOS 26 (arm64e), methods are matched by selector via the
+ * Objective-C runtime without requiring the iOS 16.5 unslid address.
  */
 static struct replacement {
 	const char *class_name, *selector;
@@ -493,6 +456,8 @@ static struct replacement {
 } replacements[] = {
 	{ "BWCoreImageFilterRenderer", "prewarmPortraitFilterVersion:semanticStyleFilters:", 0x1a2115c0cUL,
 	  (IMP)prewarm_portrait_filter, NULL, false, false },
+	{ "BWFigCaptureDeviceVendor", "sharedCaptureDeviceVendorWithDefaultDeviceCreateFunction:", 0UL,
+	  (IMP)shared_vendor_with_func, &original_shared_vendor_with_func, false, false },
 	{ "BWFigCaptureDeviceVendor", "sharedCaptureDeviceVendor", 0x1a1ef0d04UL,
 	  (IMP)shared_vendor, &original_shared_vendor, false, false },
 	{ "BWAudioSourceNode", "start:", 0x1a1eefa18UL, (IMP)audio_source_start, &original_audio_source_start, true, false },
@@ -506,48 +471,13 @@ static struct replacement {
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
 };
 
-/* ---- the Metal device leaves this process before the capture stack asks for it -------------------- */
+/* ---- the Metal device leaves this process on iOS 16.5 when cvadepth-iOS.metallib is absent -------- */
 
-/*
- * With the Metal properties on the accelerator service (boot-arg metal=1) MTLCreateSystemDefaultDevice()
- * answers in every process, and in mediaserverd the first to ask is the capture stack: CMCapture's
- * FigPreloadShadersInternal reaches -[_MTLDevice newLibraryWithURL:error:] through three functions of
- * AppleCVAPhoto, asking for System/Library/PrivateFrameworks/AppleCVAPhoto.framework/Resources/
- * cvadepth-iOS.metallib. That file is not in this image (ios165/select-system.py drops .metallib under
- * the framework directories), so the URL is nil and Metal aborts on `url must not be nil' -- twenty-eight
- * times in one boot, launchd restarting the daemon after each (logs/135751-run.log, docs/metal.md 10.38).
- * AppleCVAPhoto itself survives a library it cannot make: it checks the result and logs "Error creating
- * metal library". What kills the process is Metal's own assertion, and that is reached only because there
- * IS a device to send the message to.
- *
- * So the device is taken out of this process, exactly as inject.c does for the window server: Metal keeps
- * every device it has made in one static NSMutableArray (0x1e1efe9a0, __DATA_DIRTY.__bss, so one per
- * process), and MTLCreateSystemDefaultDevice() is no more than "if that array holds exactly one object,
- * return it" -- an empty array answers nil without a single instruction of Metal's being touched. The
- * array is built on first use, so it has to be asked for first; that makes the device object, which is
- * what the capture stack's next instruction would have done anyway, so the process pays nothing new.
- * The device is retained and never released, for inject.c's reason: what our -dealloc would do to a GPU
- * is not measured.
- *
- * WHEN, and why not where inject.c does it. There the hook is -[CAWindowServer _detectDisplays], the last
- * Objective-C method on the way in and an address that can be checked. Here the way in is three C
- * functions of AppleCVAPhoto with no method of ours to stand on, so this runs from the add-image notifier
- * this library already registers, the first time Metal is in the process at all -- which is before any
- * code of the image that brought it has run. Being early cannot cost correctness: if the device can be
- * made, it is made and removed; if the accelerator service is not matched yet and the array is built
- * empty, nil is what the capture stack gets, and nil is the whole point.
- *
- * Boot-arg mediamtl=1 leaves the device where it is. It is a switch of its own and not inject.c's camtl=1
- * because the two processes do not risk the same thing: a window server that aborts is a crash loop and a
- * black screen, while mediaserverd aborting costs HEIC decoding, the camera and the sound. A boot may
- * reasonably want Metal in one and not the other. Either way the metallib has to be in the image first,
- * or the same assertion comes straight back.
- */
-#define MTL_DEVICE_ARRAY        0x1e1efe9a0UL   /* Metal's static NSMutableArray *_deviceArray */
+#define MTL_DEVICE_ARRAY        0x1e1efe9a0UL   /* Metal's static NSMutableArray *_deviceArray (20F66) */
 
 extern id objc_retain(id object);
 
-static bool metal_left_alone;                   /* boot-arg mediamtl=1 */
+static bool metal_left_alone;                   /* boot-arg mediamtl=1, or iOS 26 */
 
 static bool
 boot_arg(const char *what)
@@ -573,9 +503,6 @@ keep_metal_from_the_capture_stack(void)
 	if (done || metal_left_alone) {
 		return;
 	}
-	/* Metal is not in this process yet: the image that brings it has not arrived, and the notifier
-	 * will be back here when it does. Nothing is printed for that -- a line per image would bury
-	 * the log, and the constructor has already said that this is armed. */
 	if ((create = (id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice")) == NULL) {
 		return;
 	}
@@ -607,9 +534,17 @@ keep_metal_from_the_capture_stack(void)
 static void
 image_added(__unused const struct mach_header *header, __unused intptr_t image_slide)
 {
-	/* before anything of the image that was just added runs, and this is the only place in this
-	 * library that is told about a new image at all */
-	keep_metal_from_the_capture_stack();
+	bool is_ios26 = false;
+#if __has_feature(ptrauth_calls)
+	is_ios26 = true;
+#else
+	if (objc_getClass("BWFigCaptureDevice") != NULL) {
+		is_ios26 = true;
+	}
+#endif
+	if (!is_ios26) {
+		keep_metal_from_the_capture_stack();
+	}
 	for (size_t i = 0; i < sizeof(replacements) / sizeof(replacements[0]); i++) {
 		struct replacement *r = &replacements[i];
 		Class cls;
@@ -623,17 +558,18 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		method = r->instance ? class_getInstanceMethod(cls, sel_registerName(r->selector)) :
 		    class_getClassMethod(cls, sel_registerName(r->selector));
 		original = method ? method_getImplementation(method) : NULL;
-		if (original == NULL || (uintptr_t)original != r->expected + slide) {
-			say("redwood: %c[%s %s]: found %#lx, expected %#lx; left alone\n", r->instance ? '-' : '+', r->class_name,
-			    r->selector,
-			    original ? (uintptr_t)original - slide : 0, r->expected);
+		if (original == NULL || (!is_ios26 && r->expected != 0 && STRIP_FN(original) != r->expected + slide)) {
+			if (r->expected != 0) {
+				say("redwood: %c[%s %s]: found %#lx, expected %#lx; left alone\n", r->instance ? '-' : '+',
+				    r->class_name, r->selector, original ? STRIP_FN(original) - slide : 0, r->expected);
+			}
 			continue;
 		}
 		if (r->original != NULL) {
 			*r->original = original;
 		}
 		method_setImplementation(method, r->replacement);
-		say("redwood: mediaserverd: %c[%s %s] replaced\n", r->instance ? '-' : '+', r->class_name, r->selector);
+		say("redwood: media: %c[%s %s] replaced\n", r->instance ? '-' : '+', r->class_name, r->selector);
 	}
 }
 
@@ -644,27 +580,32 @@ redwood_media_init(void)
 	const char *name = getprogname();
 	size_t length = 0;
 
-	if (name == NULL || strcmp(name, "mediaserverd") != 0) {
+	if (name == NULL || (strcmp(name, "mediaserverd") != 0 && strcmp(name, "cameracaptured") != 0)) {
 		return;
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
-	metal_left_alone = boot_arg("mediamtl=1");
-	if (metal_left_alone) {
-		say("redwood: mediaserverd: mediamtl=1: the capture stack may have the Metal device (it "
-		    "needs AppleCVAPhoto's cvadepth-iOS.metallib in the image)\n");
-	} else {
-		say("redwood: mediaserverd: the Metal device leaves this process as soon as Metal is in "
-		    "it (mediamtl=1 leaves it there)\n");
+#if __has_feature(ptrauth_calls)
+	metal_left_alone = !boot_arg("mediamtl=0");
+#else
+	metal_left_alone = boot_arg("mediamtl=1") || strcmp(name, "cameracaptured") == 0;
+#endif
+	if (!metal_left_alone) {
+		say("redwood: %s: the Metal device leaves this process as soon as Metal is in "
+		    "it (mediamtl=1 leaves it there)\n", name);
 	}
 	torch = open("/dev/redwood-torch", O_WRONLY);
 	camera = access("/dev/redwood-camera", F_OK) == 0;
 	if (torch >= 0) {
 		flashlight_classes();
-		say("redwood: mediaserverd: the kernel has a flashlight (/dev/redwood-torch)\n");
+		say("redwood: %s: the kernel has a flashlight (/dev/redwood-torch)\n", name);
 	}
 	if (camera) {
-		say("redwood: mediaserverd: the kernel has a camera (/dev/redwood-camera)\n");
+		say("redwood: %s: the kernel has a camera (/dev/redwood-camera)\n", name);
 		register_hevc_encoder();
+	}
+	/* On iOS 26, cameracaptured loads CMCapture on demand or via dyld shared cache; ensure CMCapture is loaded so hooks attach immediately */
+	if (strcmp(name, "cameracaptured") == 0) {
+		(void)dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY | RTLD_GLOBAL);
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
 }

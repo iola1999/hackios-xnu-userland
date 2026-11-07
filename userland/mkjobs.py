@@ -341,6 +341,10 @@ if rest:
         label = name[:-len('.plist')]
         if not name.endswith('.plist') or label in labels or any(word in label for word in DENY):
             continue
+        # If CommCenter is unlocked via ALLOW="CommCenter", skip the AppleBasebandPCI cellular plist
+        # so it does not collide with com.apple.CommCenter-noncellular.plist or crash-loop on PCIe baseband.
+        if label == 'com.apple.CommCenter':
+            continue
         with open(f'{directory}/{name}', 'rb') as f:
             job = plistlib.load(f)
         program = job.get('Program') or (job.get('ProgramArguments') or [''])[0]

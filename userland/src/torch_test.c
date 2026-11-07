@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,53 +59,90 @@ kernel_state(void)
 	}
 }
 
+static int
+kernel_write_str(const char *arg)
+{
+	int device = open("/dev/redwood-torch", O_WRONLY);
+	ssize_t n;
+
+	if (device < 0) {
+		printf("torch_test: cannot open /dev/redwood-torch for write\n");
+		return 1;
+	}
+	n = write(device, arg, strlen(arg));
+	close(device);
+	if (n < 0) {
+		printf("torch_test: write /dev/redwood-torch \"%s\" failed\n", arg);
+		return 1;
+	}
+	usleep(150000);
+	printf("torch_test: wrote \"%s\" to /dev/redwood-torch; ", arg);
+	kernel_state();
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
 	Class flashlight_class = objc_getClass("AVFlashlight");
-	id flashlight;
+	id flashlight = NULL;
+	BOOL has_av = NO;
 	int failed = 0;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
-	if (flashlight_class == NULL) {
-		printf("torch_test: no AVFlashlight\n");
-		return 1;
+	if (flashlight_class != NULL) {
+		has_av = yes((id)flashlight_class, "hasFlashlight");
+		printf("torch_test: AVFlashlight says hasFlashlight %s\n", has_av ? "YES" : "NO");
+		if (has_av) {
+			flashlight = send(send((id)flashlight_class, "alloc"), "init");
+			printf("torch_test: an AVFlashlight %s; available %s, overheated %s, level %.2f\n",
+			    flashlight ? "made" : "NOT MADE",
+			    yes(flashlight, "isAvailable") ? "YES" : "NO",
+			    yes(flashlight, "isOverheated") ? "YES" : "NO",
+			    flashlight ? ((float (*)(id, SEL))objc_msgSend)(flashlight, sel_registerName("flashlightLevel")) : -1.0f);
+		}
+	} else {
+		printf("torch_test: no AVFlashlight class in process\n");
 	}
-	printf("torch_test: AVFlashlight says hasFlashlight %s\n", yes((id)flashlight_class, "hasFlashlight") ? "YES" : "NO");
-	if (!yes((id)flashlight_class, "hasFlashlight")) {
-		/* (AVFlashlight refuses to be made, with an exception, where there is none: the loader adds the flash with torch=N) */
-		kernel_state();
-		return 1;
-	}
-	flashlight = send(send((id)flashlight_class, "alloc"), "init");
-	printf("torch_test: an AVFlashlight %s; available %s, overheated %s, level %.2f\n", flashlight ? "made" : "NOT MADE",
-	    yes(flashlight, "isAvailable") ? "YES" : "NO", yes(flashlight, "isOverheated") ? "YES" : "NO",
-	    flashlight ? ((float (*)(id, SEL))objc_msgSend)(flashlight, sel_registerName("flashlightLevel")) : -1.0f);
-	if (flashlight == NULL) {
-		return 1;
-	}
+	kernel_state();
+
 	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "wait") == 0 && i + 1 < argc) {
 			usleep((useconds_t)(atof(argv[++i]) * 1e6));
+		} else if (strcmp(argv[i], "direct") == 0 && i + 1 < argc) {
+			failed |= kernel_write_str(argv[++i]);
+		} else if (strcmp(argv[i], "on") == 0) {
+			failed |= kernel_write_str("on");
 		} else if (strcmp(argv[i], "level") == 0 && i + 1 < argc) {
-			float level = (float)atof(argv[++i]);
-			id error = NULL;
-			BOOL done = ((BOOL (*)(id, SEL, float, id *))objc_msgSend)(flashlight, sel_registerName("setFlashlightLevel:withError:"),
-			    level, &error);
+			const char *arg = argv[++i];
+			float level = (float)atof(arg);
 
-			printf("torch_test: level %.2f: %s%s; available %s, level now %.2f\n", level, done ? "done" : "FAILED: ",
-			    done ? "" : text(error), yes(flashlight, "isAvailable") ? "YES" : "NO",
-			    ((float (*)(id, SEL))objc_msgSend)(flashlight, sel_registerName("flashlightLevel")));
-			failed |= !done;
+			if (flashlight != NULL) {
+				id error = NULL;
+				BOOL done = ((BOOL (*)(id, SEL, float, id *))objc_msgSend)(flashlight,
+				    sel_registerName("setFlashlightLevel:withError:"), level, &error);
+
+				printf("torch_test: level %.2f: %s%s; available %s, level now %.2f\n", level,
+				    done ? "done" : "FAILED: ", done ? "" : text(error),
+				    yes(flashlight, "isAvailable") ? "YES" : "NO",
+				    ((float (*)(id, SEL))objc_msgSend)(flashlight, sel_registerName("flashlightLevel")));
+				if (!done) {
+					failed |= kernel_write_str(arg);
+				}
+			} else {
+				failed |= kernel_write_str(arg);
+			}
 		} else if (strcmp(argv[i], "off") == 0) {
-			/* (as Control Center does it: level 0, then the power; FigFlashlight powers off only what is dark) */
-			id error = NULL;
+			if (flashlight != NULL) {
+				id error = NULL;
 
-			((BOOL (*)(id, SEL, float, id *))objc_msgSend)(flashlight, sel_registerName("setFlashlightLevel:withError:"), 0.0f,
-			    &error);
-			send(flashlight, "turnPowerOff");
-			printf("torch_test: off; level now %.2f\n", ((float (*)(id, SEL))objc_msgSend)(flashlight,
-			    sel_registerName("flashlightLevel")));
+				((BOOL (*)(id, SEL, float, id *))objc_msgSend)(flashlight,
+				    sel_registerName("setFlashlightLevel:withError:"), 0.0f, &error);
+				send(flashlight, "turnPowerOff");
+				printf("torch_test: off; level now %.2f\n", ((float (*)(id, SEL))objc_msgSend)(flashlight,
+				    sel_registerName("flashlightLevel")));
+			}
+			failed |= kernel_write_str("off");
 		} else if (strcmp(argv[i], "state") == 0) {
 			kernel_state();
 		} else {

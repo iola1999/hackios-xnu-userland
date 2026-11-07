@@ -17,6 +17,8 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -255,6 +257,51 @@ analyse(double seconds, double vibrate_at)
 	return 0;
 }
 
+static int
+record_raw(double seconds)
+{
+	const char *dev = "/dev/redwood-mic";
+	int fd = open(dev, O_RDONLY);
+	if (fd < 0) {
+		dev = "/dev/redwood-audio";
+		fd = open(dev, O_RDONLY);
+	}
+	if (fd < 0) {
+		printf("record_test: raw: cannot open %s: %s\n", dev, strerror(errno));
+		return 1;
+	}
+	long target = (long)(seconds * RATE);
+	int16_t *samples = calloc((size_t)target, sizeof(int16_t));
+	if (samples == NULL) {
+		close(fd);
+		return 1;
+	}
+	long got_samples = 0;
+	while (got_samples < target) {
+		long chunk = target - got_samples;
+		if (chunk > 960) {
+			chunk = 960;
+		}
+		ssize_t n = read(fd, samples + got_samples, (size_t)chunk * sizeof(int16_t));
+		if (n <= 0) {
+			break;
+		}
+		got_samples += n / 2;
+	}
+	close(fd);
+	long peak = 0;
+	for (long i = 0; i < got_samples; i++) {
+		long v = samples[i] < 0 ? -(long)samples[i] : samples[i];
+		if (v > peak) {
+			peak = v;
+		}
+	}
+	printf("record_test: raw (%s): %ld samples (%.2f s of %.2f), peak %ld of 32768, %.1f dBFS RMS\n",
+	    dev, got_samples, (double)got_samples / RATE, seconds, peak, rms_db(samples, 0, got_samples));
+	free(samples);
+	return got_samples > 0 ? 0 : 1;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -267,10 +314,13 @@ main(int argc, char **argv)
 	int tenths;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
+	seconds = seconds < 1 ? 1 : seconds > 60 ? 60 : seconds;
+	if (argc > 2 && strcmp(argv[2], "raw") == 0) {
+		return record_raw(seconds);
+	}
 	if (argc > 3 && strcmp(argv[2], "vibrate") == 0) {
 		vibrate_at = atof(argv[3]);
 	}
-	seconds = seconds < 1 ? 1 : seconds > 60 ? 60 : seconds;
 	if (!session_up()) {
 		return 1;
 	}

@@ -360,15 +360,19 @@ restart(void)
 	static int pids[2048];
 	int count = proc_listallpids(pids, sizeof(pids));
 	char name[64];
+	int killed = 0;
 
 	for (int i = 0; i < count; i++) {
-		if (proc_name(pids[i], name, sizeof(name)) > 0 && strcmp(name, "mediaserverd") == 0) {
-			printf("sound_test: restart: killing mediaserverd[%d]: %s\n", pids[i],
+		if (proc_name(pids[i], name, sizeof(name)) > 0 &&
+		    (strcmp(name, "audiomxd") == 0 || strcmp(name, "mediaserverd") == 0)) {
+			printf("sound_test: restart: killing %s[%d]: %s\n", name, pids[i],
 			    kill(pids[i], SIGKILL) == 0 ? "done" : strerror(errno));
-			return;
+			killed++;
 		}
 	}
-	printf("sound_test: restart: no mediaserverd is running\n");
+	if (killed == 0) {
+		printf("sound_test: restart: neither audiomxd nor mediaserverd is running\n");
+	}
 }
 
 int

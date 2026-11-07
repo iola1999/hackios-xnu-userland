@@ -61,6 +61,10 @@ extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(CFAllocatorRef allocat
     uint32_t options);
 extern IOHIDEventRef IOHIDEventCreateKeyboardEvent(CFAllocatorRef allocator, uint64_t time, uint32_t usage_page, uint32_t usage,
     Boolean down, uint32_t options);
+extern IOHIDEventRef IOHIDEventCreateAmbientLightSensorEvent(CFAllocatorRef allocator, uint64_t time, uint32_t level,
+    uint32_t options);
+extern IOHIDEventRef IOHIDEventCreateProximtyEvent(CFAllocatorRef allocator, uint64_t time, uint32_t detection_mask,
+    uint32_t options);
 extern void IOHIDEventAppendEvent(IOHIDEventRef parent, IOHIDEventRef child, uint32_t options);
 extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFIndex value);
 
@@ -69,6 +73,11 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 #define HID_USAGE_TOUCH_SCREEN          0x04
 #define HID_PAGE_CONSUMER               0x0c
 #define HID_USAGE_CONSUMER_CONTROL      0x01
+#define HID_PAGE_APPLE_VENDOR           0xff00  /* kHIDPage_AppleVendor */
+#define HID_USAGE_APPLE_ALS             0x0004  /* kHIDUsage_AppleVendor_AmbientLightSensor */
+#define HID_USAGE_APPLE_PROXIMITY       0x0005  /* kHIDUsage_AppleVendor_ProximitySensor */
+#define HID_EVENT_TYPE_ALS              12      /* kIOHIDEventTypeAmbientLightSensor */
+#define HID_EVENT_TYPE_PROXIMITY        14      /* kIOHIDEventTypeProximity */
 #define HID_USAGE_POWER                 0x30    /* the lock button */
 #define HID_USAGE_MENU                  0x40    /* the home button */
 #define HID_USAGE_VOLUME_UP             0xe9
@@ -80,6 +89,26 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 #define DIGITIZER_FROM_EDGE_TIP         0x800   /* not a change: this finger came in over an edge of the screen */
 #define FIELD_IS_BUILT_IN               0x4
 #define FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xb0019
+#define FIELD_ALS_RAW_CH0               0xc0001
+#define FIELD_ALS_RAW_CH1               0xc0002
+#define FIELD_ALS_BRIGHTNESS_CHANGED    0xc0005
+#define FIELD_ALS_ILLUMINANCE           0xc000a
+#define PROXIMITY_MASK_NEAR             0x41
+
+#define REDWOOD_SENSORS_DEVICE          "/dev/redwood-sensors"
+
+struct redwood_sensor_sample {
+	uint64_t timestamp;
+	uint32_t als_lux;
+	uint32_t clear_raw;
+	uint32_t ir_raw;
+	uint32_t prox_raw;
+	uint16_t prox_distance_mm;
+	uint8_t  prox_near;
+	uint8_t  source_flags;
+};
+
+_Static_assert(sizeof(struct redwood_sensor_sample) == 32, "redwood sensor sample size");
 
 #define MAX_FINGERS     10
 
@@ -122,14 +151,63 @@ service_copy_property(__unused void *target, void *refcon, __unused IOHIDService
  */
 #define TOUCH_MODE_WAKE         0xfe
 static _Atomic int touch_mode;
+static _Atomic int prox_detection_mode;
+static _Atomic uint32_t cached_als_lux = 150;
+static _Atomic uint32_t cached_clear_raw = 600;
+static _Atomic uint32_t cached_ir_raw = 120;
+static _Atomic uint32_t cached_prox_near = 0;
+
+static IOHIDEventRef
+create_als_event(uint64_t ts, uint32_t lux, uint32_t clear_raw, uint32_t ir_raw)
+{
+	IOHIDEventRef event = IOHIDEventCreateAmbientLightSensorEvent(NULL, ts ? ts : mach_absolute_time(), lux, 0);
+	if (!event) {
+		return NULL;
+	}
+	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+	IOHIDEventSetIntegerValue(event, FIELD_ALS_RAW_CH0, (CFIndex)clear_raw);
+	IOHIDEventSetIntegerValue(event, FIELD_ALS_RAW_CH1, (CFIndex)ir_raw);
+	IOHIDEventSetIntegerValue(event, FIELD_ALS_BRIGHTNESS_CHANGED, 1);
+	IOHIDEventSetIntegerValue(event, FIELD_ALS_ILLUMINANCE, (CFIndex)lux);
+	return event;
+}
+
+static IOHIDEventRef
+create_prox_event(uint64_t ts, bool near)
+{
+	IOHIDEventRef event = IOHIDEventCreateProximtyEvent(NULL, ts ? ts : mach_absolute_time(),
+	    near ? PROXIMITY_MASK_NEAR : 0, 0);
+	if (!event) {
+		return NULL;
+	}
+	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
+	return event;
+}
+
+static IOHIDEventRef
+service_copy_event(__unused void *target, __unused void *refcon, __unused IOHIDServiceClientRef service,
+    uint32_t type, __unused IOHIDEventRef matching, __unused uint32_t options)
+{
+	if (type == HID_EVENT_TYPE_ALS) {
+		return create_als_event(mach_absolute_time(), cached_als_lux, cached_clear_raw, cached_ir_raw);
+	}
+	if (type == HID_EVENT_TYPE_PROXIMITY) {
+		return create_prox_event(mach_absolute_time(), cached_prox_near != 0);
+	}
+	return NULL;
+}
 
 static Boolean
 service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceClientRef service, CFStringRef key,
     CFTypeRef value)
 {
+    struct service *srv = (struct service *)refcon;
+    if (key && value && srv && srv->properties) {
+        CFDictionarySetValue(srv->properties, key, value);
+    }
     if (key && value && CFEqual(key, CFSTR("DeviceOpenedByEventSystem")) &&
         CFGetTypeID(value) == CFBooleanGetTypeID() && CFBooleanGetValue(value)) {
-        ((struct service *)refcon)->opened = true;
+        srv->opened = true;
         say("input26: DeviceOpenedByEventSystem service=%p\n", (void *)service);
     }
     if (key && value && CFEqual(key, CFSTR("TouchDetectionMode")) && CFGetTypeID(value) == CFNumberGetTypeID()) {
@@ -137,6 +215,12 @@ service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceC
         CFNumberGetValue(value, kCFNumberIntType, &mode);
         if (mode != touch_mode) say("input26: touch detection mode %#x\n", mode);
         touch_mode = mode;
+    }
+    if (key && value && CFEqual(key, CFSTR("DetectionMode")) && CFGetTypeID(value) == CFNumberGetTypeID()) {
+        int mode = 0;
+        CFNumberGetValue(value, kCFNumberIntType, &mode);
+        if (mode != prox_detection_mode) say("input26: proximity detection mode %#x\n", mode);
+        prox_detection_mode = mode;
     }
     return true;
 }
@@ -156,13 +240,13 @@ service_notification(__unused void *target, __unused void *refcon, __unused IOHI
 
 static const struct virtual_service_callbacks service_callbacks = {
 	.version = 2, .notification = service_notification, .setProperty = service_set_property,
-	.copyProperty = service_copy_property,
+	.copyProperty = service_copy_property, .copyEvent = service_copy_event,
 };
 
 /* Each service gets one registration attempt and its own callback state.
  * On failure the process exits, so pending callbacks retain valid refcon data. */
 static IOHIDServiceClientRef
-make_service(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool display)
+make_service_ext(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool display, bool require_open)
 {
 	struct service *made = calloc(1, sizeof(*made));
 	IOHIDServiceClientRef service = NULL;
@@ -208,14 +292,21 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
         say("input26: registration failed for %s\n", product);
         return NULL;
     }
-    for (int tenths = 0; tenths < 20 && !made->opened; tenths++) {
+    int max_polls = require_open ? 20 : 5;
+    for (int tenths = 0; tenths < max_polls && !made->opened; tenths++) {
         usleep(100000);
     }
-    if (!made->opened) {
-        say("input26: event server did not open %s after 20 polls\n", product);
+    if (!made->opened && require_open) {
+        say("input26: event server did not open %s after %d polls\n", product, max_polls);
         return NULL;
     }
     return service;
+}
+
+static IOHIDServiceClientRef
+make_service(IOHIDEventSystemClientRef client, const char *product, int page, int usage, bool display)
+{
+    return make_service_ext(client, product, page, usage, display, true);
 }
 
 /* touch_lat=1 samples at most 128 dispatched touch records. CPU values are
@@ -386,11 +477,95 @@ send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
 	CFRelease(event);
 }
 
+static void
+start_sensors_poller(dispatch_queue_t queue, IOHIDServiceClientRef als_service, IOHIDServiceClientRef prox_service)
+{
+	if (!als_service && !prox_service) {
+		return;
+	}
+	dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+	if (!timer) {
+		return;
+	}
+	static int sensors_fd = -1;
+	static uint32_t last_als_lux = UINT32_MAX;
+	static uint32_t last_prox_near = UINT32_MAX;
+	static int last_prox_mode = 0;
+
+	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
+	    250 * NSEC_PER_MSEC, 25 * NSEC_PER_MSEC);
+	dispatch_source_set_event_handler(timer, ^{
+		struct redwood_sensor_sample sample = { 0 };
+		bool have_sample = false;
+
+		if (sensors_fd < 0) {
+			sensors_fd = open(REDWOOD_SENSORS_DEVICE, O_RDONLY | O_NONBLOCK);
+		}
+		if (sensors_fd >= 0) {
+			ssize_t n = pread(sensors_fd, &sample, sizeof(sample), 0);
+			if (n == (ssize_t)sizeof(sample)) {
+				have_sample = true;
+			}
+		}
+		if (!have_sample) {
+			int lux_val = 150, prox_val = 0;
+			size_t sz = sizeof(int);
+			if (sysctlbyname("kern.redwood.als_lux", &lux_val, &sz, NULL, 0) == 0 && lux_val >= 0) {
+				sample.als_lux = (uint32_t)lux_val;
+				sample.clear_raw = sample.als_lux * 4;
+				sample.ir_raw = sample.als_lux;
+				have_sample = true;
+			}
+			sz = sizeof(int);
+			if (sysctlbyname("kern.redwood.prox_near", &prox_val, &sz, NULL, 0) == 0) {
+				sample.prox_near = prox_val ? 1 : 0;
+				have_sample = true;
+			}
+			sample.timestamp = mach_absolute_time();
+		}
+		if (!have_sample) {
+			return;
+		}
+		cached_als_lux = sample.als_lux;
+		cached_clear_raw = sample.clear_raw;
+		cached_ir_raw = sample.ir_raw;
+		cached_prox_near = sample.prox_near;
+
+		if (als_service && sample.als_lux != last_als_lux) {
+			IOHIDEventRef ev = create_als_event(sample.timestamp, sample.als_lux,
+			    sample.clear_raw, sample.ir_raw);
+			if (ev) {
+				if (IOHIDVirtualServiceClientDispatchEvent(als_service, ev)) {
+					if (last_als_lux == UINT32_MAX) {
+						say("input26: dispatched initial ALS lux=%u\n", sample.als_lux);
+					}
+					last_als_lux = sample.als_lux;
+				}
+				CFRelease(ev);
+			}
+		}
+		int cur_prox_mode = prox_detection_mode;
+		if (prox_service && (sample.prox_near != last_prox_near || (cur_prox_mode != 0 && last_prox_mode == 0))) {
+			IOHIDEventRef ev = create_prox_event(sample.timestamp, sample.prox_near != 0);
+			if (ev) {
+				if (IOHIDVirtualServiceClientDispatchEvent(prox_service, ev)) {
+					say("input26: dispatched proximity near=%u (mode=%#x)\n",
+					    sample.prox_near, cur_prox_mode);
+					last_prox_near = sample.prox_near;
+				}
+				CFRelease(ev);
+			}
+		}
+		last_prox_mode = cur_prox_mode;
+	});
+	dispatch_resume(timer);
+}
+
 static int
 input_run(void)
 {
 	IOHIDEventSystemClientRef client = NULL;
-	IOHIDServiceClientRef screen = NULL, buttons = NULL;
+	IOHIDServiceClientRef screen = NULL, buttons = NULL, als_service = NULL, prox_service = NULL;
 	struct redwood_touch t;
 	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
 	int device;
@@ -431,7 +606,10 @@ input_run(void)
     if (!screen) return 1;
     buttons = make_service(client, "Redwood buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
     if (!buttons) return 1;
-    say("input26: both services opened; reading %s\n", REDWOOD_TOUCH_DEVICE);
+    als_service = make_service_ext(client, "Redwood ambient light sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_ALS, true, false);
+    prox_service = make_service_ext(client, "Redwood proximity sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_PROXIMITY, false, false);
+    start_sensors_poller(queue, als_service, prox_service);
+    say("input26: services registered (als=%p prox=%p); reading %s\n", (void *)als_service, (void *)prox_service, REDWOOD_TOUCH_DEVICE);
     device = open(REDWOOD_TOUCH_DEVICE, O_RDONLY);
     if (device < 0) {
         say("input26: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
