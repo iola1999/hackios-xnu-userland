@@ -2,7 +2,9 @@
  * net_test: bring the network interface up the way iOS itself would, and see whether iOS can
  * use it. Each step is one layer of what a stock application needs:
  *
- * usage: net_test STEP...
+ * usage: net_test [--deadline SECONDS] STEP...
+ *   --deadline SECONDS    bound the entire invocation; expiry exits 124 (use 12 for rwsh's 15 s limit)
+ * DNS, TCP, HTTP and waitaddr failures exit 1 after the remaining steps; fetch requires HTTP 2xx.
  *   show                  the interfaces and their addresses, as the kernel has them
  *   store [PATTERN]       what configd has in its dynamic store (default: everything under
  *                         State:/Network and Setup:/Network)
@@ -49,6 +51,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <ifaddrs.h>
+#include <limits.h>
 #include <mach/mach.h>
 #include <sys/sysctl.h>
 #include <mach/mach_time.h>
@@ -56,6 +59,7 @@
 #include <net/if_dl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +86,16 @@ seconds(void)
 		mach_timebase_info(&base);
 	}
 	return (double)mach_absolute_time() * base.numer / base.denom / 1e9;
+}
+
+static void
+deadline_expired(int signal_number)
+{
+	static const char message[] = "net_test: deadline expired\n";
+
+	(void)signal_number;
+	(void)write(STDERR_FILENO, message, sizeof(message) - 1);
+	_exit(124);
 }
 
 /* ---- show ------------------------------------------------------------------------------------------ */
@@ -266,69 +280,111 @@ resolve(const char *name, char *first, size_t size)
 	return true;
 }
 
-static void
+static bool
 tcp(const char *host, const char *port)
 {
 	struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *list = NULL;
 	char request[256], answer[2048], *end;
 	double start = seconds();
 	ssize_t n, total = 0;
-	int s, error;
+	int s = -1, error, no_sigpipe = 1;
+	bool ok = false;
 
 	error = getaddrinfo(host, port, &hints, &list);
 	if (error != 0) {
 		printf("net_test: tcp %s: %s\n", host, gai_strerror(error));
-		return;
+		return false;
 	}
 	s = socket(AF_INET, SOCK_STREAM, 0);
 	if (s < 0 || connect(s, list->ai_addr, list->ai_addrlen) != 0) {
 		printf("net_test: tcp %s port %s: %s (after %.2f s)\n", host, port, strerror(errno), seconds() - start);
-		freeaddrinfo(list);
-		return;
+		goto out;
 	}
 	printf("net_test: tcp %s port %s: connected in %.2f s\n", host, port, seconds() - start);
-	snprintf(request, sizeof(request), "GET / HTTP/1.0\r\nHost: %s\r\nUser-Agent: net_test\r\n\r\n", host);
-	write(s, request, strlen(request));
+	error = snprintf(request, sizeof(request), "GET / HTTP/1.0\r\nHost: %s\r\nUser-Agent: net_test\r\n\r\n", host);
+	if (error < 0 || (size_t)error >= sizeof(request) ||
+	    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe)) != 0) {
+		printf("net_test: tcp %s: request setup failed\n", host);
+		goto out;
+	}
+	for (size_t sent = 0, length = (size_t)error; sent < length; sent += (size_t)n) {
+		n = write(s, request + sent, length - sent);
+		if (n < 0 && errno == EINTR) {
+			n = 0;
+			continue;
+		}
+		if (n <= 0) {
+			printf("net_test: tcp %s: write failed: %s\n", host, n < 0 ? strerror(errno) : "no progress");
+			goto out;
+		}
+	}
 	answer[0] = 0;
-	while ((n = read(s, total == 0 ? answer : request, total == 0 ? sizeof(answer) - 1 : sizeof(request))) > 0) {
+	for (;;) {
+		n = read(s, total == 0 ? answer : request, total == 0 ? sizeof(answer) - 1 : sizeof(request));
+		if (n < 0 && errno == EINTR) {
+			continue;
+		}
+		if (n <= 0) {
+			break;
+		}
 		if (total == 0) {
 			answer[n] = 0;
 		}
 		total += n;
 	}
+	error = errno;
 	if ((end = strpbrk(answer, "\r\n")) != NULL) {
 		*end = 0;
 	}
 	printf("net_test: tcp %s: %zd bytes in %.2f s, the answer begins \"%s\"\n", host, total, seconds() - start, answer);
-	close(s);
+	if (n < 0) {
+		printf("net_test: tcp %s: read failed: %s\n", host, strerror(error));
+	}
+	ok = n == 0 && total > 0;
+out:
+	if (s >= 0) {
+		close(s);
+	}
 	freeaddrinfo(list);
+	return ok;
 }
 
 /* ---- fetch, reach ---------------------------------------------------------------------------------- */
 
-static void
+static bool
 fetch(const char *address)
 {
 	NSURL *url = [NSURL URLWithString:@(address)];
 	NSURLSessionConfiguration *configuration = NSURLSessionConfiguration.ephemeralSessionConfiguration;
 	dispatch_semaphore_t done = dispatch_semaphore_create(0);
 	double start = seconds();
+	__block bool ok = false;
+
+	if (url.host.length == 0 || !([url.scheme.lowercaseString isEqual:@"http"] ||
+	    [url.scheme.lowercaseString isEqual:@"https"])) {
+		printf("net_test: fetch %s: invalid HTTP(S) URL\n", address);
+		return false;
+	}
 
 	configuration.timeoutIntervalForRequest = 60;
-	[[[NSURLSession sessionWithConfiguration:configuration] dataTaskWithURL:url
+	configuration.timeoutIntervalForResource = 90;
+	NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
+	NSURLSessionDataTask *task = [session dataTaskWithURL:url
 	    completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
 		if (error != nil) {
 			printf("net_test: fetch %s: FAILED after %.2f s: %s (%s %ld)\n", address, seconds() - start,
 			    error.localizedDescription.UTF8String, error.domain.UTF8String, (long)error.code);
-		} else {
+		} else if ([response isKindOfClass:NSHTTPURLResponse.class]) {
 			NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
 			NSRange title = [text rangeOfString:@"<title>"], close = [text rangeOfString:@"</title>"];
 
 			NSDictionary *headers = [(NSHTTPURLResponse *)response allHeaderFields];
+			NSInteger status = ((NSHTTPURLResponse *)response).statusCode;
+			ok = status >= 200 && status < 300;
 
 			printf("net_test: fetch %s: status %ld, %lu bytes in %.2f s", address,
 			    (long)((NSHTTPURLResponse *)response).statusCode, (unsigned long)data.length, seconds() - start);
-			if (title.location != NSNotFound && close.location != NSNotFound && close.location > title.location) {
+			if (text.length != 0 && title.location != NSNotFound && close.location != NSNotFound && close.location > title.location) {
 				printf(", title \"%s\"", [text substringWithRange:NSMakeRange(NSMaxRange(title),
 				    close.location - NSMaxRange(title))].UTF8String);
 			}
@@ -343,12 +399,19 @@ fetch(const char *address)
 					    [headers[name] description].UTF8String);
 				}
 			}
+		} else {
+			printf("net_test: fetch %s: no HTTP response\n", address);
 		}
 		dispatch_semaphore_signal(done);
-	}] resume];
+	}];
+	[task resume];
 	if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 90 * NSEC_PER_SEC)) != 0) {
 		printf("net_test: fetch %s: no answer and no error in 90 s\n", address);
+		[session invalidateAndCancel];
+		return false;
 	}
+	[session finishTasksAndInvalidate];
+	return ok;
 }
 
 static void
@@ -548,9 +611,33 @@ wrongjoin(void)
 int
 main(int argc, char **argv)
 {
+	int first_step = 1;
+	bool ok = true;
+
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	if (argc > 1 && strcmp(argv[1], "--deadline") == 0) {
+		char *end;
+		unsigned long limit;
+
+		if (argc < 4 || argv[2][0] < '0' || argv[2][0] > '9') {
+			fprintf(stderr, "net_test: --deadline requires positive integer seconds and a step\n");
+			return 1;
+		}
+		errno = 0;
+		limit = strtoul(argv[2], &end, 10);
+		if (errno != 0 || *end != 0 || limit == 0 || limit > UINT_MAX) {
+			fprintf(stderr, "net_test: invalid deadline\n");
+			return 1;
+		}
+		if (signal(SIGALRM, deadline_expired) == SIG_ERR) {
+			perror("net_test: signal");
+			return 1;
+		}
+		alarm((unsigned int)limit);
+		first_step = 3;
+	}
 	@autoreleasepool {
-		for (int i = 1; i < argc; i++) {
+		for (int i = first_step; i < argc; i++) {
 			const char *step = argv[i];
 
 			if (strcmp(step, "show") == 0) {
@@ -568,14 +655,14 @@ main(int argc, char **argv)
 				}
 				printf("net_test: waitaddr %s: %s after %.1f s\n", interface, show(interface, true) ? "an address" :
 				    "NO address", seconds() - start);
-				show(interface, false);
+				ok = show(interface, false) && ok;
 			} else if (strcmp(step, "resolve") == 0 && i + 1 < argc) {
-				resolve(argv[++i], NULL, 0);
+				ok = resolve(argv[++i], NULL, 0) && ok;
 			} else if (strcmp(step, "tcp") == 0 && i + 2 < argc) {
-				tcp(argv[i + 1], argv[i + 2]);
+				ok = tcp(argv[i + 1], argv[i + 2]) && ok;
 				i += 2;
 			} else if (strcmp(step, "fetch") == 0 && i + 1 < argc) {
-				fetch(argv[++i]);
+				ok = fetch(argv[++i]) && ok;
 			} else if (strcmp(step, "reach") == 0 && i + 1 < argc) {
 				reach(argv[++i]);
 			} else if (strcmp(step, "wait") == 0 && i + 1 < argc) {
@@ -592,5 +679,6 @@ main(int argc, char **argv)
 			}
 		}
 	}
-	return 0;
+	alarm(0);
+	return ok ? 0 : 1;
 }
