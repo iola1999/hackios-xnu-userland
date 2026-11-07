@@ -48,20 +48,66 @@ sb26_airdrop_init(id self, SEL cmd)
     return self;
 }
 
+static const char *const kAirDropModeFile = "/private/var/mobile/Library/Preferences/com.redwood.airdrop.mode";
+static long long g_airdrop_mode = -1;
+
+static long long
+sb26_airdrop_load_mode(void)
+{
+    if (g_airdrop_mode >= 0 && g_airdrop_mode <= 2) {
+        return g_airdrop_mode;
+    }
+    FILE *f = fopen(kAirDropModeFile, "r");
+    if (f) {
+        long long v = 2;
+        if (fscanf(f, "%lld", &v) == 1 && v >= 0 && v <= 2) {
+            g_airdrop_mode = v;
+        }
+        fclose(f);
+    }
+    if (g_airdrop_mode < 0 || g_airdrop_mode > 2) {
+        g_airdrop_mode = 2;
+    }
+    return g_airdrop_mode;
+}
+
+static void
+sb26_airdrop_save_mode(long long mode)
+{
+    if (mode < 0 || mode > 2) mode = 2;
+    g_airdrop_mode = mode;
+    FILE *f = fopen(kAirDropModeFile, "w");
+    if (f) {
+        fprintf(f, "%lld\n", mode);
+        fclose(f);
+    }
+}
+
 static BOOL
 sb26_airdrop_is_available(id self, SEL cmd)
 {
     (void)self;
     (void)cmd;
-    return NO;
+    return YES;
 }
 
 static void
 sb26_airdrop_set_discoverable_mode(id self, SEL cmd, long long mode)
 {
-    (void)self;
     (void)cmd;
-    (void)mode;
+    sb26_airdrop_save_mode(mode);
+    SEL sel_del = sel_registerName("delegate");
+    if (self && class_respondsToSelector(object_getClass(self), sel_del)) {
+        id del = ((id (*)(id, SEL))objc_msgSend)(self, sel_del);
+        SEL sel_chg = sel_registerName("discoveryControllerSettingsDidChange:");
+        if (del && class_respondsToSelector(object_getClass(del), sel_chg)) {
+            ((void (*)(id, SEL, id))objc_msgSend)(del, sel_chg, self);
+        }
+        SEL sel_vis = sel_registerName("discoveryControllerVisibilityDidChange:");
+        if (del && class_respondsToSelector(object_getClass(del), sel_vis)) {
+            ((void (*)(id, SEL, id))objc_msgSend)(del, sel_vis, self);
+        }
+    }
 }
 
 static long long
@@ -69,7 +115,7 @@ sb26_airdrop_discoverable_mode(id self, SEL cmd)
 {
     (void)self;
     (void)cmd;
-    return 0;
+    return sb26_airdrop_load_mode();
 }
 
 static BOOL
@@ -77,7 +123,7 @@ sb26_airdrop_is_action_disabled(id self, SEL cmd)
 {
     (void)self;
     (void)cmd;
-    return YES;
+    return NO;
 }
 
 static void

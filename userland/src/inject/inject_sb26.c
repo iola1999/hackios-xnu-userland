@@ -619,7 +619,7 @@ sb26_hook_MGCopyAnswer(CFStringRef property)
         }
 
         if (CFEqual(property, CFSTR("airdrop-p2p")) || CFEqual(property, CFSTR("airdrop"))) {
-            return kCFBooleanFalse;
+            return kCFBooleanTrue;
         }
     }
 
@@ -899,6 +899,14 @@ install_sb26(void)
         return;
     }
 
+    _dyld_register_func_for_add_image(discovery_image_callback);
+    Class airdrop_cls = objc_getClass("SFAirDropDiscoveryController");
+    if (airdrop_cls) install_airdrop_hooks(airdrop_cls);
+    Class session_cls = objc_getClass("AVOutputDeviceDiscoverySession");
+    if (session_cls) install_screen_mirroring_hooks(session_cls);
+    Class mru_cls = objc_getClass("MRUMirroringController");
+    if (mru_cls) install_mru_mirroring_hooks(mru_cls);
+
     if (strcmp(prog, "SpringBoard") != 0) return;
 
     size_t size = 0;
@@ -930,13 +938,6 @@ install_sb26(void)
         install_haptic_hooks(engine_cls);
     }
 
-    _dyld_register_func_for_add_image(discovery_image_callback);
-    Class airdrop_cls = objc_getClass("SFAirDropDiscoveryController");
-    if (airdrop_cls) install_airdrop_hooks(airdrop_cls);
-    Class session_cls = objc_getClass("AVOutputDeviceDiscoverySession");
-    if (session_cls) install_screen_mirroring_hooks(session_cls);
-    Class mru_cls = objc_getClass("MRUMirroringController");
-    if (mru_cls) install_mru_mirroring_hooks(mru_cls);
     Class cal_cls = objc_getClass("SBCalendarIconImageProvider");
     if (cal_cls) install_calendar_icon_hooks(cal_cls);
 

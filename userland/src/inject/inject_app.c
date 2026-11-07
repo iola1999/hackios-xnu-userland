@@ -377,6 +377,12 @@ setup_app_container_env(const char *name)
 			uuid = "8E5B1A2C-3D4E-4F5A-9B6C-7D8E9F0A1B2C";
 		} else if (strcmp(name, "Maps") == 0) {
 			uuid = "9F6C2B3D-4E5F-4A6B-8C7D-8E9F0A1B2C3D";
+		} else if (strcmp(name, "MobileSafari") == 0) {
+			uuid = "A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D";
+		} else if (strcmp(name, "com.apple.WebKit.Networking") == 0 ||
+		           strcmp(name, "com.apple.WebKit.WebContent") == 0 ||
+		           strcmp(name, "com.apple.WebKit.GPU") == 0) {
+			uuid = "A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D";
 		}
 		if (uuid != NULL) {
 			char home[256], tmp[256];

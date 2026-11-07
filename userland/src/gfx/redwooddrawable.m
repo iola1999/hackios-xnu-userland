@@ -415,15 +415,15 @@ static const struct rwd_format rwd_formats[] = {
 	{  80, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm" },
 	{  81, 'BGRA', 4, 0, "MTLPixelFormatBGRA8Unorm_sRGB" },
 	{  90, 'R10k', 4, 0, "a ten-bit RGB format" },
-	{  94, 'l10r', 4, 1, "a ten-bit RGB format" },
+	{  94, 'BGRA', 4, 0, "a ten-bit RGB format" },
 	{ 115, 'RGhA', 8, 0, "MTLPixelFormatRGBA16Float" },
 	{ 500, '420v', 1, 0, "MTLPixelFormatYCBCR8_420_2P" },
-	{ 550, 'b3a8', 4, 1, "a ten-bit XR format" },
-	{ 551, 'b3a8', 4, 1, "a ten-bit XR format" },
-	{ 552, 'w40a', 4, 1, "a ten-bit XR format" },
-	{ 553, 'w40a', 4, 1, "a ten-bit XR format" },
-	{ 554, 'w30r', 4, 1, "a ten-bit XR format" },
-	{ 555, 'w30r', 4, 1, "a ten-bit XR format" },
+	{ 550, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 551, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 552, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 553, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 554, 'BGRA', 4, 0, "a ten-bit XR format" },
+	{ 555, 'BGRA', 4, 0, "a ten-bit XR format" },
 };
 
 int
@@ -632,8 +632,8 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 		    "import plane 0 only", plane);
 		return NULL;
 	}
-	if (!is_ycbcr_biplanar && (surface.width != want->width || surface.height != want->height)) {
-		rwd_say(why, why_size, "surface %u is %ux%u and the descriptor asks for %ux%u",
+	if (!is_ycbcr_biplanar && (surface.width < want->width || surface.height < want->height)) {
+		rwd_say(why, why_size, "surface %u is %ux%u, smaller than the %ux%u the descriptor asks for",
 		    id, surface.width, surface.height, want->width, want->height);
 		return NULL;
 	}
@@ -673,6 +673,12 @@ rwd_texture_for_surface(struct rwa_device *mesa_device, void *iosurface, unsigne
 	struct rwd_texture_shape import_shape = *want;
 	unsigned req_offset = surface.offset;
 	unsigned req_row_bytes = surface.rowBytes;
+
+	if (import_shape.pixel_format == 94 ||
+	    (import_shape.pixel_format >= 550 && import_shape.pixel_format <= 555)) {
+		import_shape.pixel_format = (import_shape.pixel_format == 551 ||
+		    import_shape.pixel_format == 553 || import_shape.pixel_format == 555) ? 81 : 80;
+	}
 
 	if (is_ycbcr_biplanar) {
 		if (plane == 0) {
