@@ -4,7 +4,8 @@
 # SpringBoard reads its layout from SpringBoard. The last two give iconservicesagent (user
 # _iconservices, uid 276, home /var/empty) the folder Metal's shader cache looks for under its home.
 # /private/var/empty itself is in the image's template: init stops at the first line whose directory
-# already exists, so no line here may repeat one of those.
+# already exists, so no line here may repeat one of those. Application and AppGroup child paths are
+# created by MobileContainerManager from bundle identifiers at launch.
 d	755	501	501	/private/var/mobile/Library/MobileInstallation
 d	755	501	501	/private/var/mobile/Library/SpringBoard
 d	755	0	0	/private/var/empty/Library
@@ -13,15 +14,7 @@ d	755	501	501	/private/var/mobile/Containers/Data/Application
 d	755	501	501	/private/var/mobile/Containers/Shared/AppGroup
 d	755	501	501	/private/var/mobile/Library/SafariSafeBrowsing
 d	755	501	501	/private/var/mobile/Library/SyncedPreferences
-d	755	501	501	/private/var/mobile/Library/Weather
-d	755	501	501	/private/var/mobile/Library/WeatherDaemon
-d	755	501	501	/private/var/mobile/Library/Caches/com.apple.weather
-d	755	501	501	/private/var/mobile/Library/Caches/com.apple.weatherd
 d	755	205	205	/private/var/db/locationd
 d	755	501	501	/private/var/mobile/Library/Location
 d	777	0	0	/private/var/db/redwood-aircache
 d	777	0	0	/private/var/db/redwood-ir3cache
-d	755	501	501	/private/var/mobile/Containers/Shared/AppGroup/group.com.apple.weather
-d	755	501	501	/private/var/mobile/Containers/Shared/AppGroup/group.com.apple.Maps
-d	755	501	501	/private/var/mobile/Library/Caches/GeoServices
-d	755	501	501	/private/var/mobile/Library/Maps
