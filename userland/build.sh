@@ -85,7 +85,8 @@ source ../xnu-env.sh
 
 CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
-DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1"
+SRC_INC="-Isrc/boot -Isrc/inject -Isrc/gfx -Isrc/services -Isrc/apps -Isrc/tests"
+DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1 $SRC_INC"
 # ldid signs a program with its entitlements. The build container has it in theos's toolchain but not
 # on PATH, and the iOS 26 branch below calls it three times without a guard, so name it here when PATH
 # has none. The entitlement check further down reads LDID out of the environment, hence the export;
@@ -111,7 +112,7 @@ esac
 # (the architecture check below), so on macOS its dynamic programs and libraries are built with
 # Xcode's clang and iPhoneOS SDK. The static ones (CC) keep xnu-clang, which links with Xcode's ld there.
 if [ "$V" = 26 ] && [ "$(uname -s)" = Darwin ]; then
-	DYN="/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -O1"
+	DYN="/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -O1 $SRC_INC"
 fi
 # ios165/rootfs and ios165/cryptex must be this copy's own directories of hard links, the way
 # tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
@@ -191,11 +192,11 @@ if [ -n "$PREBUILT" ]; then
 	done
 	cp obj/hello hello
 else
-	$CC $LD -o hello src/hello.c
+	$CC $LD -o hello src/tests/hello.c
 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
 	$CC -c libmini/start.S -o obj/start.o
 	for prog in init child stage0 var_store; do
-		$CC -Ilibmini $LD -o obj/$prog.new src/$prog.c obj/mini.o obj/start.o
+		$CC -Ilibmini $LD -o obj/$prog.new src/boot/$prog.c obj/mini.o obj/start.o
 		# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
 		cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
 	done
@@ -206,21 +207,21 @@ if [ "$V" = 26 ]; then
 	if [ -z "$PREBUILT" ]; then
 		if [ "$(uname -s)" = Darwin ]; then
 			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
-				-Os -Wall -Wextra -Werror -framework CoreFoundation -framework IOKit \
-				src/input26_service.c -o obj/input26-service
-			/usr/bin/codesign --force --sign - --entitlements src/input26_service.entitlements obj/input26-service
+				-Os -Wall -Wextra -Werror $SRC_INC -framework CoreFoundation -framework IOKit \
+				src/services/input26_service.c -o obj/input26-service
+			/usr/bin/codesign --force --sign - --entitlements src/services/input26_service.entitlements obj/input26-service
 			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
-				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os -Wall -Wextra -Werror \
-				-framework CoreFoundation -framework Metal -lobjc -lMobileGestalt src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
+				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os -Wall -Wextra -Werror $SRC_INC \
+				-framework CoreFoundation -framework Metal -lobjc -lMobileGestalt src/inject/inject_sb26.c src/inject/inject_sb26_layers.c src/inject/inject_sb26_rate.c src/inject/inject_posterboard.c -o obj/libredwood-sb26.dylib
 			/usr/bin/codesign --force --sign - obj/libredwood-sb26.dylib
 			# Metal device registration in SpringBoard and backboardd, and the compression
 			# preference the driver needs set before QuartzCore picks a format: it imports
 			# linear IOSurfaces only.
 			/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 \
 				-dynamiclib -install_name /redwood/lib/libredwood-sbmetal-experiment.dylib \
-				-Os -fno-objc-arc -Wall -Wextra -Werror \
+				-Os -fno-objc-arc -Wall -Wextra -Werror $SRC_INC \
 				-framework Foundation -framework Metal -framework UIKit -framework IOKit -lobjc \
-				src/sb_metal_experiment.m -o obj/libredwood-sbmetal-experiment.dylib
+				src/inject/sb_metal_experiment.m -o obj/libredwood-sbmetal-experiment.dylib
 			/usr/bin/codesign --force --sign - obj/libredwood-sbmetal-experiment.dylib
 		else
 			# The iOS 26 SDK is a symlink farm into the build host's Xcode SDK, so a container
@@ -234,16 +235,16 @@ if [ "$V" = 26 ]; then
 				exit 1
 			}
 			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk -miphoneos-version-min=26.0 \
-				-Os -framework CoreFoundation -framework IOKit src/input26_service.c -o obj/input26-service
-			${LDID:-ldid} -Ssrc/input26_service.entitlements obj/input26-service
+				-Os $SRC_INC -framework CoreFoundation -framework IOKit src/services/input26_service.c -o obj/input26-service
+			${LDID:-ldid} -Ssrc/services/input26_service.entitlements obj/input26-service
 			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
-				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os \
-				-framework CoreFoundation -framework Metal -lobjc -lMobileGestalt src/inject_sb26.c src/inject_sb26_layers.c src/inject_sb26_rate.c src/inject_posterboard.c -o obj/libredwood-sb26.dylib
+				-dynamiclib -install_name /redwood/lib/libredwood-sb26.dylib -Os $SRC_INC \
+				-framework CoreFoundation -framework Metal -lobjc -lMobileGestalt src/inject/inject_sb26.c src/inject/inject_sb26_layers.c src/inject/inject_sb26_rate.c src/inject/inject_posterboard.c -o obj/libredwood-sb26.dylib
 			${LDID:-ldid} -S obj/libredwood-sb26.dylib
 			XNU_SDK_VERSION=26.0 xnu-clang -arch arm64e -isysroot ../xnu-deps/26/sdk/iPhoneOS.sdk \
 				-dynamiclib -install_name /redwood/lib/libredwood-sbmetal-experiment.dylib \
-				-Os -fno-objc-arc -framework Foundation -framework Metal -framework UIKit -framework IOKit -lobjc \
-				src/sb_metal_experiment.m -o obj/libredwood-sbmetal-experiment.dylib
+				-Os -fno-objc-arc $SRC_INC -framework Foundation -framework Metal -framework UIKit -framework IOKit -lobjc \
+				src/inject/sb_metal_experiment.m -o obj/libredwood-sbmetal-experiment.dylib
 			${LDID:-ldid} -S obj/libredwood-sbmetal-experiment.dylib
 		fi
 	fi
@@ -289,147 +290,147 @@ done
 if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -z "$PREBUILT" ]; then
 		# ordinary dynamically linked programs of our own, built against the iOS SDK
-		$DYN -o obj/hello_dyn src/hello_dyn.c
-		$DYN -framework CoreFoundation -o obj/svc_test src/svc_test.c
-		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/surf_test.c
+		$DYN -o obj/hello_dyn src/tests/hello_dyn.c
+		$DYN -framework CoreFoundation -o obj/svc_test src/tests/svc_test.c
+		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface -o obj/surf_test src/tests/surf_test.c
 		# an IOSurface of ours imported as a texture of the GPU, written through one view
-		# and read through the other (src/drawable_test.c): the check that tells a texture
+		# and read through the other (src/tests/drawable_test.c): the check that tells a texture
 		# over the surface's own pages from a texture over a copy of them. It goes through
-		# src/redwooddrawable.m, which is the bridge under test, and dlopens the compiler
+		# src/gfx/redwooddrawable.m, which is the bridge under test, and dlopens the compiler
 		# library the way the driver does.
 		$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface \
-			-framework IOKit -o obj/drawable_test src/drawable_test.c src/redwooddrawable.m
-		$DYN -o obj/rwtouch src/rwtouch.c
+			-framework IOKit -o obj/drawable_test src/tests/drawable_test.c src/gfx/redwooddrawable.m
+		$DYN -o obj/rwtouch src/apps/rwtouch.c
 		# stop and continue named daemons, so that one round carries both halves of an
-		# experiment without rebuilding the image (src/rwsig.m)
-		$DYN -o obj/rwsig src/rwsig.m
+		# experiment without rebuilding the image (src/apps/rwsig.m)
+		$DYN -o obj/rwsig src/apps/rwsig.m
 		# wait for the compositor to stop putting frames on the panel and ask for a thread
-		# dump at that instant (src/framewatch.m). rwsig freezes a process and asks where it
+		# dump at that instant (src/apps/framewatch.m). rwsig freezes a process and asks where it
 		# sits; framewatch waits for the system to stop by itself, which is what the round
 		# with 17 frames did.
-		$DYN -o obj/framewatch src/framewatch.m
-		# what LaunchServices and pluginkit answer on this boot (src/lsprobe.m)
-		$DYN -framework Foundation -o obj/lsprobe src/lsprobe.m
-		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/sound_test.c
-		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/mg_test.c
-		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/torch_test.c
-		$DYN -O2 -o obj/camera_test src/camera_test.c src/camera_isp.c
-		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/camera_avtest.m
+		$DYN -o obj/framewatch src/apps/framewatch.m
+		# what LaunchServices and pluginkit answer on this boot (src/apps/lsprobe.m)
+		$DYN -framework Foundation -o obj/lsprobe src/apps/lsprobe.m
+		$DYN -framework CoreFoundation -framework AudioToolbox -framework AVFoundation -lobjc -o obj/sound_test src/tests/sound_test.c
+		$DYN -framework CoreFoundation -lMobileGestalt -o obj/mg_test src/tests/mg_test.c
+		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/torch_test src/tests/torch_test.c
+		$DYN -O2 -o obj/camera_test src/tests/camera_test.c src/services/camera_isp.c
+		$DYN -fobjc-arc -framework Foundation -framework AVFoundation -o obj/camera_avtest src/tests/camera_avtest.m
 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
-		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/record_test.c &&
-			{ ${LDID:-ldid} -Ssrc/record_test.entitlements obj/record_test 2>/dev/null ||
+		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/tests/record_test.c &&
+			{ ${LDID:-ldid} -Ssrc/tests/record_test.entitlements obj/record_test 2>/dev/null ||
 			  echo "build.sh: no ldid: record_test is unsigned, and the system may not let it record"; }
-		$DYN -o obj/cpu_test src/cpu_test.c
-		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/cow_test.c
-		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/cg_test.c
-		# what iOS here believes about Metal, and what CoreImage does without it (src/metal_test.m);
+		$DYN -o obj/cpu_test src/tests/cpu_test.c
+		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/tests/cow_test.c
+		$DYN -framework CoreFoundation -framework CoreGraphics -framework IOSurface -o obj/cg_test src/tests/cg_test.c
+		# what iOS here believes about Metal, and what CoreImage does without it (src/tests/metal_test.m);
 		# OpenGLES for the CIContext made over an EAGLContext, which is deprecated and the point
 		$DYN -fobjc-arc -Wno-deprecated-declarations -framework Foundation -framework CoreGraphics \
 			-framework CoreImage -framework IOKit -framework Metal -framework OpenGLES \
-			-lMobileGestalt -o obj/metal_test src/metal_test.m
+			-lMobileGestalt -o obj/metal_test src/tests/metal_test.m
 		# the first question of subsystem (2): can a subclass of the private _MTLDevice be
-		# made here, and what does its initWithAcceleratorPort: do (src/metal_dev.m). No ARC:
+		# made here, and what does its initWithAcceleratorPort: do (src/tests/metal_dev.m). No ARC:
 		# it calls objc_msgSend by hand and allocates a class at runtime.
 		$DYN -framework Foundation -framework IOKit -framework Metal -lobjc \
-			-o obj/metal_dev src/metal_dev.m
+			-o obj/metal_dev src/tests/metal_dev.m
 		# a device object that implements nothing and logs what Apple's own init asks it
-		# for (src/metal_stubdev.m); same reasons for no ARC and for -lobjc
+		# for (src/tests/metal_stubdev.m); same reasons for no ARC and for -lobjc
 		$DYN -framework Foundation -framework IOKit -framework Metal -lobjc \
-			-o obj/metal_stubdev src/metal_stubdev.m
+			-o obj/metal_stubdev src/tests/metal_stubdev.m
 		# the device object of the driver itself, as the library a bundle would hold
-		# (src/redwoodmetal.m). It links against Metal's private _OBJC_CLASS_$__MTLDevice,
+		# (src/gfx/redwoodmetal.m). It links against Metal's private _OBJC_CLASS_$__MTLDevice,
 		# which is bindable because IOGPU.framework imports the same symbol; -lobjc for
 		# class_addProtocol and no ARC because it calls objc_msgSend by hand.
-		# (with src/redwooddrawable.m beside it: the IOSurface a CAMetalLayer hands a
+		# (with src/gfx/redwooddrawable.m beside it: the IOSurface a CAMetalLayer hands a
 		# device, as a texture. A file of its own because it answers CoreAnimation and
 		# not Metal, and the two meet in one method -- docs/metal.md 10.46.)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwoodmetal.dylib \
 			-framework Foundation -framework IOKit -framework Metal -lobjc \
-			-o obj/libredwoodmetal.dylib src/redwoodmetal.m src/redwooddrawable.m
+			-o obj/libredwoodmetal.dylib src/gfx/redwoodmetal.m src/gfx/redwooddrawable.m
 		# and the program that walks Metal's own steps 4 and 5 against it
 		$DYN -framework Foundation -framework IOKit -framework Metal -lobjc \
-			-o obj/metal_drv_test src/metal_drv_test.m
+			-o obj/metal_drv_test src/tests/metal_drv_test.m
 		# An application of this port's own: a window, a CAMetalLayer, a drawable and a
-		# triangle in it (src/triangle_app.m). UIKit because that is the point -- every
+		# triangle in it (src/tests/triangle_app.m). UIKit because that is the point -- every
 		# Metal result so far is from inside one of Apple's daemons, and this is an
 		# ordinary bundle in /Applications that SpringBoard launches; IOSurface because
 		# it reads the drawable's own surface back to say whether the texture WAS those
 		# pages; no ARC and -lobjc because it sends -initWithAcceleratorPort: by hand,
-		# the way src/metal_drv_test.m does. The bundle is assembled further down, where
+		# the way src/tests/metal_drv_test.m does. The bundle is assembled further down, where
 		# a PREBUILT tree can assemble it too.
 		# (signed, if ldid is there, for the entitlements an application has and a
-		# /redwood/bin program does not: see src/triangle_app.entitlements, which says
+		# /redwood/bin program does not: see src/tests/triangle_app.entitlements, which says
 		# why none of them is needed to RUN. Signed here rather than in the bundle, so
 		# that the copy in /redwood/bin carries the same signature.)
 		$DYN -framework Foundation -framework UIKit -framework QuartzCore \
 			-framework Metal -framework IOSurface -framework IOKit -lobjc \
-			-o obj/RedwoodTriangle src/triangle_app.m &&
-			{ ${LDID:-ldid} -Ssrc/triangle_app.entitlements obj/RedwoodTriangle 2>/dev/null ||
+			-o obj/RedwoodTriangle src/tests/triangle_app.m &&
+			{ ${LDID:-ldid} -Ssrc/tests/triangle_app.entitlements obj/RedwoodTriangle 2>/dev/null ||
 			  echo "build.sh: no ldid: RedwoodTriangle is unsigned, which still runs (AMFI here accepts everything) but holds no entitlements"; }
 		# what the device ANSWERS when an application asks what it supports
-		# (src/metal_caps.m). It takes the device from MTLCreateSystemDefaultDevice() so
+		# (src/tests/metal_caps.m). It takes the device from MTLCreateSystemDefaultDevice() so
 		# that the ivars behind Apple's inherited answers are filled by the registration
 		# Metal itself ran; no ARC and -lobjc because most of what it asks is MTLDeviceSPI,
 		# whose header this port has not got, so every send is an objc_msgSend by hand. MetalFX
 		# because the acceptance test's own capability gate is +supportsDevice: on its two
 		# scaler descriptors, and that gate can be measured without the game.
 		$DYN -framework Foundation -framework IOKit -framework Metal -lobjc \
-			-framework MetalFX -o obj/metal_caps src/metal_caps.m
+			-framework MetalFX -o obj/metal_caps src/tests/metal_caps.m
 		# ... and the switch that steps 1 and 2 need: it puts MetalPluginName and
-		# MetalPluginClassName on the IOAcceleratorES service (src/metal_props.c). IOKit and
+		# MetalPluginClassName on the IOAcceleratorES service (src/tests/metal_props.c). IOKit and
 		# CoreFoundation only -- a program that flips this switch must not itself ask Metal,
 		# whose conditions are asserts. It needs the kernel booted with metal=1.
-		$DYN -framework CoreFoundation -framework IOKit -o obj/metal_props src/metal_props.c
-		$DYN -o obj/shm_test src/shm_test.c
-		$DYN -o obj/apfs_mmap_test src/apfs_mmap_test.c
-		$DYN -o obj/vol_ls src/vol_ls.c
-		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/snap_test.c
-		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/font_test.c
-		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/net_test.m
-		# (the account database answers only a client with the entitlements its own daemons hold: src/store_test.m)
-		$DYN -fobjc-arc -framework Foundation -framework Accounts -o obj/store_test src/store_test.m &&
-			{ ${LDID:-ldid} -Ssrc/store_test.entitlements obj/store_test 2>/dev/null ||
+		$DYN -framework CoreFoundation -framework IOKit -o obj/metal_props src/tests/metal_props.c
+		$DYN -o obj/shm_test src/tests/shm_test.c
+		$DYN -o obj/apfs_mmap_test src/tests/apfs_mmap_test.c
+		$DYN -o obj/vol_ls src/apps/vol_ls.c
+		$DYN -framework CoreFoundation -framework CoreGraphics -framework ImageIO -o obj/snap_test src/tests/snap_test.c
+		$DYN -framework CoreFoundation -framework CoreGraphics -framework CoreText -o obj/font_test src/tests/font_test.c
+		$DYN -fobjc-arc -framework Foundation -framework SystemConfiguration -o obj/net_test src/tests/net_test.m
+		# (the account database answers only a client with the entitlements its own daemons hold: src/tests/store_test.m)
+		$DYN -fobjc-arc -framework Foundation -framework Accounts -o obj/store_test src/tests/store_test.m &&
+			{ ${LDID:-ldid} -Ssrc/tests/store_test.entitlements obj/store_test 2>/dev/null ||
 			  echo "build.sh: no ldid: store_test is unsigned, and accountsd will not show it the accounts"; }
-		# (with an entitlement for "battery_test open URL", if ldid is there: src/battery_test.c)
-		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/battery_test.c &&
-			{ ${LDID:-ldid} -Ssrc/battery_test.entitlements obj/battery_test 2>/dev/null ||
+		# (with an entitlement for "battery_test open URL", if ldid is there: src/tests/battery_test.c)
+		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/tests/battery_test.c &&
+			{ ${LDID:-ldid} -Ssrc/tests/battery_test.entitlements obj/battery_test 2>/dev/null ||
 			  echo "build.sh: no ldid: battery_test is unsigned, and SpringBoard will not open URLs for it"; }
 		# (the keychain answers only a program that has a keychain access group: signed with one, if ldid is there)
-		$DYN -framework CoreFoundation -framework Security -o obj/keychain_test src/keychain_test.c &&
-			{ ${LDID:-ldid} -Ssrc/keychain_test.entitlements obj/keychain_test 2>/dev/null ||
+		$DYN -framework CoreFoundation -framework Security -o obj/keychain_test src/tests/keychain_test.c &&
+			{ ${LDID:-ldid} -Ssrc/tests/keychain_test.entitlements obj/keychain_test 2>/dev/null ||
 			  echo "build.sh: no ldid: keychain_test is unsigned, and the keychain will refuse it (-34018)"; }
-		# (and wifid's way of keeping a network's password, by wifid's name: src/wifipw_test.c)
-		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/wifipw_test.c &&
-			{ ${LDID:-ldid} -Ssrc/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
+		# (and wifid's way of keeping a network's password, by wifid's name: src/tests/wifipw_test.c)
+		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/tests/wifipw_test.c &&
+			{ ${LDID:-ldid} -Ssrc/tests/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood.dylib -framework CoreFoundation -framework IOKit -lobjc \
-			-o obj/libredwood.dylib src/inject.c
+			-o obj/libredwood.dylib src/inject/inject.c
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
-			-o obj/libredwood-sb.dylib src/inject_sb.c
-		# ... the tweak loader of the package manager's prefix (src/inject_tweaks.c): it goes into a
+			-o obj/libredwood-sb.dylib src/inject/inject_sb.c
+		# ... the tweak loader of the package manager's prefix (src/inject/inject_tweaks.c): it goes into a
 		# program either as the one library the kernel inserts or opened by a library of ours
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-tweaks.dylib -framework CoreFoundation -lobjc \
-			-o obj/libredwood-tweaks.dylib src/inject_tweaks.c
-		# ... and inside an application, to say what killed it (src/inject_app.c)
+			-o obj/libredwood-tweaks.dylib src/inject/inject_tweaks.c
+		# ... and inside an application, to say what killed it (src/inject/inject_app.c)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood-app.dylib -lobjc \
-			-o obj/libredwood-app.dylib src/inject_app.c
+			-o obj/libredwood-app.dylib src/inject/inject_app.c
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-media.dylib -framework CoreFoundation -framework CoreMedia \
 			-framework CoreVideo -framework IOSurface -lobjc \
-			-o obj/libredwood-media.dylib src/inject_media.c src/camera_device.c src/camera_isp.c
+			-o obj/libredwood-media.dylib src/inject/inject_media.c src/services/camera_device.c src/services/camera_isp.c
 		# ... and inside appstored (STOREFRONT=1), which answers with a storefront and watches for a bag
-		# request being built (src/inject_store.c)
+		# request being built (src/inject/inject_store.c)
 		# (-lc++abi for __cxa_throw: every C++ exception thrown in the process is watched, which is how
 		#  the jetpack parser's rejections are seen -- a throw somebody catches logs nothing of itself)
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-store.dylib -framework CoreFoundation -lobjc \
-			-lc++abi -o obj/libredwood-store.dylib src/inject_store.c
+			-lc++abi -o obj/libredwood-store.dylib src/inject/inject_store.c
 		# ... and inside fairplayd.H2, which starts and leaves at once: what it looks for, and where it
-		# gives up (src/inject_fairplay.c; watches only, replaces nothing)
+		# gives up (src/inject/inject_fairplay.c; watches only, replaces nothing)
 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libredwood-fairplay.dylib -framework CoreFoundation \
 			-framework IOKit -framework Security -lMobileGestalt \
-			-o obj/libredwood-fairplay.dylib src/inject_fairplay.c
+			-o obj/libredwood-fairplay.dylib src/inject/inject_fairplay.c
 		# the output device of the audio server: a plug-in for CoreAudio's HAL
-		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/audio_plugin.c
+		$DYN -bundle -framework CoreFoundation -o obj/RedwoodAudio src/services/audio_plugin.c
 		# The same driver again as a loadable bundle, which is the form Metal's own
 		# discovery wants: step 3 builds the path /System/Library/Extensions/<name>.bundle
 		# and opens it with NSBundle, and -[NSBundle classNamed:] then tests that the class
@@ -437,7 +438,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# executable: dyld uniques images by install_name, so a process that already has
 		# /redwood/lib/libredwoodmetal.dylib would bind the bundle to it and fail that test.
 		$DYN -bundle -framework Foundation -framework IOKit -framework Metal -lobjc \
-			-o obj/RedwoodMetal src/redwoodmetal.m src/redwooddrawable.m
+			-o obj/RedwoodMetal src/gfx/redwoodmetal.m src/gfx/redwooddrawable.m
 		if [ -n "$GL" ]; then
 			# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 			# (Mesa says beside the library what it was built from: one from other patches is built again)
@@ -463,13 +464,13 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 				echo "build.sh: tools/mesa/air/ has changed since libredwoodair.dylib was built"
 				env AIR=1 $MESA_BUILD ../tools/mk-mesa.sh
 			}
-			./mkeagl.py src/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/eagl.c > obj/eagl_gen.h
+			./mkeagl.py src/gfx/eagl_slots.txt $M/gl.xml $M/exported-gl.txt src/gfx/eagl.c > obj/eagl_gen.h
 			$DYN -dynamiclib -install_name /redwood/lib/libredwood-gl.dylib -Iobj -framework CoreFoundation \
 				-framework IOKit -framework IOSurface -lobjc $M/libOSMesa.8.dylib -o obj/libredwood-gl.dylib \
-				src/eagl.c src/gl_osmesa.c
-			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/gl_test.c
-			# ... and what this GPU makes of an unsigned integer turned into a float (src/u2f_test.c)
-			$DYN $M/libOSMesa.8.dylib -o obj/u2f_test src/u2f_test.c
+				src/gfx/eagl.c src/gfx/gl_osmesa.c
+			$DYN -framework CoreFoundation -framework IOKit $M/libOSMesa.8.dylib -o obj/gl_test src/tests/gl_test.c
+			# ... and what this GPU makes of an unsigned integer turned into a float (src/tests/u2f_test.c)
+			$DYN $M/libOSMesa.8.dylib -o obj/u2f_test src/tests/u2f_test.c
 			cp $M/libOSMesa.8.dylib obj/
 			# air_run draws with a Metal shader translated by the AIR frontend
 			# and reads the pixels back (docs/air.md). It is built inside the
@@ -479,7 +480,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			[ -f $M/air_run ] && cp $M/air_run obj/air_run
 			# The compiler the Metal driver asks for: AIR in, a dispatch on the
 			# Adreno out (tools/mesa/air/air_metal.h). It is copied whether or not
-			# GL is wanted, because src/redwoodmetal.m dlopens it by that path --
+			# GL is wanted, because src/gfx/redwoodmetal.m dlopens it by that path --
 			# and its absence is a sentence the driver prints, not a crash.
 			[ -f $M/libredwoodair.dylib ] && cp $M/libredwoodair.dylib obj/
 		fi
@@ -493,8 +494,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# prebuilt/userland ships no lsprobe and PREBUILT=1 promises nothing it does not carry.
 	if [ -z "$PREBUILT" ]; then
 		[ -f obj/lsprobe ] || { echo "build.sh: obj/lsprobe missing" >&2; exit 1; }
-		[ obj/lsprobe -nt src/lsprobe.m ] || {
-			echo "build.sh: obj/lsprobe is older than src/lsprobe.m; build it (IOS=$IOS) before staging" >&2
+		[ obj/lsprobe -nt src/apps/lsprobe.m ] || {
+			echo "build.sh: obj/lsprobe is older than src/apps/lsprobe.m; build it (IOS=$IOS) before staging" >&2
 			exit 1
 		}
 	fi
@@ -551,7 +552,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		rm -rf obj/RedwoodTriangle.app
 		mkdir -p obj/RedwoodTriangle.app
 		cp obj/RedwoodTriangle obj/RedwoodTriangle.app/
-		cp src/triangle_app.plist obj/RedwoodTriangle.app/Info.plist
+		cp src/tests/triangle_app.plist obj/RedwoodTriangle.app/Info.plist
 		printf 'APPL????' > obj/RedwoodTriangle.app/PkgInfo
 		# The icon is the picture the application draws: an orange triangle over the
 		# lower left half of a blue square, by the same rule the shader covers a pixel
@@ -604,14 +605,14 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# skipped and the image gets whatever object was left from an earlier run. That is how a
 	# driver built on 23 October reached a 28 October image (docs/plan/k90auto-run-protocol.md).
 	[ -f obj/libredwoodmetal.dylib ] || { echo "build.sh: obj/libredwoodmetal.dylib missing"; exit 1; }
-	[ obj/libredwoodmetal.dylib -nt src/redwoodmetal.m ] || {
-		echo "build.sh: obj/libredwoodmetal.dylib is older than src/redwoodmetal.m; build it (IOS=../ios26) before staging"
+	[ obj/libredwoodmetal.dylib -nt src/gfx/redwoodmetal.m ] || {
+		echo "build.sh: obj/libredwoodmetal.dylib is older than src/gfx/redwoodmetal.m; build it (IOS=../ios26) before staging"
 		exit 1
 	}
 	cp obj/libredwoodmetal.dylib root/lib/
 	# The AIR library comes from the Mesa build rather than from this script, so its architecture is
 	# not decided here -- and dyld refuses an arm64 slice in an arm64e process outright, which leaves
-	# src/redwoodmetal.m without a compiler: no shader is ever translated, the GPU takes no
+	# src/gfx/redwoodmetal.m without a compiler: no shader is ever translated, the GPU takes no
 	# submission, and the desktop ran at 9-11 frames a second where the same image with an arm64e
 	# library reached 60. Only the kernel log says any of that, so the build stops here instead.
 	# AIR_DYLIB names another library to install. The 26 line's is the arm64e one
@@ -634,7 +635,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -f obj/RedwoodAudio ]; then
 		mkdir -p root/lib/RedwoodAudio.driver
 		cp obj/RedwoodAudio root/lib/RedwoodAudio.driver/
-		cp src/audio_plugin.plist root/lib/RedwoodAudio.driver/Info.plist
+		cp src/services/audio_plugin.plist root/lib/RedwoodAudio.driver/Info.plist
 	fi
 	# The Metal plug-in bundle, flat and unsigned -- which is enough here: AMFI in this
 	# kernel is a stand-in that accepts every signature (libkern/amfi/miniamfi.c), and
@@ -646,7 +647,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	if [ -f obj/RedwoodMetal ]; then
 		mkdir -p root/lib/RedwoodMetal.bundle
 		cp obj/RedwoodMetal root/lib/RedwoodMetal.bundle/
-		cp src/metal_plugin.plist root/lib/RedwoodMetal.bundle/Info.plist
+		cp src/gfx/metal_plugin.plist root/lib/RedwoodMetal.bundle/Info.plist
 	fi
 	if [ -n "$GL" ]; then
 		cp obj/libOSMesa.8.dylib root/lib/
@@ -750,7 +751,9 @@ PY
 		done
 	fi
 	cp ${RC:-rc.launchd} root/etc/rc
-	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
+	rc_jobs_src=${RC_JOBS:-jobs/rc.jobs}
+	[ -f "$rc_jobs_src" ] || [ ! -f "jobs/$rc_jobs_src" ] || rc_jobs_src="jobs/$rc_jobs_src"
+	cp "$rc_jobs_src" root/etc/rc.jobs
 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
 	# lines about its own business in the first minutes and pushes everything else out of the
 	# kernel's log; the daemons keep their own standard error on the console all the same.
@@ -860,8 +863,8 @@ if [ "$V" = 26 ]; then
 	done
 fi
 [ -d root/lib/RedwoodAudio.driver ] && ln -sf /redwood/lib/RedwoodAudio.driver root/hal/RedwoodAudio.driver
-if [ -f src/build_installer.sh ]; then
-	bash src/build_installer.sh
+if [ -f src/apps/build_installer.sh ]; then
+	bash src/apps/build_installer.sh
 fi
 if [ -d obj/RedwoodInstaller.app ]; then
 	mkdir -p root/Applications

@@ -3,7 +3,7 @@
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-USERLAND_DIR="$(cd "$HERE/.." && pwd)"
+USERLAND_DIR="$(cd "$HERE/../.." && pwd)"
 OBJ_DIR="$USERLAND_DIR/obj"
 APP_DIR="$OBJ_DIR/RedwoodInstaller.app"
 

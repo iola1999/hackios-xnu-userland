@@ -252,12 +252,6 @@ if '--root-volume' in args:
     del args[i:i + 2]
 args = [a for a in args if a != '--rest']
 src_root, dest, labels = args[0], args[1], args[2:]
-if not root_volume:
-    possible_slt = os.path.join(os.path.dirname(os.path.abspath(src_root)), 'rootfs.slt')
-    if os.path.isfile(possible_slt):
-        root_volume = possible_slt
-    elif os.path.isfile(src_root + '.slt'):
-        root_volume = src_root + '.slt'
 oslog = os.environ.get('OSLOG', '').split()
 src = f'{src_root}/System/Library/LaunchDaemons'
 # A program in a cryptex -- on a device a volume of its own, grafted at /System/Cryptexes/NAME (eight of

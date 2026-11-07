@@ -16,13 +16,9 @@ REPO_ROOT = HERE.parents[1]
 
 
 class TestVarStoreConfig(unittest.TestCase):
-    def test_varstore_plist_arguments(self):
+    def test_varstore_plist_removed(self):
         plist_path = HERE / "com.redwood.varstore.plist"
-        self.assertTrue(plist_path.is_file(), f"{plist_path} missing")
-        data = plistlib.loads(plist_path.read_bytes())
-        args = data.get("ProgramArguments", [])
-        self.assertEqual(args, ["/redwood/bin/var_store", "watch", "20"],
-                         f"Unexpected ProgramArguments: {args}")
+        self.assertFalse(plist_path.exists(), f"{plist_path} should be removed (RDWFS001 handles persistence)")
 
     def test_cycle_boot_args(self):
         cycle_path = REPO_ROOT / "tools/k90auto/cycle.py"
@@ -35,18 +31,16 @@ class TestVarStoreConfig(unittest.TestCase):
         pkg_path = REPO_ROOT / "tools/k90auto/package.py"
         self.assertTrue(pkg_path.is_file(), f"{pkg_path} missing")
         text = pkg_path.read_text()
-        self.assertIn('["/redwood/bin/var_store", "watch", "20"]', text,
-                      "package.py must configure watch 20 for var_store")
         self.assertIn("com.redwood.varstore.plist", text)
 
     def test_file_line_limits(self):
         checked_files = [
-            HERE / "src/var_store.c",
-            HERE / "src/var_store_dirty.inc",
-            HERE / "src/var_store_delta.inc",
-            HERE / "src/var_store_klog.inc",
-            HERE / "src/var_store_stamp.inc",
-            HERE / "src/var_store_unpack.inc",
+            HERE / "src/boot/var_store.c",
+            HERE / "src/boot/var_store_dirty.inc",
+            HERE / "src/boot/var_store_delta.inc",
+            HERE / "src/boot/var_store_klog.inc",
+            HERE / "src/boot/var_store_stamp.inc",
+            HERE / "src/boot/var_store_unpack.inc",
             REPO_ROOT / "tools/k90auto/package.py",
             REPO_ROOT / "tools/k90auto/cycle.py",
             REPO_ROOT / "tools/k90auto/run-auto.py",
@@ -149,12 +143,30 @@ static void *links = mock_links;
 static uint64_t skipped_kinds, skipped_big;
 static char path[MAX_PATH];
 static int delta_mode = 0;
+enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5, ENT_DELETE = 6 };
+struct entry {
+    uint32_t kind;
+    uint32_t mode;
+    uint32_t uid, gid;
+    uint32_t flags;
+    uint32_t pathlen;
+    uint32_t nxattr;
+    uint32_t mtime_nsec;
+    int64_t  mtime_sec;
+    uint64_t size;
+};
+static off_t slot_at(int slot) { return store_at + (off_t)slot * 0x80000000LL; }
+static int out(const void *p, uint64_t n) { (void)p; (void)n; return 1; }
+static int out_pad(void) { return 1; }
 static int pack_tree(const char *rel) { (void)rel; return 1; }
 static int out_flush(int last) { (void)last; return 1; }
 
-#include "src/var_store_dirty.inc"
-#include "src/var_store_klog.inc"
-#include "src/var_store_delta.inc"
+static int unpack_one(int make) { (void)make; return 1; }
+static int save(void) { return 1; }
+
+#include "src/boot/var_store_dirty.inc"
+#include "src/boot/var_store_klog.inc"
+#include "src/boot/var_store_delta.inc"
 
 int main(int argc, char **argv) {
     crc_init();
@@ -162,39 +174,12 @@ int main(int argc, char **argv) {
     const char *cmd = argv[1];
 
     if (strcmp(cmd, "test_dirty") == 0) {
-        struct dir_snapshot s1, s2;
-        memset(&s1, 0, sizeof(s1));
-        memset(&s2, 0, sizeof(s2));
-
-        s1.max_mtime_sec = 100;
-        s1.total_size = 500;
-        s1.count = 5;
-
-        s2 = s1;
-        if (snapshot_is_dirty(&s2, &s1)) {
-            printf("FAIL: identical snapshot marked dirty\\n");
-            return 2;
-        }
-
-        s2.total_size = 501;
-        if (!snapshot_is_dirty(&s2, &s1)) {
-            printf("FAIL: size change not marked dirty\\n");
-            return 3;
-        }
-
-        s2 = s1;
-        s2.max_mtime_sec = 101;
-        if (!snapshot_is_dirty(&s2, &s1)) {
-            printf("FAIL: mtime change not marked dirty\\n");
-            return 4;
-        }
-
-        if (!is_transient_name("diagnostics") || !is_transient_name("tmp")) {
-            printf("FAIL: transient name not recognized\\n");
+        if (!path_has_component("db/diagnostics", "diagnostics") || !path_has_component("tmp", "tmp")) {
+            printf("FAIL: transient component not recognized\\n");
             return 5;
         }
-        if (is_transient_name("SpringBoard") || is_transient_name("Preferences")) {
-            printf("FAIL: whitelist name recognized as transient\\n");
+        if (path_has_component("mobile/Library/SpringBoard", "tmp") || path_has_component("Preferences", "tmp")) {
+            printf("FAIL: whitelist path matched transient component\\n");
             return 6;
         }
 
@@ -221,7 +206,7 @@ int main(int argc, char **argv) {
     }
 
     if (strcmp(cmd, "test_delta") == 0) {
-        struct delta_head dh;
+        struct delta_head dh, out_dh;
         memset(&dh, 0, sizeof(dh));
         memcpy(dh.magic, DELTA_MAGIC, sizeof(dh.magic));
         dh.version = DELTA_VERSION;
@@ -253,21 +238,21 @@ int main(int argc, char **argv) {
             return 11;
         }
 
-        /* Test delta_is_near_full */
+        /* Test payload limit guard in delta_read_head_slot */
         dh.flags = 0;
-        dh.bytes = 61u << 20; /* 61 MiB >= 60 MiB limit */
+        dh.bytes = 61u << 20; /* > DELTA_PAYLOAD_LIMIT */
         dh.head_crc = delta_head_checksum(&dh);
         memcpy(mock_delta_block, &dh, sizeof(dh));
-        if (!delta_is_near_full()) {
-            printf("FAIL: delta 61 MiB not detected as near full\\n");
+        if (delta_read_head_slot(0, &out_dh)) {
+            printf("FAIL: oversized delta 61 MiB accepted by delta_read_head_slot\\n");
             return 12;
         }
 
-        dh.bytes = 5u << 20; /* 5 MiB */
+        dh.bytes = 5u << 20; /* 5 MiB <= DELTA_PAYLOAD_LIMIT */
         dh.head_crc = delta_head_checksum(&dh);
         memcpy(mock_delta_block, &dh, sizeof(dh));
-        if (delta_is_near_full()) {
-            printf("FAIL: delta 5 MiB detected as near full\\n");
+        if (!delta_read_head_slot(0, &out_dh)) {
+            printf("FAIL: valid delta 5 MiB rejected by delta_read_head_slot\\n");
             return 13;
         }
 

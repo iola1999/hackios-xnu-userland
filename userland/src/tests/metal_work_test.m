@@ -2,8 +2,8 @@
  * xcrun clang -fno-objc-arc -Wall -Wextra -Werror -framework Foundation
  *   userland/src/metal_work_test.m -o /tmp/metal_work_test
  * No Metal device is used; GPU completion and fence behavior are outside this test. */
-#include "redwoodmetal_work_private.h"
-#include "redwoodmetal_work.inc"
+#include "../gfx/redwoodmetal_work_private.h"
+#include "../gfx/redwoodmetal_work.inc"
 #include <assert.h>
 #include <stdio.h>
 

@@ -815,7 +815,7 @@ def verdict(sites):
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", action="append", default=[], required=True)
-    ap.add_argument("--src", default=os.path.join(ROOT, "userland/src/redwoodmetal.m"))
+    ap.add_argument("--src", default=os.path.join(ROOT, "userland/src/gfx/redwoodmetal.m"))
     ap.add_argument("--images", help="directory of `ipsw dyld extract` output")
     ap.add_argument("--selmap", action="append", default=[])
     ap.add_argument("--sender", action="append", default=[], metavar="NAME=PATH")

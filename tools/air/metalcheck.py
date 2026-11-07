@@ -90,7 +90,7 @@ AIR_RUN = os.environ.get(
 # a log is a run of is decided by overlap with the kernels found in it, and the
 # choice is printed -- comparing a log against the wrong list would report most of
 # another batch as lost.
-JOB_GLOB = os.path.join(ROOT, "userland/rc.jobs.metal*")
+JOB_GLOB = os.path.join(ROOT, "userland/jobs/rc.jobs.metal*")
 LOGS = os.environ.get("LOGS", os.path.join(ROOT, "logs"))
 
 # The grid and the fill both sides have to be using. Written out rather than

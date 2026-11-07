@@ -304,7 +304,7 @@ def declared_encodings(images, selmap):
 def main(argv):
     ap = argparse.ArgumentParser()
     ap.add_argument("--dump", action="append", default=[], required=True)
-    ap.add_argument("--src", default=os.path.join(ROOT, "userland/src/redwoodmetal.m"))
+    ap.add_argument("--src", default=os.path.join(ROOT, "userland/src/gfx/redwoodmetal.m"))
     ap.add_argument("--class", dest="only", action="append", default=[])
     ap.add_argument("--images", help="directory of images extracted with `ipsw dyld extract`")
     ap.add_argument("--selmap", action="append", default=[],

@@ -10,7 +10,7 @@ static bool native_use(void) {
     assert(!CFPreferencesGetAppBooleanValue(CFSTR("CAEnableIOSurfaceCompression"),domain,&valid) && valid);
     ++calls;return native_value;
 }
-#include "sb_metal_compression_preference.inc"
+#include "../inject/sb_metal_compression_preference.inc"
 int main(void) { @autoreleasepool {
     NSString *name=[@"org.hackios.host-compression-test." stringByAppendingString:NSUUID.UUID.UUIDString];
     domain=(CFStringRef)name;

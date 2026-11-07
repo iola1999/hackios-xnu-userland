@@ -148,7 +148,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('binary')
     ap.add_argument('--decl', action='append', default=[], required=True)
-    ap.add_argument('--src', default=os.path.join(ROOT, 'userland/src/redwoodmetal.m'))
+    ap.add_argument('--src', default=os.path.join(ROOT, 'userland/src/gfx/redwoodmetal.m'))
     ap.add_argument('--imports', action='store_true', help='also how it reaches the runtime')
     ap.add_argument('--missing', action='store_true', help='list what we do not implement')
     ap.add_argument('--ours', action='store_true',

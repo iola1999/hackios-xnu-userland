@@ -8,9 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "../../tools/mesa/air/air_metal.h"
-#include "redwoodmetal_work_private.h"
-#include "redwoodmetal_work.inc"
+#include "../../../tools/mesa/air/air_metal.h"
+#include "../gfx/redwoodmetal_work_private.h"
+#include "../gfx/redwoodmetal_work.inc"
 
 static char why[512];
 static unsigned destroyed_buffers, buffer_calls, texture_calls;
@@ -145,7 +145,7 @@ static struct {
 	__typeof__(&rwa_texture_copy) texture_copy;
 	__typeof__(&rwa_texture_generate_mipmaps) texture_generate_mipmaps;
 } mesa = { rwa_buffer_copy, rwa_texture_copy, rwa_texture_generate_mipmaps };
-#include "redwoodmetal_blit.inc"
+#include "../gfx/redwoodmetal_blit.inc"
 #undef _MTLCommandEncoder
 
 @implementation RedwoodMetalCommandBuffer

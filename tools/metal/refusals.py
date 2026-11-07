@@ -165,7 +165,7 @@ def events(path):
 
 def rw_once(root=ROOT):
     """The driver's RW_ONCE notices: printed once, work dropped, nothing refused."""
-    path = os.path.join(root, "userland/src/redwoodmetal.m")
+    path = os.path.join(root, "userland/src/gfx/redwoodmetal.m")
     if not os.path.exists(path):
         return []
     text = open(path, encoding="utf-8", errors="replace").read()

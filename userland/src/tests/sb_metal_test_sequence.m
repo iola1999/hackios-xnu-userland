@@ -6,7 +6,7 @@ static void attempt_registration(const char *b) { trace[n++]='R'; bundle=b; if(t
 static void registration_exception(NSException *e) { (void)e;trace[n++]='E'; }
 static void registration_skipped(const char *b,const char *f) { (void)b;(void)f;trace[n++]='S'; }
 static void load_baseline(const char *p) { trace[n++]='B'; loaded=p; }
-#include "sb_metal_registration_sequence.inc"
+#include "../inject/sb_metal_registration_sequence.inc"
 static void check(const char *p,const char *b,const char *f,int t,const char *expected,const char *want)
 {
     n=0;memset(trace,0,sizeof(trace));throws=t;bundle=loaded="<unset>";run_sequence(p,b,f);
