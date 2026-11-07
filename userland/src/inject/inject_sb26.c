@@ -27,6 +27,7 @@
 #include <mach-o/dyld.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <os/lock.h>
 #include <unistd.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *);
@@ -203,12 +204,18 @@ unlock_once(const char *why)
 
 static int boot_unlock_seen_locked;
 
+static unsigned sb26_logged_icon_labels;
+
 static void
 refresh_view_recursive(id view, int depth)
 {
     if (!view || depth > 8) return;
 
     SEL layout_sel = sel_registerName("setNeedsLayout");
+    SEL update_label_sel = sel_registerName("_updateLabel");
+    SEL icon_sel = sel_registerName("icon");
+    SEL disp_sel = sel_registerName("displayName");
+    SEL utf8_sel = sel_registerName("UTF8String");
     SEL update_img_anim = sel_registerName("updateImageAnimated:");
     SEL update_icon_img_anim = sel_registerName("updateIconImageViewAnimated:");
     SEL update_img = sel_registerName("updateImage");
@@ -220,6 +227,20 @@ refresh_view_recursive(id view, int depth)
     const char *cls_name = class_getName(view_cls);
 
     if (cls_name && (strstr(cls_name, "Icon") != NULL)) {
+        if (class_respondsToSelector(view_cls, update_label_sel)) {
+            ((void (*)(id, SEL))objc_msgSend)(view, update_label_sel);
+        }
+        if (sb26_logged_icon_labels < 12 && class_respondsToSelector(view_cls, icon_sel)) {
+            id icon = ((id (*)(id, SEL))objc_msgSend)(view, icon_sel);
+            if (icon && class_respondsToSelector(object_getClass(icon), disp_sel)) {
+                id dname = ((id (*)(id, SEL))objc_msgSend)(icon, disp_sel);
+                const char *cstr = (dname && class_respondsToSelector(object_getClass(dname), utf8_sel))
+                    ? ((const char *(*)(id, SEL))objc_msgSend)(dname, utf8_sel) : NULL;
+                if (cstr && cstr[0]) {
+                    fprintf(stderr, "sb26: icon[%u] displayName='%s'\n", sb26_logged_icon_labels++, cstr);
+                }
+            }
+        }
         if (class_respondsToSelector(view_cls, update_img_anim)) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(view, update_img_anim, NO);
         } else if (class_respondsToSelector(view_cls, update_icon_img_anim)) {
@@ -692,7 +713,8 @@ sb26_hook_CFBundleCopyBundleLocalizations(CFBundleRef bundle)
     if (!bundle_has_localization_resources(bundle)) return orig;
 
     static const CFStringRef zh_codes[] = {
-        CFSTR("zh-Hans"), CFSTR("zh_CN"), CFSTR("zh-Hant"), CFSTR("zh_TW"), CFSTR("zh_HK"),
+        CFSTR("zh-Hans"), CFSTR("zh_CN"), CFSTR("zh_CN~iphone"), CFSTR("zh-Hans~iphone"),
+        CFSTR("zh-Hant"), CFSTR("zh_TW"), CFSTR("zh_HK"),
     };
     const CFIndex num_zh = (CFIndex)(sizeof(zh_codes) / sizeof(zh_codes[0]));
     CFMutableArrayRef mut = CFArrayCreateMutableCopy(kCFAllocatorDefault, count + num_zh, orig);
@@ -812,6 +834,29 @@ sb26_ensure_chinese_preferences(void)
         CFRelease(new_langs);
         fprintf(stderr, "sb26: AppleLanguages ensured zh-Hans-CN prioritized (updated)\n");
     }
+    {
+        CFDataRef sync_xml = CFPropertyListCreateData(kCFAllocatorDefault, dict, kCFPropertyListXMLFormat_v1_0, 0, NULL);
+        if (sync_xml) {
+            static const char *const sys_prefs[] = {
+                "/private/var/preferences/.GlobalPreferences.plist",
+                "/private/var/root/Library/Preferences/.GlobalPreferences.plist",
+            };
+            mkdir("/private/var/preferences", 0755);
+            mkdir("/private/var/root", 0750);
+            mkdir("/private/var/root/Library", 0750);
+            mkdir("/private/var/root/Library/Preferences", 0750);
+            for (unsigned i = 0; i < sizeof(sys_prefs) / sizeof(sys_prefs[0]); i++) {
+                int sfd = open(sys_prefs[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (sfd >= 0) {
+                    ssize_t w = write(sfd, CFDataGetBytePtr(sync_xml), (size_t)CFDataGetLength(sync_xml));
+                    (void)w;
+                    close(sfd);
+                    chmod(sys_prefs[i], 0644);
+                }
+            }
+            CFRelease(sync_xml);
+        }
+    }
     CFRelease(dict);
 }
 
@@ -825,6 +870,7 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
 
 #include "inject_sb26_airdrop.inc"
 #include "inject_sb26_uninstall.inc"
+#include "inject_sb26_loc.inc"
 
 static void
 sb26_trigger_poweroff(id self, SEL _cmd, id arg1, id arg2)
@@ -883,6 +929,7 @@ discovery_image_callback(const struct mach_header *header, intptr_t slide)
     Class cal = objc_getClass("SBCalendarIconImageProvider");
     if (cal) install_calendar_icon_hooks(cal);
 
+    sb26_install_localization_hooks();
     install_uninstall_hooks();
 }
 
@@ -890,9 +937,13 @@ __attribute__((constructor)) static void
 install_sb26(void)
 {
     const char *prog = getprogname();
-    if (!prog || (strcmp(prog, "SpringBoard") && strcmp(prog, "Preferences"))) return;
+    if (!prog || (strcmp(prog, "SpringBoard") && strcmp(prog, "Preferences") &&
+        strcmp(prog, "lsd") && strcmp(prog, "wifid"))) return;
 
     sb26_ensure_chinese_preferences();
+    sb26_clear_wifi_join_failures();
+    sb26_install_localization_hooks();
+    if (!strcmp(prog, "lsd") || !strcmp(prog, "wifid")) return;
 
     if (!is_build_23g90()) {
         fprintf(stderr, "sb26: skipped build mismatch or unreadable SystemVersion.plist\n");
@@ -931,6 +982,7 @@ install_sb26(void)
     sb26_install_layer_dump();
     sb26_install_rate(slide);
     install_powerdown_hooks();
+    sb26_install_localization_hooks();
 
     _dyld_register_func_for_add_image(haptic_image_callback);
     Class engine_cls = objc_getClass("CHHapticEngine");

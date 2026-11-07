@@ -167,7 +167,7 @@ create_als_event(uint64_t ts, uint32_t lux, uint32_t clear_raw, uint32_t ir_raw)
 	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
 	IOHIDEventSetIntegerValue(event, FIELD_ALS_RAW_CH0, (CFIndex)clear_raw);
 	IOHIDEventSetIntegerValue(event, FIELD_ALS_RAW_CH1, (CFIndex)ir_raw);
-	IOHIDEventSetIntegerValue(event, FIELD_ALS_BRIGHTNESS_CHANGED, 1);
+	IOHIDEventSetIntegerValue(event, FIELD_ALS_BRIGHTNESS_CHANGED, 0);
 	IOHIDEventSetIntegerValue(event, FIELD_ALS_ILLUMINANCE, (CFIndex)lux);
 	return event;
 }

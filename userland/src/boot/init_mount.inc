@@ -388,6 +388,19 @@ restore_var(void)
 	chmod("/private/var/db/redwood-aircache", 0777);
 	mkdir("/private/var/db/redwood-ir3cache", 0777);
 	chmod("/private/var/db/redwood-ir3cache", 0777);
+	mkdir("/private/var/preferences", 0755);
+	mkdir("/private/var/root", 0750);
+	mkdir("/private/var/root/Library", 0750);
+	mkdir("/private/var/root/Library/Preferences", 0750);
+	{
+		struct stat gp_st;
+		if (stat("/private/var/mobile/Library/Preferences/.GlobalPreferences.plist", &gp_st) == 0 && gp_st.st_size > 0) {
+			(void)copy_file("/private/var/mobile/Library/Preferences/.GlobalPreferences.plist",
+			    "/private/var/preferences/.GlobalPreferences.plist", 0644, 0, 0);
+			(void)copy_file("/private/var/mobile/Library/Preferences/.GlobalPreferences.plist",
+			    "/private/var/root/Library/Preferences/.GlobalPreferences.plist", 0644, 0, 0);
+		}
+	}
 
 	int seed_done = 1;
 	(void)sysctlbyname("kern.redwood.var_seed_done", NULL, NULL, &seed_done, sizeof(seed_done));

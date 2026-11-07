@@ -164,7 +164,7 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 if [ "$V" = 26 ]; then
 	# The default injection libraries use 20F66 private layouts.
-	INJECT=${INJECT-"/redwood/lib/libredwood-sb26.dylib SpringBoard Preferences"}
+	INJECT=${INJECT-"/redwood/lib/libredwood-sb26.dylib SpringBoard Preferences lsd wifid"}
 fi
 INJECT=${INJECT-"/redwood/lib/libredwood.dylib backboardd containermanagerd containermanagerd_system
 /redwood/lib/libredwood-sb.dylib SpringBoard
@@ -319,6 +319,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# (the microphone as an application records: allowed to, by an entitlement, if ldid is there)
 		$DYN -framework CoreFoundation -framework AVFoundation -lobjc -o obj/record_test src/tests/record_test.c &&
 			{ ${LDID:-ldid} -Ssrc/tests/record_test.entitlements obj/record_test 2>/dev/null ||
+			  /usr/bin/codesign --force --sign - --entitlements src/tests/record_test.entitlements obj/record_test 2>/dev/null ||
 			  echo "build.sh: no ldid: record_test is unsigned, and the system may not let it record"; }
 		$DYN -o obj/cpu_test src/tests/cpu_test.c
 		$DYN -framework CoreFoundation -framework IOSurface -o obj/cow_test src/tests/cow_test.c
@@ -366,6 +367,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 			-framework Metal -framework IOSurface -framework IOKit -lobjc \
 			-o obj/RedwoodTriangle src/tests/triangle_app.m &&
 			{ ${LDID:-ldid} -Ssrc/tests/triangle_app.entitlements obj/RedwoodTriangle 2>/dev/null ||
+			  /usr/bin/codesign --force --sign - --entitlements src/tests/triangle_app.entitlements obj/RedwoodTriangle 2>/dev/null ||
 			  echo "build.sh: no ldid: RedwoodTriangle is unsigned, which still runs (AMFI here accepts everything) but holds no entitlements"; }
 		# what the device ANSWERS when an application asks what it supports
 		# (src/tests/metal_caps.m). It takes the device from MTLCreateSystemDefaultDevice() so
@@ -390,18 +392,22 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		# (the account database answers only a client with the entitlements its own daemons hold: src/tests/store_test.m)
 		$DYN -fobjc-arc -framework Foundation -framework Accounts -o obj/store_test src/tests/store_test.m &&
 			{ ${LDID:-ldid} -Ssrc/tests/store_test.entitlements obj/store_test 2>/dev/null ||
+			  /usr/bin/codesign --force --sign - --entitlements src/tests/store_test.entitlements obj/store_test 2>/dev/null ||
 			  echo "build.sh: no ldid: store_test is unsigned, and accountsd will not show it the accounts"; }
 		# (with an entitlement for "battery_test open URL", if ldid is there: src/tests/battery_test.c)
 		$DYN -framework CoreFoundation -framework IOKit -lsqlite3 -o obj/battery_test src/tests/battery_test.c &&
 			{ ${LDID:-ldid} -Ssrc/tests/battery_test.entitlements obj/battery_test 2>/dev/null ||
+			  /usr/bin/codesign --force --sign - --entitlements src/tests/battery_test.entitlements obj/battery_test 2>/dev/null ||
 			  echo "build.sh: no ldid: battery_test is unsigned, and SpringBoard will not open URLs for it"; }
 		# (the keychain answers only a program that has a keychain access group: signed with one, if ldid is there)
 		$DYN -framework CoreFoundation -framework Security -o obj/keychain_test src/tests/keychain_test.c &&
 			{ ${LDID:-ldid} -Ssrc/tests/keychain_test.entitlements obj/keychain_test 2>/dev/null ||
+			  /usr/bin/codesign --force --sign - --entitlements src/tests/keychain_test.entitlements obj/keychain_test 2>/dev/null ||
 			  echo "build.sh: no ldid: keychain_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# (and wifid's way of keeping a network's password, by wifid's name: src/tests/wifipw_test.c)
 		$DYN -framework CoreFoundation -framework Security -o obj/wifipw_test src/tests/wifipw_test.c &&
 			{ ${LDID:-ldid} -Ssrc/tests/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
+			  /usr/bin/codesign --force --sign - --entitlements src/tests/wifipw_test.entitlements obj/wifipw_test 2>/dev/null ||
 			  echo "build.sh: no ldid: wifipw_test is unsigned, and the keychain will refuse it (-34018)"; }
 		# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 		$DYN -dynamiclib -install_name /redwood/lib/libredwood.dylib -framework CoreFoundation -framework IOKit -lobjc \
