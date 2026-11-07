@@ -122,4 +122,24 @@ else
 	${LDID:-ldid} -S"$HERE/installer_app.entitlements" "$APP_DIR/RedwoodInstaller"
 fi
 
-echo "build_installer.sh: successfully built RedwoodInstaller.app ($(du -sk "$APP_DIR" | cut -f1) KB)"
+echo "build_installer.sh: compiling appinst CLI..."
+if [ "$(uname -s)" = Darwin ]; then
+	/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -Os -fobjc-arc \
+		-Wno-deprecated-declarations -Wno-unused-command-line-argument \
+		-framework Foundation -larchive \
+		"$HERE/appinst.m" -o "$OBJ_DIR/appinst"
+	/usr/bin/codesign --force --sign - --entitlements "$HERE/appinst.entitlements" "$OBJ_DIR/appinst"
+else
+	${CC:-xnu-clang} -arch arm64e -miphoneos-version-min=26.0 -Os -fobjc-arc \
+		-Wno-deprecated-declarations \
+		-framework Foundation -larchive \
+		"$HERE/appinst.m" -o "$OBJ_DIR/appinst"
+	${LDID:-ldid} -S"$HERE/appinst.entitlements" "$OBJ_DIR/appinst"
+fi
+
+if [ -d "$USERLAND_DIR/../out/ios26-resume" ]; then
+	mkdir -p "$USERLAND_DIR/../out/ios26-resume/appinst"
+	cp -f "$OBJ_DIR/appinst" "$USERLAND_DIR/../out/ios26-resume/appinst/appinst"
+fi
+
+echo "build_installer.sh: successfully built RedwoodInstaller.app ($(du -sk "$APP_DIR" | cut -f1) KB) and appinst"

@@ -21,7 +21,7 @@ common/ugit status        # 在这棵树里操作本仓库
 | 路径 | 内容 |
 |---|---|
 | `userland/build.sh` | 构建 APFS 镜像，变量说明在文件开头。iOS 26：在 macOS 上执行 `IOS=../ios26 bash build.sh`（需要 Xcode），得到系统盘 `system26.apfs`；暂存目录 `root/` 是顶层 `package.py` 打根盘的基线 |
-| `userland/src/` | `init.c`（1 号进程）、注入 SpringBoard 等进程的库（`inject_sb26*.c` 等）、触摸与按键服务、OpenGL ES 到 Mesa 的桥接（`eagl.c`）、测试程序 |
+| `userland/src/` | `init.c`（1 号进程）、注入 SpringBoard 等进程的库（`inject_sb26*.c` 等）、原生 IPA 管理器应用 `RedwoodInstaller.app`（`installer_app.m`、`build_installer.sh`）与安装工具 `appinst`（`appinst.m`）、触摸与按键服务、OpenGL ES 到 Mesa 的桥接（`eagl.c`）、测试程序 |
 | `userland/var/`、`var.skel.extra` | `/private/var` 的默认内容 |
 | `ios26/` | `fetch.sh` 从 iPhone 17 的 iOS 26.6.2 IPSW 取出文件（IPSW 需另行下载）；哪些文件进系统盘由 `ios165/select-system.py` 决定，`ios26/select-system.py` 是指向它的符号链接 |
 | `tools/mk-mesa.sh`、`tools/mesa/` | Mesa 加本项目补丁。K90 用 26.2.5 与 `REBASE=26`，补丁说明见 [tools/mesa/rebase-26/README.md](tools/mesa/rebase-26/README.md) |
