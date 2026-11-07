@@ -159,8 +159,8 @@ setup_activation_state(id self, SEL selector)
  * before that were dropped. isUILocked is not yet true at the first attempts either, so the boot
  * unlock is done only once the lock screen has been seen up and then gone.
  */
-#define UNLOCK_FIRST_SECONDS 10
-#define UNLOCK_EVERY_SECONDS 3
+#define UNLOCK_FIRST_SECONDS 4
+#define UNLOCK_EVERY_SECONDS 1
 #define UNLOCK_ATTEMPTS 60
 
 static id

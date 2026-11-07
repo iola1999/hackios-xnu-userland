@@ -519,7 +519,9 @@ install_into(NSString *source, NSString *bundle)
 		@"group.com.SideStore.SideStore",
 		@"group.com.rileytestut.AltStore"
 	]);
-	sign_all_machos(app, nil);
+	if (access(execPath.fileSystemRepresentation, W_OK) == 0) {
+		sign_all_machos(app, nil);
+	}
 
 	NSMutableDictionary *record = [NSMutableDictionary dictionaryWithDictionary:@{
 		@"ApplicationType": @"System",
@@ -614,7 +616,9 @@ register_system_app(NSString *appPath)
 	                                                                               existed:NULL error:&error];
 	NSString *home = data.url.path ?: @"/private/var/mobile";
 
-	sign_all_machos(app, nil);
+	if (access(execPath.fileSystemRepresentation, W_OK) == 0) {
+		sign_all_machos(app, nil);
+	}
 
 	/* Unregister existing stale LaunchServices proxy if present to force fresh registration */
 	LSApplicationWorkspace *ws = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
