@@ -531,6 +531,9 @@ app_enable_webkit_vp9(void)
 	if (app_vp9_hook_installed) {
 		return;
 	}
+	if (who == NULL || (strcmp(who, "MobileSafari") != 0 && strncmp(who, "com.apple.WebKit", 16) != 0)) {
+		return;
+	}
 	Class wkPrefClass = objc_getClass("WKPreferences");
 	if (wkPrefClass != NULL) {
 		SEL initSel = sel_registerName("init");
@@ -548,22 +551,23 @@ app_enable_webkit_vp9(void)
 		reg_vp9();
 		fprintf(stderr, "redwood-app: registered libwebrtc VP9 decoder\n");
 	}
-	/* Set user defaults keys via NSUserDefaults */
-	Class defsCls = objc_getClass("NSUserDefaults");
-	if (defsCls != NULL) {
-		id defs = ((id (*)(Class, SEL))objc_msgSend)(defsCls, sel_registerName("standardUserDefaults"));
-		if (defs != NULL) {
-			Class strCls = objc_getClass("NSString");
-			SEL setBoolSel = sel_registerName("setBool:forKey:");
-			SEL strSel = sel_registerName("stringWithUTF8String:");
-			if (strCls && class_getInstanceMethod(object_getClass(defs), setBoolSel)) {
-				id k1 = ((id (*)(Class, SEL, const char *))objc_msgSend)(strCls, strSel, "SWVPDecodersAlwaysEnabled");
-				id k2 = ((id (*)(Class, SEL, const char *))objc_msgSend)(strCls, strSel, "WebKitSWVPDecodersAlwaysEnabled");
-				((void (*)(id, SEL, BOOL, id))objc_msgSend)(defs, setBoolSel, YES, k1);
-				((void (*)(id, SEL, BOOL, id))objc_msgSend)(defs, setBoolSel, YES, k2);
+	dispatch_async(dispatch_get_main_queue(), ^{
+		Class defsCls = objc_getClass("NSUserDefaults");
+		if (defsCls != NULL) {
+			id defs = ((id (*)(Class, SEL))objc_msgSend)(defsCls, sel_registerName("standardUserDefaults"));
+			if (defs != NULL) {
+				Class strCls = objc_getClass("NSString");
+				SEL setBoolSel = sel_registerName("setBool:forKey:");
+				SEL strSel = sel_registerName("stringWithUTF8String:");
+				if (strCls && class_getInstanceMethod(object_getClass(defs), setBoolSel)) {
+					id k1 = ((id (*)(Class, SEL, const char *))objc_msgSend)(strCls, strSel, "SWVPDecodersAlwaysEnabled");
+					id k2 = ((id (*)(Class, SEL, const char *))objc_msgSend)(strCls, strSel, "WebKitSWVPDecodersAlwaysEnabled");
+					((void (*)(id, SEL, BOOL, id))objc_msgSend)(defs, setBoolSel, YES, k1);
+					((void (*)(id, SEL, BOOL, id))objc_msgSend)(defs, setBoolSel, YES, k2);
+				}
 			}
 		}
-	}
+	});
 }
 
 #include "inject_cellular.inc"

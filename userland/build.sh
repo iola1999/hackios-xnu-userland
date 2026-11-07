@@ -856,8 +856,8 @@ if [ "$V" = 26 ]; then
 	# and it panics on a job whose program is not a platform binary; the kernel takes an ad hoc
 	# signed program for one (xnu/files/bsd/kern/kern_minimac.c). macOS's own codesign: the one of
 	# the kernel build's host tools (xnu-deps/host/bin) does nothing.
-	for f in root/sbin/* root/bin/*; do
-		if file -b "$f" | grep -q Mach-O && /usr/bin/codesign -dv "$f" 2>&1 | grep -q 'not signed at all'; then
+	for f in root/sbin/* root/bin/* root/lib/* root/lib/*/*; do
+		if [ -f "$f" ] && file -b "$f" | grep -q Mach-O && /usr/bin/codesign -dv "$f" 2>&1 | grep -q 'not signed at all'; then
 			/usr/bin/codesign -s - "$f"
 		fi
 	done

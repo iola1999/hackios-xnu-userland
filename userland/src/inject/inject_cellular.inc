@@ -785,12 +785,11 @@ rebind_image_symbols(const struct mach_header *header, intptr_t slide_val)
 static void
 app_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
 {
-	rebind_image_symbols(mh, vmaddr_slide);
+	if ((uintptr_t)mh < CACHE_BASE) {
+		rebind_image_symbols(mh, vmaddr_slide);
+	}
 	watch_network_classes();
 	if (!app_vp9_hook_installed) {
 		app_enable_webkit_vp9();
-	}
-	if (en0_has_ipv4()) {
-		dispatch_async(dispatch_get_main_queue(), ^{ post_geo_network_reachable_notification(); });
 	}
 }

@@ -848,7 +848,9 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	for (int i = 0; i < MAX_CAMERA_FORMATS && camera->formats[i][0] > 0; i++) {
 		f[nf++] = format_crop(camera->formats[i][0], camera->formats[i][1],
 		    camera->formats[i][2], camera->formats[i][3],
-		    camera->formats[i][4], false, camera->fov);
+		    camera->formats[i][4], camera->formats[i][5],
+		    camera->formats[i][6], camera->formats[i][7],
+		    false, camera->fov);
 	}
 	s->formats = CFArrayCreate(NULL, (const void **)f, nf, &kCFTypeArrayCallBacks);
 	s->supported = supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0]));

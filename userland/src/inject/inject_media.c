@@ -605,6 +605,11 @@ redwood_media_init(void)
 	}
 	/* On iOS 26, cameracaptured loads CMCapture on demand or via dyld shared cache; ensure CMCapture is loaded so hooks attach immediately */
 	if (strcmp(name, "cameracaptured") == 0) {
+		unlink("/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist");
+		CFPreferencesSetValue(CFSTR("CaptureSourceInfo"), NULL, CFSTR("com.apple.cameracapture.volatile"),
+		    kCFPreferencesCurrentUser, kCFPreferencesCurrentHost);
+		CFPreferencesSynchronize(CFSTR("com.apple.cameracapture.volatile"),
+		    kCFPreferencesCurrentUser, kCFPreferencesCurrentHost);
 		(void)dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY | RTLD_GLOBAL);
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */

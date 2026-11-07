@@ -325,16 +325,22 @@ supported(const struct prop *p, size_t n)
 
 #define PF_420F         0x34323066      /* '420f' */
 #define PF_420V         0x34323076      /* '420v' */
+#define PF_X420         0x78343230      /* 'x420' */
+#define PF_X422         0x78343232      /* 'x422' */
 #define PF_BGRA         0x42475241      /* 'BGRA' */
 
 static CFDictionaryRef
 output_info(int width, int height)
 {
 	CFMutableDictionaryRef o = (CFMutableDictionaryRef)new_dict();
-	CFNumberRef pf[3] = { number_i(PF_420F), number_i(PF_420V), number_i(PF_BGRA) };
-	CFArrayRef pfs = CFArrayCreate(NULL, (const void **)pf, 3, &kCFTypeArrayCallBacks);
+	CFNumberRef pf[5] = {
+		number_i(PF_420F), number_i(PF_420V),
+		number_i(PF_X420), number_i(PF_X422),
+		number_i(PF_BGRA)
+	};
+	CFArrayRef pfs = CFArrayCreate(NULL, (const void **)pf, 5, &kCFTypeArrayCallBacks);
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 5; i++) {
 		CFRelease(pf[i]);
 	}
 	put(o, "SupportedPixelFormats", pfs);
@@ -348,7 +354,7 @@ output_info(int width, int height)
 }
 
 static CFDictionaryRef
-format_crop(int sensor_width, int sensor_height, int crop_width, int crop_height, int max_fps, bool binned, double fov)
+format_crop(int sensor_width, int sensor_height, int crop_width, int crop_height, int max_fps, int fes_width, int fes_height, int sifr_binning, bool binned, double fov)
 {
 	CFMutableDictionaryRef f = (CFMutableDictionaryRef)new_dict(), outputs = (CFMutableDictionaryRef)new_dict();
 	CMVideoFormatDescriptionRef fd = NULL;
@@ -375,6 +381,14 @@ format_crop(int sensor_width, int sensor_height, int crop_width, int crop_height
 	put(f, "SensorHeight", number_i(sensor_height));
 	put(f, "ISOBase", number_f(32));
 	put(f, "DefaultAEMaxGain", number_f(64));
+	if (fes_width > 0 && fes_height > 0) {
+		put(f, "FrontEndScalerOutputWidth", number_i(fes_width));
+		put(f, "FrontEndScalerOutputHeight", number_i(fes_height));
+	}
+	if (sifr_binning > 0) {
+		put(f, "SIFREnabled", CFRetain(kCFBooleanTrue));
+		put(f, "SIFRBinningFactor", number_i(sifr_binning));
+	}
 
 	put(f, "SensorCropWidth", number_i(cw));
 	put(f, "SensorCropHeight", number_i(ch));
@@ -414,38 +428,48 @@ static void let_go(struct output *out);
 static const char *const output_names[OUTPUTS] = { "PrimaryScaler", "SecondaryScaler", "StillImage" };
 
 #define MAX_ZOOM                16      /* (the most the iPhone's wide camera zooms digitally) */
-#define MAX_CAMERA_FORMATS      8
+#define MAX_CAMERA_FORMATS      16
 
 /*
  * The device's cameras, offering stream formats matching both D22/AVCaptureSession.plist (iOS 16.5)
  * and V57/AVCaptureSession.plist (iOS 26 iPhone18,3):
- *   formats[k] = { sensor_width, sensor_height, crop_width, crop_height, max_fps }
+ *   formats[k] = { sensor_width, sensor_height, crop_width, crop_height, max_fps, fes_width, fes_height, sifr_binning }
  */
 static const struct camera {
 	uint32_t        sensor;         /* the kernel's (the frames' sensor, REDWOOD_CAMERA_SENSOR) */
 	const char      *name, *unique_id;
 	bool            turned;         /* its sensor the other way up from the iPhone's: the pictures turned half round */
 	double          focal_length, f_number, pixel_size, fov;
-	int             formats[MAX_CAMERA_FORMATS][5];
+	int             formats[MAX_CAMERA_FORMATS][8];
 } cameras[2] = {
 	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
 	  {
-		{ 4032, 3024, 0, 0, 30 },       /* D22 Photo */
-		{ 4224, 2376, 0, 0, 60 },       /* D22 Video-60 */
-		{ 4224, 3024, 0, 0, 60 },       /* V57 Photo */
-		{ 4224, 2640, 0, 0, 30 },       /* V57 Video-30 */
-		{ 4224, 2640, 0, 0, 60 },       /* V57 Video-60 */
+		{ 4032, 3024,    0,    0, 30,    0,    0, 0 },  /* D22 Photo */
+		{ 4224, 2376,    0,    0, 60,    0,    0, 0 },  /* D22 Video-60 */
+		{ 4224, 3024,    0,    0, 60,    0,    0, 1 },  /* V57 Photo */
+		{ 4224, 3024,    0,    0, 60, 2464, 1764, 1 },  /* V57 Photo FESCompanion */
+		{ 4224, 3024, 4032, 3024, 60, 1920, 1440, 0 },  /* V57 Photo DepthCompanion */
+		{ 4224, 3024, 4224, 2640, 60, 2464, 1764, 2 },  /* V57 Video-FullSensor-FES-30/60 & Medium-Res */
+		{ 4224, 3024, 4032, 3024, 60, 1440, 1080, 2 },  /* V57 Video-4by3-Low-Resolution */
+		{ 4224, 2640,    0,    0, 60,    0,    0, 2 },  /* V57 Video-30 & Video-60 */
+		{ 4224, 2640, 4224, 2376, 60, 2464, 1540, 2 },  /* V57 Video-30 DepthCompanion */
 	  } },
 	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
 	  {
-		{ 3088, 2320, 0, 0, 30 },       /* D22 Photo */
-		{ 3840, 2160, 0, 0, 30 },       /* D22 Video-30 */
-		{ 4896, 4896, 0, 0, 30 },       /* V57 FrontUltraWide Photo / Video-30 */
-		{ 4896, 4896, 0, 0, 60 },       /* V57 FrontUltraWide Video-60 */
-		{ 4896, 4896, 3024, 4032, 60 }, /* V57 FrontVirtual Photo 4032x3024 */
-		{ 4896, 4896, 2520, 4032, 30 }, /* V57 FrontVirtual Video-30 */
-		{ 3072, 4896, 2520, 4032, 60 }, /* V57 FrontVirtual Video-60 */
-		{ 4896, 4896, 2316, 3088, 60 }, /* V57 FrontVirtual Photo 3088x2316 */
+		{ 3088, 2320,    0,    0, 30,    0,    0, 0 },  /* D22 Photo */
+		{ 3840, 2160,    0,    0, 30,    0,    0, 0 },  /* D22 Video-30 */
+		{ 4896, 4896,    0,    0, 60, 4608, 4608, 1 },  /* V57 FrontUltraWide Photo */
+		{ 4896, 4896,    0,    0, 60, 2496, 2496, 1 },  /* V57 FrontUltraWide Photo FESCompanion */
+		{ 4896, 4896,    0,    0, 60, 4608, 4608, 2 },  /* V57 FrontUltraWide Video-30 / 16x10-30 / 10x16-30 */
+		{ 4896, 4896,    0,    0, 60, 2496, 2496, 2 },  /* V57 FrontUltraWide Video-FES-30 / 10x16-FES-30 / 16x10-FES-30 */
+		{ 4896, 4896, 3672, 4896, 60, 1224, 1224, 0 },  /* V57 FrontUltraWide Video-3by4-Low-Resolution */
+		{ 4896, 4896, 3024, 4032, 60, 4032, 4032, 1 },  /* V57 FrontVirtual Photo & Photo-3088x2316 */
+		{ 4896, 4896, 3024, 4032, 60, 2112, 2112, 1 },  /* V57 FrontVirtual Photo FESCompanion */
+		{ 4896, 4896, 2520, 4032, 60, 4032, 4032, 2 },  /* V57 FrontVirtual Video-30 */
+		{ 4896, 4896, 3024, 4032, 60, 2112, 2112, 2 },  /* V57 FrontVirtual Video-FullSensor-FES-30 & Medium-Res */
+		{ 3680, 4896, 3024, 4032, 60,  852, 1136, 0 },  /* V57 FrontVirtual Video-4by3-Low-Resolution */
+		{ 3072, 4896, 2520, 4032, 60, 2520, 4032, 0 },  /* V57 FrontVirtual Video-60 */
+		{ 3072, 4896, 2520, 4032, 60, 1320, 2112, 0 },  /* V57 FrontVirtual Video-FES-60 */
 	  } },
 };
 
