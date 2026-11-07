@@ -1,6 +1,6 @@
 /*
- * inject_cellular.inc — Network reachability, pdp_ip0 cellular data path, and
- * CoreTelephony / SystemStatus live status integration reading from /dev/redwood-modem
+ * inject_cellular.inc — CoreTelephony / SystemStatus live status integration
+ * reading from /dev/redwood-modem
  * and kern.redwood.{modem_state,cellular_bars,cellular_rat,cellular_operator,cellular_sim_state}.
  * Included by src/inject_app.c.
  */
@@ -100,64 +100,7 @@ redwood_refresh_cellular_state(void)
 	}
 }
 
-static bool
-en0_has_ipv4(void)
-{
-	static time_t last_check = 0;
-	static bool cached = false;
-	time_t now = time(NULL);
-
-	if (now - last_check < 2 && last_check != 0) {
-		return cached;
-	}
-	last_check = now;
-	struct ifaddrs *list = NULL;
-	if (getifaddrs(&list) == 0) {
-		bool ok = false;
-		for (struct ifaddrs *ifa = list; ifa != NULL; ifa = ifa->ifa_next) {
-			if (ifa->ifa_name != NULL && ifa->ifa_addr != NULL &&
-			    (ifa->ifa_flags & (IFF_UP | IFF_RUNNING)) &&
-			    !(ifa->ifa_flags & IFF_LOOPBACK)) {
-				if (ifa->ifa_addr->sa_family == AF_INET || ifa->ifa_addr->sa_family == AF_INET6) {
-					ok = true;
-					break;
-				}
-			}
-		}
-		freeifaddrs(list);
-		cached = ok;
-		return ok;
-	}
-	return cached;
-}
-
-static bool
-pdp_ip0_active(void)
-{
-	redwood_refresh_cellular_state();
-	return cell_cache.modem_state >= 6;
-}
-
-/* ObjC hooks for Network.framework, GeoServices, CoreTelephony, SystemStatus, and NSFileManager */
-static IMP orig_geo_is_net_reachable;
-static IMP orig_geo_is_wifi_reachable;
-static IMP orig_geo_is_cell;
-static IMP orig_geo_is_constrained;
-static IMP orig_geo_is_cell_constrained;
-static IMP orig_geo_net_reachable;
-static IMP orig_geo_wifi_reachable;
-
-static IMP orig_nwpath_status;
-static IMP orig_nwpath_is_satisfied;
-static IMP orig_nwpath_is_expensive;
-static IMP orig_nwpath_is_constrained;
-static IMP orig_nwpath_has_ipv4;
-static IMP orig_nwpath_has_dns;
-static IMP orig_nwpath_uses_interface;
-
-static IMP orig_evaluator_is_satisfied;
-static IMP orig_evaluator_status;
-
+/* CoreTelephony and SystemStatus read the modem status exported by the kernel. */
 static IMP orig_ctcarrier_name;
 static IMP orig_ctcarrier_mcc;
 static IMP orig_ctcarrier_mnc;
@@ -217,7 +160,7 @@ static signed char
 hooked_ctcarrier_voip(id self, SEL cmd)
 {
 	redwood_refresh_cellular_state();
-	if (cell_cache.modem_state >= 4 || en0_has_ipv4()) {
+	if (cell_cache.modem_state >= 4) {
 		return 1;
 	}
 	return orig_ctcarrier_voip ? ((signed char (*)(id, SEL))orig_ctcarrier_voip)(self, cmd) : 1;
@@ -293,178 +236,10 @@ hooked_st_service_state(id self, SEL cmd)
 	return orig_st_service_state ? ((unsigned long (*)(id, SEL))orig_st_service_state)(self, cmd) : 0;
 }
 
-static signed char
-hooked_geo_is_net_reachable(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 1;
-	}
-	return orig_geo_is_net_reachable ? ((signed char (*)(id, SEL))orig_geo_is_net_reachable)(self, cmd) : 1;
-}
-
-static signed char
-hooked_geo_is_wifi_reachable(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 1;
-	}
-	return orig_geo_is_wifi_reachable ? ((signed char (*)(id, SEL))orig_geo_is_wifi_reachable)(self, cmd) : 1;
-}
-
-static signed char
-hooked_geo_is_cell(id self, SEL cmd)
-{
-	(void)self; (void)cmd;
-	return pdp_ip0_active() ? 1 : 0;
-}
-
-static signed char
-hooked_geo_is_constrained(id self, SEL cmd)
-{
-	(void)self; (void)cmd;
-	return 0;
-}
-
-static int
-hooked_nwpath_status(id self, SEL cmd)
-{
-	int s = orig_nwpath_status ? ((int (*)(id, SEL))orig_nwpath_status)(self, cmd) : 1;
-	if (s != 1 && en0_has_ipv4()) {
-		return 1; /* nw_path_status_satisfied */
-	}
-	return s;
-}
-
-static signed char
-hooked_nwpath_is_satisfied(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 1;
-	}
-	return orig_nwpath_is_satisfied ? ((signed char (*)(id, SEL))orig_nwpath_is_satisfied)(self, cmd) : 1;
-}
-
-static signed char
-hooked_nwpath_is_expensive(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 0;
-	}
-	return orig_nwpath_is_expensive ? ((signed char (*)(id, SEL))orig_nwpath_is_expensive)(self, cmd) : 0;
-}
-
-static signed char
-hooked_nwpath_is_constrained(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 0;
-	}
-	return orig_nwpath_is_constrained ? ((signed char (*)(id, SEL))orig_nwpath_is_constrained)(self, cmd) : 0;
-}
-
-static signed char
-hooked_nwpath_has_ipv4(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 1;
-	}
-	return orig_nwpath_has_ipv4 ? ((signed char (*)(id, SEL))orig_nwpath_has_ipv4)(self, cmd) : 1;
-}
-
-static signed char
-hooked_nwpath_has_dns(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 1;
-	}
-	return orig_nwpath_has_dns ? ((signed char (*)(id, SEL))orig_nwpath_has_dns)(self, cmd) : 1;
-}
-
-static signed char
-hooked_nwpath_uses_interface(id self, SEL cmd, int type)
-{
-	if (type == 1 /* wifi */ && en0_has_ipv4()) {
-		return 1;
-	}
-	if (type == 2 /* cellular */ && pdp_ip0_active()) {
-		return 1;
-	}
-	return orig_nwpath_uses_interface ? ((signed char (*)(id, SEL, int))orig_nwpath_uses_interface)(self, cmd, type) : 0;
-}
-
-static signed char
-hooked_evaluator_is_satisfied(id self, SEL cmd)
-{
-	if (en0_has_ipv4()) {
-		return 1;
-	}
-	return orig_evaluator_is_satisfied ? ((signed char (*)(id, SEL))orig_evaluator_is_satisfied)(self, cmd) : 1;
-}
-
-static int
-hooked_evaluator_status(id self, SEL cmd)
-{
-	int s = orig_evaluator_status ? ((int (*)(id, SEL))orig_evaluator_status)(self, cmd) : 1;
-	if (s != 1 && en0_has_ipv4()) {
-		return 1;
-	}
-	return s;
-}
-
 static id
 watched_container_url_for_group(id self, SEL cmd, id groupId)
 {
-	id url = orig_container_url_for_group ? orig_container_url_for_group(self, cmd, groupId) : nil;
-	if (url != nil) {
-		return url;
-	}
-	if (groupId != nil) {
-		const char *group_cstr = ((const char * (*)(id, SEL))objc_msgSend)(groupId, sel_registerName("UTF8String"));
-		if (group_cstr != NULL && group_cstr[0] != '\0') {
-			char path[512];
-			snprintf(path, sizeof(path), "/private/var/mobile/Containers/Shared/AppGroup/%s", group_cstr);
-			(void)mkdir("/private/var/mobile/Containers/Shared", 0755);
-			(void)mkdir("/private/var/mobile/Containers/Shared/AppGroup", 0755);
-			(void)mkdir(path, 0755);
-			char sub[540];
-			snprintf(sub, sizeof(sub), "%s/Library", path); (void)mkdir(sub, 0755);
-			snprintf(sub, sizeof(sub), "%s/Library/Preferences", path); (void)mkdir(sub, 0755);
-			snprintf(sub, sizeof(sub), "%s/Library/Caches", path); (void)mkdir(sub, 0755);
-			snprintf(sub, sizeof(sub), "%s/Documents", path); (void)mkdir(sub, 0755);
-			snprintf(sub, sizeof(sub), "%s/tmp", path); (void)mkdir(sub, 0755);
-
-			Class urlClass = objc_getClass("NSURL");
-			Class strClass = objc_getClass("NSString");
-			if (urlClass && strClass) {
-				id pathStr = ((id (*)(id, SEL, const char *))objc_msgSend)((id)strClass, sel_registerName("stringWithUTF8String:"), path);
-				if (pathStr) {
-					url = ((id (*)(id, SEL, id, signed char))objc_msgSend)((id)urlClass, sel_registerName("fileURLWithPath:isDirectory:"), pathStr, (signed char)1);
-				}
-			}
-		}
-	}
-	return url;
-}
-
-static void
-post_geo_network_reachable_notification(void)
-{
-	if (!en0_has_ipv4()) {
-		return;
-	}
-	Class notifClass = objc_getClass("NSNotificationCenter");
-	Class strClass = objc_getClass("NSString");
-	if (notifClass && strClass) {
-		id center = ((id (*)(id, SEL))objc_msgSend)((id)notifClass, sel_registerName("defaultCenter"));
-		SEL strSel = sel_registerName("stringWithUTF8String:");
-		SEL postSel = sel_registerName("postNotificationName:object:");
-		if (center && class_getInstanceMethod(object_getClass(center), postSel)) {
-			id name1 = ((id (*)(id, SEL, const char *))objc_msgSend)((id)strClass, strSel, "GEONetworkObserverNetworkReachableNotification");
-			id name2 = ((id (*)(id, SEL, const char *))objc_msgSend)((id)strClass, strSel, "GEONetworkObserverReachable");
-			if (name1) ((void (*)(id, SEL, id, id))objc_msgSend)(center, postSel, name1, nil);
-			if (name2) ((void (*)(id, SEL, id, id))objc_msgSend)(center, postSel, name2, nil);
-		}
-	}
+	return orig_container_url_for_group ? orig_container_url_for_group(self, cmd, groupId) : nil;
 }
 
 static void
@@ -483,55 +258,12 @@ watch_cellular_classes(void)
 }
 
 static void
-watch_network_classes(void)
-{
-	watch("GEONetworkObserver", "isNetworkReachable", (IMP)hooked_geo_is_net_reachable, &orig_geo_is_net_reachable);
-	watch("GEONetworkObserver", "isWiFiReachable", (IMP)hooked_geo_is_wifi_reachable, &orig_geo_is_wifi_reachable);
-	watch("GEONetworkObserver", "isCellConnection", (IMP)hooked_geo_is_cell, &orig_geo_is_cell);
-	watch("GEONetworkObserver", "isNetworkConstrained", (IMP)hooked_geo_is_constrained, &orig_geo_is_constrained);
-	watch("GEONetworkObserver", "isCellularPathConstrained", (IMP)hooked_geo_is_constrained, &orig_geo_is_cell_constrained);
-	watch("GEONetworkObserver", "networkReachable", (IMP)hooked_geo_is_net_reachable, &orig_geo_net_reachable);
-	watch("GEONetworkObserver", "wifiReachable", (IMP)hooked_geo_is_wifi_reachable, &orig_geo_wifi_reachable);
-
-	Class geoMeta = object_getClass((id)objc_getClass("GEONetworkObserver"));
-	if (geoMeta != NULL) {
-		Method m = class_getInstanceMethod(geoMeta, sel_registerName("isNetworkReachable"));
-		if (m != NULL && method_getImplementation(m) != (IMP)hooked_geo_is_net_reachable) {
-			method_setImplementation(m, (IMP)hooked_geo_is_net_reachable);
-		}
-	}
-
-	watch("NWPath", "status", (IMP)hooked_nwpath_status, &orig_nwpath_status);
-	watch("NWPath", "isSatisfied", (IMP)hooked_nwpath_is_satisfied, &orig_nwpath_is_satisfied);
-	watch("NWPath", "isExpensive", (IMP)hooked_nwpath_is_expensive, &orig_nwpath_is_expensive);
-	watch("NWPath", "isConstrained", (IMP)hooked_nwpath_is_constrained, &orig_nwpath_is_constrained);
-	watch("NWPath", "hasIPv4", (IMP)hooked_nwpath_has_ipv4, &orig_nwpath_has_ipv4);
-	watch("NWPath", "hasDNS", (IMP)hooked_nwpath_has_dns, &orig_nwpath_has_dns);
-	watch("NWPath", "usesInterfaceType:", (IMP)hooked_nwpath_uses_interface, &orig_nwpath_uses_interface);
-
-	watch("NWConcrete_nw_path", "status", (IMP)hooked_nwpath_status, &orig_nwpath_status);
-	watch("NWConcrete_nw_path", "isSatisfied", (IMP)hooked_nwpath_is_satisfied, &orig_nwpath_is_satisfied);
-	watch("NWConcrete_nw_path", "isExpensive", (IMP)hooked_nwpath_is_expensive, &orig_nwpath_is_expensive);
-	watch("NWConcrete_nw_path", "isConstrained", (IMP)hooked_nwpath_is_constrained, &orig_nwpath_is_constrained);
-	watch("NWConcrete_nw_path", "hasIPv4", (IMP)hooked_nwpath_has_ipv4, &orig_nwpath_has_ipv4);
-	watch("NWConcrete_nw_path", "hasDNS", (IMP)hooked_nwpath_has_dns, &orig_nwpath_has_dns);
-	watch("NWConcrete_nw_path", "usesInterfaceType:", (IMP)hooked_nwpath_uses_interface, &orig_nwpath_uses_interface);
-
-	watch("NWPathEvaluator", "isSatisfied", (IMP)hooked_evaluator_is_satisfied, &orig_evaluator_is_satisfied);
-	watch("NWPathEvaluator", "status", (IMP)hooked_evaluator_status, &orig_evaluator_status);
-	watch("NWConcrete_nw_path_evaluator", "isSatisfied", (IMP)hooked_evaluator_is_satisfied, &orig_evaluator_is_satisfied);
-	watch("NWConcrete_nw_path_evaluator", "status", (IMP)hooked_evaluator_status, &orig_evaluator_status);
-
-	watch("NSFileManager", "containerURLForSecurityApplicationGroupIdentifier:", (IMP)watched_container_url_for_group, &orig_container_url_for_group);
-	watch_cellular_classes();
-}
-
-static void
 app_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
 {
 	(void)mh;
 	(void)vmaddr_slide;
-	watch_network_classes();
+	watch_cellular_classes();
+	watch("NSFileManager", "containerURLForSecurityApplicationGroupIdentifier:", (IMP)watched_container_url_for_group, &orig_container_url_for_group);
 	if (!app_vp9_hook_installed) {
 		app_enable_webkit_vp9();
 	}

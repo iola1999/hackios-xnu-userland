@@ -1156,8 +1156,7 @@ void rwa_render_destroy(struct rwa_render *render);
  * One draw into one render pass, which is what MTLRenderPassDescriptor plus one
  * -drawPrimitives: amounts to. The colour attachments are textures made by this library.
  *
- * `clear_color` is NULL when the pass is to keep what the attachment already holds, which is
- * Metal's MTLLoadActionLoad; a pointer to four floats is MTLLoadActionClear with that colour.
+ * `clear_color`: NULL for Load; indexed RGBA for Clear (`discard` bits 8..15; no bits clears attachment 0).
  * `primitive` is MTLPrimitiveType as Metal defines it.
  *
  * The depth/stencil attachment and its clears are the same shape -- the texture or NULL, and
@@ -1270,7 +1269,7 @@ struct rwa_vertex_stream {
 struct rwa_draw {
 	struct rwa_texture *const *color;
 	unsigned color_count;
-	const float *clear_color;      /* NULL, or four floats */
+	const float *clear_color;      /* NULL, or attachment-indexed RGBA values */
 	struct rwa_texture *depth;     /* the depth/stencil attachment, or NULL for none */
 	const float *clear_depth;      /* NULL, or one float: MTLClearDepth */
 	const unsigned *clear_stencil; /* NULL, or one value: MTLClearStencil */
@@ -1406,6 +1405,7 @@ struct rwa_draw {
 	unsigned discard;
 };
 
+int rwa_render_clear(struct rwa_device *, const struct rwa_draw *, char *, size_t);
 int rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 		    char *why, size_t why_size);
 

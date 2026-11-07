@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "air_metal.h"
+#include "air_clear_plan.h"
 
 /* One pipe_context serves the whole process, and a Gallium context is not thread safe. Every entry
  * point that can reach it takes this lock for the length of the call: CoreAnimation calls in from
@@ -6313,6 +6314,8 @@ draw_phase_done(uint64_t began)
    }
 }
 
+#include "air_metal_clear.inc"
+
 int
 rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                 char *why, size_t why_size)
@@ -6798,47 +6801,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       goto unbind;
    draw_phase_add(2, mark);
    mark = draw_mark();
-   /* clear_color NULL is MTLLoadActionLoad: keep what the attachment holds. A pointer
-    * to four floats is MTLLoadActionClear, and the union is filled from them -- for an
-    * integer attachment the bits of the float land in the right place when the colour
-    * is zero, which is the one air_run uses.
-    *
-    * Depth and stencil are each their own pointer and so their own load action, because
-    * a pass that clears the depth and keeps the stencil is ordinary and one action for
-    * both would be a lie about one of them. Gallium takes all three in one call with a
-    * mask, and a mask of nothing means no clear at all -- which is three load actions
-    * of Load and the case where this does nothing.
-    */
-   {
-      union pipe_color_union clear = { 0 };
-      unsigned mask = 0;
-      uint32_t colormask = 0;
-      if (draw->clear_color) {
-         unsigned clear_mask = (draw->discard >> 8) & 0xffu;
-         mask |= clear_mask ? 0 : PIPE_CLEAR_COLOR0;
-         for (unsigned i = 0; clear_mask && i < 8; i++)
-            if (clear_mask & (1u << i)) mask |= (PIPE_CLEAR_COLOR0 << i);
-         for (unsigned c = 0; c < 4; c++) clear.f[c] = draw->clear_color[c];
-         if (clear.f[0] == 0.0f && clear.f[1] == 0.0f && clear.f[2] == 0.0f && clear.f[3] == 1.0f) {
-            bool off = draw->color_count > 1;
-            for (unsigned i = 0; !off && i < draw->color_count; i++)
-               if (draw->color[i] && (draw->color[i]->shape.width != 1206 || draw->color[i]->shape.height != 2622))
-                  off = true;
-            if (off) clear.f[3] = 0.0f;
-         }
-      }
-      for (unsigned i = 0; i < draw->color_count && i < 8; i++)
-         if (mask & (PIPE_CLEAR_COLOR0 << i)) colormask |= (0xfu << (i * 4));
-      if (!colormask) colormask = 0xf;
-      if (draw->clear_depth && draw->depth && format_has_depth(draw->depth->res->format))
-         mask |= PIPE_CLEAR_DEPTH;
-      if (draw->clear_stencil && draw->depth && format_has_stencil(draw->depth->res->format))
-         mask |= PIPE_CLEAR_STENCIL;
-      if (mask)
-         pipe->clear(pipe, mask, colormask, 0xff, NULL, &clear,
-                     draw->clear_depth ? (double)*draw->clear_depth : 0.0,
-                     draw->clear_stencil ? *draw->clear_stencil & 0xff : 0);
-   }
+   clear_bound_attachments(pipe, draw);
    draw_phase_add(3, mark);
    mark = draw_mark();
    {

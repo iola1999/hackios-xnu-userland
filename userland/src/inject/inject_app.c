@@ -24,7 +24,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-#include <ifaddrs.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <mach-o/loader.h>
@@ -349,133 +348,20 @@ setup_app_container_env(const char *name)
 
 	snprintf(env_path, sizeof(env_path), "/redwood/etc/env/%s", name);
 	f = fopen(env_path, "r");
-	if (f != NULL) {
-		while (fgets(line, sizeof(line), f) != NULL) {
-			char *eq = strchr(line, '=');
-
-			line[strcspn(line, "\r\n")] = '\0';
-			if (eq != NULL && eq != line) {
-				*eq = '\0';
-				setenv(line, eq + 1, 1);
-			}
-		}
-		fclose(f);
+	if (f == NULL) {
+		return;
 	}
-	/* Ensure CFFIXED_USER_HOME, HOME and TMPDIR are defined for containerized applications */
-	if (getenv("CFFIXED_USER_HOME") == NULL) {
-		const char *uuid = NULL;
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *eq;
 
-		if (strcmp(name, "Calculator") == 0) {
-			uuid = "28C5E77E-97C5-4927-A2B0-04987EBF4665";
-		} else if (strcmp(name, "MobileNotes") == 0) {
-			uuid = "39D6F88F-A8D6-4A38-B1F1-15A98FCA5776";
-		} else if (strcmp(name, "Reminders") == 0) {
-			uuid = "5BF8A0AF-C8E6-4B1A-9D2E-2C3D4E5F6A71";
-		} else if (strcmp(name, "MobileCal") == 0) {
-			uuid = "7DFA02CB-E0A8-4D3C-BF40-4E5F6A7B8C93";
-		} else if (strcmp(name, "Weather") == 0) {
-			uuid = "8E5B1A2C-3D4E-4F5A-9B6C-7D8E9F0A1B2C";
-		} else if (strcmp(name, "Maps") == 0) {
-			uuid = "9F6C2B3D-4E5F-4A6B-8C7D-8E9F0A1B2C3D";
-		} else if (strcmp(name, "MobileSafari") == 0) {
-			uuid = "A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D";
-		} else if (strcmp(name, "com.apple.WebKit.Networking") == 0 ||
-		           strcmp(name, "com.apple.WebKit.WebContent") == 0 ||
-		           strcmp(name, "com.apple.WebKit.GPU") == 0) {
-			uuid = "A1B2C3D4-5E6F-4A7B-8C9D-0E1F2A3B4C5D";
-		}
-		if (uuid != NULL) {
-			char home[256], tmp[256];
-
-			snprintf(home, sizeof(home), "/private/var/mobile/Containers/Data/Application/%s", uuid);
-			snprintf(tmp, sizeof(tmp), "%s/tmp", home);
-			setenv("CFFIXED_USER_HOME", home, 1);
-			setenv("HOME", home, 0);
-			setenv("TMPDIR", tmp, 0);
+		line[strcspn(line, "\r\n")] = '\0';
+		eq = strchr(line, '=');
+		if (eq != NULL && eq != line) {
+			*eq = '\0';
+			setenv(line, eq + 1, 1);
 		}
 	}
-	{
-		const char *home = getenv("CFFIXED_USER_HOME");
-
-		if (home != NULL && home[0] == '/') {
-			static const char *const subdirs[] = {
-				"", "/Documents", "/Library", "/Library/Preferences", "/Library/Caches", "/tmp"
-			};
-			static const char *const weather_subdirs[] = {
-				"/Library/Weather", "/Library/WeatherDaemon"
-			};
-			static const char *const maps_subdirs[] = {
-				"/Library/Maps"
-			};
-			char path[320];
-
-			(void)mkdir("/private/var/mobile/Containers", 0755);
-			(void)mkdir("/private/var/mobile/Containers/Data", 0755);
-			(void)mkdir("/private/var/mobile/Containers/Data/Application", 0755);
-			(void)mkdir("/private/var/mobile/Containers/Shared", 0755);
-			(void)mkdir("/private/var/mobile/Containers/Shared/AppGroup", 0755);
-
-			for (unsigned i = 0; i < sizeof(subdirs) / sizeof(subdirs[0]); i++) {
-				snprintf(path, sizeof(path), "%s%s", home, subdirs[i]);
-				(void)mkdir(path, 0755);
-			}
-			if (strcmp(name, "Weather") == 0) {
-				for (unsigned i = 0; i < sizeof(weather_subdirs) / sizeof(weather_subdirs[0]); i++) {
-					snprintf(path, sizeof(path), "%s%s", home, weather_subdirs[i]);
-					(void)mkdir(path, 0755);
-				}
-			} else if (strcmp(name, "Maps") == 0) {
-				for (unsigned i = 0; i < sizeof(maps_subdirs) / sizeof(maps_subdirs[0]); i++) {
-					snprintf(path, sizeof(path), "%s%s", home, maps_subdirs[i]);
-					(void)mkdir(path, 0755);
-				}
-			}
-		}
-
-		/* AppGroup containers and shared directory structures */
-		static const char *const group_subdirs[] = {
-			"", "/Documents", "/Library", "/Library/Preferences", "/Library/Caches", "/tmp"
-		};
-		char gpath[320];
-
-		for (unsigned i = 0; i < sizeof(group_subdirs) / sizeof(group_subdirs[0]); i++) {
-			snprintf(gpath, sizeof(gpath), "/private/var/mobile/Containers/Shared/AppGroup/group.com.apple.weather%s", group_subdirs[i]);
-			(void)mkdir(gpath, 0755);
-			snprintf(gpath, sizeof(gpath), "/private/var/mobile/Containers/Shared/AppGroup/group.com.apple.Maps%s", group_subdirs[i]);
-			(void)mkdir(gpath, 0755);
-		}
-
-		/* Shared daemon and caching paths */
-		static const char *const shared_paths[] = {
-			"/private/var/mobile/Library/Weather", "/private/var/mobile/Library/WeatherDaemon",
-			"/private/var/mobile/Library/Caches/Weather", "/private/var/mobile/Library/Caches/com.apple.weather",
-			"/private/var/mobile/Library/Caches/com.apple.weatherd", "/private/var/mobile/Library/SyncedPreferences",
-			"/private/var/mobile/Library/Maps", "/private/var/mobile/Library/Caches/Maps",
-			"/private/var/mobile/Library/Caches/com.apple.Maps", "/private/var/mobile/Library/Caches/GeoServices"
-		};
-		for (unsigned i = 0; i < sizeof(shared_paths) / sizeof(shared_paths[0]); i++) {
-			(void)mkdir(shared_paths[i], 0755);
-		}
-
-		/* Fallback DNS resolver setup in /private/var/run/resolv.conf */
-		(void)mkdir("/private/var/run", 0775);
-		struct stat st_rc;
-		if (stat("/private/var/run/resolv.conf", &st_rc) != 0 || st_rc.st_size == 0) {
-			int rcfd = open("/private/var/run/resolv.conf", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-			if (rcfd >= 0) {
-				static const char default_dns[] =
-					"nameserver 119.29.29.29\n"
-					"nameserver 223.5.5.5\n"
-					"nameserver 8.8.8.8\n"
-					"nameserver 1.1.1.1\n";
-				(void)write(rcfd, default_dns, sizeof(default_dns) - 1);
-				close(rcfd);
-			}
-		}
-		if (stat("/private/etc/resolv.conf", &st_rc) != 0) {
-			(void)symlink("/private/var/run/resolv.conf", "/private/etc/resolv.conf");
-		}
-	}
+	fclose(f);
 }
 
 /*
@@ -628,10 +514,8 @@ redwood_app_init(void)
 	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
 	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
 
-	watch_network_classes();
-	if (en0_has_ipv4()) {
-		dispatch_async(dispatch_get_main_queue(), ^{ post_geo_network_reachable_notification(); });
-	}
+	watch_cellular_classes();
+	watch("NSFileManager", "containerURLForSecurityApplicationGroupIdentifier:", (IMP)watched_container_url_for_group, &orig_container_url_for_group);
 
 	app_enable_webkit_vp9();
 	_dyld_register_func_for_add_image(app_dyld_image_added);
