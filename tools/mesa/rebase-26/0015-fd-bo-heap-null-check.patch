@@ -1,6 +1,6 @@
 --- a/src/freedreno/drm/freedreno_bo_heap.c
 +++ b/src/freedreno/drm/freedreno_bo_heap.c
-@@ -221,6 +221,10 @@
+@@ -221,6 +221,10 @@ fd_bo_heap_alloc(struct fd_bo_heap *heap, uint32_t siz
     }
  
     struct sa_bo *s = calloc(1, sizeof(*s));
@@ -11,7 +11,7 @@
  
     s->heap = heap;
     s->offset = offset;
-@@ -232,12 +236,24 @@
+@@ -233,6 +237,11 @@ fd_bo_heap_alloc(struct fd_bo_heap *heap, uint32_t siz
        heap->blocks[idx] = fd_bo_new(
              heap->dev, FD_BO_HEAP_BLOCK_SIZE, heap->flags | _FD_BO_HINT_HEAP,
              "heap-%x-block-%u", heap->flags, idx);
@@ -23,7 +23,7 @@
        if (heap->flags == RING_FLAGS)
           fd_bo_mark_for_dump(heap->blocks[idx]);
     }
-    /* Take a reference to the backing obj: */
+@@ -240,6 +249,13 @@ fd_bo_heap_alloc(struct fd_bo_heap *heap, uint32_t siz
     fd_bo_ref(heap->blocks[idx]);
     simple_mtx_unlock(&heap->lock);
  
@@ -37,7 +37,7 @@
     struct fd_bo *bo = &s->base;
  
     bo->size = size;
-@@ -246,7 +262,7 @@
+@@ -248,7 +264,7 @@ fd_bo_heap_alloc(struct fd_bo_heap *heap, uint32_t siz
     bo->alloc_flags = flags;
  
     /* Pre-initialize mmap ptr, to avoid trying to os_mmap() */

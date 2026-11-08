@@ -1,10 +1,9 @@
 --- a/src/freedreno/ir3/ir3_disk_cache.c
 +++ b/src/freedreno/ir3/ir3_disk_cache.c
-@@ -28,6 +28,38 @@
-  * for this reason, because binning pass variants share const_state with
+@@ -27,29 +27,81 @@
   * their draw-pass counterpart, both variants are serialized together.
   */
-+
+ 
 +#ifdef __APPLE__
 +#include <dlfcn.h>
 +#include <mach-o/loader.h>
@@ -36,22 +35,20 @@
 +   return NULL;
 +}
 +#endif
- 
++
  void
  ir3_disk_cache_init(struct ir3_compiler *compiler)
-@@ -34,17 +66,37 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+ {
     if (ir3_shader_debug & IR3_DBG_NOCACHE)
        return;
  
--#ifdef __APPLE__
--   /* no build id in a Mach-O library to tell one build's shaders from another's: no cache */
--   return;
--#else
-    const char *renderer = fd_dev_name(compiler->dev_id);
++   const char *renderer = fd_dev_name(compiler->dev_id);
 +   const uint8_t *build_id_bytes = NULL;
 +   unsigned build_id_len = 0;
 +
-+#ifdef __APPLE__
+ #ifdef __APPLE__
+-   /* no build id in a Mach-O library to tell one build's shaders from another's: no cache */
+-   return;
 +   build_id_bytes = get_darwin_macho_uuid((const void *)ir3_disk_cache_init, &build_id_len);
 +   if (!build_id_bytes || build_id_len == 0)
 +      return;
@@ -70,7 +67,8 @@
 +      mkdir(cache_dir, 0777);
 +      setenv("MESA_SHADER_CACHE_DIR", cache_dir, 1);
 +   }
-+#else
+ #else
+-   const char *renderer = fd_dev_name(compiler->dev_id);
     const struct build_id_note *note =
        build_id_find_nhdr_for_addr(ir3_disk_cache_init);
 -   unsigned build_id_len = build_id_length(note);
@@ -85,17 +83,17 @@
  
     blake3_hasher ctx;
     uint8_t blake3[BLAKE3_KEY_LEN];
-@@ -52,6 +104,6 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+    _mesa_blake3_init(&ctx);
 -   _mesa_blake3_update(&ctx, id_sha1, build_id_len);
 +   _mesa_blake3_update(&ctx, build_id_bytes, build_id_len);
     _mesa_blake3_update(&ctx, &compiler->options.uche_trap_base,
                       sizeof(compiler->options.uche_trap_base));
     _mesa_blake3_final(&ctx, blake3);
- 
-    char timestamp[BLAKE3_HEX_LEN];
-    _mesa_blake3_format(timestamp, blake3);
+@@ -59,7 +111,6 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
  
     uint64_t driver_flags = ir3_shader_debug_hash_key();
     compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
 -#endif
  }
+ 
+ void
