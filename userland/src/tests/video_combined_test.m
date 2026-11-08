@@ -3,6 +3,12 @@
 #import <Metal/Metal.h>
 #import <CoreVideo/CoreVideo.h>
 #import <IOSurface/IOSurfaceRef.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+#include <dispatch/dispatch.h>
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <string.h>
 #include <math.h>
 #include <signal.h>
 #include <unistd.h>
@@ -25,10 +31,33 @@ static BOOL submit(id<MTLCommandBuffer> command) {
 }
 int main(int argc,char **argv) { @autoreleasepool { @try {
     setbuf(stdout,NULL); signal(SIGALRM,deadline); alarm(30);
-    if(argc!=2) {fprintf(stderr,"usage: video_combined_test LIBRARY.metallib\n");return 2;}
-    id<MTLDevice> device=MTLCreateSystemDefaultDevice();
+    BOOL native=argc==3 && !strcmp(argv[1],"--native");
+    if(argc!=(native?3:2)) {fprintf(stderr,"usage: video_combined_test [--native] LIBRARY.metallib\n");return 2;}
+    id<MTLDevice> device=nil;
+    if(native) device=MTLCreateSystemDefaultDevice();
+    else {
+        int console=open("/dev/console",O_WRONLY|O_NOCTTY);
+        if(console>=0) {dup2(console,STDOUT_FILENO);dup2(console,STDERR_FILENO);if(console>STDERR_FILENO)close(console);}
+        unsetenv("RWA_SOFTWARE");
+        if(!dlopen("/redwood/lib/libredwoodmetal.dylib",RTLD_NOW|RTLD_LOCAL)) {printf("video_combined: driver load failed\n");return 2;}
+        Class cls=objc_getClass("RedwoodMetalDevice");SEL init=sel_registerName("initWithAcceleratorPort:");
+        if(!cls || ![cls instancesRespondToSelector:init])return 2;
+        device=((id(*)(id,SEL,uint32_t))objc_msgSend)([cls alloc],init,0);
+        void *air=dlopen("/redwood/lib/libredwoodair.dylib",RTLD_NOW|RTLD_NOLOAD);
+        const char *(*device_name)(void *)=air?dlsym(air,"rwa_device_name"):NULL;
+        SEL mesa=sel_registerName("mesaDevice");
+        if(!device_name || ![device respondsToSelector:mesa])return 2;
+        const char *name=device_name(((void *(*)(id,SEL))objc_msgSend)(device,mesa));
+        if(!name || strstr(name,"softpipe"))return 2;
+        printf("video_combined: backend=%s\n",name);
+    }
     id<MTLCommandQueue> queue=[device newCommandQueue]; NSError *error=nil;
-    id<MTLLibrary> library=[device newLibraryWithFile:[NSString stringWithUTF8String:argv[1]] error:&error];
+    if(!device || !queue)return 2;
+    NSData *data=[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[native?2:1]]];
+    if(!data.length)return 3;
+    dispatch_data_t wrapped=dispatch_data_create(data.bytes,data.length,NULL,DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    id<MTLLibrary> library=[device newLibraryWithData:wrapped error:&error];
+    dispatch_release(wrapped);
     if(!library) {printf("video_combined: library error=%s:%ld\n",error.domain.UTF8String ?: "-",(long)error.code);return 3;}
     id<MTLFunction> compute=[library newFunctionWithName:@"combined_sample"];
     id<MTLComputePipelineState> cp=[device newComputePipelineStateWithFunction:compute error:&error];
