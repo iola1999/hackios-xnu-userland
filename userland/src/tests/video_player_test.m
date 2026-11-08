@@ -1,6 +1,6 @@
 /*
- * Play a local video through AVPlayer and inspect AVPlayerItemVideoOutput NV12 frames.
- * Usage: video_player_test [--deadline SECONDS] FILE
+ * Play a file or HTTP(S) video through AVPlayer and inspect its NV12 output frames.
+ * Usage: video_player_test [--deadline SECONDS] FILE | --url HTTP_URL
  * Default deadline: 12 seconds, including startup, playback and cleanup.
  * Exit: 0 ready, playing, advancing clock, valid pixels and end notification observed;
  *       1 input/player/pixel failure; 2 arguments; 124 whole-process deadline.
@@ -83,14 +83,14 @@ pixel_summary(CVPixelBufferRef image, uint64_t *hash, uint64_t *bytes, unsigned 
 }
 
 static int
-play(const char *path)
+play(const char *path, bool remote)
 {
 	struct stat st;
-	if (stat(path, &st) != 0) {
+	if (!remote && stat(path, &st) != 0) {
 		printf("video_player_test: stage=input errno=%d\n", errno);
 		return 1;
 	}
-	if (!S_ISREG(st.st_mode)) {
+	if (!remote && !S_ISREG(st.st_mode)) {
 		printf("video_player_test: stage=input error=not_regular_file\n");
 		return 1;
 	}
@@ -106,7 +106,12 @@ play(const char *path)
 	uint64_t bytes = 0;
 	CMTime previous = kCMTimeInvalid, maximum = kCMTimeZero;
 	@try {
-		NSURL *url = [NSURL fileURLWithPath:@(path)];
+		NSURL *url = remote ? [NSURL URLWithString:@(path)] : [NSURL fileURLWithPath:@(path)];
+		if (remote && (!url.host.length ||
+		    (![url.scheme isEqualToString:@"http"] && ![url.scheme isEqualToString:@"https"]))) {
+			printf("video_player_test: stage=input error=invalid_http_url\n");
+			return 1;
+		}
 		item = [AVPlayerItem playerItemWithURL:url];
 		output = [[AVPlayerItemVideoOutput alloc] initWithPixelBufferAttributes:@{
 			(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
@@ -211,12 +216,16 @@ main(int argc, char **argv)
 {
 	double deadline = 12;
 	const char *path = NULL;
+	bool remote = false;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--deadline") && i + 1 < argc) {
 			char *end = NULL;
 			errno = 0;
 			deadline = strtod(argv[++i], &end);
 			if (errno || end == argv[i] || *end || !isfinite(deadline) || deadline <= 0 || deadline > 3600) goto usage;
+		} else if (!strcmp(argv[i], "--url") && i + 1 < argc && path == NULL) {
+			remote = true;
+			path = argv[++i];
 		} else if (argv[i][0] != '-' && path == NULL) {
 			path = argv[i];
 		} else goto usage;
@@ -239,9 +248,9 @@ main(int argc, char **argv)
 		return 1;
 	}
 	@autoreleasepool {
-		return play(path);
+		return play(path, remote);
 	}
 usage:
-	fprintf(stderr, "usage: video_player_test [--deadline SECONDS] FILE\n");
+	fprintf(stderr, "usage: video_player_test [--deadline SECONDS] FILE | --url HTTP_URL\n");
 	return 2;
 }
