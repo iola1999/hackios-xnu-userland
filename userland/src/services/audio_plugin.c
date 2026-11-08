@@ -142,6 +142,7 @@ struct AudioServerPlugInDriverInterface {
 enum {
 	kAudioHardwareUnknownPropertyError = 'who?', kAudioHardwareBadPropertySizeError = '!siz',
 	kAudioHardwareIllegalOperationError = 'nope', kAudioHardwareBadObjectError = '!obj',
+	kAudioHardwareUnspecifiedError = 'what',
 	kAudioHardwareUnsupportedOperationError = 'unop', kAudioDeviceUnsupportedFormatError = '!dat',
 
 	kAudioObjectPropertyScopeGlobal = 'glob', kAudioObjectPropertyScopeInput = 'inpt', kAudioObjectPropertyScopeOutput = 'outp',
@@ -214,6 +215,7 @@ struct device {
 	unsigned running;               /* how many clients have started I/O */
 	UInt64 anchor;                  /* mach_absolute_time() when the first of them did */
 	UInt64 periods;                 /* whole timestamp periods since */
+	UInt64 seed;                    /* changes whenever StartIO establishes a new time line */
 };
 
 static struct device devices[] = {
@@ -977,7 +979,8 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 	if (d->running++ == 0) {
 		d->anchor = mach_absolute_time();
 		d->periods = 0;
-		if (d->output != 0) {
+		d->seed++;
+		if (d->object == OBJECT_SPEAKER) {
 			written = refused = 0;
 			say("redwood: audio: playing\n");
 		}
@@ -1001,7 +1004,7 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 	if (d->running != 0 && --d->running == 0) {
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
-		} else if (d->output != 0) {
+		} else if (d->object == OBJECT_SPEAKER) {
 			say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
 			    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
 		}
@@ -1028,7 +1031,7 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
 	}
 	*sample_time = (Float64)d->periods * TIMESTAMP_PERIOD;
 	*host_time = d->anchor + (UInt64)((Float64)d->periods * ticks_per_period);
-	*seed = 1;
+	*seed = d->seed;
 	pthread_mutex_unlock(&lock);
 	return 0;
 }
@@ -1102,11 +1105,15 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
-		/* the kernel takes it all or leaves it: this thread must not wait */
-		if (sink < 0 || write(sink, buffer, (size_t)frames * REDWOOD_AUDIO_FRAME) < 0) {
-			refused += frames;
-		}
+		/* Report incomplete writes to the HAL without retrying on its real-time thread. */
+		size_t wanted = (size_t)frames * REDWOOD_AUDIO_FRAME;
+		ssize_t bytes = sink < 0 ? -1 : write(sink, buffer, wanted);
+
 		written += frames;
+		if (bytes < 0 || (size_t)bytes != wanted) {
+			refused += frames - (bytes > 0 ? (UInt64)bytes / REDWOOD_AUDIO_FRAME : 0);
+			return kAudioHardwareUnspecifiedError;
+		}
 	}
 	return 0;
 }

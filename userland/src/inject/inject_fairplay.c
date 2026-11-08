@@ -1,6 +1,6 @@
 /*
  * Optional diagnostics for fairplayd.H2; injection is selected by the test configuration.
- * iOS 26 build 23G90 imports IOConnectCallStructMethod directly. Observe that entry point and each caller-requested IOIteratorNext without consuming or resetting an iterator in the probe.
+ * iOS 26 build 23G90 imports IORegistryEntryFromPath, IORegistryEntryCreateCFProperty and IOConnectCallStructMethod directly. Observe those entry points and each caller-requested IOIteratorNext without consuming or resetting an iterator in the probe.
  * Matching names, user-client types, selectors, buffer lengths and return values identify the native IOKit contract. Authentication buffers, property values, filesystem paths and argument contents stay out of the log.
  * The 23G90 matching class, Open type and selectors remain unverified. Earlier-system observations of an early return from main do not establish this build's behavior.
  * Interposing observes calls across image boundaries. Calls within libSystem require kernel tracing; zero hook calls alone cannot establish that no syscall occurred.
@@ -20,6 +20,7 @@ extern xpc_connection_t xpc_connection_create_mach_service(const char *name, dis
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -41,6 +42,7 @@ extern CFTypeRef SecTaskCopyValueForEntitlement(void *task, CFStringRef entitlem
 
 static uintptr_t slide;
 static bool ours;
+static uintptr_t own_image_base, own_text_start, own_text_size;
 
 static void
 say(const char *format, ...)
@@ -98,6 +100,111 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 }
 
 /* IOKit calls retain their original arguments, results and object ownership. */
+
+static uintptr_t
+caller_offset(uintptr_t address)
+{
+	if (own_image_base != 0 && address >= own_image_base && address >= own_text_start &&
+	    address - own_text_start < own_text_size) {
+		return address - own_image_base;
+	}
+	return UINTPTR_MAX;
+}
+
+static io_registry_entry_t
+watched_IORegistryEntryFromPath(mach_port_t port, const char *path)
+{
+	io_registry_entry_t entry = IORegistryEntryFromPath(port, path);
+	int saved_errno = errno;
+
+	if (ours) {
+		const char *kind = path == NULL ? "null" : "other";
+		uint64_t hash = 0;
+		size_t length = 0;
+		bool topology = false;
+		uintptr_t offset = caller_offset((uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0)));
+
+		if (path != NULL && strncmp(path, "IODeviceTree:/", sizeof("IODeviceTree:/") - 1) == 0) {
+			kind = "IODeviceTree";
+			topology = true;
+		} else if (path != NULL && strncmp(path, "IOService:/", sizeof("IOService:/") - 1) == 0) {
+			kind = "IOService";
+			topology = true;
+		}
+		/* Hash only recognized registry topology; path text stays out of the log. */
+		if (topology) {
+			hash = UINT64_C(14695981039346656037);
+			while (length < sizeof(io_string_t) && path[length] != 0) {
+				hash = (hash ^ (unsigned char)path[length++]) * UINT64_C(1099511628211);
+			}
+		}
+		say("redwood: fairplayd: IORegistryEntryFromPath path_kind=%s path_hash=%016llx "
+		    "path_bytes=%zu path_complete=%u entry_present=%u errno_after=%d caller_main=%u caller_offset=%#lx\n",
+		    kind, (unsigned long long)hash, length, topology && length < sizeof(io_string_t),
+		    entry != IO_OBJECT_NULL, saved_errno, offset != UINTPTR_MAX, offset != UINTPTR_MAX ? offset : 0);
+	}
+	errno = saved_errno;
+	return entry;
+}
+
+static CFTypeRef
+watched_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
+    CFAllocatorRef allocator, IOOptionBits options)
+{
+	CFTypeRef value = IORegistryEntryCreateCFProperty(entry, key, allocator, options);
+	int saved_errno = errno;
+
+	if (ours) {
+		char name[96] = "(unreadable)";
+		const char *kind = value != NULL ? "other" : "null";
+		const char *units = "none";
+		CFTypeID type = value != NULL ? CFGetTypeID(value) : 0;
+		CFIndex length = -1;
+		uintptr_t offset = caller_offset((uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0)));
+
+		if (key != NULL && CFGetTypeID(key) == CFStringGetTypeID() &&
+		    CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8)) {
+			for (size_t i = 0; name[i] != 0; i++) {
+				unsigned char c = (unsigned char)name[i];
+				if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				    (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) {
+					strlcpy(name, "(unreadable)", sizeof(name));
+					break;
+				}
+			}
+		} else {
+			strlcpy(name, "(unreadable)", sizeof(name));
+		}
+		/* Read size metadata only; the returned Create reference belongs to the caller. */
+		if (value != NULL && type == CFDataGetTypeID()) {
+			kind = "data";
+			length = CFDataGetLength(value);
+			units = "bytes";
+		} else if (value != NULL && type == CFStringGetTypeID()) {
+			kind = "string";
+			length = CFStringGetLength(value);
+			units = "utf16";
+		} else if (value != NULL && type == CFArrayGetTypeID()) {
+			kind = "array";
+			length = CFArrayGetCount(value);
+			units = "elements";
+		} else if (value != NULL && type == CFDictionaryGetTypeID()) {
+			kind = "dictionary";
+			length = CFDictionaryGetCount(value);
+			units = "entries";
+		} else if (value != NULL && type == CFNumberGetTypeID()) {
+			kind = "number";
+		} else if (value != NULL && type == CFBooleanGetTypeID()) {
+			kind = "boolean";
+		}
+		say("redwood: fairplayd: IORegistryEntryCreateCFProperty key=%s value_present=%u "
+		    "type=%s type_id=%lu length=%ld units=%s errno_after=%d caller_main=%u caller_offset=%#lx\n",
+		    name, value != NULL, kind, (unsigned long)type, (long)length, units, saved_errno,
+		    offset != UINTPTR_MAX, offset != UINTPTR_MAX ? offset : 0);
+	}
+	errno = saved_errno;
+	return value;
+}
 
 static CFMutableDictionaryRef
 watched_IOServiceMatching(const char *name)
@@ -322,6 +429,7 @@ static CFTypeRef
 watched_MGCopyAnswer(CFStringRef key)
 {
 	CFTypeRef answer = MGCopyAnswer(key);
+	int saved_errno = errno;
 
 	if (ours) {
 		char text[96] = "";
@@ -331,6 +439,7 @@ watched_MGCopyAnswer(CFStringRef key)
 		}
 		say("redwood: fairplayd: MGCopyAnswer(\"%s\") -> %s\n", text, answer != NULL ? "an answer" : "NOTHING");
 	}
+	errno = saved_errno;
 	return answer;
 }
 
@@ -338,6 +447,7 @@ static CFTypeRef
 watched_SecTaskCopyValueForEntitlement(void *task, CFStringRef entitlement, CFErrorRef *error)
 {
 	CFTypeRef value = SecTaskCopyValueForEntitlement(task, entitlement, error);
+	int saved_errno = errno;
 
 	if (ours) {
 		char text[96] = "";
@@ -347,6 +457,7 @@ watched_SecTaskCopyValueForEntitlement(void *task, CFStringRef entitlement, CFEr
 		}
 		say("redwood: fairplayd: entitlement \"%s\" -> %s\n", text, value != NULL ? "held" : "NOT HELD");
 	}
+	errno = saved_errno;
 	return value;
 }
 
@@ -438,6 +549,8 @@ watched_exit(int status)
 __attribute__((used)) static struct {
 	const void *ours, *theirs;
 } interposed[] __attribute__((section("__DATA,__interpose"))) = {
+	{ (const void *)watched_IORegistryEntryFromPath, (const void *)IORegistryEntryFromPath },
+	{ (const void *)watched_IORegistryEntryCreateCFProperty, (const void *)IORegistryEntryCreateCFProperty },
 	{ (const void *)watched_IOServiceMatching, (const void *)IOServiceMatching },
 	{ (const void *)watched_IOServiceGetMatchingServices, (const void *)IOServiceGetMatchingServices },
 	{ (const void *)watched_IOServiceGetMatchingService, (const void *)IOServiceGetMatchingService },
@@ -485,6 +598,16 @@ redwood_fairplay_init(void)
 	sigaction(SIGTRAP, &action, NULL);
 	main_thread = mach_thread_self();
 	own_slide = (uintptr_t)_dyld_get_image_vmaddr_slide(0);
+	{
+		const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(0);
+		unsigned long text_size = 0;
+
+		own_image_base = (uintptr_t)header;
+		if (header != NULL) {
+			own_text_start = (uintptr_t)getsegmentdata(header, "__TEXT", &text_size);
+			own_text_size = text_size;
+		}
+	}
 	atexit(at_the_end);
 	{
 		pthread_t thread;

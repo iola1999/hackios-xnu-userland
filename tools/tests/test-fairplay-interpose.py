@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the production FairPlay wrappers with host IOKit stubs.
 
-This checks forwarding, iterator ownership and diagnostic output. It does not
+This checks forwarding, CF and iterator ownership, and diagnostic output. It does not
 validate dyld interposition or FairPlay behavior on the device.
 """
 import os
@@ -24,11 +24,23 @@ PRELUDE = r'''
 typedef uint32_t mach_port_t;
 typedef uint32_t io_iterator_t;
 typedef uint32_t io_object_t;
+typedef uint32_t io_registry_entry_t;
+typedef uint32_t IOOptionBits;
+typedef char io_string_t[512];
 typedef int kern_return_t;
 typedef const void *CFDictionaryRef;
+typedef const void *CFAllocatorRef;
+typedef unsigned long CFTypeID;
+typedef long CFIndex;
+struct cf_object { CFTypeID type; CFIndex length; const char *text; };
+typedef const struct cf_object *CFTypeRef;
+typedef CFTypeRef CFStringRef;
+typedef CFTypeRef CFErrorRef;
+#define kCFStringEncodingUTF8 0x08000100
 #define KERN_SUCCESS 0
 #define IO_OBJECT_NULL 0
 static bool ours;
+static uintptr_t own_image_base, own_text_start, own_text_size, return_address;
 static char log_text[2048];
 static size_t log_size;
 static unsigned match_calls, next_calls, struct_calls, dlopen_calls, dlerror_calls;
@@ -44,6 +56,88 @@ static size_t expected_input_length;
 static void *expected_output;
 static const char private_path[] = "/private/var/containers/UUID-PRIVATE/probe";
 static void *library_result;
+static unsigned path_calls, property_calls, metadata_calls, release_calls, retain_calls;
+static unsigned gestalt_calls, entitlement_calls;
+static const char *expected_path;
+static io_registry_entry_t registry_result;
+static CFStringRef expected_key;
+static CFTypeRef property_result;
+static CFAllocatorRef expected_allocator;
+static IOOptionBits expected_options;
+static CFErrorRef *expected_error;
+static const struct cf_object good_key = {2, 14, "unique-chip-id"};
+static const struct cf_object unsafe_key = {2, 42, "/private/var/containers/UUID-PRIVATE/key"};
+static const struct cf_object newline_key = {2, 8, "key\nextra"};
+static const struct cf_object long_key = {2, 110,
+    "long-property-name-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"};
+static const struct cf_object values[] = {
+    {1, 32, "AUTHENTICATION-PAYLOAD"}, {2, 36, "VALUE-PRIVATE-UUID"},
+    {3, 4, "ARRAY-PRIVATE"}, {4, 5, "DICTIONARY-PRIVATE"},
+    {5, 8, "NUMBER-PRIVATE"}, {6, 1, "BOOLEAN-PRIVATE"}, {99, 77, "UNKNOWN-PRIVATE"}
+};
+
+static io_registry_entry_t IORegistryEntryFromPath(mach_port_t port, const char *path) {
+    path_calls++;
+    assert(port == 17 && path == expected_path);
+    errno = ENODEV;
+    return registry_result;
+}
+static CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key,
+                                                CFAllocatorRef allocator, IOOptionBits options) {
+    property_calls++;
+    assert(entry == 103 && key == expected_key && allocator == expected_allocator);
+    assert(options == expected_options);
+    errno = EBUSY;
+    return property_result;
+}
+static CFTypeRef MGCopyAnswer(CFStringRef key) {
+    gestalt_calls++; assert(key == expected_key); errno = EBUSY;
+    return property_result;
+}
+static CFTypeRef SecTaskCopyValueForEntitlement(void *task, CFStringRef key, CFErrorRef *error) {
+    entitlement_calls++;
+    assert(task == (void *)(uintptr_t)111 && key == expected_key && error == expected_error);
+    if (error) *error = &values[6];
+    errno = EBUSY;
+    return property_result;
+}
+static CFTypeID CFGetTypeID(CFTypeRef value) {
+    assert(value && (value == expected_key || value == property_result));
+    metadata_calls++; errno = EACCES;
+    return value->type;
+}
+static CFTypeID CFDataGetTypeID(void) { return 1; }
+static CFTypeID CFStringGetTypeID(void) { return 2; }
+static CFTypeID CFArrayGetTypeID(void) { return 3; }
+static CFTypeID CFDictionaryGetTypeID(void) { return 4; }
+static CFTypeID CFNumberGetTypeID(void) { return 5; }
+static CFTypeID CFBooleanGetTypeID(void) { return 6; }
+static CFIndex metadata_length(CFTypeRef value, CFTypeID type) {
+    assert(value == property_result && value->type == type);
+    metadata_calls++; errno = EACCES;
+    return value->length;
+}
+static CFIndex CFDataGetLength(CFTypeRef value) { return metadata_length(value, 1); }
+static CFIndex CFStringGetLength(CFTypeRef value) { return metadata_length(value, 2); }
+static CFIndex CFArrayGetCount(CFTypeRef value) { return metadata_length(value, 3); }
+static CFIndex CFDictionaryGetCount(CFTypeRef value) { return metadata_length(value, 4); }
+static bool CFStringGetCString(CFStringRef value, char *buffer, CFIndex size, unsigned encoding) {
+    assert(value == expected_key && value->type == 2 && encoding == kCFStringEncodingUTF8);
+    metadata_calls++; errno = EACCES;
+    if (strlen(value->text) >= (size_t)size) {
+        memcpy(buffer, value->text, (size_t)size - 1); buffer[size - 1] = 0;
+        return false;
+    }
+    strcpy(buffer, value->text);
+    return true;
+}
+static void CFRelease(CFTypeRef value) { assert(value == property_result); release_calls++; }
+static CFTypeRef CFRetain(CFTypeRef value) {
+    assert(value == property_result); retain_calls++; return value;
+}
+static void CFDataGetBytes(CFTypeRef value) { (void)value; assert(!"property payload read"); }
+#define __builtin_return_address(level) ((void *)return_address)
+#define __builtin_extract_return_addr(address) (address)
 
 static ssize_t fake_write(int fd, const void *bytes, size_t length) {
     assert(fd == 2 && log_size + length < sizeof(log_text));
@@ -96,7 +190,108 @@ static void reset(bool logging) {
     ours = logging;
     log_text[0] = 0; log_size = 0;
     match_calls = next_calls = struct_calls = dlopen_calls = dlerror_calls = 0;
+    path_calls = property_calls = metadata_calls = release_calls = retain_calls = 0;
+    gestalt_calls = entitlement_calls = 0;
+    own_image_base = own_text_start = 0x100000000UL; own_text_size = 0x1000;
+    return_address = own_image_base + 0x234;
     driver_result = 0;
+}
+static void registry_path(bool logging, const char *path, const char *kind, bool succeeds) {
+    reset(logging);
+    expected_path = path; registry_result = succeeds ? 107 : IO_OBJECT_NULL;
+    assert(watched_IORegistryEntryFromPath(17, path) == registry_result);
+    assert(path_calls == 1 && errno == ENODEV && metadata_calls == 0);
+    assert(logging == (log_size != 0));
+    assert(strstr(log_text, "UUID-PRIVATE") == NULL && strstr(log_text, private_path) == NULL);
+    if (logging) {
+        char expected[96];
+        snprintf(expected, sizeof(expected), "path_kind=%s ", kind);
+        assert(strstr(log_text, expected));
+        snprintf(expected, sizeof(expected), "entry_present=%u errno_after=%d", succeeds, ENODEV);
+        assert(strstr(log_text, expected));
+        assert(strstr(log_text, "caller_main=1 caller_offset=0x234"));
+        if (!strcmp(kind, "other") || !strcmp(kind, "null"))
+            assert(strstr(log_text, "path_hash=0000000000000000 path_bytes=0 path_complete=0"));
+        else assert(strstr(log_text, "path_hash=0000000000000000") == NULL);
+    }
+}
+static void registry_paths(bool logging) {
+    registry_path(logging, "IODeviceTree:/chosen", "IODeviceTree", true);
+    registry_path(logging, "IOService:/Root/UUID-PRIVATE", "IOService", false);
+    registry_path(logging, private_path, "other", true);
+    registry_path(logging, "IODeviceTree:private", "other", true);
+    registry_path(logging, "IOService:private", "other", false);
+    registry_path(logging, NULL, "null", false);
+    char full_path[sizeof(io_string_t)];
+    memset(full_path, 'x', sizeof(full_path)); memcpy(full_path, "IOService:/", 11);
+    registry_path(logging, full_path, "IOService", true);
+    if (logging) assert(strstr(log_text, "path_bytes=512 path_complete=0"));
+    assert(caller_offset(own_image_base) == 0);
+    assert(caller_offset(own_image_base + own_text_size - 1) == own_text_size - 1);
+    assert(caller_offset(own_image_base - 1) == UINTPTR_MAX);
+    assert(caller_offset(own_image_base + own_text_size) == UINTPTR_MAX);
+    return_address = own_image_base + own_text_size;
+    log_size = 0; log_text[0] = 0;
+    assert(watched_IORegistryEntryFromPath(17, full_path) == registry_result);
+    assert(errno == ENODEV && path_calls == 2);
+    if (logging) assert(strstr(log_text, "caller_main=0 caller_offset=0"));
+    own_image_base = 0;
+    assert(caller_offset(own_text_start + 1) == UINTPTR_MAX);
+}
+static void registry_property(bool logging, CFTypeRef value, CFStringRef key, const char *key_text) {
+    reset(logging);
+    expected_key = key; property_result = value;
+    expected_allocator = (void *)(uintptr_t)109; expected_options = 0x104;
+    assert(watched_IORegistryEntryCreateCFProperty(103, key, expected_allocator, expected_options) == value);
+    assert(property_calls == 1 && errno == EBUSY && release_calls == 0 && retain_calls == 0);
+    assert(logging == (log_size != 0));
+    assert(strstr(log_text, "PRIVATE") == NULL && strstr(log_text, "AUTHENTICATION-PAYLOAD") == NULL);
+    if (logging) {
+        char expected[192];
+        const char *units[] = {"none", "bytes", "utf16", "elements", "entries"};
+        const char *types[] = {"null", "data", "string", "array", "dictionary", "number", "boolean"};
+        CFTypeID type = value ? value->type : 0;
+        bool sized = type >= 1 && type <= 4;
+        snprintf(expected, sizeof(expected), "key=%s value_present=%u type=%s type_id=%lu length=%ld units=%s errno_after=%d",
+                 key_text, value != NULL, type <= 6 ? types[type] : "other", type,
+                 sized ? value->length : -1, units[sized ? type : 0], EBUSY);
+        assert(strstr(log_text, expected));
+        assert(strstr(log_text, "caller_main=1 caller_offset=0x234"));
+        assert(strstr(log_text, "key\nextra") == NULL);
+    } else assert(metadata_calls == 0);
+}
+static void registry_properties(bool logging) {
+    for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++)
+        registry_property(logging, &values[i], &good_key, "unique-chip-id");
+    registry_property(logging, NULL, &good_key, "unique-chip-id");
+    registry_property(logging, &values[0], NULL, "(unreadable)");
+    registry_property(logging, &values[0], &unsafe_key, "(unreadable)");
+    registry_property(logging, &values[0], &newline_key, "(unreadable)");
+    registry_property(logging, &values[0], &long_key, "(unreadable)");
+    registry_property(logging, &values[0], &values[0], "(unreadable)");
+    expected_key = NULL; expected_allocator = NULL; expected_options = 0;
+    return_address = own_image_base - 1;
+    log_size = 0; log_text[0] = 0;
+    assert(watched_IORegistryEntryCreateCFProperty(103, NULL, NULL, 0) == property_result);
+    assert(property_calls == 2 && errno == EBUSY && release_calls == 0 && retain_calls == 0);
+    if (logging) assert(strstr(log_text, "caller_main=0 caller_offset=0"));
+}
+static void other_property_calls(bool logging, bool succeeds) {
+    reset(logging);
+    expected_key = &good_key; property_result = succeeds ? &values[0] : NULL;
+    assert(watched_MGCopyAnswer(expected_key) == property_result);
+    assert(gestalt_calls == 1 && errno == EBUSY);
+    CFErrorRef error = NULL; expected_error = &error;
+    assert(watched_SecTaskCopyValueForEntitlement((void *)(uintptr_t)111, expected_key, &error) == property_result);
+    assert(entitlement_calls == 1 && error == &values[6] && errno == EBUSY);
+    expected_key = NULL; expected_error = NULL;
+    assert(watched_MGCopyAnswer(NULL) == property_result);
+    assert(gestalt_calls == 2 && errno == EBUSY);
+    assert(watched_SecTaskCopyValueForEntitlement((void *)(uintptr_t)111, NULL, NULL) == property_result);
+    assert(entitlement_calls == 2 && errno == EBUSY && release_calls == 0 && retain_calls == 0);
+    assert(strstr(log_text, "AUTHENTICATION-PAYLOAD") == NULL);
+    assert(logging == (log_size != 0));
+    if (!logging) assert(metadata_calls == 0);
 }
 static void iterator_calls(bool logging) {
     reset(logging);
@@ -168,8 +363,12 @@ int main(void) {
         empty_struct_call(logging);
         loader_calls(logging, false);
         loader_calls(logging, true);
+        registry_paths(logging);
+        registry_properties(logging);
+        other_property_calls(logging, false);
+        other_property_calls(logging, true);
     }
-    puts("PASS: FairPlay forwarding, lengths, iterator calls, errno and private output");
+    puts("PASS: FairPlay forwarding, lengths, ownership, call counts, errno, caller offsets and private output");
     return 0;
 }
 '''
@@ -183,10 +382,13 @@ def extract(source, name):
 
 def main():
     source = (ROOT / 'userland/src/inject/inject_fairplay.c').read_text()
-    names = ['say', 'watched_IOServiceGetMatchingServices', 'watched_IOIteratorNext',
-             'watched_IOConnectCallStructMethod', 'watched_dlopen']
+    names = ['say', 'caller_offset', 'watched_IORegistryEntryFromPath',
+             'watched_IORegistryEntryCreateCFProperty', 'watched_IOServiceGetMatchingServices', 'watched_IOIteratorNext',
+             'watched_IOConnectCallStructMethod', 'watched_dlopen', 'watched_MGCopyAnswer',
+             'watched_SecTaskCopyValueForEntitlement']
     functions = {name: extract(source, name) for name in names}
-    for symbol in ('IOIteratorNext', 'IOConnectCallStructMethod'):
+    for symbol in ('IOIteratorNext', 'IOConnectCallStructMethod',
+                   'IORegistryEntryFromPath', 'IORegistryEntryCreateCFProperty'):
         assert '{ (const void *)watched_' + symbol + ', (const void *)' + symbol + ' }' in source
     assert 'IOIteratorReset(' not in source and 'IOObjectRelease(' not in source
     compiler = shlex.split(os.environ.get('CC', 'clang'))
@@ -200,6 +402,33 @@ def main():
          '\treturn result;', '\tif (output_struct_count) *output_struct_count = 0;\n\treturn result;'),
         ('diagnostic changes errno', 'say', 'errno = saved_errno;', '(void)saved_errno;'),
         ('diagnostic consumes loader error', 'watched_dlopen', '\tif (ours) {', '\tif (ours) {\n\t\tdlerror();'),
+        ('extra registry lookup', 'watched_IORegistryEntryFromPath',
+         '\treturn entry;', '\tIORegistryEntryFromPath(port, path);\n\treturn entry;'),
+        ('changed registry result', 'watched_IORegistryEntryFromPath',
+         '\treturn entry;', '\treturn IO_OBJECT_NULL;'),
+        ('registry path text exposed', 'watched_IORegistryEntryFromPath',
+         '\treturn entry;', '\tif (ours && path) say("%s", path);\n\treturn entry;'),
+        ('changed property options', 'watched_IORegistryEntryCreateCFProperty',
+         'IORegistryEntryCreateCFProperty(entry, key, allocator, options);',
+         'IORegistryEntryCreateCFProperty(entry, key, allocator, options + 1);'),
+        ('extra property lookup', 'watched_IORegistryEntryCreateCFProperty',
+         '\treturn value;', '\tIORegistryEntryCreateCFProperty(entry, key, allocator, options);\n\treturn value;'),
+        ('changed property result', 'watched_IORegistryEntryCreateCFProperty',
+         '\treturn value;', '\treturn NULL;'),
+        ('property released by probe', 'watched_IORegistryEntryCreateCFProperty',
+         '\treturn value;', '\tif (value) CFRelease(value);\n\treturn value;'),
+        ('property retained by probe', 'watched_IORegistryEntryCreateCFProperty',
+         '\treturn value;', '\tif (value) CFRetain(value);\n\treturn value;'),
+        ('property payload read', 'watched_IORegistryEntryCreateCFProperty',
+         '\treturn value;', '\tif (value) CFDataGetBytes(value);\n\treturn value;'),
+        ('property metadata changes errno', 'watched_IORegistryEntryCreateCFProperty',
+         '\terrno = saved_errno;', '\t(void)saved_errno;'),
+        ('foreign caller address exposed', 'caller_offset',
+         '\treturn UINTPTR_MAX;', '\treturn address;'),
+        ('gestalt metadata changes errno', 'watched_MGCopyAnswer',
+         '\terrno = saved_errno;', '\t(void)saved_errno;'),
+        ('entitlement metadata changes errno', 'watched_SecTaskCopyValueForEntitlement',
+         '\terrno = saved_errno;', '\t(void)saved_errno;'),
     ]
     with tempfile.TemporaryDirectory(prefix='fairplay-interpose-') as temporary:
         cfile, binary = Path(temporary) / 'test.c', Path(temporary) / 'test'

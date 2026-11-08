@@ -15,10 +15,12 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <execinfo.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -90,27 +92,7 @@ watched_begin_task(id self, SEL cmd, id handler)
 	return task;
 }
 
-static void
-watched_resume_task(id self, SEL cmd)
-{
-	const char *(*string)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
-	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-	const char *url = "?";
-	char line[700];
-	id request, address, text;
-	int n;
-
-	request = get(self, sel_registerName("originalRequest"));
-	address = request != NULL ? get(request, sel_registerName("URL")) : NULL;
-	text = address != NULL ? get(address, sel_registerName("absoluteString")) : NULL;
-	if (text != NULL) {
-		url = string(text, sel_registerName("UTF8String"));
-	}
-	n = snprintf(line, sizeof(line), "redwood: %s: starting a session task for %s\n", who,
-	    url != NULL ? url : "?");
-	say(line, (size_t)(n > 0 ? n : 0));
-	resume_task(self, cmd);
-}
+#include "inject_app_network.inc"
 
 /*
  * One setting of Sileo's, set for it at every start: "Show Packages From Canister" (ShowProvisional,
@@ -509,6 +491,7 @@ redwood_app_init(void)
 	 * would leave ours as the "original" of itself -- a call that never returns.
 	 */
 	watch("NSURLSessionTask", "resume", (IMP)watched_resume_task, &resume_task);
+	watch_network_completion();
 	watch("NSFileManager", "moveItemAtURL:toURL:error:", (IMP)watched_move_url, &move_url);
 	watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
 	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
