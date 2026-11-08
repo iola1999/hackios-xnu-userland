@@ -251,7 +251,12 @@ sign_macho(NSString *path, NSDictionary *extraEntitlements)
 	uint32_t nSpecialSlots = 5;
 	const char *ident = [path.lastPathComponent.stringByDeletingPathExtension UTF8String];
 	if (!ident || strlen(ident) == 0) ident = "binary";
-	uint32_t ident_offset = 44;
+	/*
+	 * Version 0x20100 puts scatterOffset at byte 44 of the CodeDirectory; it stays 0 (no scatter
+	 * vector) and the identifier follows it. With the identifier at 44 the kernel reads its first
+	 * bytes as scatterOffset and rejects the signature (EBADEXEC) whenever it loads it from the file.
+	 */
+	uint32_t ident_offset = 48;
 	uint32_t hash_offset = ident_offset + (uint32_t)strlen(ident) + 1;
 	while (hash_offset % 4 != 0) hash_offset++;
 	uint32_t actual_hash_offset = hash_offset + nSpecialSlots * 32;
@@ -278,12 +283,6 @@ sign_macho(NSString *path, NSDictionary *extraEntitlements)
 	memcpy(cd_bytes + actual_hash_offset - 2 * 32, req_hash, 32);
 	memcpy(cd_bytes + actual_hash_offset - 5 * 32, ent_hash, 32);
 
-	for (uint32_t p = 0; p < nCodeSlots; p++) {
-		uint32_t pstart = p * 4096;
-		uint32_t plen = (pstart + 4096 <= codeLimit) ? 4096 : (codeLimit - pstart);
-		CC_SHA256((const uint8_t *)data.bytes + pstart, plen, cd_bytes + actual_hash_offset + p * 32);
-	}
-
 	uint32_t sb_index_size = 12 + 4 * 8;
 	uint32_t cd_offset = (sb_index_size + 15) & ~15;
 	uint32_t req_offset = (cd_offset + (uint32_t)cd_data.length + 15) & ~15;
@@ -291,27 +290,11 @@ sign_macho(NSString *path, NSDictionary *extraEntitlements)
 	uint32_t sig_offset = (ent_offset_val + (uint32_t)ent_blob.length + 15) & ~15;
 	uint32_t sb_total_size = (sig_offset + 8 + 15) & ~15;
 
-	NSMutableData *sb = [NSMutableData dataWithLength:sb_total_size];
-	uint32_t *sb_words = (uint32_t *)sb.mutableBytes;
-	sb_words[0] = htonl(0xfade0cc0);
-	sb_words[1] = htonl(sb_total_size);
-	sb_words[2] = htonl(4);
-	sb_words[3] = htonl(0);
-	sb_words[4] = htonl(cd_offset);
-	sb_words[5] = htonl(2);
-	sb_words[6] = htonl(req_offset);
-	sb_words[7] = htonl(5);
-	sb_words[8] = htonl(ent_offset_val);
-	sb_words[9] = htonl(0x10000);
-	sb_words[10] = htonl(sig_offset);
-
-	memcpy(sb.mutableBytes + cd_offset, cd_data.bytes, cd_data.length);
-	memcpy(sb.mutableBytes + req_offset, req_blob, 12);
-	memcpy(sb.mutableBytes + ent_offset_val, ent_blob.bytes, ent_blob.length);
-	memcpy(sb.mutableBytes + sig_offset, sig_blob, 8);
-
-	[data appendData:sb];
-
+	/*
+	 * The load commands that point at the signature are part of the first pages, so they are
+	 * rewritten before those pages are hashed; hashing first leaves the hashes of pages 0 and 1
+	 * describing the old load commands.
+	 */
 	mh = (struct mach_header_64 *)data.mutableBytes;
 	struct segment_command_64 *linkedit_cmd = (struct segment_command_64 *)(data.mutableBytes + linkedit_cmd_offset);
 
@@ -336,6 +319,33 @@ sign_macho(NSString *path, NSDictionary *extraEntitlements)
 
 	linkedit_cmd->filesize = (codeLimit + sb_total_size) - linkedit_cmd->fileoff;
 	linkedit_cmd->vmsize = (linkedit_cmd->filesize + 0x3fff) & ~0x3fff;
+
+	for (uint32_t p = 0; p < nCodeSlots; p++) {
+		uint32_t pstart = p * 4096;
+		uint32_t plen = (pstart + 4096 <= codeLimit) ? 4096 : (codeLimit - pstart);
+		CC_SHA256((const uint8_t *)data.bytes + pstart, plen, cd_bytes + actual_hash_offset + p * 32);
+	}
+
+	NSMutableData *sb = [NSMutableData dataWithLength:sb_total_size];
+	uint32_t *sb_words = (uint32_t *)sb.mutableBytes;
+	sb_words[0] = htonl(0xfade0cc0);
+	sb_words[1] = htonl(sb_total_size);
+	sb_words[2] = htonl(4);
+	sb_words[3] = htonl(0);
+	sb_words[4] = htonl(cd_offset);
+	sb_words[5] = htonl(2);
+	sb_words[6] = htonl(req_offset);
+	sb_words[7] = htonl(5);
+	sb_words[8] = htonl(ent_offset_val);
+	sb_words[9] = htonl(0x10000);
+	sb_words[10] = htonl(sig_offset);
+
+	memcpy(sb.mutableBytes + cd_offset, cd_data.bytes, cd_data.length);
+	memcpy(sb.mutableBytes + req_offset, req_blob, 12);
+	memcpy(sb.mutableBytes + ent_offset_val, ent_blob.bytes, ent_blob.length);
+	memcpy(sb.mutableBytes + sig_offset, sig_blob, 8);
+
+	[data appendData:sb];
 
 	if (![data writeToFile:path atomically:YES]) {
 		return NO;
