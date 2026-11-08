@@ -1,117 +1,9 @@
 /*
- * libredwood-fairplay.dylib: code of ours inside fairplayd.H2 (see inject.c for how it gets there).
- *
- * Why. The App Store's front page never loads, and the root of that is not in the store: an
- * AppleMediaServices thread inside appstored sits in a Mach call in _AMSFairPlayGetDeviceType
- * waiting for a reply, and seventeen promises queue behind that one wait (src/inject_store.c). The
- * reply never comes because com.apple.fairplayd.H2 starts, exits 0 at once and is restarted by
- * launchd every ten seconds -- 34 times in a six-minute session, each "Service only ran for 0
- * seconds". It does not crash; it declines to work. A daemon in that state leaves no failed lookup
- * at all, which is why the shape was invisible to the method that found apsd.
- *
- * What this does. Nothing is replaced: it only watches, through dyld's interposing (__DATA,__interpose,
- * as src/inject_app.c does), the four calls that decide whether fairplayd has anything to work with:
- *   IOServiceMatching            -- THE NAME IT LOOKS FOR, which is the one thing a driver of ours
- *                                   has to answer to; the binary is obfuscated and does not carry it
- *                                   as a plain string, so it is asked for at run time instead of guessed
- *   IOServiceGetMatchingServices -- and whether anything was found
- *   IOServiceOpen                -- the user client it wants (its entitlement names
- *                                   com_apple_driver_FairPlayIOKitUserClient) and the type
- *   IOConnectCallMethod          -- every selector it then sends, which is the minimum set a stub
- *                                   would have to implement
- * and exit(), with a walk up the frame pointers, which says where it decides to leave.
- *
- * The fault reporter is here as well: an Objective-C exception ends in abort(), and iOS answers a
- * crash in a stock daemon with "Failed to send exception EXC_CORPSE_NOTIFY" and nothing else.
- *
- * WHAT IT ANSWERED, and it says the obvious next step would have been the wrong one. Over three runs:
- *   argv[0] = /usr/sbin/fairplayd.H2, one argument, as Apple's own job plist asks for (ours matches
- *     it field for field but KeepAlive, which mkjobs.py drops; MachServices are all three there)
- *   open() of the CoreFoundation and containermanagerd feature flags, and of /usr/sbin/Info.plist
- *     -- CFBundle finding its own bundle, and nothing else. WITH THE RESULTS, which is the only way
- *     to tell "it read the flags" from "it tried and got ENOENT": the four that exist on the volume
- *     are opened successfully (Global.plist, GlobalDisclosures.plist, Domain/CoreFoundation.plist,
- *     Domain/containermanagerd.plist -> fd 3), and every -1 is a file a stock iPhone has not got
- *     either (/Library/Preferences/FeatureFlags/..., Settings.plist, Profiles.plist, and
- *     /usr/sbin/Info.plist, which no unbundled daemon has). Nothing it needs is missing from this
- *     image: the feature flags are not the reason it leaves.
- *   NOT ONE IOServiceMatching, IOServiceGetMatchingService(s), IOServiceOpen or IOConnectCallMethod
- *   no xpc_connection_create_mach_service, no sysctlbyname, no dlopen, no stat or mkdir of its own
- *   the exit handler runs, so it leaves of its own accord -- and neither exit() nor _exit() nor
- *     abort() is caught, so main simply returns
- *   and the sampler: every program counter of its ~10 ms of life, 13 to 25 samples, lies inside its
- *     own binary (0x1000d9a40 to 0x1008565ac, which is 0xd9a40 to 0x8565ac into the file). Not one
- *     sample in the shared cache.
- * So it decides with code we cannot interpose, inlining whatever syscalls it makes -- which is what
- * an obfuscated FairPlay binary would do on purpose. IT NEVER ASKS IOKIT FOR ANYTHING, so a stub of
- * com_apple_driver_FairPlayIOKit in the kernel, which was the plan after the last finding, would not
- * be reached at all: the daemon gives up before that. (Its entitlement does name
- * com_apple_driver_FairPlayIOKitUserClient, which is what made the driver look like the next step.)
- * One guess checked and killed before it cost a run: not the platform-binary flag. iOS's own
- * binaries are ad hoc signed and this kernel marks exactly those as platform binaries
- * (bsd/kern/kern_minimac.c), so fairplayd is one here.
- * Two warnings for whoever reads this next.
- * AN ENTITLEMENT NAMES WHAT A PROGRAM MAY DO, NEVER WHAT IT DOES. fairplayd's signature carries
- * com.apple.security.iokit-user-client-class = com_apple_driver_FairPlayIOKitUserClient, and on that
- * evidence a kernel driver looked like the obvious next piece of work. It never opens one. The
- * entitlement is permission, not behaviour, and one run of watching beat a day of writing.
- * AND mkjobs.py DROPS KeepAlive from the job plists it makes (ours is Apple's field for field
- * otherwise, MachServices included). Harmless here -- launchd restarts fairplayd anyway, on demand,
- * 34 times in six minutes -- but worth knowing, because a daemon that is meant to stay resident and
- * is not kept alive looks exactly like a daemon that quits, and two shapes with the same log have
- * cost this project an evening once already.
- *
- * WHAT THE SYSTEM-CALL TRACE ADDS (systrace=2 systrace_name=fairplayd.H2, which logs every BSD call
- * of one process and nothing else -- a few hundred lines rather than a flood). Its whole life, by
- * census over four of its starts: open x241, write x220, close x78, mprotect x57, stat64 x54,
- * getattrlist x45, lseek x39, pread x39, SYSCTL x33, mmap x31, fcntl x24, munmap x21, kevent_qos
- * x16, sigaction x15, thread_selfid x13, proc_info x12, fsgetpath x12, __MAC_SYSCALL x12, openat
- * x12, geteuid x12. The opens are the feature flags and its own bundle, and the writes at the end
- * are OUR OWN lines, not its: it prints nothing of its own before leaving.
- * Three things follow. It touches no IOKit node, no socket and no file of its own, so those theories
- * are closed by trace and not by inference. It calls SYSCTL by number, never sysctlbyname -- which
- * is why the hook on the name caught nothing all along, the wrong-name shape once more; the numeric
- * one is hooked now. And __mac_syscall x12 is the channel to AMFI and the sandbox, so a question
- * asked there is among the few things left that it could be deciding on.
- * Mach traps are not BSD calls and so are invisible to this trace: whatever it asks over Mach --
- * including a bootstrap check-in -- would not appear here.
- *
- * AND A LIMIT WORTH KNOWING BEFORE ANYONE TRIES AGAIN: __sysctl and __mac_syscall were hooked here
- * too, and neither fired, while the kernel's own trace counted 33 and 12 of them in the same life.
- * open() and access() fire in the same build, 1300 lines of them, so the library is plainly there.
- * The reason is the mechanism, not the names this time: dyld interposing replaces a symbol where one
- * image calls ANOTHER image's stub, and these calls are made inside libsystem itself. USER-SPACE
- * INTERPOSING CANNOT SEE A LIBSYSTEM-INTERNAL SYSCALL. For arguments to those, the instrument has to
- * be the kernel: systrace already prints the call and the return, and printing the sysctl MIB and
- * the __mac_syscall policy and request beside them is a small addition in the same place
- * (xnu/redwood.patch, systrace_report). That is the next instrument, and it wants a kernel build.
- * It mattered because this kernel's AMFI stand-in answers exactly two requests, 0x5a and 0x60, and
- * returns ENOPOLICY to every other (bsd/kern/kern_minimac.c), and a daemon refused there would be
- * refused invisibly. MEASURED, AMFI IS CLEARED, and by two roads at once.
- * The kernel's own trace, once it was taught to print the policy and the return:
- *   policy "AMFI" request 90 = 0          (0x5a, the dyld policy check, answered)
- *   policy "Sandbox" request 2 = 0, request 4 = 0
- * and not one other request, not one ENOPOLICY. (That 0x5a is also the known call to check the
- * instrument against: it is dyld's, it happens at every process start, and seeing it with its
- * return proves the trace prints both halves.)
- * And a static read of the binary agrees from the other side: fairplayd.H2 imports neither
- * __mac_syscall nor sysctl, and has no svc instruction anywhere in its text, so the twelve AMFI and
- * thirty-three sysctl calls in its trace belong to dyld, libSystem and CoreFoundation -- not to it.
- * It imports no exit either, so its departure is a return from main, which is a decision and not a
- * refusal: a MAC denial forced by the kernel kills a process, it does not give a clean exit(0).
- *
- * The next instrument should therefore be on the other side of the wall: this kernel is ours, so
- * logging the system calls of the process named fairplayd.H2 sees through the inlining that defeats
- * interposing. The other way in is to read the binary, and this project has a worked path for
- * exactly that (it is what the camera work used on CMCapture): Ghidra in ~/.local/share/ghidra,
- * imported with -noanalysis because a full analysis runs for hours, a project under
- * ~/ghidra-projects whose path has no dot in it, and ~/.local/share/ghidra/tools/dec.sh to
- * decompile by symbol with the cache's island and stub names filled in; got.py, cfstr.py and
- * callers.py beside it; "ipsw dyld" only for dump, a2s and a2f, since disass runs out of memory.
- * The window is small: offsets 0xd9a40 to 0x8565ac of /usr/sbin/fairplayd.H2, and what to look for
- * is an early return from main and the strings of whatever it compared against just before -- a
- * comparison, not a failed call, since every sampled program counter is in code Apple shipped
- * precisely so that it could not be watched from outside.
+ * Optional diagnostics for fairplayd.H2; injection is selected by the test configuration.
+ * iOS 26 build 23G90 imports IOConnectCallStructMethod directly. Observe that entry point and each caller-requested IOIteratorNext without consuming or resetting an iterator in the probe.
+ * Matching names, user-client types, selectors, buffer lengths and return values identify the native IOKit contract. Authentication buffers, property values, filesystem paths and argument contents stay out of the log.
+ * The 23G90 matching class, Open type and selectors remain unverified. Earlier-system observations of an early return from main do not establish this build's behavior.
+ * Interposing observes calls across image boundaries. Calls within libSystem require kernel tracing; zero hook calls alone cannot establish that no syscall occurred.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <crt_externs.h>
@@ -155,7 +47,7 @@ say(const char *format, ...)
 {
 	char line[512];
 	va_list ap;
-	int n;
+	int n, saved_errno = errno;
 
 	va_start(ap, format);
 	n = vsnprintf(line, sizeof(line), format, ap);
@@ -163,7 +55,10 @@ say(const char *format, ...)
 	if (n > (int)sizeof(line) - 1) {
 		n = sizeof(line) - 1;
 	}
-	write(2, line, (size_t)n);
+	if (n > 0) {
+		write(2, line, (size_t)n);
+	}
+	errno = saved_errno;
 }
 
 /* up the frame pointers, unslid, for "ipsw dyld a2s" */
@@ -202,7 +97,7 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 	raise(signal_number);
 }
 
-/* ---- the four questions, and the leaving ------------------------------------------------------- */
+/* IOKit calls retain their original arguments, results and object ownership. */
 
 static CFMutableDictionaryRef
 watched_IOServiceMatching(const char *name)
@@ -222,16 +117,21 @@ watched_IOServiceGetMatchingServices(mach_port_t port, CFDictionaryRef matching,
 	kern_return_t result = IOServiceGetMatchingServices(port, matching, existing);
 
 	if (ours) {
-		io_object_t one = existing != NULL ? IOIteratorNext(*existing) : 0;
-
-		say("redwood: fairplayd: IOServiceGetMatchingServices -> %#x, %s\n", result,
-		    one != 0 ? "something matched" : "NOTHING MATCHED");
-		if (one != 0) {
-			IOObjectRelease(one);
-			IOIteratorReset(*existing);
-		}
+		say("redwood: fairplayd: IOServiceGetMatchingServices -> %#x, iterator %#x\n", result,
+		    result == KERN_SUCCESS && existing != NULL ? *existing : IO_OBJECT_NULL);
 	}
 	return result;
+}
+
+static io_object_t
+watched_IOIteratorNext(io_iterator_t iterator)
+{
+	io_object_t object = IOIteratorNext(iterator);
+
+	if (ours) {
+		say("redwood: fairplayd: IOIteratorNext(%#x) -> %#x\n", iterator, object);
+	}
+	return object;
 }
 
 static io_service_t
@@ -270,11 +170,23 @@ watched_IOConnectCallMethod(mach_port_t connection, uint32_t selector, const uin
 	return result;
 }
 
-/*
- * It leaves without ever asking IOKit for anything -- the first run of this library caught not one
- * IOServiceMatching -- so the net is wider: the files it opens, the sysctls and the libraries it
- * asks for, and every way out of a process. Whatever it looked at last is where it made up its mind.
- */
+static kern_return_t
+watched_IOConnectCallStructMethod(mach_port_t connection, uint32_t selector, const void *input_struct,
+    size_t input_struct_count, void *output_struct, size_t *output_struct_count)
+{
+	size_t output_capacity = output_struct_count != NULL ? *output_struct_count : 0;
+	kern_return_t result = IOConnectCallStructMethod(connection, selector, input_struct,
+	    input_struct_count, output_struct, output_struct_count);
+
+	if (ours) {
+		say("redwood: fairplayd: IOConnectCallStructMethod selector=%u input_bytes=%zu "
+		    "output_capacity=%zu output_bytes=%zu output_size_present=%u result=%#x\n",
+		    selector, input_struct_count, output_capacity,
+		    output_struct_count != NULL ? *output_struct_count : 0, output_struct_count != NULL, result);
+	}
+	return result;
+}
+
 static int
 watched_open(const char *path, int flags, ...)
 {
@@ -289,24 +201,13 @@ watched_open(const char *path, int flags, ...)
 	}
 	int fd = open(path, flags, mode);
 
-	/*
-	 * The RESULT, not only the call: "it read the feature flags" and "it tried to and got ENOENT"
-	 * are the same line without it, and completely different findings. Every watcher here says what
-	 * came back.
-	 */
 	if (ours) {
-		say("redwood: fairplayd: open(\"%s\") -> %d%s\n", path != NULL ? path : "(null)", fd,
-		    fd < 0 ? (errno == ENOENT ? " (no such file)" : " (refused)") : "");
+		say("redwood: fairplayd: open flags=%#x -> %d errno=%d\n", flags, fd, fd < 0 ? errno : 0);
 	}
 	return fd;
 }
 
-/*
- * The numeric form, which is the one it actually uses: a trace of its system calls
- * (systrace=2 systrace_name=fairplayd.H2) counts 33 sysctl and not one sysctlbyname, so the hook on
- * the name took nothing all along -- the wrong name, again. The MIB is printed as numbers: the
- * first two say which subsystem, and that is enough to name what it asked about.
- */
+/* Only the numeric MIB and return code are logged; sysctl buffers remain private. */
 static int
 watched_sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, size_t in_size)
 {
@@ -319,13 +220,7 @@ watched_sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, 
 	return result;
 }
 
-/*
- * ... and the private name underneath it. The hook on sysctl() did not fire once while the trace
- * counted thirty-three of them, because inside libsystem the call is __sysctl: a stub is interposed
- * only where another image calls through it. That is the wrong-name shape for the fourth time on
- * this branch, and the answer each time is the same -- hook every name the thing is known by, and
- * let the one that never fires say so.
- */
+/* Image-local libSystem calls may bypass both public and private interpose entries. */
 extern int __sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, size_t in_size);
 
 static int
@@ -340,7 +235,7 @@ watched___sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in
 	return result;
 }
 
-/* the channel to AMFI and the sandbox: twelve calls a life, and one of the few things left */
+/* Log the MAC policy and request number without reading the request payload. */
 extern int __mac_syscall(const char *policy, int call, void *arg);
 
 static int
@@ -372,19 +267,11 @@ watched_dlopen(const char *path, int mode)
 	void *library = dlopen(path, mode);
 
 	if (ours) {
-		say("redwood: fairplayd: dlopen(\"%s\") -> %s\n", path != NULL ? path : "(null)",
-		    library != NULL ? "loaded" : dlerror());
+		say("redwood: fairplayd: dlopen mode=%#x -> %s\n", mode, library != NULL ? "loaded" : "failed");
 	}
 	return library;
 }
 
-/*
- * It reads the feature flags of containermanagerd and its own Info.plist and then leaves, so the
- * next question is who it asks over XPC and what it looks for on disk: its container, most likely
- * (its entitlements name com.apple.security.system-container and
- * com.apple.private.security.storage.fpsd), and a lookup that fails there would explain a daemon
- * that declines to work without complaining.
- */
 static xpc_connection_t
 watched_xpc_connection_create_mach_service(const char *name, dispatch_queue_t queue, uint64_t flags)
 {
@@ -403,7 +290,7 @@ watched_stat(const char *path, struct stat *out)
 	int result = stat(path, out);
 
 	if (ours) {
-		say("redwood: fairplayd: stat(\"%s\") -> %d\n", path != NULL ? path : "(null)", result);
+		say("redwood: fairplayd: stat -> %d errno=%d\n", result, result < 0 ? errno : 0);
 	}
 	return result;
 }
@@ -414,7 +301,7 @@ watched_access(const char *path, int mode)
 	int result = access(path, mode);
 
 	if (ours) {
-		say("redwood: fairplayd: access(\"%s\") -> %d\n", path != NULL ? path : "(null)", result);
+		say("redwood: fairplayd: access -> %d errno=%d\n", result, result < 0 ? errno : 0);
 	}
 	return result;
 }
@@ -425,36 +312,12 @@ watched_mkdir(const char *path, mode_t mode)
 	int result = mkdir(path, mode);
 
 	if (ours) {
-		say("redwood: fairplayd: mkdir(\"%s\") -> %d\n", path != NULL ? path : "(null)", result);
+		say("redwood: fairplayd: mkdir -> %d errno=%d\n", result, result < 0 ? errno : 0);
 	}
 	return result;
 }
 
-/*
- * WHAT IT ASKS ABOUT THE DEVICE, which is the question left after AMFI was cleared twice over --
- * by a static read of the binary (it imports neither __mac_syscall nor sysctl, and has no svc
- * instruction at all, so the twelve and the thirty-three in the kernel's trace are dyld's and
- * libSystem's, not its) and by the trace itself (policy "AMFI" request 90 = 0, policy "Sandbox"
- * requests 2 and 4 = 0, and no ENOPOLICY anywhere).
- * MGCopyAnswer and SecTaskCopyValueForEntitlement are called ACROSS AN IMAGE BOUNDARY, which is
- * exactly what dyld interposing can stand between -- unlike the libsystem-internal calls this
- * library could not see. The key is built at run time by the obfuscator, but at the call it is a
- * finished string.
- * ONLY THE KEY IS PRINTED, never the answer: MobileGestalt answers with serial numbers, the unique
- * device identifier and the like, and this log goes into a repository.
- *
- * AND THE ANSWER IS THAT IT ASKS NOTHING. Not one MGCopyAnswer and not one entitlement read in a
- * session, while the same library's open() and access() hooks print 1675 lines from the same
- * processes -- so the interposing works and the calls do not happen. It is not for want of the
- * machinery: its import table carries _MGCopyAnswer, _SecTaskCopyValueForEntitlement,
- * _IOServiceMatching, _IOServiceGetMatchingServices, _IOServiceOpen, _bootstrap_check_in,
- * _bootstrap_look_up, _notify_register_check and the rest. It imports all of it and calls none of
- * it.
- * So the decision is made BEFORE it asks the device anything at all, which rules out the reading
- * that was most tempting -- that it looked for H2 hardware, did not find it, and left. It never
- * looks. What it does do first, from the kernel's trace, is what CoreFoundation does for every
- * process: the feature flags, and its own bundle, where /usr/sbin/Info.plist does not exist.
- */
+/* MobileGestalt and entitlement logs contain keys and presence only. */
 static CFTypeRef
 watched_MGCopyAnswer(CFStringRef key)
 {
@@ -511,16 +374,7 @@ watched_abort(void)
 	abort();
 }
 
-/*
- * A sampler, because it does not call anything we can watch. It reads the feature flags, opens its
- * own bundle and leaves, without IOKit, without XPC, without a sysctl or a dlopen -- so whatever it
- * decides on, it decides with code we cannot interpose. The main thread's program counter, read a
- * few hundred times a second from a thread of ours (the same thread_get_state the store library uses
- * for its thread dump), says where it was instead. The daemon lives about a fifth of a second, so a
- * sample every half a millisecond covers the whole of it.
- * Addresses are printed three ways -- as they are, less the shared cache's slide (for
- * "ipsw dyld a2s"), and less this program's own slide (for its own 19 MB of obfuscated code).
- */
+/* Bounded main-thread PC sampling also covers execution within the obfuscated binary. */
 #define SAMPLES 2048
 static uintptr_t samples[SAMPLES];
 static unsigned sample_count;
@@ -551,9 +405,9 @@ at_the_end(void)
 	if (!ours) {
 		return;
 	}
-	say("redwood: fairplayd: at the end (an exit handler ran: it left of its own accord), %u samples\n",
+	say("redwood: fairplayd: atexit samples=%u\n",
 	    sample_count);
-	/* every distinct pc, newest first: a fifth of a second of a daemon is a short story */
+	/* Print at most 40 distinct samples, newest first. */
 	for (unsigned i = sample_count; i > 0 && shown < 40; i--) {
 		uintptr_t pc = samples[i - 1];
 		bool seen = false;
@@ -587,8 +441,10 @@ __attribute__((used)) static struct {
 	{ (const void *)watched_IOServiceMatching, (const void *)IOServiceMatching },
 	{ (const void *)watched_IOServiceGetMatchingServices, (const void *)IOServiceGetMatchingServices },
 	{ (const void *)watched_IOServiceGetMatchingService, (const void *)IOServiceGetMatchingService },
+	{ (const void *)watched_IOIteratorNext, (const void *)IOIteratorNext },
 	{ (const void *)watched_IOServiceOpen, (const void *)IOServiceOpen },
 	{ (const void *)watched_IOConnectCallMethod, (const void *)IOConnectCallMethod },
+	{ (const void *)watched_IOConnectCallStructMethod, (const void *)IOConnectCallStructMethod },
 	{ (const void *)watched_exit, (const void *)exit },
 	{ (const void *)watched__exit, (const void *)_exit },
 	{ (const void *)watched_abort, (const void *)abort },
@@ -638,12 +494,8 @@ redwood_fairplay_init(void)
 		}
 	}
 	{
-		char ***argv = _NSGetArgv();
 		int *argc = _NSGetArgc();
 
-		say("redwood: fairplayd: ours is in, %d argument(s)\n", argc != NULL ? *argc : -1);
-		for (int i = 0; argv != NULL && argc != NULL && i < *argc && i < 6; i++) {
-			say("redwood: fairplayd: argv[%d] = %s\n", i, (*argv)[i] != NULL ? (*argv)[i] : "(null)");
-		}
+		say("redwood: fairplayd: probe loaded argc=%d\n", argc != NULL ? *argc : -1);
 	}
 }
