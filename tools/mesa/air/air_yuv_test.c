@@ -15,7 +15,7 @@ static const float expected[4][4] = {{.419433594f, .166503906f, 0, 1},
                                      {.447753906f, .215820312f, .019042969f, 1}};
 int main(int argc, char **argv) {
    char why[1024] = {0};
-   CHECK(argc == 2);
+   CHECK(argc == 3);
    setenv("RWA_SOFTWARE", "1", 1);
    FILE *f = fopen(argv[1], "rb");
    CHECK(f);
@@ -34,6 +34,7 @@ int main(int argc, char **argv) {
       nir_shader *n = nir_shader_clone(NULL, cs->nir);
       struct rwa_yuv_key key = {.mask = 1, .full_range = c / 2, .bt709 = c % 2, .uv_slot = {2}};
       CHECK(lower_yuv(n, &key, why, sizeof why));
+      CHECK(BITSET_TEST(n->info.textures_used, 2));
       unsigned y = 0, uv = 0, guard = 0;
       nir_foreach_function_impl(impl, n) {
          nir_builder b = nir_builder_create(impl);
@@ -91,6 +92,44 @@ int main(int argc, char **argv) {
       printf("nir case=%u Y=%u UV=%u guard=%u stores=%u pass\n", c, y, uv, guard, stores);
       ralloc_free(n);
    }
+   f = fopen(argv[2], "rb");
+   CHECK(f);
+   fseek(f, 0, SEEK_END);
+   size_t fragment_length = ftell(f);
+   rewind(f);
+   void *fragment = malloc(fragment_length);
+   CHECK(fread(fragment, 1, fragment_length, f) == fragment_length);
+   fclose(f);
+   struct rwa_render_shape rs = {.color_format = {125}, .color_count = 1, .sample_count = 1};
+   struct rwa_render *render = rwa_render_create(d, NULL, 0, NULL, fragment, fragment_length,
+       "combined_fragment", &rs, NULL, why, sizeof why);
+   CHECK(render);
+   nir_shader *fs = nir_shader_clone(NULL, render->fragment_nir);
+   struct rwa_yuv_key fragment_key = {.mask = 1, .uv_slot = {1}};
+   CHECK(lower_yuv(fs, &fragment_key, why, sizeof why));
+   finalize_for_gallium(fs, d->screen);
+   /* IR3 uses this mask to size the fragment texture descriptors. */
+   CHECK(BITSET_LAST_BIT(fs->info.textures_used) == 2);
+   unsigned fragment_planes = 0;
+   nir_foreach_function_impl(impl, fs) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_tex)
+               continue;
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (nir_def_is_unused(&tex->def))
+               continue;
+            CHECK(tex->texture_index < 2 && tex->sampler_index == 0);
+            CHECK(BITSET_TEST(fs->info.textures_used, tex->texture_index));
+            fragment_planes |= 1u << tex->texture_index;
+         }
+      }
+   }
+   CHECK(fragment_planes == 3);
+   ralloc_free(fs);
+   rwa_render_destroy(render);
+   free(fragment);
+   puts("fragment Y/UV descriptor mask passed");
    struct rwa_texture_shape s = {.pixel_format = 10,
                                  .type = 2,
                                  .width = 32,

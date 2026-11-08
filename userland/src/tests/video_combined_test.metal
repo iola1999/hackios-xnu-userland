@@ -1,3 +1,7 @@
+/* Build for the device runtime explicitly; SDK defaults can emit newer AIR:
+ * xcrun -sdk iphoneos metal -mios-version-min=26.0 -std=metal4.0 -c video_combined_test.metal -o video_combined_test.air
+ * xcrun -sdk iphoneos metallib video_combined_test.air -o video_combined_test.metallib
+ */
 #include <metal_stdlib>
 using namespace metal;
 kernel void combined_sample(texture2d<float, access::sample> image [[texture(0)]],

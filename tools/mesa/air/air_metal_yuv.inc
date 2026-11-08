@@ -143,8 +143,12 @@ lower_yuv(nir_shader *nir, const struct rwa_yuv_key *key, char *why, size_t why_
             if (source < 0)
                continue;
             unsigned plane = nir_src_as_uint(tex->src[source].src);
-            if (plane == 1)
+            if (plane == 1) {
                tex->texture_index = key->uv_slot[tex->texture_index];
+               /* gather_info does not update this mask; IR3 sizes fragment
+                * texture descriptors from its highest set bit. */
+               BITSET_SET(nir->info.textures_used, tex->texture_index);
+            }
             nir_tex_instr_remove_src(tex, source);
          }
       }
