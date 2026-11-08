@@ -209,7 +209,7 @@ import sys
 DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'ReportCrash',
-        'osanalytics', 'lockdown', 'audio', 'jetsamproperties',
+        'lockdown', 'audio', 'jetsamproperties',
         'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'bird',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
@@ -335,8 +335,15 @@ if rest:
         program = job.get('Program') or (job.get('ProgramArguments') or [''])[0]
         if not job.get('MachServices') or not present(program):
             continue
+        # The XPC activities a job declares under LaunchEvents stay: a job that checks in with
+        # XPC_ACTIVITY_CHECK_IN reads its criteria from them. With them taken out, osanalyticshelper's
+        # check-in got no criteria dictionary and stopped in libxpc's xpc_dictionary_get_int64 each
+        # time it started (docs/analysis/2026-11-09-crash-reports.md in the top-level repository).
+        activities = (job.get('LaunchEvents') or {}).get('com.apple.xpc.activity')
         for key in startup_triggers:
             job.pop(key, None)
+        if activities:
+            job['LaunchEvents'] = {'com.apple.xpc.activity': activities}
         if label == 'com.apple.timed':
             job['RunAtLoad'] = True
             job['KeepAlive'] = {'SuccessfulExit': False}
