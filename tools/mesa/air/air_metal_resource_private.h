@@ -15,6 +15,11 @@ struct rwa_bound_state {
    unsigned num_views[2], num_samplers[2];
 };
 
+struct rwa_yuv_key {
+   unsigned mask, full_range, bt709;
+   uint8_t uv_slot[RWA_MAX_TEXTURES];
+};
+
 struct rwa_vertex_cso_entry;
 
 struct rwa_device {
@@ -171,6 +176,8 @@ struct rwa_texture {
    unsigned references;
    /* Views retain the original texture that owns buffer writeback state. */
    struct rwa_texture *storage_owner;
+   struct rwa_texture *chroma;
+   bool yuv_full_range, yuv_bt709;
    struct rwa_device *device;
    struct pipe_resource *res;
    struct pipe_sampler_view *view;  /* made when a dispatch first samples it, then kept */

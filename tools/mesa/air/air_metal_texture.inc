@@ -381,6 +381,10 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
       say(why, why_size, "a view of no texture");
       return NULL;
    }
+   if (texture->chroma) {
+      say(why, why_size, "combined NV12 texture views are unsupported");
+      return NULL;
+   }
    if (num_levels == 0 || first_level + num_levels > texture_levels(texture)) {
       say(why, why_size, "a view of levels %u+%u of a %s with %u", first_level, num_levels,
           texture->format_name, texture_levels(texture));
@@ -581,6 +585,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
    pipe_sampler_view_release_ptr(&texture->view);
    pipe_resource_reference(&texture->res, NULL);
    struct rwa_texture *owner = texture->storage_owner;
+   struct rwa_texture *chroma = texture->chroma;
    free(texture);
    rwa_texture_destroy(owner);
+   rwa_texture_destroy(chroma);
 }

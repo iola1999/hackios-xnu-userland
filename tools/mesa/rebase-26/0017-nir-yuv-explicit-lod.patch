@@ -1,0 +1,9 @@
+--- a/src/compiler/nir/nir_lower_tex.c
++++ b/src/compiler/nir/nir_lower_tex.c
+@@ -315 +315,2 @@
+-   assert(tex->op == nir_texop_tex);
++   assert(tex->op == nir_texop_tex || tex->op == nir_texop_txl ||
++          tex->op == nir_texop_txb || tex->op == nir_texop_txd);
+@@ -326 +327 @@
+-   plane_tex->op = nir_texop_tex;
++   plane_tex->op = tex->op;

@@ -3,6 +3,7 @@
  */
 
 static void *compute_state_for(struct rwa_compute *compute, const unsigned block[3],
+                               const struct rwa_yuv_key *yuv,
                                char *why, size_t why_size);
 
 struct rwa_compute *
@@ -155,7 +156,7 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
 
    /* The hardware pipeline reports the limit of the same variable-workgroup
     * CSO that dispatch will use. Softpipe requires a fixed block at dispatch. */
-   if (!device->software && !compute_state_for(compute, NULL, why, why_size))
+   if (!device->software && !compute_state_for(compute, NULL, &compute->yuv, why, why_size))
       goto fail;
    if (info)
       *info = compute->caps;
@@ -210,11 +211,15 @@ rwa_compute_destroy(struct rwa_compute *compute)
  * Compile a clone because the driver takes ownership of the input NIR. */
 static void *
 compute_state_for(struct rwa_compute *compute, const unsigned block[3],
-                  char *why, size_t why_size)
+                  const struct rwa_yuv_key *yuv, char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
+   if (device->software && yuv->mask) {
+      say(why, why_size, "combined NV12 requires separate texture/sampler indices unavailable in softpipe");
+      return NULL;
+   }
 
-   if (compute->cso && (!device->software ||
+   if (compute->cso && memcmp(&compute->yuv, yuv, sizeof(*yuv)) == 0 && (!device->software ||
        (compute->cso_block[0] == block[0] && compute->cso_block[1] == block[1] &&
         compute->cso_block[2] == block[2])))
       return compute->cso;
@@ -236,7 +241,8 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
       cs->info.workgroup_size_variable = false;
    }
 
-   if (!lower_half_for_backend(cs, device, &compute->info, why, why_size)) {
+   if (!lower_yuv(cs, yuv, why, why_size) ||
+       !lower_half_for_backend(cs, device, &compute->info, why, why_size)) {
       ralloc_free(cs);
       return NULL;
    }
@@ -280,6 +286,7 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
    }
 
    compute->cso = cso;
+   compute->yuv = *yuv;
    if (device->software) {
       compute->cso_block[0] = block[0];
       compute->cso_block[1] = block[1];

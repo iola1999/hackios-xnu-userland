@@ -84,7 +84,10 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                       name, why, why_size) != 0)
       return -1;
 
-   void *cso = compute_state_for(compute, group_size, why, why_size);
+   struct rwa_yuv_key yuv;
+   if (!yuv_key_for(&compute->info, bindings, table, table_count, &yuv, why, why_size))
+      return -1;
+   void *cso = compute_state_for(compute, group_size, &yuv, why, why_size);
    if (!cso)
       return -1;
    pipe->bind_compute_state(pipe, cso);
@@ -96,7 +99,7 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
     */
    struct rwa_bound bound = { 0 };
    if (bind_stage(device, MESA_SHADER_COMPUTE, &compute->info, compute->own_sampler,
-                  compute->compare_sampler,
+                  compute->compare_sampler, &yuv,
                   bindings, table, table_count, name, &bound, why, why_size) != 0)
       return -1;
 
