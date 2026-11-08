@@ -786,7 +786,7 @@ PY
 	[ -n "$QUIET" ] && : > root/etc/quiet
 	# init exposes these jobs at /System/Library/LaunchDaemons. FLASHBOOT checks programs against
 	# the original volume listing; other builds check the extracted files (complete for iOS 26).
-	cp com.redwood.demo.plist com.redwood.wifi.plist root/LaunchDaemons/
+	cp com.redwood.demo.plist com.redwood.wifi.plist com.redwood.appinst.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS

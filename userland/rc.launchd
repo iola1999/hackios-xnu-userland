@@ -1,2 +1,7 @@
-# Experiment: hand process 1 over to the real iOS launchd.
+# Hand process 1 over to the real iOS launchd.
+# rd=md0 makes launchd treat this boot as a restore environment, so it skips its real-device boot
+# tasks (see init.c). usermanagerd --init is one this system needs: it allocates the kernel personas
+# listed in /private/var/keybags/persona.kb. launchd gives them to the jobs it spawns, and
+# fileproviderd and containermanagerd look them up. It runs here, after init has mounted /private/var.
+/usr/libexec/usermanagerd --init
 exec /sbin/launchd.ios

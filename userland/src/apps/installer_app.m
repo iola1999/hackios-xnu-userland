@@ -43,6 +43,7 @@
 @property (nonatomic, copy) NSString *version;
 @property (nonatomic, copy) NSString *bundlePath;
 @property (nonatomic, copy) NSString *containerPath;
+@property (nonatomic, strong) UIImage *icon;
 @property (nonatomic, assign) unsigned long long sizeBytes;
 @end
 
@@ -106,46 +107,18 @@ static BOOL is_test_identifier(NSString *bid)
 	return NO;
 }
 
-static BOOL perform_app_uninstall(NSString *bundleID, NSString *bundlePath)
-{
-	NSFileManager *fm = NSFileManager.defaultManager;
-	LSApplicationWorkspace *ws = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
-	LSApplicationProxy *proxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:bundleID];
+/* libsystem's private persona spawn calls (spawn_private.h) */
+#define POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE 1
+int posix_spawnattr_set_persona_np(const posix_spawnattr_t *, uid_t, uint32_t);
+int posix_spawnattr_set_persona_uid_np(const posix_spawnattr_t *, uid_t);
+int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *, gid_t);
 
-	if (proxy != nil && proxy.bundleURL != nil) {
-		[ws unregisterApplication:proxy.bundleURL];
-	} else if (bundlePath != nil) {
-		[ws unregisterApplication:[NSURL fileURLWithPath:bundlePath]];
-	}
-
-	if (bundlePath != nil) {
-		NSString *containerDir = [bundlePath stringByDeletingLastPathComponent];
-		[fm removeItemAtPath:containerDir error:nil];
-	}
-
-	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
-	Class mcmClass = NSClassFromString(@"MCMAppDataContainer");
-	if (mcmClass != Nil) {
-		MCMContainer *data = [mcmClass containerWithIdentifier:bundleID createIfNecessary:NO existed:NULL error:NULL];
-		if (data != nil && data.url != nil) {
-			[fm removeItemAtPath:data.url.path error:nil];
-		}
-	}
-
-	NSString *dataRoot = @"/private/var/mobile/Containers/Data/Application";
-	for (NSString *duuid in [fm contentsOfDirectoryAtPath:dataRoot error:nil]) {
-		NSString *dpath = [dataRoot stringByAppendingPathComponent:duuid];
-		NSString *meta = [dpath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
-		NSDictionary *mdict = [NSDictionary dictionaryWithContentsOfFile:meta];
-		if ([mdict[@"MCMMetadataIdentifier"] isEqualToString:bundleID]) {
-			[fm removeItemAtPath:dpath error:nil];
-		}
-	}
-
-	notify_post("com.redwood.var_save");
-	return YES;
-}
-
+/*
+ * appinst writes under /private/var/containers/Bundle/Application, which only root may write, and
+ * this application runs as mobile. It is started in the system persona (99) with uid and gid 0, the
+ * way package managers start their root helpers; the kernel's spawn_validate_persona accepts that
+ * without the persona-mgmt entitlement.
+ */
 static int run_external_appinst(const char *action, const char *arg, NSString **output)
 {
 	const char *candidates[] = {
@@ -183,9 +156,16 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 		NULL
 	};
 
+	posix_spawnattr_t attr;
+	posix_spawnattr_init(&attr);
+	posix_spawnattr_set_persona_np(&attr, 99, POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE);
+	posix_spawnattr_set_persona_uid_np(&attr, 0);
+	posix_spawnattr_set_persona_gid_np(&attr, 0);
+
 	extern char **environ;
 	pid_t pid;
-	int status = posix_spawn(&pid, bin_path, &actions, NULL, argv, environ);
+	int status = posix_spawn(&pid, bin_path, &actions, &attr, argv, environ);
+	posix_spawnattr_destroy(&attr);
 	posix_spawn_file_actions_destroy(&actions);
 	close(pipe_fd[1]);
 
@@ -211,13 +191,62 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 	return WEXITSTATUS(wait_stat);
 }
 
+/* The application's primary icon: the asset catalog entry first, then the loose PNGs Info.plist names. */
+static UIImage *bundle_icon(NSString *appPath, NSDictionary *info)
+{
+	NSBundle *bundle = [NSBundle bundleWithPath:appPath];
+	NSDictionary *primary = info[@"CFBundleIcons"][@"CFBundlePrimaryIcon"];
+	NSMutableArray<NSString *> *names = [NSMutableArray array];
+	if ([primary[@"CFBundleIconName"] isKindOfClass:NSString.class]) {
+		[names addObject:primary[@"CFBundleIconName"]];
+	}
+	for (NSString *name in [[primary[@"CFBundleIconFiles"] reverseObjectEnumerator] allObjects]) {
+		if ([name isKindOfClass:NSString.class]) {
+			[names addObject:name];
+		}
+	}
+	if ([info[@"CFBundleIconFile"] isKindOfClass:NSString.class]) {
+		[names addObject:info[@"CFBundleIconFile"]];
+	}
+	for (NSString *name in names) {
+		UIImage *image = [UIImage imageNamed:name inBundle:bundle compatibleWithTraitCollection:nil];
+		if (image != nil) {
+			return image;
+		}
+		for (NSString *suffix in @[ @"@3x.png", @"@2x.png", @".png" ]) {
+			image = [UIImage imageWithContentsOfFile:[appPath stringByAppendingPathComponent:[name stringByAppendingString:suffix]]];
+			if (image != nil) {
+				return image;
+			}
+		}
+	}
+	return nil;
+}
+
+static UIButton *capsule_button(NSString *title, SEL action, id target, NSInteger tag)
+{
+	UIButtonConfiguration *config = [UIButtonConfiguration grayButtonConfiguration];
+	config.title = title;
+	config.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+	config.contentInsets = NSDirectionalEdgeInsetsMake(5, 14, 5, 14);
+	config.titleTextAttributesTransformer = ^NSDictionary *(NSDictionary *attributes) {
+		NSMutableDictionary *result = [attributes mutableCopy];
+		result[NSFontAttributeName] = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
+		return result;
+	};
+	UIButton *button = [UIButton buttonWithConfiguration:config primaryAction:nil];
+	button.tag = tag;
+	[button addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
+	[button sizeToFit];
+	return button;
+}
+
 @interface InstallerViewController : UIViewController <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UISegmentedControl *segmentedControl;
 @property (nonatomic, strong) UITableView *tableView;
 @property (nonatomic, strong) UIRefreshControl *refreshControl;
 @property (nonatomic, strong) NSMutableArray<AppRecord *> *installedApps;
 @property (nonatomic, strong) NSMutableArray<IPARecord *> *availableIPAs;
-@property (nonatomic, strong) UIActivityIndicatorView *activityIndicator;
 - (void)handleIncomingFile:(NSURL *)fileURL;
 @end
 
@@ -227,42 +256,39 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 {
 	[super viewDidLoad];
 	self.title = @"IPA 管理器";
-	self.view.backgroundColor = UIColor.systemBackgroundColor;
+	self.navigationController.navigationBar.prefersLargeTitles = YES;
+	self.navigationItem.largeTitleDisplayMode = UINavigationItemLargeTitleDisplayModeAlways;
 
 	self.installedApps = [NSMutableArray array];
 	self.availableIPAs = [NSMutableArray array];
 
-	self.segmentedControl = [[UISegmentedControl alloc] initWithItems:@[ @"已安装应用", @"可用安装包" ]];
-	self.segmentedControl.selectedSegmentIndex = 0;
-	[self.segmentedControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
-	self.navigationItem.titleView = self.segmentedControl;
-
-	UIBarButtonItem *cleanButton = [[UIBarButtonItem alloc] initWithTitle:@"清理残留"
-	                                                                style:UIBarButtonItemStylePlain
-	                                                               target:self
-	                                                               action:@selector(cleanTestAppsClicked)];
-	self.navigationItem.leftBarButtonItem = cleanButton;
-
-	UIBarButtonItem *refreshButton = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
-	                                                                                target:self
-	                                                                                action:@selector(reloadCurrentData)];
-	self.navigationItem.rightBarButtonItem = refreshButton;
+	UIAction *refresh = [UIAction actionWithTitle:@"刷新" image:[UIImage systemImageNamed:@"arrow.clockwise"]
+	                                   identifier:nil handler:^(__kindof UIAction *action) { [self reloadCurrentData]; }];
+	UIAction *clean = [UIAction actionWithTitle:@"清理测试应用" image:[UIImage systemImageNamed:@"trash"]
+	                                 identifier:nil handler:^(__kindof UIAction *action) { [self cleanTestAppsClicked]; }];
+	clean.attributes = UIMenuElementAttributesDestructive;
+	self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"ellipsis.circle"]
+	                                                                           menu:[UIMenu menuWithChildren:@[ refresh, clean ]]];
 
 	self.tableView = [[UITableView alloc] initWithFrame:self.view.bounds style:UITableViewStyleInsetGrouped];
 	self.tableView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
 	self.tableView.dataSource = self;
 	self.tableView.delegate = self;
-	self.tableView.rowHeight = 84;
+	self.tableView.rowHeight = 68;
 	[self.view addSubview:self.tableView];
+
+	self.segmentedControl = [[UISegmentedControl alloc] initWithItems:@[ @"已安装", @"安装包" ]];
+	self.segmentedControl.selectedSegmentIndex = 0;
+	[self.segmentedControl addTarget:self action:@selector(segmentChanged:) forControlEvents:UIControlEventValueChanged];
+	UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, 48)];
+	self.segmentedControl.frame = CGRectInset(header.bounds, 20, 8);
+	self.segmentedControl.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+	[header addSubview:self.segmentedControl];
+	self.tableView.tableHeaderView = header;
 
 	self.refreshControl = [[UIRefreshControl alloc] init];
 	[self.refreshControl addTarget:self action:@selector(reloadCurrentData) forControlEvents:UIControlEventValueChanged];
 	self.tableView.refreshControl = self.refreshControl;
-
-	self.activityIndicator = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
-	self.activityIndicator.center = self.view.center;
-	self.activityIndicator.hidesWhenStopped = YES;
-	[self.view addSubview:self.activityIndicator];
 
 	[self reloadCurrentData];
 }
@@ -287,6 +313,21 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 	}
 	[self.refreshControl endRefreshing];
 	[self.tableView reloadData];
+	[self updateEmptyState];
+}
+
+- (void)updateEmptyState
+{
+	BOOL apps = self.segmentedControl.selectedSegmentIndex == 0;
+	if ((apps ? self.installedApps.count : self.availableIPAs.count) > 0) {
+		self.tableView.backgroundView = nil;
+		return;
+	}
+	UIContentUnavailableConfiguration *empty = [UIContentUnavailableConfiguration emptyConfiguration];
+	empty.image = [UIImage systemImageNamed:apps ? @"square.dashed" : @"arrow.down.doc"];
+	empty.text = apps ? @"没有已安装的应用" : @"没有安装包";
+	empty.secondaryText = apps ? @"在「安装包」里选择 .ipa 安装" : @"用 Safari 下载的 .ipa 会出现在这里";
+	self.tableView.backgroundView = [[UIContentUnavailableView alloc] initWithConfiguration:empty];
 }
 
 - (void)scanInstalledApplications
@@ -309,6 +350,7 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 					record.version = info[@"CFBundleShortVersionString"] ?: info[@"CFBundleVersion"] ?: @"1.0";
 					record.bundlePath = appPath;
 					record.sizeBytes = calculate_directory_size(bundleRoot);
+					record.icon = bundle_icon(appPath, info);
 					[self.installedApps addObject:record];
 				}
 			}
@@ -382,11 +424,11 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 	[alert addAction:[UIAlertAction actionWithTitle:@"开始清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
 		int count = 0;
 		NSString *cliOut = nil;
-		int rc = run_external_appinst("clean", "", &cliOut);
+		int rc = run_external_appinst("clean", NULL, &cliOut);
 		if (rc != 0) {
 			for (AppRecord *rec in [self.installedApps copy]) {
 				if (is_test_identifier(rec.bundleID)) {
-					perform_app_uninstall(rec.bundleID, rec.bundlePath);
+					run_external_appinst("remove", rec.bundleID.UTF8String, NULL);
 					count++;
 				}
 			}
@@ -433,26 +475,28 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 
 - (void)executeInstallIPA:(NSString *)ipaPath
 {
-	[self.activityIndicator startAnimating];
-	self.view.userInteractionEnabled = NO;
+	UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"正在安装"
+	                                                                  message:ipaPath.lastPathComponent
+	                                                           preferredStyle:UIAlertControllerStyleAlert];
+	[self presentViewController:progress animated:YES completion:nil];
 
-	dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
 		NSString *output = nil;
 		int res = run_external_appinst("install", ipaPath.fileSystemRepresentation, &output);
 
 		dispatch_async(dispatch_get_main_queue(), ^{
-			[self.activityIndicator stopAnimating];
-			self.view.userInteractionEnabled = YES;
-
-			NSString *msg = (res == 0) ? @"应用已成功安装并在主屏注册。" : [NSString stringWithFormat:@"安装失败，错误码：%d\n%@", res, output ?: @""];
-			UIAlertController *resultAlert = [UIAlertController alertControllerWithTitle:(res == 0 ? @"安装成功" : @"安装失败")
-			                                                                     message:msg
-			                                                              preferredStyle:UIAlertControllerStyleAlert];
-			[resultAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-				self.segmentedControl.selectedSegmentIndex = 0;
-				[self reloadCurrentData];
-			}]];
-			[self presentViewController:resultAlert animated:YES completion:nil];
+			[progress dismissViewControllerAnimated:YES completion:^{
+				if (res == 0) {
+					self.segmentedControl.selectedSegmentIndex = 0;
+					[self reloadCurrentData];
+					return;
+				}
+				UIAlertController *failed = [UIAlertController alertControllerWithTitle:@"安装失败"
+				                                                                message:output.length ? output : [NSString stringWithFormat:@"appinst 退出码 %d", res]
+				                                                         preferredStyle:UIAlertControllerStyleAlert];
+				[failed addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+				[self presentViewController:failed animated:YES completion:nil];
+			}];
 		});
 	});
 }
@@ -466,149 +510,115 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-	if (self.segmentedControl.selectedSegmentIndex == 0) {
-		return self.installedApps.count;
-	} else {
-		return self.availableIPAs.count;
-	}
+	return self.segmentedControl.selectedSegmentIndex == 0 ? self.installedApps.count : self.availableIPAs.count;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
 {
-	static NSString *CellID = @"InstallerCell";
-	UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:CellID];
+	UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Row"];
 	if (cell == nil) {
-		cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:CellID];
+		cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"Row"];
 		cell.selectionStyle = UITableViewCellSelectionStyleNone;
 	}
+	UIListContentConfiguration *content = [UIListContentConfiguration subtitleCellConfiguration];
+	content.textProperties.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+	content.textProperties.numberOfLines = 1;
+	content.secondaryTextProperties.color = UIColor.secondaryLabelColor;
+	content.imageProperties.maximumSize = CGSizeMake(44, 44);
+	content.imageProperties.reservedLayoutSize = CGSizeMake(44, 44);
+	content.imageProperties.cornerRadius = 10;
 
 	if (self.segmentedControl.selectedSegmentIndex == 0) {
 		AppRecord *record = self.installedApps[indexPath.row];
-		cell.textLabel.text = record.name;
-		cell.textLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
-		cell.detailTextLabel.numberOfLines = 2;
-		cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ • 版本: %@ • 大小: %@",
-		                             record.bundleID, record.version, format_size_string(record.sizeBytes)];
-
-		UIView *actionView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 140, 36)];
-		UIButton *openBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-		openBtn.frame = CGRectMake(0, 0, 64, 36);
-		[openBtn setTitle:@"打开" forState:UIControlStateNormal];
-		openBtn.backgroundColor = UIColor.systemBlueColor;
-		[openBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-		openBtn.layer.cornerRadius = 8;
-		openBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-		openBtn.tag = indexPath.row;
-		[openBtn addTarget:self action:@selector(openAppClicked:) forControlEvents:UIControlEventTouchUpInside];
-		[actionView addSubview:openBtn];
-
-		UIButton *delBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-		delBtn.frame = CGRectMake(72, 0, 64, 36);
-		[delBtn setTitle:@"卸载" forState:UIControlStateNormal];
-		delBtn.backgroundColor = UIColor.systemRedColor;
-		[delBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-		delBtn.layer.cornerRadius = 8;
-		delBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-		delBtn.tag = indexPath.row;
-		[delBtn addTarget:self action:@selector(uninstallAppClicked:) forControlEvents:UIControlEventTouchUpInside];
-		[actionView addSubview:delBtn];
-
-		cell.accessoryView = actionView;
+		content.text = record.name;
+		content.secondaryText = [NSString stringWithFormat:@"版本 %@ · %@", record.version, format_size_string(record.sizeBytes)];
+		content.image = record.icon ?: [UIImage systemImageNamed:@"app.dashed"];
+		content.imageProperties.tintColor = UIColor.tertiaryLabelColor;
+		cell.accessoryView = capsule_button(@"打开", @selector(openAppClicked:), self, indexPath.row);
 	} else {
 		IPARecord *record = self.availableIPAs[indexPath.row];
-		cell.textLabel.text = record.filename;
-		cell.textLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-		cell.detailTextLabel.numberOfLines = 2;
-		cell.detailTextLabel.text = [NSString stringWithFormat:@"大小: %@ • 日期: %@",
-		                             format_size_string(record.sizeBytes), record.modDate];
-
-		UIView *actionView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 140, 36)];
-		UIButton *installBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-		installBtn.frame = CGRectMake(0, 0, 64, 36);
-		[installBtn setTitle:@"安装" forState:UIControlStateNormal];
-		installBtn.backgroundColor = UIColor.systemGreenColor;
-		[installBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-		installBtn.layer.cornerRadius = 8;
-		installBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-		installBtn.tag = indexPath.row;
-		[installBtn addTarget:self action:@selector(installIPAClicked:) forControlEvents:UIControlEventTouchUpInside];
-		[actionView addSubview:installBtn];
-
-		UIButton *delFileBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-		delFileBtn.frame = CGRectMake(72, 0, 64, 36);
-		[delFileBtn setTitle:@"删除" forState:UIControlStateNormal];
-		delFileBtn.backgroundColor = UIColor.systemGrayColor;
-		[delFileBtn setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
-		delFileBtn.layer.cornerRadius = 8;
-		delFileBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-		delFileBtn.tag = indexPath.row;
-		[delFileBtn addTarget:self action:@selector(deleteIPAClicked:) forControlEvents:UIControlEventTouchUpInside];
-		[actionView addSubview:delFileBtn];
-
-		cell.accessoryView = actionView;
+		content.text = record.filename.stringByDeletingPathExtension;
+		content.secondaryText = [NSString stringWithFormat:@"%@ · %@", format_size_string(record.sizeBytes), record.modDate];
+		content.image = [UIImage systemImageNamed:@"shippingbox.fill"];
+		content.imageProperties.tintColor = UIColor.systemBlueColor;
+		cell.accessoryView = capsule_button(@"安装", @selector(installIPAClicked:), self, indexPath.row);
 	}
-
+	cell.contentConfiguration = content;
 	return cell;
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+    trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath
+{
+	BOOL apps = self.segmentedControl.selectedSegmentIndex == 0;
+	UIContextualAction *remove = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
+	                                                                     title:apps ? @"卸载" : @"删除"
+	                                                                   handler:^(UIContextualAction *action, UIView *view, void (^done)(BOOL)) {
+		if (apps) {
+			[self confirmUninstallAtIndex:indexPath.row];
+		} else {
+			[self confirmDeleteIPAAtIndex:indexPath.row];
+		}
+		done(YES);
+	}];
+	return [UISwipeActionsConfiguration configurationWithActions:@[ remove ]];
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
+{
+	if (self.segmentedControl.selectedSegmentIndex == 0 || self.availableIPAs.count == 0) {
+		return nil;
+	}
+	return @"左滑可删除安装包";
 }
 
 - (void)openAppClicked:(UIButton *)sender
 {
 	NSInteger idx = sender.tag;
 	if (idx >= 0 && idx < (NSInteger)self.installedApps.count) {
-		AppRecord *rec = self.installedApps[idx];
-		LSApplicationWorkspace *ws = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
-		[ws openApplicationWithBundleID:rec.bundleID];
+		[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] openApplicationWithBundleID:self.installedApps[idx].bundleID];
 	}
 }
 
-- (void)uninstallAppClicked:(UIButton *)sender
+- (void)confirmUninstallAtIndex:(NSInteger)idx
 {
-	NSInteger idx = sender.tag;
 	if (idx < 0 || idx >= (NSInteger)self.installedApps.count) {
 		return;
 	}
 	AppRecord *rec = self.installedApps[idx];
-
-	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"卸载应用"
-	                                                               message:[NSString stringWithFormat:@"确定彻底卸载 %@ 吗？应用数据与配置将一并删除。", rec.name]
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"卸载「%@」？", rec.name]
+	                                                               message:@"应用及其数据都会被删除。"
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
-
 	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-	[alert addAction:[UIAlertAction actionWithTitle:@"彻底卸载" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-		perform_app_uninstall(rec.bundleID, rec.bundlePath);
+	[alert addAction:[UIAlertAction actionWithTitle:@"卸载" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+		run_external_appinst("remove", rec.bundleID.UTF8String, NULL);
 		[self reloadCurrentData];
 	}]];
-
 	[self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)installIPAClicked:(UIButton *)sender
 {
 	NSInteger idx = sender.tag;
-	if (idx < 0 || idx >= (NSInteger)self.availableIPAs.count) {
-		return;
+	if (idx >= 0 && idx < (NSInteger)self.availableIPAs.count) {
+		[self executeInstallIPA:self.availableIPAs[idx].filePath];
 	}
-	IPARecord *rec = self.availableIPAs[idx];
-	[self executeInstallIPA:rec.filePath];
 }
 
-- (void)deleteIPAClicked:(UIButton *)sender
+- (void)confirmDeleteIPAAtIndex:(NSInteger)idx
 {
-	NSInteger idx = sender.tag;
 	if (idx < 0 || idx >= (NSInteger)self.availableIPAs.count) {
 		return;
 	}
 	IPARecord *rec = self.availableIPAs[idx];
-
-	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除安装包"
-	                                                               message:[NSString stringWithFormat:@"确定删除安装包 %@ 吗？", rec.filename]
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"删除「%@」？", rec.filename]
+	                                                               message:nil
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
 	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 	[alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
 		[NSFileManager.defaultManager removeItemAtPath:rec.filePath error:nil];
 		[self reloadCurrentData];
 	}]];
-
 	[self presentViewController:alert animated:YES completion:nil];
 }
 

@@ -87,6 +87,11 @@ class VideoPlayerTest(unittest.TestCase):
             raise AssertionError('sample has no mdat box')
         cls.damaged = cls.directory / 'damaged-nal.mp4'
         cls.damaged.write_bytes(data)
+        cls.long_movie = cls.directory / 'synthetic-h264-72.mp4'
+        subprocess.run(['ffmpeg', '-y', '-hide_banner', '-loglevel', 'error', '-f', 'lavfi',
+                        '-i', 'testsrc2=size=160x96:rate=12', '-frames:v', '72', '-c:v', 'libx264',
+                        '-preset', 'veryfast', '-pix_fmt', 'yuv420p', '-bf', '2', '-movflags',
+                        '+faststart', str(cls.long_movie)], check=True, timeout=30)
 
     def run_probe(self, *args, status=0, binary=None, label='', **kwargs):
         result = subprocess.run([str(binary or self.binary), *map(str, args)],
@@ -105,14 +110,25 @@ class VideoPlayerTest(unittest.TestCase):
         for key in ('ready', 'playing', 'advanced', 'ended'):
             self.assertEqual(summary[key], '1', output)
         self.assertEqual(summary['pixel_errors'], '0')
-        self.assertEqual(records(output, 'end'), [{'stage': 'end', 'received': '1'}])
+        self.assertEqual(records(output, 'end')[0]['received'], '1')
+        self.assertEqual(len(records(output, 'end')), 1)
         self.assertGreaterEqual(Fraction(summary['max_time']), Fraction(11, 12))
         frames = records(output, 'frame')
-        # Output is sampled against the playing clock and can skip frames under host load.
+        # Every frame is summarized in memory; only the first three and each sixtieth are logged.
         self.assertGreaterEqual(len(frames), 2)
         self.assertLessEqual(len(frames), 12)
-        self.assertEqual(int(summary['frames']), len(frames))
-        self.assertEqual(int(summary['output_bytes']), len(frames) * FRAME_BYTES)
+        self.assertEqual(int(summary['frame_logs']), len(frames))
+        self.assertGreaterEqual(int(summary['frames']), len(frames))
+        self.assertEqual(int(summary['output_bytes']), int(summary['frames']) * FRAME_BYTES)
+        self.assertEqual(records(output, 'first_frame')[0]['elapsed_ms'], summary['first_frame_ms'])
+        self.assertGreater(int(records(output, 'start')[0]['epoch_us']), 0)
+        for stage in ('item_created', 'output_added', 'player_created', 'play', 'play_returned'):
+            self.assertIn('elapsed_ms', records(output, stage)[0])
+        states = records(output, 'state')
+        self.assertTrue(states)
+        for key in ('elapsed_ms', 'waiting_reason', 'buffer_empty', 'likely_to_keep_up', 'loaded', 'has_new'):
+            self.assertIn(key, states[-1])
+        self.assertTrue(any(state['likely_to_keep_up'] == '1' for state in states))
         previous = Fraction(-1)
         for frame in frames:
             self.assertEqual(frame['pixel_error'], '0')
@@ -144,6 +160,7 @@ class VideoPlayerTest(unittest.TestCase):
         output = self.run_probe(self.directory / 'private-path-marker.mp4', status=1)
         self.assertNotIn('private-path-marker', output)
         self.assertTrue(records(output, 'input'))
+        self.assertEqual(records(output, 'summary')[-1]['result'], 'fail')
 
     def test_argument_validation(self):
         for index, value in enumerate(('0', '-1', 'nan', 'inf', '3601', '1x')):
@@ -153,17 +170,35 @@ class VideoPlayerTest(unittest.TestCase):
 
     def test_process_deadline(self):
         start = time.monotonic()
-        self.run_probe('--deadline', '0.000001', self.movie, status=124)
+        output = self.run_probe('--deadline', '0.000001', self.movie, status=124)
         self.assertLess(time.monotonic() - start, 3)
+        self.assertEqual(records(output, 'summary')[-1]['result'], 'fail')
 
     def test_inherited_blocked_alarm(self):
-        self.run_probe('--deadline', '0.000001', self.movie, status=124,
+        output = self.run_probe('--deadline', '0.000001', self.movie, status=124,
             preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM}))
+        self.assertEqual(records(output, 'summary')[-1]['result'], 'fail')
 
     def test_deadline_during_playback(self):
         output = self.run_probe('--deadline', '0.4', self.movie, status=124)
-        self.assertIn('video_player_test: stage=start\n', output)
-        self.assertFalse(records(output, 'summary'))
+        self.assertIn('video_player_test: stage=start ', output)
+        summary = records(output, 'summary')[-1]
+        self.assertEqual(summary['result'], 'fail')
+        self.assertIn('elapsed_ms', summary)
+        self.assertIn('frame_logs', summary)
+
+    def test_frame_log_downsampling(self):
+        output = self.run_probe(self.long_movie)
+        summary = records(output, 'summary')[-1]
+        frames = records(output, 'frame')
+        self.assertEqual(summary['result'], 'pass')
+        self.assertGreater(int(summary['frames']), 3)
+        self.assertEqual(int(summary['frame_logs']), len(frames))
+        self.assertLess(len(frames), int(summary['frames']))
+        self.assertEqual([int(frame['index']) for frame in frames[:3]], [1, 2, 3])
+        for frame in frames[3:]:
+            self.assertEqual(int(frame['index']) % 60, 0)
+        self.assertEqual(int(summary['output_bytes']), int(summary['frames']) * FRAME_BYTES)
 
     def test_end_without_pixels_fails(self):
         source = self.directory / 'no-pixels.m'

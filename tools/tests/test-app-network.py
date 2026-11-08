@@ -73,9 +73,9 @@ static void no_private_output(void) {
 int main(void) {
   @autoreleasepool {
     unsetenv("REDWOOD_NET_TRACE"); watch_network_completion();
-    assert(finish_local_task == NULL && finish_background_task == NULL);
+    assert(finish_local_task == NULL && finish_background_task == NULL && finish_background_download_task == NULL);
     setenv("REDWOOD_NET_TRACE", "0", 1); watch_network_completion();
-    assert(finish_local_task == NULL && finish_background_task == NULL);
+    assert(finish_local_task == NULL && finish_background_task == NULL && finish_background_download_task == NULL);
     char bounded[2048]; memset(bounded, 'a', sizeof(bounded));
     assert(network_hash(bounded) != 0 && network_hash(NULL) == 0);
 
@@ -108,6 +108,10 @@ int main(void) {
     finish_background_task = (void (*)(id, SEL, id))original;
     reset_log(); watched_finish_background_task(task, expected_selector, error);
     assert(finished == 2 && errno == ENODEV && strstr(captured, "stage=background-finish"));
+    no_private_output();
+    finish_background_download_task = (void (*)(id, SEL, id))original;
+    reset_log(); watched_finish_background_download_task(task, expected_selector, error);
+    assert(finished == 3 && errno == ENODEV && strstr(captured, "stage=background-download-finish"));
     no_private_output();
     IMP wrong_before = class_getMethodImplementation([WrongABI class], expected_selector);
     IMP untouched = NULL;
@@ -156,6 +160,8 @@ print(result.stdout.strip())
 mutations = [
     ('lost-completion', 'finish_local_task(self, cmd, error);', '(void)self; (void)cmd; (void)error;'),
     ('changed-completion-error', 'finish_local_task(self, cmd, error);', 'finish_local_task(self, cmd, NULL);'),
+    ('lost-background-download-completion', 'finish_background_download_task(self, cmd, error);',
+     '(void)self; (void)cmd; (void)error;'),
     ('lost-errno', 'errno = saved_errno;', '(void)saved_errno;'),
     ('private-error-domain', 'return "other";', 'return domain != NULL ? domain : "other";'),
     ('unbounded-hash', 'i < 2048 && text[i] != 0', 'text[i] != 0'),

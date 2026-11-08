@@ -46,6 +46,7 @@
  *   air_metal_test --textures FILE.metallib [FUNCTION]
  *   air_metal_test --draw FILE.metallib FUNCTION
  *                  [MTLPixelFormat[,...] [MTLPixelFormat[:MTLTextureType][,...]]]
+ *   air_metal_test --fbfetch FILE.bc FUNCTION
  *   air_metal_test --draw-depth FILE.metallib FUNCTION
  *                  [MTLPixelFormat[,...]|none [DEPTHFORMAT]]
  *   air_metal_test --draw-ms FILE.metallib FUNCTION [SAMPLES [FILLFUNCTION]]
@@ -6214,6 +6215,163 @@ run_blend(const char *path, const char *func)
    return (wrong || refused_wrong || thin || !served) ? 1 : 0;
 }
 
+/* --fbfetch isolates the fragment input [[color(0)]] on the device. The attachment
+ * starts at opaque RGB 234 and the shader returns dest_0 unchanged, with fixed blending
+ * disabled. Every pixel in the Calendar draw's scissor must retain that value; zero RGB
+ * exposes a failed fetch without involving textures, uniforms or vertex inputs.
+ * Softpipe cannot supply this value, so this mode always requests the hardware screen.
+ */
+static int
+run_fbfetch(const char *path, const char *func)
+{
+   enum {
+      WIDTH = 1206, HEIGHT = 2622,
+      SCISSOR_X = 632, SCISSOR_Y = 369, SCISSOR_W = 446, SCISSOR_H = 446,
+   };
+   const unsigned origin[3] = { 0, 0, 0 };
+   const unsigned extent[3] = { WIDTH, HEIGHT, 1 };
+   const unsigned read_origin[3] = { SCISSOR_X, SCISSOR_Y, 0 };
+   const unsigned read_extent[3] = { SCISSOR_W, SCISSOR_H, 1 };
+   const unsigned scissor[4] = { SCISSOR_X, SCISSOR_Y, SCISSOR_W, SCISSOR_H };
+   const size_t fill_size = (size_t)WIDTH * HEIGHT * 4;
+   const size_t read_size = (size_t)SCISSOR_W * SCISSOR_H * 4;
+   struct metallib lib = { 0 };
+   struct rwa_device *device = NULL;
+   struct rwa_render *render = NULL;
+   struct rwa_texture *color = NULL;
+   uint8_t *fill = NULL, *got = NULL;
+   char why[WHY] = "";
+   int result = 1;
+
+   if (!load_metallib(path, &lib))
+      goto out;
+   char name[256];
+   const uint8_t *bitcode = NULL;
+   size_t bitcode_size = 0;
+   if (!find_function(&lib, func, name, sizeof(name), &bitcode, &bitcode_size))
+      goto out;
+   printf("fbfetch: %s, %zu bytes of bitcode\n", name, bitcode_size);
+
+   setenv("RWA_SOFTWARE", "0", 1);
+   device = rwa_device_open(why, sizeof(why));
+   if (!device) {
+      printf("fbfetch: FAIL rwa_device_open: %s\n", why);
+      goto out;
+   }
+   printf("fbfetch: device is \"%s\"\n", rwa_device_name(device));
+   if (!strcmp(rwa_device_name(device), "softpipe")) {
+      printf("fbfetch: FAIL softpipe cannot validate a framebuffer-fetch value\n");
+      goto out;
+   }
+
+   struct rwa_render_shape shape = {
+      .color_count = 1, .sample_count = 1, .color_blend_count = 1,
+   };
+   shape.color_format[0] = MTL_BGRA8_UNORM;
+   shape.color_blend[0] = (struct rwa_color_blend){
+      .blending_enabled = 0, .rgb_blend_operation = BO_ADD,
+      .alpha_blend_operation = BO_ADD, .source_rgb_blend_factor = BF_ONE,
+      .destination_rgb_blend_factor = BF_ZERO, .source_alpha_blend_factor = BF_ONE,
+      .destination_alpha_blend_factor = BF_ZERO, .write_mask = CWM_ALL,
+   };
+   struct rwa_render_info info = { 0 };
+   render = rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size, func, &shape,
+                              &info, why, sizeof(why));
+   if (!render) {
+      printf("fbfetch: FAIL rwa_render_create: %s\n", why);
+      goto out;
+   }
+   if (info.fragment_buffers || info.fragment_textures || info.fragment_samplers ||
+       info.blend_enabled_mask) {
+      printf("fbfetch: FAIL unexpected pipeline state: %u buffers, %u textures, "
+             "%u samplers, blend mask 0x%x\n", info.fragment_buffers,
+             info.fragment_textures, info.fragment_samplers, info.blend_enabled_mask);
+      goto out;
+   }
+
+   const struct rwa_texture_shape texture_shape = {
+      .pixel_format = MTL_BGRA8_UNORM, .type = MTL_TEXTURE_TYPE_2D,
+      .width = WIDTH, .height = HEIGHT, .depth = 1, .array_length = 1, .mip_levels = 1,
+      .sample_count = 1, .usage = MTL_USAGE_SHADER_READ | MTL_USAGE_RENDER_TARGET,
+   };
+   color = rwa_texture_create(device, &texture_shape, why, sizeof(why));
+   if (!color) {
+      printf("fbfetch: FAIL rwa_texture_create: %s\n", why);
+      goto out;
+   }
+   fill = malloc(fill_size);
+   got = malloc(read_size);
+   if (!fill || !got) {
+      printf("fbfetch: FAIL allocating %zu fill bytes and %zu readback bytes\n",
+             fill_size, read_size);
+      goto out;
+   }
+   for (size_t i = 0; i < fill_size; i += 4) {
+      fill[i] = fill[i + 1] = fill[i + 2] = 234;
+      fill[i + 3] = 255;
+   }
+   if (rwa_texture_write(color, 0, 0, origin, extent, fill, 0, why, sizeof(why)) != 0) {
+      printf("fbfetch: FAIL prefill: %s\n", why);
+      goto out;
+   }
+
+   const struct rwa_draw draw = {
+      .color = &color, .color_count = 1,
+      .clear_color = NULL,              /* MTLLoadActionLoad */
+      .primitive = 4,                   /* MTLPrimitiveTypeTriangleStrip */
+      .vertex_start = 0, .vertex_count = 4,
+      .scissor = scissor,
+   };
+   if (rwa_render_draw(render, &draw, why, sizeof(why)) != 0) {
+      printf("fbfetch: FAIL rwa_render_draw: %s\n", why);
+      goto out;
+   }
+   memset(got, 0, read_size);
+   if (rwa_texture_read(color, 0, 0, read_origin, read_extent, got, 0, why,
+                        sizeof(why)) != 0) {
+      printf("fbfetch: FAIL readback: %s\n", why);
+      goto out;
+   }
+
+   unsigned wrong = 0, zero_rgb = 0;
+   for (unsigned y = 0; y < SCISSOR_H; y++) {
+      for (unsigned x = 0; x < SCISSOR_W; x++) {
+         const uint8_t *pixel = got + ((size_t)y * SCISSOR_W + x) * 4;
+         if (pixel[0] == 234 && pixel[1] == 234 && pixel[2] == 234 && pixel[3] == 255)
+            continue;
+         wrong++;
+         zero_rgb += !pixel[0] && !pixel[1] && !pixel[2];
+         if (wrong == 1)
+            printf("fbfetch: first mismatch at %u,%u: BGRA %u,%u,%u,%u, "
+                   "want 234,234,234,255\n", SCISSOR_X + x, SCISSOR_Y + y,
+                   pixel[0], pixel[1], pixel[2], pixel[3]);
+      }
+   }
+   printf("fbfetch: %u,%u %ux%u, %u/%u pixels differ, %u zero RGB\n",
+          SCISSOR_X, SCISSOR_Y, SCISSOR_W, SCISSOR_H, wrong, SCISSOR_W * SCISSOR_H,
+          zero_rgb);
+   if (wrong) {
+      printf("fbfetch: FAIL expected every scissor pixel to remain BGRA "
+             "234,234,234,255\n");
+      goto out;
+   }
+   printf("fbfetch: PASS all %u scissor pixels retained BGRA 234,234,234,255\n",
+          SCISSOR_W * SCISSOR_H);
+   result = 0;
+
+out:
+   free(got);
+   free(fill);
+   if (color)
+      rwa_texture_destroy(color);
+   if (render)
+      rwa_render_destroy(render);
+   if (device)
+      rwa_device_close(device);
+   free(lib.bytes);
+   return result;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -6297,6 +6455,14 @@ main(int argc, char **argv)
          return 2;
       }
       return run_blend(argv[2], argv[3]);
+   }
+
+   if (argc >= 2 && !strcmp(argv[1], "--fbfetch")) {
+      if (argc != 4) {
+         fprintf(stderr, "usage: %s --fbfetch FILE.bc FUNCTION\n", argv[0]);
+         return 2;
+      }
+      return run_fbfetch(argv[2], argv[3]);
    }
 
    if (argc >= 2 && !strcmp(argv[1], "--pixel-formats")) {
@@ -6409,6 +6575,7 @@ main(int argc, char **argv)
                       "       air_metal_test --draw FILE.metallib FUNCTION "
                       "[MTLPixelFormat[,...] "
                       "[MTLPixelFormat[:MTLTextureType][,...]]]\n"
+                      "       air_metal_test --fbfetch FILE.bc FUNCTION\n"
                       "       air_metal_test --draw-depth FILE.metallib FUNCTION "
                       "[MTLPixelFormat[,...]|none [DEPTHFORMAT]]\n"
                       "       air_metal_test --draw-ms FILE.metallib FUNCTION "

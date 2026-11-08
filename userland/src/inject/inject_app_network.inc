@@ -1,9 +1,11 @@
 /*
  * Request diagnostics preserve URLSession behavior and object ownership. Logs contain
  * host/path hashes, HTTP status and error domain/code; URL text and userInfo stay private.
- * REDWOOD_NET_TRACE=1 observes the two completion methods present in 23G90 CFNetwork.
+ * REDWOOD_NET_TRACE=1 observes the local, background and background-download completion methods
+ * present in 23G90 CFNetwork.
  */
 static void (*finish_local_task)(id, SEL, id), (*finish_background_task)(id, SEL, id);
+static void (*finish_background_download_task)(id, SEL, id);
 
 static id
 network_object(id object, const char *selector)
@@ -109,6 +111,13 @@ watched_finish_background_task(id self, SEL cmd, id error)
 }
 
 static void
+watched_finish_background_download_task(id self, SEL cmd, id error)
+{
+	network_task_record(self, error, "background-download-finish");
+	finish_background_download_task(self, cmd, error);
+}
+
+static void
 watch_network_finish(const char *name, IMP replacement, void *original)
 {
 	Class cls = objc_getClass(name);
@@ -131,10 +140,13 @@ watch_network_completion(void)
 	}
 	watch_network_finish("__NSCFLocalSessionTask", (IMP)watched_finish_local_task, &finish_local_task);
 	watch_network_finish("__NSCFBackgroundSessionTask", (IMP)watched_finish_background_task, &finish_background_task);
-	char line[160];
+	watch_network_finish("__NSCFBackgroundDownloadTask", (IMP)watched_finish_background_download_task,
+	    &finish_background_download_task);
+	char line[192];
 	int install_errno = errno;
-	int n = snprintf(line, sizeof(line), "redwood: %.64s: network completion hooks local=%u background=%u\n",
-	    who, finish_local_task != NULL, finish_background_task != NULL);
+	int n = snprintf(line, sizeof(line),
+	    "redwood: %.64s: network completion hooks local=%u background=%u background_download=%u\n",
+	    who, finish_local_task != NULL, finish_background_task != NULL, finish_background_download_task != NULL);
 	if (n > 0) {
 		say(line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1);
 	}

@@ -1,12 +1,11 @@
 /*
- * appinst: installs an application on this boot from an .ipa or an .app directory.
+ * appinst: installs an application from an .ipa or an .app directory.
  *
- * The application is unpacked into a bundle container of its own under
- * /private/var/containers/Bundle/Application, containermanagerd makes its data container, and
- * LaunchServices registers it, which puts the icon on the home screen. installd takes no part, so no
- * provisioning profile is asked for: the kernel's AMFI stand-in (bsd/kern/kern_minimac.c) runs every
- * ad hoc signed program. /private/var is rebuilt at every boot, so whatever is installed here is gone
- * after a reboot.
+ * containermanagerd makes the application's bundle container under
+ * /private/var/containers/Bundle/Application and its data container, the application is moved into
+ * the first, and LaunchServices registers it, which puts the icon on the home screen. installd takes no
+ * part, so no provisioning profile is asked for: the kernel's AMFI stand-in (bsd/kern/kern_minimac.c)
+ * runs every ad hoc signed program. Both containers are kept with the rest of /private/var.
  *
  * usage: appinst install FILE.ipa|DIR.app
  *        appinst remove BUNDLE-ID
@@ -32,6 +31,7 @@
 #include <mach-o/loader.h>
 #include <notify.h>
 #include <stdio.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 
 /* libarchive, in the shared cache; the iOS SDK has the library and no header */
@@ -470,43 +470,69 @@ plugins_of(NSString *app, NSDictionary<NSString *, NSString *> *groupContainers)
 	return plugins;
 }
 
+/*
+ * The bundle container comes from containermanagerd (MCMAppContainer), as installd gets it: the
+ * container carries its .com.apple.mobile_container_manager.metadata.plist, and containermanagerd
+ * deletes a directory under Bundle/Application without one at its next start ("Deleting orphaned data
+ * missing a metadata file"). The application is unpacked into STAGING first, on the same volume, to
+ * learn its identifier, and then moved into the container.
+ */
 static int
-install_into(NSString *source, NSString *bundle)
+install_into(NSString *source, NSString *staging)
 {
 	NSFileManager *fm = NSFileManager.defaultManager;
 	NSString *app;
 	NSDictionary *info;
 	NSError *error = nil;
 
-	if (![fm createDirectoryAtPath:bundle withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0755 } error:&error]) {
-		fprintf(stderr, "appinst: %s: %s\n", bundle.UTF8String, error.description.UTF8String);
+	if (![fm createDirectoryAtPath:staging withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0755 } error:&error]) {
+		fprintf(stderr, "appinst: %s: %s\n", staging.UTF8String, error.description.UTF8String);
 		return 1;
 	}
 	if ([source.pathExtension isEqualToString:@"app"]) {
-		if (![fm copyItemAtPath:source toPath:[bundle stringByAppendingPathComponent:source.lastPathComponent] error:&error]) {
+		if (![fm copyItemAtPath:source toPath:[staging stringByAppendingPathComponent:source.lastPathComponent] error:&error]) {
 			fprintf(stderr, "appinst: copying %s: %s\n", source.UTF8String, error.description.UTF8String);
 			return 1;
 		}
-	} else if (!unpack(source, bundle)) {
+	} else if (!unpack(source, staging)) {
 		return 1;
 	}
-	app = app_in(bundle);
+	app = app_in(staging);
 	info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
 	if (app == nil || info[@"CFBundleIdentifier"] == nil || info[@"CFBundleExecutable"] == nil) {
 		fprintf(stderr, "appinst: no application with an Info.plist naming its identifier and executable in %s\n", source.UTF8String);
 		return 1;
 	}
 	NSString *identifier = info[@"CFBundleIdentifier"];
-	chmod([app stringByAppendingPathComponent:info[@"CFBundleExecutable"]].fileSystemRepresentation, 0755);
 
-	/* an earlier copy on this boot goes first, or LaunchServices keeps the old path */
+	/* an earlier copy goes first, or LaunchServices keeps the old path */
 	LSApplicationProxy *old = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:identifier];
 	if (old.bundleURL != nil && [old.bundleURL.path hasPrefix:BUNDLES]) {
 		[[NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace] unregisterApplication:old.bundleURL];
-		[fm removeItemAtPath:old.bundleURL.path.stringByDeletingLastPathComponent error:nil];
+		[fm removeItemAtPath:old.bundleURL.path error:nil];
 	}
 
 	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+	MCMContainer *bundle = [NSClassFromString(@"MCMAppContainer") containerWithIdentifier:identifier createIfNecessary:YES
+	                                                                            existed:NULL error:&error];
+	if (bundle.url.path == nil) {
+		fprintf(stderr, "appinst: no bundle container for %s: %s\n", identifier.UTF8String, error.description.UTF8String);
+		return 1;
+	}
+	for (NSString *name in [fm contentsOfDirectoryAtPath:bundle.url.path error:nil]) {
+		if ([name.pathExtension isEqualToString:@"app"]) {
+			[fm removeItemAtPath:[bundle.url.path stringByAppendingPathComponent:name] error:nil];
+		}
+	}
+	NSString *installed = [bundle.url.path stringByAppendingPathComponent:app.lastPathComponent];
+	if (![fm moveItemAtPath:app toPath:installed error:&error]) {
+		fprintf(stderr, "appinst: moving %s into %s: %s\n", app.UTF8String, bundle.url.path.UTF8String,
+		    error.description.UTF8String);
+		return 1;
+	}
+	app = installed;
+	chmod([app stringByAppendingPathComponent:info[@"CFBundleExecutable"]].fileSystemRepresentation, 0755);
+
 	MCMContainer *data = [NSClassFromString(@"MCMAppDataContainer") containerWithIdentifier:identifier createIfNecessary:YES
 	                                                                               existed:NULL error:&error];
 	NSString *home = data.url.path;
@@ -567,17 +593,36 @@ install_into(NSString *source, NSString *bundle)
 	return 0;
 }
 
-/* a failed install leaves no bundle container behind: /private/var is in memory */
+/* the staging directory goes whether or not the install succeeded */
 static int
 install(NSString *source)
 {
-	NSString *bundle = [BUNDLES stringByAppendingPathComponent:NSUUID.UUID.UUIDString];
-	int status = install_into(source, bundle);
+	NSString *staging = [@"/private/var/tmp" stringByAppendingPathComponent:[@"appinst-" stringByAppendingString:NSUUID.UUID.UUIDString]];
+	int status = install_into(source, staging);
 
-	if (status != 0) {
-		[NSFileManager.defaultManager removeItemAtPath:bundle error:nil];
-	}
+	[NSFileManager.defaultManager removeItemAtPath:staging error:nil];
 	return status;
+}
+
+/*
+ * LaunchServices keeps a bundle as a volume and file ID pair, and lsd refuses a bundle on a volume that
+ * reports no persistent object IDs: registerContainerURL: fails in -[FSNode getResourceValue:...] with
+ * OSStatus -10813. /redwood is a bindfs view of /private/preboot/redwood and reports none, while the
+ * APFS volume under it does, so a bundle seen through a bindfs mount is registered at its source path.
+ */
+static NSString *
+path_on_backing_volume(NSString *path)
+{
+	struct statfs fs;
+
+	if (statfs(path.fileSystemRepresentation, &fs) != 0 || strcmp(fs.f_fstypename, "bindfs") != 0) {
+		return path;
+	}
+	NSString *mountPoint = @(fs.f_mntonname);
+	if (![path hasPrefix:[mountPoint stringByAppendingString:@"/"]]) {
+		return path;
+	}
+	return [@(fs.f_mntfromname) stringByAppendingString:[path substringFromIndex:mountPoint.length]];
 }
 
 /*
@@ -600,6 +645,7 @@ register_system_app(NSString *appPath)
 			return 1;
 		}
 	}
+	app = path_on_backing_volume(app);
 
 	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[app stringByAppendingPathComponent:@"Info.plist"]];
 	if (info[@"CFBundleIdentifier"] == nil || info[@"CFBundleExecutable"] == nil) {
