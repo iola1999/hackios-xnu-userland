@@ -16,6 +16,7 @@
  *   system ID                          a system sound by its number (1100 is the lock sound,
  *                                      1104 a keyboard click), as SpringBoard plays them
  *   file PATH                          a sound file, played as a system sound
+ *   activate                           activate an AVAudioSession with the playback category
  *   route                              where iOS says its sound goes: the audio session's outputs and volume,
  *                                      and the devices of the system's output context
  *   haptic [SECONDS]                   haptics the way an application (and UIKit's feedback generators) plays
@@ -216,6 +217,32 @@ text(id string)
 	return utf8 ? utf8 : "(none)";
 }
 
+/* Explicit session activation separates session errors from AudioQueue startup errors. */
+static int
+activate_playback(void)
+{
+	id session = send((id)objc_getClass("AVAudioSession"), "sharedInstance");
+	id *category = dlsym(RTLD_DEFAULT, "AVAudioSessionCategoryPlayback");
+	id error = NULL;
+	if (session == NULL || category == NULL) {
+		printf("sound_test: session: playback API unavailable\n");
+		return 1;
+	}
+	BOOL ok = ((BOOL (*)(id, SEL, id, id *))objc_msgSend)(session,
+	    sel_registerName("setCategory:error:"), *category, &error);
+	printf("sound_test: session: category=%d error=%ld\n", ok,
+	    error ? ((long (*)(id, SEL))objc_msgSend)(error, sel_registerName("code")) : 0);
+	if (!ok) {
+		return 1;
+	}
+	error = NULL;
+	ok = ((BOOL (*)(id, SEL, BOOL, id *))objc_msgSend)(session,
+	    sel_registerName("setActive:error:"), YES, &error);
+	printf("sound_test: session: active=%d error=%ld\n", ok,
+	    error ? ((long (*)(id, SEL))objc_msgSend)(error, sel_registerName("code")) : 0);
+	return !ok;
+}
+
 /*
  * What the audio session of this program says of the route (AVAudioSession, as an application would
  * ask), and what the system's output context holds (AVOutputContext: what Control Center goes by).
@@ -388,6 +415,10 @@ main(int argc, char **argv)
 			wait_for_ringer();
 		} else if (strcmp(argv[i], "route") == 0) {
 			route();
+		} else if (strcmp(argv[i], "activate") == 0) {
+			if (activate_playback()) {
+				return 1;
+			}
 		} else if (strcmp(argv[i], "restart") == 0) {
 			restart();
 		} else if (strcmp(argv[i], "haptic") == 0) {
