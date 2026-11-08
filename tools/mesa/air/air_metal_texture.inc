@@ -417,6 +417,9 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
       return NULL;
    }
    view->device = texture->device;
+   view->references = 1;
+   view->storage_owner = texture->storage_owner ? texture->storage_owner : texture;
+   view->storage_owner->references++;
    pipe_resource_reference(&view->res, res);
    view->shape = texture->shape;
    view->shape.pixel_format = mtl_format;
@@ -552,4 +555,32 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
       return false;
    }
    return true;
+}
+
+void
+rwa_texture_destroy(struct rwa_texture *texture)
+{
+   RWA_LOCKED;
+   if (!texture || --texture->references != 0)
+      return;
+   if (texture->backing) {
+      struct rwa_buffer_texture **at = &texture->device->buffer_textures;
+
+      while (*at && *at != texture->backing)
+         at = &(*at)->next;
+      if (*at) {
+         *at = texture->backing->next;
+         free(texture->backing);
+      }
+      texture->backing = NULL;
+   }
+   argbuf_scrub(texture->device, NULL, texture, NULL);
+   state_texture_gone(texture->device, texture->res);
+   /* Released, not destroyed: a draw may have left the view bound (air_metal_state.inc),
+    * and the context's reference then keeps it until it is unbound. */
+   pipe_sampler_view_release_ptr(&texture->view);
+   pipe_resource_reference(&texture->res, NULL);
+   struct rwa_texture *owner = texture->storage_owner;
+   free(texture);
+   rwa_texture_destroy(owner);
 }

@@ -168,6 +168,9 @@ struct rwa_buffer {
  * R32G32B32A32_FLOAT.
  */
 struct rwa_texture {
+   unsigned references;
+   /* Views retain the original texture that owns buffer writeback state. */
+   struct rwa_texture *storage_owner;
    struct rwa_device *device;
    struct pipe_resource *res;
    struct pipe_sampler_view *view;  /* made when a dispatch first samples it, then kept */
@@ -196,6 +199,19 @@ struct rwa_texture {
    /* Channel swizzle for sampler views (0 = default/identity). */
    uint8_t swizzle_r, swizzle_g, swizzle_b, swizzle_a;
 };
+
+/* Writes through a view update the original texture's buffer writeback record.
+ * storage_owner always names the original texture, including for nested views. */
+static void
+texture_written(struct rwa_texture *t)
+{
+   if (!t)
+      return;
+   if (t->storage_owner)
+      t = t->storage_owner;
+   if (t->backing)
+      t->backing->written = true;
+}
 
 /*
  * A colour or depth target made here starts at zero. freedreno takes a new resource's memory

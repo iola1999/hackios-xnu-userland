@@ -1325,15 +1325,6 @@ texture_levels(const struct rwa_texture *t)
    return t->num_levels ? t->num_levels : t->res->last_level + 1;
 }
 
-/* A texture laid over a buffer has been written, so its bytes go back to the buffer before
- * the buffer is read again (rwa_buffer_textures_writeback). */
-static void
-texture_written(struct rwa_texture *t)
-{
-   if (t && t->backing)
-      t->backing->written = true;
-}
-
 /* A caller's level of the texture as a level of its resource, refused past the texture's
  * last level. */
 static bool
@@ -1743,6 +1734,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       return NULL;
    }
    texture->device = device;
+   texture->references = 1;
    texture->shape = *shape;
    texture->format_name = fmt->name;
    texture->layers = array_size;
@@ -1888,31 +1880,6 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
 #include "air_metal_texture.inc"
 #include "air_metal_fence.inc"
 
-void
-rwa_texture_destroy(struct rwa_texture *texture)
-{
-   RWA_LOCKED;
-   if (!texture)
-      return;
-   if (texture->backing) {
-      struct rwa_buffer_texture **at = &texture->device->buffer_textures;
-
-      while (*at && *at != texture->backing)
-         at = &(*at)->next;
-      if (*at) {
-         *at = texture->backing->next;
-         free(texture->backing);
-      }
-      texture->backing = NULL;
-   }
-   argbuf_scrub(texture->device, NULL, texture, NULL);
-   state_texture_gone(texture->device, texture->res);
-   /* Released, not destroyed: a draw may have left the view bound (air_metal_state.inc),
-    * and the context's reference then keeps it until it is unbound. */
-   pipe_sampler_view_release_ptr(&texture->view);
-   pipe_resource_reference(&texture->res, NULL);
-   free(texture);
-}
 
 int
 rwa_texture_generate_mipmaps(struct rwa_texture *texture, char *why, size_t why_size)
