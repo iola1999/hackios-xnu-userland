@@ -16,5 +16,5 @@ d	755	501	501	/private/var/mobile/Library/SafariSafeBrowsing
 d	755	501	501	/private/var/mobile/Library/SyncedPreferences
 d	755	205	205	/private/var/db/locationd
 d	755	501	501	/private/var/mobile/Library/Location
-d	777	0	0	/private/var/db/redwood-aircache
-d	777	0	0	/private/var/db/redwood-ir3cache
+d	777	0	0	/private/var/db/annibale-aircache
+d	777	0	0	/private/var/db/annibale-ir3cache

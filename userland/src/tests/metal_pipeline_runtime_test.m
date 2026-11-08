@@ -470,8 +470,8 @@ int main(int argc, char **argv)
 {
     BOOL software = NO;
     BOOL surface_mode = NO;
-    const char *library_path = "/redwood/lib/libredwoodmetal.dylib";
-    const char *compute_path = "/redwood/share/metal-pipeline-pattern.metallib";
+    const char *library_path = "/annibale/lib/libannibalemetal.dylib";
+    const char *compute_path = "/annibale/share/metal-pipeline-pattern.metallib";
     const char *system_path = "/System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--software")) software = YES;
@@ -509,7 +509,7 @@ int main(int argc, char **argv)
             stage("dlopen Metal candidate");
             plugin = dlopen(library_path, RTLD_NOW | RTLD_LOCAL);
             if (!plugin) { fail("dlopen: %s", dlerror()); goto finished; }
-            Class cls = objc_getClass("RedwoodMetalDevice");
+            Class cls = objc_getClass("AnnibaleMetalDevice");
             SEL init = sel_registerName("initWithAcceleratorPort:");
             if (!cls || ![cls instancesRespondToSelector:init]) { fail("device initializer unavailable"); goto finished; }
             stage("initWithAcceleratorPort:0");
@@ -517,7 +517,7 @@ int main(int argc, char **argv)
             SEL mesa_selector = sel_registerName("mesaDevice");
             if (!device || ![device respondsToSelector:mesa_selector]) { fail("device/Mesa accessor unavailable"); goto finished; }
             void *mesa = ((void *(*)(id, SEL))objc_msgSend)(device, mesa_selector);
-            backend = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW | RTLD_NOLOAD);
+            backend = dlopen("/annibale/lib/libannibaleair.dylib", RTLD_NOW | RTLD_NOLOAD);
             const char *(*backend_name)(void *) = backend ? dlsym(backend, "rwa_device_name") : NULL;
             const char *name = mesa && backend_name ? backend_name(mesa) : NULL;
             if (!name || (!!strstr(name, "softpipe") != !!software)) {

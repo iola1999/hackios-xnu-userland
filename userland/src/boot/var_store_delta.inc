@@ -13,11 +13,11 @@
 #define DELTA_SLOTS         2
 #define DELTA_SLOT_BYTES    (DELTA_BYTES / DELTA_SLOTS)
 #define DELTA_PAYLOAD_LIMIT (DELTA_SLOT_BYTES - BLOCK)
-#define DELTA_MAGIC         "RDWDEL\0"
+#define DELTA_MAGIC         "ANNDEL\0"
 #define DELTA_VERSION       1
 
 struct delta_head {
-	char     magic[8];          /* "RDWDEL\0" */
+	char     magic[8];          /* "ANNDEL\0" */
 	uint32_t version;          /* 1 */
 	uint32_t flags;            /* 0: active, 1: invalidated/merged */
 	uint64_t base_generation;  /* Generation of Base Slot this delta applies to */

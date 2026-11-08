@@ -1,13 +1,13 @@
 /*
  * inject_cellular.inc — CoreTelephony / SystemStatus live status integration
- * reading from /dev/redwood-modem
- * and kern.redwood.{modem_state,cellular_bars,cellular_rat,cellular_operator,cellular_sim_state}.
+ * reading from /dev/annibale-modem
+ * and kern.annibale.{modem_state,cellular_bars,cellular_rat,cellular_operator,cellular_sim_state}.
  * Included by src/inject_app.c.
  */
 
 #include <sys/sysctl.h>
 
-struct redwood_modem_user_status {
+struct annibale_modem_user_status {
 	uint32_t magic;
 	uint32_t state;
 	uint32_t sim_state;
@@ -42,7 +42,7 @@ static struct {
 } cell_cache = { .rsrp_dbm = -140, .rat = "None" };
 
 static void
-redwood_refresh_cellular_state(void)
+annibale_refresh_cellular_state(void)
 {
 	time_t now = time(NULL);
 	size_t sz;
@@ -54,35 +54,35 @@ redwood_refresh_cellular_state(void)
 	cell_cache.last_poll = now;
 
 	sz = sizeof(val);
-	if (sysctlbyname("kern.redwood.modem_state", &val, &sz, NULL, 0) == 0) {
+	if (sysctlbyname("kern.annibale.modem_state", &val, &sz, NULL, 0) == 0) {
 		cell_cache.modem_state = val;
 	}
 	sz = sizeof(val);
-	if (sysctlbyname("kern.redwood.cellular_bars", &val, &sz, NULL, 0) == 0) {
+	if (sysctlbyname("kern.annibale.cellular_bars", &val, &sz, NULL, 0) == 0) {
 		cell_cache.bars = val < 0 ? 0 : (val > 4 ? 4 : val);
 	}
 	sz = sizeof(val);
-	if (sysctlbyname("kern.redwood.cellular_sim_state", &val, &sz, NULL, 0) == 0) {
+	if (sysctlbyname("kern.annibale.cellular_sim_state", &val, &sz, NULL, 0) == 0) {
 		cell_cache.sim_state = val;
 	}
 	sz = sizeof(val);
-	if (sysctlbyname("kern.redwood.cellular_rsrp", &val, &sz, NULL, 0) == 0) {
+	if (sysctlbyname("kern.annibale.cellular_rsrp", &val, &sz, NULL, 0) == 0) {
 		cell_cache.rsrp_dbm = val;
 	}
 	sz = sizeof(cell_cache.rat) - 1;
-	if (sysctlbyname("kern.redwood.cellular_rat", cell_cache.rat, &sz, NULL, 0) == 0) {
+	if (sysctlbyname("kern.annibale.cellular_rat", cell_cache.rat, &sz, NULL, 0) == 0) {
 		cell_cache.rat[sz] = '\0';
 	}
 	sz = sizeof(cell_cache.operator_name) - 1;
-	if (sysctlbyname("kern.redwood.cellular_operator", cell_cache.operator_name, &sz, NULL, 0) == 0) {
+	if (sysctlbyname("kern.annibale.cellular_operator", cell_cache.operator_name, &sz, NULL, 0) == 0) {
 		cell_cache.operator_name[sz] = '\0';
 	}
 
-	/* Also read binary snapshot from /dev/redwood-modem when MCC/MNC or full status is available. */
-	int fd = open("/dev/redwood-modem", O_RDONLY | O_NONBLOCK);
+	/* Also read binary snapshot from /dev/annibale-modem when MCC/MNC or full status is available. */
+	int fd = open("/dev/annibale-modem", O_RDONLY | O_NONBLOCK);
 	if (fd >= 0) {
-		struct redwood_modem_user_status st;
-		if (read(fd, &st, sizeof(st)) == (ssize_t)sizeof(st) && st.magic == 0x5244574du) {
+		struct annibale_modem_user_status st;
+		if (read(fd, &st, sizeof(st)) == (ssize_t)sizeof(st) && st.magic == 0x414e4e4du) {
 			cell_cache.modem_state = (int)st.state;
 			cell_cache.bars = (int)(st.signal_bars <= 4 ? st.signal_bars : 4);
 			cell_cache.sim_state = (int)st.sim_state;
@@ -125,7 +125,7 @@ nsstring_from_cstr(const char *s)
 static id
 hooked_ctcarrier_name(id self, SEL cmd)
 {
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	if (cell_cache.operator_name[0] != '\0' && strcmp(cell_cache.operator_name, "None") != 0) {
 		return nsstring_from_cstr(cell_cache.operator_name);
 	}
@@ -135,7 +135,7 @@ hooked_ctcarrier_name(id self, SEL cmd)
 static id
 hooked_ctcarrier_mcc(id self, SEL cmd)
 {
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	if (cell_cache.mcc != 0) {
 		char buf[16];
 		snprintf(buf, sizeof(buf), "%03u", cell_cache.mcc);
@@ -147,7 +147,7 @@ hooked_ctcarrier_mcc(id self, SEL cmd)
 static id
 hooked_ctcarrier_mnc(id self, SEL cmd)
 {
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	if (cell_cache.mnc != 0) {
 		char buf[16];
 		snprintf(buf, sizeof(buf), "%02u", cell_cache.mnc);
@@ -159,7 +159,7 @@ hooked_ctcarrier_mnc(id self, SEL cmd)
 static signed char
 hooked_ctcarrier_voip(id self, SEL cmd)
 {
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	if (cell_cache.modem_state >= 4) {
 		return 1;
 	}
@@ -187,7 +187,7 @@ ct_rat_constant_for_kernel_rat(const char *rat)
 static id
 hooked_ctnetinfo_rat(id self, SEL cmd)
 {
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	const char *ct_rat = ct_rat_constant_for_kernel_rat(cell_cache.rat);
 	if (cell_cache.modem_state >= 4 && ct_rat != NULL) {
 		return nsstring_from_cstr(ct_rat);
@@ -202,7 +202,7 @@ hooked_ctnetinfo_svc_rat(id self, SEL cmd)
 	if (orig != nil) {
 		return orig;
 	}
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	const char *ct_rat = ct_rat_constant_for_kernel_rat(cell_cache.rat);
 	if (cell_cache.modem_state >= 4 && ct_rat != NULL) {
 		Class dictCls = objc_getClass("NSDictionary");
@@ -219,7 +219,7 @@ hooked_ctnetinfo_svc_rat(id self, SEL cmd)
 static unsigned long
 hooked_st_signal_bars(id self, SEL cmd)
 {
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	if (cell_cache.modem_state >= 4 || cell_cache.bars > 0) {
 		return (unsigned long)cell_cache.bars;
 	}
@@ -229,7 +229,7 @@ hooked_st_signal_bars(id self, SEL cmd)
 static unsigned long
 hooked_st_service_state(id self, SEL cmd)
 {
-	redwood_refresh_cellular_state();
+	annibale_refresh_cellular_state();
 	if (cell_cache.modem_state >= 5) {
 		return 2; /* STTelephonyServiceStateInService */
 	}

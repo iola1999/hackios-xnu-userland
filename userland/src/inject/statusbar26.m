@@ -1,5 +1,5 @@
 /*
- * Part of libredwood-ax.dylib (tools/k90auto/package.py AX): the status bar's time and battery on
+ * Part of libannibale-ax.dylib (tools/k90auto/package.py AX): the status bar's time and battery on
  * 23G90's iPhone 17 canvas (1206x2622, 402 points) placed 12 points closer to the screen edges than
  * iOS places them. Each process lays out its own status bar, so only the processes the library is
  * inserted into get the new place.

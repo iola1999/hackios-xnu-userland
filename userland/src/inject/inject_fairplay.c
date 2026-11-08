@@ -93,7 +93,7 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 		fp = (uintptr_t)__darwin_arm_thread_state64_get_fp(context->uc_mcontext->__ss);
 	}
 	frames_from(fp, frames, sizeof(frames));
-	say("redwood: fairplayd: signal %d at %p, pc %#lx, called from%s (unslid)\n", signal_number,
+	say("annibale: fairplayd: signal %d at %p, pc %#lx, called from%s (unslid)\n", signal_number,
 	    info != NULL ? info->si_addr : NULL, pc - slide, frames);
 	signal(signal_number, SIG_DFL);
 	raise(signal_number);
@@ -138,7 +138,7 @@ watched_IORegistryEntryFromPath(mach_port_t port, const char *path)
 				hash = (hash ^ (unsigned char)path[length++]) * UINT64_C(1099511628211);
 			}
 		}
-		say("redwood: fairplayd: IORegistryEntryFromPath path_kind=%s path_hash=%016llx "
+		say("annibale: fairplayd: IORegistryEntryFromPath path_kind=%s path_hash=%016llx "
 		    "path_bytes=%zu path_complete=%u entry_present=%u errno_after=%d caller_main=%u caller_offset=%#lx\n",
 		    kind, (unsigned long long)hash, length, topology && length < sizeof(io_string_t),
 		    entry != IO_OBJECT_NULL, saved_errno, offset != UINTPTR_MAX, offset != UINTPTR_MAX ? offset : 0);
@@ -197,7 +197,7 @@ watched_IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef k
 		} else if (value != NULL && type == CFBooleanGetTypeID()) {
 			kind = "boolean";
 		}
-		say("redwood: fairplayd: IORegistryEntryCreateCFProperty key=%s value_present=%u "
+		say("annibale: fairplayd: IORegistryEntryCreateCFProperty key=%s value_present=%u "
 		    "type=%s type_id=%lu length=%ld units=%s errno_after=%d caller_main=%u caller_offset=%#lx\n",
 		    name, value != NULL, kind, (unsigned long)type, (long)length, units, saved_errno,
 		    offset != UINTPTR_MAX, offset != UINTPTR_MAX ? offset : 0);
@@ -212,7 +212,7 @@ watched_IOServiceMatching(const char *name)
 	CFMutableDictionaryRef matching = IOServiceMatching(name);
 
 	if (ours) {
-		say("redwood: fairplayd: IOServiceMatching(\"%s\") -> %s\n", name != NULL ? name : "(null)",
+		say("annibale: fairplayd: IOServiceMatching(\"%s\") -> %s\n", name != NULL ? name : "(null)",
 		    matching != NULL ? "a dictionary" : "nothing");
 	}
 	return matching;
@@ -224,7 +224,7 @@ watched_IOServiceGetMatchingServices(mach_port_t port, CFDictionaryRef matching,
 	kern_return_t result = IOServiceGetMatchingServices(port, matching, existing);
 
 	if (ours) {
-		say("redwood: fairplayd: IOServiceGetMatchingServices -> %#x, iterator %#x\n", result,
+		say("annibale: fairplayd: IOServiceGetMatchingServices -> %#x, iterator %#x\n", result,
 		    result == KERN_SUCCESS && existing != NULL ? *existing : IO_OBJECT_NULL);
 	}
 	return result;
@@ -236,7 +236,7 @@ watched_IOIteratorNext(io_iterator_t iterator)
 	io_object_t object = IOIteratorNext(iterator);
 
 	if (ours) {
-		say("redwood: fairplayd: IOIteratorNext(%#x) -> %#x\n", iterator, object);
+		say("annibale: fairplayd: IOIteratorNext(%#x) -> %#x\n", iterator, object);
 	}
 	return object;
 }
@@ -247,7 +247,7 @@ watched_IOServiceGetMatchingService(mach_port_t port, CFDictionaryRef matching)
 	io_service_t service = IOServiceGetMatchingService(port, matching);
 
 	if (ours) {
-		say("redwood: fairplayd: IOServiceGetMatchingService -> %s\n", service != 0 ? "a service" : "NOTHING");
+		say("annibale: fairplayd: IOServiceGetMatchingService -> %s\n", service != 0 ? "a service" : "NOTHING");
 	}
 	return service;
 }
@@ -258,7 +258,7 @@ watched_IOServiceOpen(io_service_t service, task_port_t task, uint32_t type, io_
 	kern_return_t result = IOServiceOpen(service, task, type, connect);
 
 	if (ours) {
-		say("redwood: fairplayd: IOServiceOpen(type %u) -> %#x\n", type, result);
+		say("annibale: fairplayd: IOServiceOpen(type %u) -> %#x\n", type, result);
 	}
 	return result;
 }
@@ -272,7 +272,7 @@ watched_IOConnectCallMethod(mach_port_t connection, uint32_t selector, const uin
 	    input_struct_count, output, output_count, output_struct, output_struct_count);
 
 	if (ours) {
-		say("redwood: fairplayd: IOConnectCallMethod selector %u -> %#x\n", selector, result);
+		say("annibale: fairplayd: IOConnectCallMethod selector %u -> %#x\n", selector, result);
 	}
 	return result;
 }
@@ -286,7 +286,7 @@ watched_IOConnectCallStructMethod(mach_port_t connection, uint32_t selector, con
 	    input_struct_count, output_struct, output_struct_count);
 
 	if (ours) {
-		say("redwood: fairplayd: IOConnectCallStructMethod selector=%u input_bytes=%zu "
+		say("annibale: fairplayd: IOConnectCallStructMethod selector=%u input_bytes=%zu "
 		    "output_capacity=%zu output_bytes=%zu output_size_present=%u result=%#x\n",
 		    selector, input_struct_count, output_capacity,
 		    output_struct_count != NULL ? *output_struct_count : 0, output_struct_count != NULL, result);
@@ -309,7 +309,7 @@ watched_open(const char *path, int flags, ...)
 	int fd = open(path, flags, mode);
 
 	if (ours) {
-		say("redwood: fairplayd: open flags=%#x -> %d errno=%d\n", flags, fd, fd < 0 ? errno : 0);
+		say("annibale: fairplayd: open flags=%#x -> %d errno=%d\n", flags, fd, fd < 0 ? errno : 0);
 	}
 	return fd;
 }
@@ -321,7 +321,7 @@ watched_sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in, 
 	int result = sysctl(mib, count, out, out_size, in, in_size);
 
 	if (ours && mib != NULL && count >= 1) {
-		say("redwood: fairplayd: sysctl [%d %d %d %d] (%u deep) -> %d\n", mib[0], count > 1 ? mib[1] : -1,
+		say("annibale: fairplayd: sysctl [%d %d %d %d] (%u deep) -> %d\n", mib[0], count > 1 ? mib[1] : -1,
 		    count > 2 ? mib[2] : -1, count > 3 ? mib[3] : -1, count, result);
 	}
 	return result;
@@ -336,7 +336,7 @@ watched___sysctl(int *mib, unsigned count, void *out, size_t *out_size, void *in
 	int result = __sysctl(mib, count, out, out_size, in, in_size);
 
 	if (ours && mib != NULL && count >= 1) {
-		say("redwood: fairplayd: sysctl [%d %d %d %d] (%u deep) -> %d\n", mib[0], count > 1 ? mib[1] : -1,
+		say("annibale: fairplayd: sysctl [%d %d %d %d] (%u deep) -> %d\n", mib[0], count > 1 ? mib[1] : -1,
 		    count > 2 ? mib[2] : -1, count > 3 ? mib[3] : -1, count, result);
 	}
 	return result;
@@ -351,7 +351,7 @@ watched___mac_syscall(const char *policy, int call, void *arg)
 	int result = __mac_syscall(policy, call, arg);
 
 	if (ours) {
-		say("redwood: fairplayd: __mac_syscall(\"%s\", %d) -> %d\n", policy != NULL ? policy : "(null)",
+		say("annibale: fairplayd: __mac_syscall(\"%s\", %d) -> %d\n", policy != NULL ? policy : "(null)",
 		    call, result);
 	}
 	return result;
@@ -363,7 +363,7 @@ watched_sysctlbyname(const char *name, void *out, size_t *out_size, void *in, si
 	int result = sysctlbyname(name, out, out_size, in, in_size);
 
 	if (ours) {
-		say("redwood: fairplayd: sysctlbyname(\"%s\") -> %d\n", name != NULL ? name : "(null)", result);
+		say("annibale: fairplayd: sysctlbyname(\"%s\") -> %d\n", name != NULL ? name : "(null)", result);
 	}
 	return result;
 }
@@ -374,7 +374,7 @@ watched_dlopen(const char *path, int mode)
 	void *library = dlopen(path, mode);
 
 	if (ours) {
-		say("redwood: fairplayd: dlopen mode=%#x -> %s\n", mode, library != NULL ? "loaded" : "failed");
+		say("annibale: fairplayd: dlopen mode=%#x -> %s\n", mode, library != NULL ? "loaded" : "failed");
 	}
 	return library;
 }
@@ -385,7 +385,7 @@ watched_xpc_connection_create_mach_service(const char *name, dispatch_queue_t qu
 	xpc_connection_t connection = xpc_connection_create_mach_service(name, queue, flags);
 
 	if (ours) {
-		say("redwood: fairplayd: xpc_connection_create_mach_service(\"%s\") -> %s\n",
+		say("annibale: fairplayd: xpc_connection_create_mach_service(\"%s\") -> %s\n",
 		    name != NULL ? name : "(null)", connection != NULL ? "a connection" : "nothing");
 	}
 	return connection;
@@ -397,7 +397,7 @@ watched_stat(const char *path, struct stat *out)
 	int result = stat(path, out);
 
 	if (ours) {
-		say("redwood: fairplayd: stat -> %d errno=%d\n", result, result < 0 ? errno : 0);
+		say("annibale: fairplayd: stat -> %d errno=%d\n", result, result < 0 ? errno : 0);
 	}
 	return result;
 }
@@ -408,7 +408,7 @@ watched_access(const char *path, int mode)
 	int result = access(path, mode);
 
 	if (ours) {
-		say("redwood: fairplayd: access -> %d errno=%d\n", result, result < 0 ? errno : 0);
+		say("annibale: fairplayd: access -> %d errno=%d\n", result, result < 0 ? errno : 0);
 	}
 	return result;
 }
@@ -419,7 +419,7 @@ watched_mkdir(const char *path, mode_t mode)
 	int result = mkdir(path, mode);
 
 	if (ours) {
-		say("redwood: fairplayd: mkdir -> %d errno=%d\n", result, result < 0 ? errno : 0);
+		say("annibale: fairplayd: mkdir -> %d errno=%d\n", result, result < 0 ? errno : 0);
 	}
 	return result;
 }
@@ -437,7 +437,7 @@ watched_MGCopyAnswer(CFStringRef key)
 		if (key == NULL || !CFStringGetCString(key, text, sizeof(text), kCFStringEncodingUTF8)) {
 			strlcpy(text, "(unreadable)", sizeof(text));
 		}
-		say("redwood: fairplayd: MGCopyAnswer(\"%s\") -> %s\n", text, answer != NULL ? "an answer" : "NOTHING");
+		say("annibale: fairplayd: MGCopyAnswer(\"%s\") -> %s\n", text, answer != NULL ? "an answer" : "NOTHING");
 	}
 	errno = saved_errno;
 	return answer;
@@ -455,7 +455,7 @@ watched_SecTaskCopyValueForEntitlement(void *task, CFStringRef entitlement, CFEr
 		if (entitlement == NULL || !CFStringGetCString(entitlement, text, sizeof(text), kCFStringEncodingUTF8)) {
 			strlcpy(text, "(unreadable)", sizeof(text));
 		}
-		say("redwood: fairplayd: entitlement \"%s\" -> %s\n", text, value != NULL ? "held" : "NOT HELD");
+		say("annibale: fairplayd: entitlement \"%s\" -> %s\n", text, value != NULL ? "held" : "NOT HELD");
 	}
 	errno = saved_errno;
 	return value;
@@ -468,7 +468,7 @@ watched__exit(int status)
 
 	if (ours) {
 		frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-		say("redwood: fairplayd: LEAVING, _exit(%d), called from%s (unslid)\n", status, frames);
+		say("annibale: fairplayd: LEAVING, _exit(%d), called from%s (unslid)\n", status, frames);
 	}
 	_exit(status);
 }
@@ -480,7 +480,7 @@ watched_abort(void)
 
 	if (ours) {
 		frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-		say("redwood: fairplayd: LEAVING, abort(), called from%s (unslid)\n", frames);
+		say("annibale: fairplayd: LEAVING, abort(), called from%s (unslid)\n", frames);
 	}
 	abort();
 }
@@ -516,7 +516,7 @@ at_the_end(void)
 	if (!ours) {
 		return;
 	}
-	say("redwood: fairplayd: atexit samples=%u\n",
+	say("annibale: fairplayd: atexit samples=%u\n",
 	    sample_count);
 	/* Print at most 40 distinct samples, newest first. */
 	for (unsigned i = sample_count; i > 0 && shown < 40; i--) {
@@ -530,7 +530,7 @@ at_the_end(void)
 			continue;
 		}
 		shown++;
-		say("redwood: fairplayd: was at %#lx (cache %#lx, own %#lx)\n", pc, pc - slide, pc - own_slide);
+		say("annibale: fairplayd: was at %#lx (cache %#lx, own %#lx)\n", pc, pc - slide, pc - own_slide);
 	}
 }
 
@@ -541,7 +541,7 @@ watched_exit(int status)
 
 	if (ours) {
 		frames_from((uintptr_t)__builtin_frame_address(0), frames, sizeof(frames));
-		say("redwood: fairplayd: LEAVING, exit(%d), called from%s (unslid)\n", status, frames);
+		say("annibale: fairplayd: LEAVING, exit(%d), called from%s (unslid)\n", status, frames);
 	}
 	exit(status);
 }
@@ -577,7 +577,7 @@ __attribute__((used)) static struct {
 
 __attribute__((constructor))
 static void
-redwood_fairplay_init(void)
+annibale_fairplay_init(void)
 {
 	const char *name = getprogname();
 	size_t length = 0;
@@ -619,6 +619,6 @@ redwood_fairplay_init(void)
 	{
 		int *argc = _NSGetArgc();
 
-		say("redwood: fairplayd: probe loaded argc=%d\n", argc != NULL ? *argc : -1);
+		say("annibale: fairplayd: probe loaded argc=%d\n", argc != NULL ? *argc : -1);
 	}
 }

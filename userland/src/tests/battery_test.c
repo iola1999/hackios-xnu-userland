@@ -1,8 +1,8 @@
 /*
  * The battery as iOS sees it: the kernel's power source (the IOPMPowerSource that powerd reads,
- * iokit/Kernel/RedwoodBattery.cpp) and what powerd has made of it (the power sources list that
+ * iokit/Kernel/AnnibaleBattery.cpp) and what powerd has made of it (the power sources list that
  * the status bar, the lock screen and Settings get through IOPS), side by side with the kernel's
- * own numbers (kern.redwood.battery_*).
+ * own numbers (kern.annibale.battery_*).
  *
  *   battery_test            once
  *   battery_test N S        N times, S seconds apart
@@ -112,10 +112,10 @@ once(void)
 	int got = IOPSGetPercentRemaining(&percent, &charging, &full);
 
 	printf("battery_test: the kernel says %d%%, %d mV, %d mA, %d C, battery %d, charger %d, charging %d, from the DSP %d\n",
-	    kernel("kern.redwood.battery_soc"), kernel("kern.redwood.battery_voltage_mv"), kernel("kern.redwood.battery_current_ma"),
-	    kernel("kern.redwood.battery_temperature_c"), kernel("kern.redwood.battery_present"),
-	    kernel("kern.redwood.battery_charger_present"), kernel("kern.redwood.battery_charging"),
-	    kernel("kern.redwood.battery_from_dsp"));
+	    kernel("kern.annibale.battery_soc"), kernel("kern.annibale.battery_voltage_mv"), kernel("kern.annibale.battery_current_ma"),
+	    kernel("kern.annibale.battery_temperature_c"), kernel("kern.annibale.battery_present"),
+	    kernel("kern.annibale.battery_charger_present"), kernel("kern.annibale.battery_charging"),
+	    kernel("kern.annibale.battery_from_dsp"));
 	if (service != 0) {
 		CFMutableDictionaryRef properties = NULL;
 		io_name_t name = "";

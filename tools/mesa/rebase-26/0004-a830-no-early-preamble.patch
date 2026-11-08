@@ -6,7 +6,7 @@
          CHIP.A8XX,
 -        [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen1],
 +        [a7xx_base, a7xx_gen3, a8xx_base, a8xx_gen1,
-+         # Darwin on redwood: with early preambles, gallium draws whose fragment shader
++         # Darwin on annibale: with early preambles, gallium draws whose fragment shader
 +         # reads the framebuffer through the bindless fb-read descriptors hang the GPU
 +         # (CP done, HLSQ busy) on this part; they finish without them
 +         # (docs/progress/2026-10-30-ios26-usable-desktop.md section 4.3).

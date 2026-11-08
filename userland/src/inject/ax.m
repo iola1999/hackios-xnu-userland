@@ -1,8 +1,8 @@
 /*
- * libredwood-ax.dylib: what an application shows, by name and place, for driving the phone from the
+ * libannibale-ax.dylib: what an application shows, by name and place, for driving the phone from the
  * host without guessing coordinates (tools/k90auto/ui.py).
  *
- * On the darwin notification com.redwood.ax every process this library is in writes
+ * On the darwin notification com.annibale.ax every process this library is in writes
  * /tmp/ax-NAME.txt on its main thread, unless it is an application in the background:
  *
  *   # NAME pid PID screen W H
@@ -13,7 +13,7 @@
  * points. Hidden and fully transparent subtrees are left out; covered ones are not detected.
  *
  * SwiftUI views (Settings' lists, Weather) list nothing until the applications load their
- * accessibility bundles. com.redwood.ax.on, taken by SpringBoard, turns application accessibility on
+ * accessibility bundles. com.annibale.ax.on, taken by SpringBoard, turns application accessibility on
  * for the system (libAccessibility's _AXSApplicationAccessibilitySetEnabled, as an accessibility
  * setting does); applications started afterwards load the bundles. It stays on until the next boot.
  */
@@ -155,12 +155,12 @@ ax_start(void)
 {
 	int token;
 
-	notify_register_dispatch("com.redwood.ax.on", &token, dispatch_get_main_queue(), ^(int t) {
+	notify_register_dispatch("com.annibale.ax.on", &token, dispatch_get_main_queue(), ^(int t) {
 		(void)t;
 		accessibility_on();
 	});
 
-	notify_register_dispatch("com.redwood.ax", &token, dispatch_get_main_queue(), ^(int t) {
+	notify_register_dispatch("com.annibale.ax", &token, dispatch_get_main_queue(), ^(int t) {
 		(void)t;
 		@autoreleasepool {
 			dump();

@@ -1,13 +1,13 @@
 /*
  * Stream frame rendering, metadata attachment, contrast autofocus state machine,
- * and /dev/redwood-camera worker thread (included by camera_device.c).
+ * and /dev/annibale-camera worker thread (included by camera_device.c).
  */
 
 /* ---- the frames ------------------------------------------------------------------------------------- */
 
 struct render_job {
 	const struct isp *isp;
-	const struct redwood_camera_frame *f;
+	const struct annibale_camera_frame *f;
 	const uint8_t *raw;
 	CVPixelBufferRef pb;
 	uint32_t format, width, height, pieces;
@@ -114,7 +114,7 @@ md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 
 /* the frame's metadata, as H10ISP's stream gives them (see md_names) */
 static CFDictionaryRef
-frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, const struct isp_stats *st, CFStringRef port)
+frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, const struct isp_stats *st, CFStringRef port)
 {
 	CFMutableDictionaryRef m;
 	double exposure = f->exposure_lines * (double)f->line_ns / 1e9, analog = f->gain_unity ? (double)f->gain / f->gain_unity : 1;
@@ -153,7 +153,7 @@ frame_metadata(const struct isp *isp, const struct redwood_camera_frame *f, cons
 }
 
 static void
-deliver(struct stream *s, struct output *out, const struct isp *isp, const struct redwood_camera_frame *f, const uint8_t *raw,
+deliver(struct stream *s, struct output *out, const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw,
     CFDictionaryRef metadata)
 {
 	CVPixelBufferRef pb = output_buffer(out);
@@ -235,7 +235,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
  * 15.9-16x, at the longest exposure a frame at 30 a second allows.
  */
 static float
-lux_index(const struct isp *isp, const struct redwood_camera_frame *f)
+lux_index(const struct isp *isp, const struct annibale_camera_frame *f)
 {
 	double exposure = f->exposure_lines * (double)f->line_ns / 1e9 * f->gain / f->gain_unity * isp->digital;
 
@@ -272,7 +272,7 @@ colour_temperature(const struct isp *isp)
 }
 
 /*
- * Focus, where the camera has a lens motor (the frames' focus is a position, not REDWOOD_CAMERA_NO_FOCUS:
+ * Focus, where the camera has a lens motor (the frames' focus is a position, not ANNIBALE_CAMERA_NO_FOCUS:
  * the wide camera's): by contrast, as there is nothing else to go by -- the sensor's phase-detection
  * pixels are not read.
  */
@@ -303,7 +303,7 @@ struct af {
 static void
 af_go(int device, struct af *af, uint32_t target)
 {
-	struct redwood_camera_command c = { .command = REDWOOD_CAMERA_FOCUS };
+	struct annibale_camera_command c = { .command = ANNIBALE_CAMERA_FOCUS };
 
 	af->target = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
 	c.a = af->at < af->target ? (af->target - af->at > AF_STEP ? af->at + AF_STEP : af->target) :
@@ -317,12 +317,12 @@ af_go(int device, struct af *af, uint32_t target)
 }
 
 static void
-af_frame(int device, struct af *af, const struct redwood_camera_frame *f, const uint8_t *raw, const float window[4], bool locked)
+af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const uint8_t *raw, const float window[4], bool locked)
 {
 	float level, sharpness;
 	unsigned needed = f->gain >= 16 * f->gain_unity ? 2 : 1;      /* (in the dark, two frames to a measurement) */
 
-	if (f->focus == REDWOOD_CAMERA_NO_FOCUS) {
+	if (f->focus == ANNIBALE_CAMERA_NO_FOCUS) {
 		return;
 	}
 	if (af->at == 0 && af->target == 0) {
@@ -471,9 +471,9 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
 		return;
 	}
-	snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", annibale_names[sensor]);
+	snprintf(path, sizeof(path), "/annibale/fw/camera-%s.isp", annibale_names[sensor]);
 	if (access(path, R_OK) != 0) {
-		snprintf(path, sizeof(path), "/redwood/fw/camera-%s.isp", names[sensor]);
+		snprintf(path, sizeof(path), "/annibale/fw/camera-%s.isp", names[sensor]);
 	}
 	if (isp_load_tuning(isp, path)) {
 		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
@@ -490,7 +490,7 @@ worker(void *context)
 {
 	CMBaseObjectRef o = context;
 	struct stream *s = stream_of(o);
-	struct redwood_camera_frame head;
+	struct annibale_camera_frame head;
 	struct isp isp;
 	struct isp_stats st;
 	uint8_t *buffer = NULL;
@@ -499,11 +499,11 @@ worker(void *context)
 	bool switched = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
-	int device = open(REDWOOD_CAMERA_DEVICE, O_RDWR), failures = 0;
+	int device = open(ANNIBALE_CAMERA_DEVICE, O_RDWR), failures = 0;
 
-	pthread_setname_np("redwood-camera");
+	pthread_setname_np("annibale-camera");
 	if (device < 0) {
-		say("no %s (%s): no frames", REDWOOD_CAMERA_DEVICE, strerror(errno));
+		say("no %s (%s): no frames", ANNIBALE_CAMERA_DEVICE, strerror(errno));
 		return NULL;
 	}
 	isp_init(&isp);
@@ -523,7 +523,7 @@ worker(void *context)
 			if (head.sensor != s->camera->sensor) {
 				/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
 				if (!switched) {
-					struct redwood_camera_command c = { .command = REDWOOD_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
+					struct annibale_camera_command c = { .command = ANNIBALE_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
 
 					switched = true;
 					say("the kernel's frames are camera %u's: to %u, the %s", head.sensor, s->camera->sensor, s->camera->name);
@@ -547,9 +547,9 @@ worker(void *context)
 		}
 		failures = 0;
 
-		const struct redwood_camera_frame *f = (const void *)buffer;
+		const struct annibale_camera_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
-		struct redwood_camera_command c;
+		struct annibale_camera_command c;
 
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
@@ -807,7 +807,7 @@ static CFStringRef
 stream_description(CMBaseObjectRef o)
 {
 	(void)o;
-	return CFRetain(CFSTR("<RedwoodCaptureStream: the wide camera>"));
+	return CFRetain(CFSTR("<AnnibaleCaptureStream: the wide camera>"));
 }
 
 static const struct base_class stream_base = {

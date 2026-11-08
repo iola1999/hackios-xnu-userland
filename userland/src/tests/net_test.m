@@ -19,7 +19,7 @@
  *                         services say what they decided (X-Set-Apple-Store-Front; rc.jobs.store)
  *   reach NAME            what SCNetworkReachability says: the question applications ask first
  *   wait SECONDS
- *   wifi                  what the job com.redwood.wifi runs in every image: if the kernel was
+ *   wifi                  what the job com.annibale.wifi runs in every image: if the kernel was
  *                         started with wifi=1, wait for the radio's interface (en0) to appear,
  *                         and ask for it to be configured by DHCP ("dhcp en0") only if configd
  *                         has no network service of its own for it; else nothing
@@ -33,9 +33,9 @@
  *                         (21: a wrong passphrase) and how long it took. The network's name is
  *                         the kernel's (its SSID request) and is not printed.
  *
- * The interface QEMU's network gives (en0, bsd/dev/redwood_net.c) has no IOKit object behind it,
+ * The interface QEMU's network gives (en0, bsd/dev/annibale_net.c) has no IOKit object behind it,
  * and configd makes its network services out of those. (The phone's radio has one now:
- * iokit/Kernel/RedwoodWLAN.cpp, and configd makes a "Wi-Fi" service of it by itself.) But the
+ * iokit/Kernel/AnnibaleWLAN.cpp, and configd makes a "Wi-Fi" service of it by itself.) But the
  * plugin that does the configuring keeps its own list
  * of interfaces, straight from the kernel, and has a Mach interface of its own, the one the
  * "ipconfig" command of macOS uses ("ipconfig set en0 DHCP"; the command itself is not part of
@@ -435,7 +435,7 @@ reach(const char *name)
 
 /*
  * With wifi=1 among the kernel's arguments: wait for en0, and for configd's own network service for
- * it ("Wi-Fi", made of the radio's IOKit objects, iokit/Kernel/RedwoodWLAN.cpp). That service runs
+ * it ("Wi-Fi", made of the radio's IOKit objects, iokit/Kernel/AnnibaleWLAN.cpp). That service runs
  * DHCP by itself, and it has to be the one that does: wifid takes the interface for usable only
  * when the address appears under a service whose settings name en0, and the service "dhcp en0"
  * makes has none (Settings then shows a spinner where the tick belongs). Only a kernel without
@@ -564,7 +564,7 @@ wrongjoin(void)
 		return;
 	}
 	length = request.length;
-	/* the layout of iOS 16.5 (bsd/dev/redwood_apple80211.c of the kernel): version, mode, authentication lower and
+	/* the layout of iOS 16.5 (bsd/dev/annibale_apple80211.c of the kernel): version, mode, authentication lower and
 	 * upper, the name's length and the name, the access point (none: any), the key's version, length and kind (10:
 	 * a passphrase as typed), the key */
 	memset(assoc, 0, sizeof(assoc));

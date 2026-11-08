@@ -588,8 +588,8 @@ install_into(NSString *source, NSString *staging)
 
 	notify_post("com.apple.LaunchServices.ApplicationsChanged");
 	notify_post("com.apple.LaunchServices.applicationRegistered");
-	notify_post("com.redwood.var_save");
-	printf("appinst: posted com.redwood.var_save for %s\n", identifier.UTF8String);
+	notify_post("com.annibale.var_save");
+	printf("appinst: posted com.annibale.var_save for %s\n", identifier.UTF8String);
 	return 0;
 }
 
@@ -607,7 +607,7 @@ install(NSString *source)
 /*
  * LaunchServices keeps a bundle as a volume and file ID pair, and lsd refuses a bundle on a volume that
  * reports no persistent object IDs: registerContainerURL: fails in -[FSNode getResourceValue:...] with
- * OSStatus -10813. /redwood is a bindfs view of /private/preboot/redwood and reports none, while the
+ * OSStatus -10813. /annibale is a bindfs view of /private/preboot/annibale and reports none, while the
  * APFS volume under it does, so a bundle seen through a bindfs mount is registered at its source path.
  */
 static NSString *
@@ -626,7 +626,7 @@ path_on_backing_volume(NSString *path)
 }
 
 /*
- * Registers a pre-installed system application (such as RedwoodInstaller.app) into LaunchServices.
+ * Registers a pre-installed system application (such as AnnibaleInstaller.app) into LaunchServices.
  * Creates an AppData container if necessary and sets ApplicationType = System.
  */
 static int
@@ -692,7 +692,7 @@ register_system_app(NSString *appPath)
 		@"SignerOrganization": @"Apple Inc.",
 		@"SignatureVersion": @132352,
 		@"SignerIdentity": @"Apple iPhone OS Application Signing",
-		@"CFBundleName": info[@"CFBundleName"] ?: @"RedwoodInstaller",
+		@"CFBundleName": info[@"CFBundleName"] ?: @"AnnibaleInstaller",
 		@"CFBundleDisplayName": info[@"CFBundleDisplayName"] ?: @"IPA 管理器",
 		@"CFBundlePackageType": info[@"CFBundlePackageType"] ?: @"APPL",
 		@"CFBundleShortVersionString": info[@"CFBundleShortVersionString"] ?: @"1.0",
@@ -738,7 +738,7 @@ register_system_app(NSString *appPath)
 	printf("appinst: %s registered as system app at %s (data in %s)\n", identifier.UTF8String, app.UTF8String, home.UTF8String);
 	notify_post("com.apple.LaunchServices.ApplicationsChanged");
 	notify_post("com.apple.LaunchServices.applicationRegistered");
-	notify_post("com.redwood.var_save");
+	notify_post("com.annibale.var_save");
 	return 0;
 }
 
@@ -792,8 +792,8 @@ watch(void)
 	[fm createDirectoryAtPath:INBOX withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0777 } error:nil];
 	[fm createDirectoryAtPath:LEGACY_INBOX withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0777 } error:nil];
 
-	/* Ensure RedwoodInstaller.app is registered in LaunchServices so it appears on home screen even with existing darwin_var */
-	register_system_app(@"/redwood/Applications/RedwoodInstaller.app");
+	/* Ensure AnnibaleInstaller.app is registered in LaunchServices so it appears on home screen even with existing darwin_var */
+	register_system_app(@"/annibale/Applications/AnnibaleInstaller.app");
 
 	for (;;) {
 		@autoreleasepool {
@@ -895,9 +895,9 @@ remove_app(NSString *identifier)
 	}
 
 	notify_post("com.apple.LaunchServices.ApplicationsChanged");
-	notify_post("com.redwood.var_save");
+	notify_post("com.annibale.var_save");
 	if (found) {
-		printf("appinst: %s removed (posted com.redwood.var_save)\n", identifier.UTF8String);
+		printf("appinst: %s removed (posted com.annibale.var_save)\n", identifier.UTF8String);
 		return 0;
 	} else {
 		fprintf(stderr, "appinst: %s was not found in bundle containers (cleaned any data containers)\n", identifier.UTF8String);
@@ -908,10 +908,10 @@ remove_app(NSString *identifier)
 static BOOL
 is_test_app_identifier(NSString *identifier)
 {
-	if ([identifier isEqualToString:@"com.redwood.installer"]) {
+	if ([identifier isEqualToString:@"com.annibale.installer"]) {
 		return NO;
 	}
-	if ([identifier isEqualToString:@"com.redwood.hello"] ||
+	if ([identifier isEqualToString:@"com.annibale.hello"] ||
 	    [identifier hasPrefix:@"com.example."] ||
 	    [identifier hasPrefix:@"com.test."] ||
 	    [identifier hasPrefix:@"com.nssurge."] ||
@@ -994,11 +994,11 @@ clean_test_apps(void)
 		}
 	}
 
-	/* 4. Ensure RedwoodInstaller is registered cleanly with LaunchServices */
-	register_system_app(@"/redwood/Applications/RedwoodInstaller.app");
+	/* 4. Ensure AnnibaleInstaller is registered cleanly with LaunchServices */
+	register_system_app(@"/annibale/Applications/AnnibaleInstaller.app");
 
 	notify_post("com.apple.LaunchServices.ApplicationsChanged");
-	notify_post("com.redwood.var_save");
+	notify_post("com.annibale.var_save");
 
 	printf("appinst: cleaned %d test app(s) and cleared LaunchServices/Icons caches\n", cleaned_count);
 	return 0;
@@ -1053,7 +1053,7 @@ main(int argc, char **argv)
 			return watch();
 		}
 		if ((argc == 2 || argc == 3) && (strcmp(argv[1], "register-system") == 0 || strcmp(argv[1], "register") == 0)) {
-			NSString *target = (argc == 3) ? @(argv[2]) : @"/redwood/Applications/RedwoodInstaller.app";
+			NSString *target = (argc == 3) ? @(argv[2]) : @"/annibale/Applications/AnnibaleInstaller.app";
 			return register_system_app(target);
 		}
 		fprintf(stderr, "usage: appinst install FILE.ipa|DIR.app | remove BUNDLE-ID | list | open BUNDLE-ID | url URL | clean | watch | register-system [APP_PATH]\n");

@@ -33,7 +33,7 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
     id<MTLDevice> before = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "sbmetal26: default_before=%s\n", before ? object_getClassName(before) : "nil");
     if (before) { [before release]; fail("default device already registered"); return nil; }
-    if (objc_getClass("RedwoodMetalDevice")) { fail("candidate class already loaded"); return nil; }
+    if (objc_getClass("AnnibaleMetalDevice")) { fail("candidate class already loaded"); return nil; }
 
     stage("resolve MTLAddDevice");
     void (*add_device)(id) = dlsym(RTLD_DEFAULT, "MTLAddDevice");
@@ -46,7 +46,7 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
 
     stage("load candidate");
     if (!dlopen(path, RTLD_NOW | RTLD_LOCAL)) { fail(dlerror()); return nil; }
-    Class cls = objc_getClass("RedwoodMetalDevice");
+    Class cls = objc_getClass("AnnibaleMetalDevice");
     if (!cls || !method_matches(cls, NO, "initWithAcceleratorPort:", "@20@0:8I16")) {
         fail("candidate initializer mismatch"); return nil;
     }
@@ -67,7 +67,7 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
         fail("candidate does not conform to MTLDevice and MTLDeviceSPI"); return nil;
     }
     SEL mesa_selector = sel_registerName("mesaDevice");
-    void *backend = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW | RTLD_NOLOAD);
+    void *backend = dlopen("/annibale/lib/libannibaleair.dylib", RTLD_NOW | RTLD_NOLOAD);
     const char *(*backend_name)(void *) = backend ? dlsym(backend, "rwa_device_name") : NULL;
     void *mesa = [device respondsToSelector:mesa_selector] ?
         ((void *(*)(id, SEL))objc_msgSend)(device, mesa_selector) : NULL;
@@ -98,7 +98,7 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
 static void attempt_registration(const char *bundle_want)
 {
     if (!prepare_uncompressed_policy(bundle_want)) return;
-    held_device=register_device("/redwood/lib/libredwoodmetal.dylib",NO);
+    held_device=register_device("/annibale/lib/libannibalemetal.dylib",NO);
     fprintf(stderr,"sbmetal26: registration completed device=%d\n",held_device!=nil);
 }
 static void registration_exception(NSException *e)
@@ -235,7 +235,7 @@ __attribute__((constructor)) static void install(void)
     @autoreleasepool {
         NSDictionary *version=[NSDictionary dictionaryWithContentsOfFile:@"/System/Library/CoreServices/SystemVersion.plist"];
         id build=version[@"ProductBuildVersion"];
-        run_sequence(getprogname(),[build isKindOfClass:[NSString class]]?[build UTF8String]:NULL,getenv("REDWOOD_SB_METAL"));
+        run_sequence(getprogname(),[build isKindOfClass:[NSString class]]?[build UTF8String]:NULL,getenv("ANNIBALE_SB_METAL"));
         /* On the main queue as inject_sb.c does it: past UIApplication startup, so the observers
          * are added to the run loop that is about to serve frames rather than to a startup one. */
         dispatch_async(dispatch_get_main_queue(), ^{ tl_watch_main_loop(); });

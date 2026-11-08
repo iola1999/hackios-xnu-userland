@@ -8,7 +8,7 @@ static Class diagnostic_device_class(Class base)
     if (!base || !method_matches(base, NO, "featureProfile", "Q16@0:8")) {
         fail("diagnostic featureProfile encoding mismatch"); return Nil;
     }
-    const char *name = "RedwoodMetalDeviceSBMPSDiagnostic";
+    const char *name = "AnnibaleMetalDeviceSBMPSDiagnostic";
     if (objc_getClass(name)) { fail("diagnostic class already registered"); return Nil; }
     Class diagnostic = objc_allocateClassPair(base, name, 0);
     if (!diagnostic) { fail("diagnostic class allocation failed"); return Nil; }

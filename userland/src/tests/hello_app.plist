@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.redwood.hellok90</string>
+	<string>com.annibale.hellok90</string>
 	<key>CFBundleExecutable</key>
 	<string>HelloK90</string>
 	<key>CFBundleName</key>

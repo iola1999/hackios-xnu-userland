@@ -1,4 +1,4 @@
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/.gitlab-ci/build/gitlab-ci.yml mesa-26.2.5/.gitlab-ci/build/gitlab-ci.yml
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/.gitlab-ci/build/gitlab-ci.yml mesa-26.2.5/.gitlab-ci/build/gitlab-ci.yml
 --- a/.gitlab-ci/build/gitlab-ci.yml	2026-10-14 23:12:24
 +++ b/.gitlab-ci/build/gitlab-ci.yml	2026-10-23 14:08:44
 @@ -199,6 +199,7 @@
@@ -41,7 +41,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
      GALLIUM_ST: >
        -D gallium-va=disabled
        -D gallium-rusticl=false
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/bin/gen_vs_module_defs.py mesa-26.2.5/bin/gen_vs_module_defs.py
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/bin/gen_vs_module_defs.py mesa-26.2.5/bin/gen_vs_module_defs.py
 --- a/bin/gen_vs_module_defs.py	2026-10-14 23:12:24
 +++ b/bin/gen_vs_module_defs.py	2026-10-23 14:08:44
 @@ -74,6 +74,9 @@
@@ -54,7 +54,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
  python ./bin/gen_vs_module_defs.py --in_file src/gallium/targets/wgl/gallium_wgl.def.in --out_file src/gallium/targets/wgl/gallium_wgl.def --compiler_abi gcc --cpu_family x86_64
  python ./bin/gen_vs_module_defs.py --in_file src/gallium/targets/wgl/gallium_wgl.def.in --out_file src/gallium/targets/wgl/gallium_wgl.mingw.def --compiler_abi gcc --cpu_family x86
  
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/bin/khronos-update.py mesa-26.2.5/bin/khronos-update.py
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/bin/khronos-update.py mesa-26.2.5/bin/khronos-update.py
 --- a/bin/khronos-update.py	2026-10-14 23:12:24
 +++ b/bin/khronos-update.py	2026-10-23 14:08:44
 @@ -124,6 +124,7 @@
@@ -65,7 +65,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
          ],
      },
  
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/docs/faq.rst mesa-26.2.5/docs/faq.rst
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/docs/faq.rst mesa-26.2.5/docs/faq.rst
 --- a/docs/faq.rst	2026-10-14 23:12:24
 +++ b/docs/faq.rst	2026-10-23 14:08:44
 @@ -57,6 +57,8 @@
@@ -77,7 +77,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
  ``/usr/lib/libGL.so``
     a symlink to ``libGL.so.1``
  ``/usr/lib/libGL.so.1``
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/docs/install.rst mesa-26.2.5/docs/install.rst
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/docs/install.rst mesa-26.2.5/docs/install.rst
 --- a/docs/install.rst	2026-10-14 23:12:24
 +++ b/docs/install.rst	2026-10-23 14:08:44
 @@ -218,8 +218,12 @@
@@ -94,7 +94,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
  
  If you built the DRI hardware drivers, you'll also see the DRI drivers:
  
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/docs/macos.rst mesa-26.2.5/docs/macos.rst
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/docs/macos.rst mesa-26.2.5/docs/macos.rst
 --- a/docs/macos.rst	2026-10-14 23:12:24
 +++ b/docs/macos.rst	2026-10-23 14:08:44
 @@ -15,4 +15,7 @@
@@ -105,7 +105,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +``-Dosmesa=true -Dglx=xlib``.
 +
  Mesa's Gallium drivers can be used on macOS by using the ``-Dgallium-drivers=<drivers>`` build option. Do not use with the previous software rasterizers options, instead add ``llvmpipe`` to the ``<drivers>`` list. Only software renderers and drivers that forward to other APIs can work, any linux hardware drivers will not work. For details on each driver's macOS support see their specific documentation.
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/include/GL/osmesa.h mesa-26.2.5/include/GL/osmesa.h
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/include/GL/osmesa.h mesa-26.2.5/include/GL/osmesa.h
 --- a/include/GL/osmesa.h	1970-01-01 08:00:00
 +++ b/include/GL/osmesa.h	2026-10-23 14:10:59
 @@ -0,0 +1,333 @@
@@ -442,7 +442,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +
 +
 +#endif
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/include/meson.build mesa-26.2.5/include/meson.build
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/include/meson.build mesa-26.2.5/include/meson.build
 --- a/include/meson.build	2026-10-14 23:12:24
 +++ b/include/meson.build	2026-10-23 14:08:44
 @@ -78,6 +78,10 @@
@@ -456,7 +456,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
  if with_dri
    install_headers('GL/internal/dri_interface.h', subdir : 'GL/internal')
  endif
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/meson.build mesa-26.2.5/meson.build
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/meson.build mesa-26.2.5/meson.build
 --- a/meson.build	2026-10-23 14:36:12
 +++ b/meson.build	2026-10-23 14:10:59
 @@ -108,6 +108,7 @@
@@ -493,7 +493,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
    gallium_summary += {'HUD lm-sensors': dep_lmsensors.found()}
    gallium_summary += {'GFX/Compute': with_gfx_compute}
  endif
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/meson.options mesa-26.2.5/meson.options
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/meson.options mesa-26.2.5/meson.options
 --- a/meson.options	2026-10-14 23:12:24
 +++ b/meson.options	2026-10-23 14:09:36
 @@ -333,6 +333,13 @@
@@ -510,14 +510,14 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
    'gles1',
    type : 'feature',
    deprecated: {'true': 'enabled', 'false': 'disabled'},
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc mesa-26.2.5/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc mesa-26.2.5/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
 --- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc	2026-10-23 14:36:12
 +++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc	2026-10-23 14:12:27
 @@ -488,6 +488,27 @@
         DRAW == DRAW_INDIRECT_OP_INDIRECT_COUNT)
        ctx->batch->barrier |= FD6_WAIT_FOR_ME;
  
-+   /* Darwin on redwood: a draw that reads the framebuffer reads it through
++   /* Darwin on annibale: a draw that reads the framebuffer reads it through
 +    * UCHE.  Among primitives drawn with FLUSH_PER_OVERLAP the hardware sees
 +    * to it that they read what the ones before them wrote, but it knows
 +    * nothing of what was drawn before that mode was on: the first triangle
@@ -541,7 +541,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
     fd6_barrier_flush<CHIP>(cs, ctx->batch);
  
     if (is_indirect(DRAW)) {
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/drivers/freedreno/meson.build mesa-26.2.5/src/gallium/drivers/freedreno/meson.build
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/drivers/freedreno/meson.build mesa-26.2.5/src/gallium/drivers/freedreno/meson.build
 --- a/src/gallium/drivers/freedreno/meson.build	2026-10-23 14:36:12
 +++ b/src/gallium/drivers/freedreno/meson.build	2026-10-23 14:21:51
 @@ -301,7 +301,7 @@
@@ -554,15 +554,15 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
                           include_directories('../../drivers')],
    dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_freedreno,
 @@ -328,7 +328,7 @@
- libredwoodair = shared_library(
-   'redwoodair',
+ libannibaleair = shared_library(
+   'annibaleair',
    files('../../../compiler/air/air_metal.c'),
 -  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
 +  include_directories : [inc_include, inc_src, include_directories('../../../mesa/glapi'), inc_mesa, inc_gallium,
                           inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
                           include_directories('../../drivers')],
    dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_freedreno,
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/frontends/osmesa/meson.build mesa-26.2.5/src/gallium/frontends/osmesa/meson.build
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/frontends/osmesa/meson.build mesa-26.2.5/src/gallium/frontends/osmesa/meson.build
 --- a/src/gallium/frontends/osmesa/meson.build	1970-01-01 08:00:00
 +++ b/src/gallium/frontends/osmesa/meson.build	2026-10-23 14:21:47
 @@ -0,0 +1,19 @@
@@ -585,7 +585,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +  ],
 +  dependencies : [idep_mesautil],
 +)
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/frontends/osmesa/osmesa.c mesa-26.2.5/src/gallium/frontends/osmesa/osmesa.c
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/frontends/osmesa/osmesa.c mesa-26.2.5/src/gallium/frontends/osmesa/osmesa.c
 --- a/src/gallium/frontends/osmesa/osmesa.c	1970-01-01 08:00:00
 +++ b/src/gallium/frontends/osmesa/osmesa.c	2026-10-23 14:24:37
 @@ -0,0 +1,999 @@
@@ -717,7 +717,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +   GLboolean y_up;        /*< TRUE  -> Y increases upward */
 +                          /*< FALSE -> Y increases downward */
 +
-+   /* Darwin on redwood: upstream's postprocess stage (filters.h, pp_queue_t) is gone in 26.x;
++   /* Darwin on annibale: upstream's postprocess stage (filters.h, pp_queue_t) is gone in 26.x;
 +    * OSMesaPostprocess() below stays a no-op: this port never used a filter. */
 +};
 +
@@ -745,7 +745,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +
 +/*
 + * There is no EGL here. What glEGLImageTargetTexture2DOES is given as an image is the ID of an
-+ * IOSurface, whose memory becomes the texture's where the driver can do that (Darwin on redwood).
++ * IOSurface, whose memory becomes the texture's where the driver can do that (Darwin on annibale).
 + */
 +static bool
 +osmesa_st_get_egl_image(struct pipe_frontend_screen *fscreen, void *image,
@@ -1580,7 +1580,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +OSMesaPostprocess(OSMesaContext osmesa, const char *filter,
 +                  unsigned enable_value)
 +{
-+   /* Darwin on redwood: upstream's postprocess filters are gone in 26.x; the entry stays so
++   /* Darwin on annibale: upstream's postprocess filters are gone in 26.x; the entry stays so
 +    * anything linked against this library still resolves it. Nothing to record: no filter
 +    * can be enabled any more. */
 +   (void) osmesa;
@@ -1588,7 +1588,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +   (void) enable_value;
 +
 +}
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/meson.build mesa-26.2.5/src/gallium/meson.build
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/meson.build mesa-26.2.5/src/gallium/meson.build
 --- a/src/gallium/meson.build	2026-10-14 23:12:24
 +++ b/src/gallium/meson.build	2026-10-23 14:09:36
 @@ -232,6 +232,10 @@
@@ -1602,7 +1602,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
  if with_platform_haiku
    subdir('frontends/hgl')
  endif
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/meson.build mesa-26.2.5/src/gallium/targets/osmesa/meson.build
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/meson.build mesa-26.2.5/src/gallium/targets/osmesa/meson.build
 --- a/src/gallium/targets/osmesa/meson.build	1970-01-01 08:00:00
 +++ b/src/gallium/targets/osmesa/meson.build	2026-10-23 14:35:03
 @@ -0,0 +1,84 @@
@@ -1638,7 +1638,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +    inc_gallium_drivers,
 +  ],
 +  link_depends : osmesa_link_deps,
-+  # Darwin on redwood: with shared-glapi the gl* entry stubs live in the glapi bridge,
++  # Darwin on annibale: with shared-glapi the gl* entry stubs live in the glapi bridge,
 +  # which nothing else in this link pulls in. On Linux the version script reaches them
 +  # through libglapi; on macOS there is no version script, so force-load the bridge or
 +  # the library ends up exporting only the OSMesa* functions and no gl* at all.
@@ -1690,7 +1690,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +    protocol : 'gtest',
 +  )
 +endif
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa-symbols.txt mesa-26.2.5/src/gallium/targets/osmesa/osmesa-symbols.txt
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa-symbols.txt mesa-26.2.5/src/gallium/targets/osmesa/osmesa-symbols.txt
 --- a/src/gallium/targets/osmesa/osmesa-symbols.txt	1970-01-01 08:00:00
 +++ b/src/gallium/targets/osmesa/osmesa-symbols.txt	2026-10-23 14:09:00
 @@ -0,0 +1,1310 @@
@@ -3004,7 +3004,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +glWindowPos3sARB
 +glWindowPos3sv
 +glWindowPos3svARB
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa.def.in mesa-26.2.5/src/gallium/targets/osmesa/osmesa.def.in
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa.def.in mesa-26.2.5/src/gallium/targets/osmesa/osmesa.def.in
 --- a/src/gallium/targets/osmesa/osmesa.def.in	1970-01-01 08:00:00
 +++ b/src/gallium/targets/osmesa/osmesa.def.in	2026-10-23 14:09:00
 @@ -0,0 +1,353 @@
@@ -3361,7 +3361,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +glVertex4sv@4
 +glVertexPointer@16
 +glViewport@16
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa.sym mesa-26.2.5/src/gallium/targets/osmesa/osmesa.sym
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa.sym mesa-26.2.5/src/gallium/targets/osmesa/osmesa.sym
 --- a/src/gallium/targets/osmesa/osmesa.sym	1970-01-01 08:00:00
 +++ b/src/gallium/targets/osmesa/osmesa.sym	2026-10-23 14:09:00
 @@ -0,0 +1,19 @@
@@ -3384,7 +3384,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +	local:
 +		*;
 +};
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa_target.c mesa-26.2.5/src/gallium/targets/osmesa/osmesa_target.c
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/osmesa_target.c mesa-26.2.5/src/gallium/targets/osmesa/osmesa_target.c
 --- a/src/gallium/targets/osmesa/osmesa_target.c	1970-01-01 08:00:00
 +++ b/src/gallium/targets/osmesa/osmesa_target.c	2026-10-23 14:22:17
 @@ -0,0 +1,147 @@
@@ -3432,7 +3432,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +#include "freedreno/driinfo_freedreno.h"
 +};
 +
-+/* The GPU's driver, where the kernel has a GPU to drive (Darwin on redwood); NULL: none. */
++/* The GPU's driver, where the kernel has a GPU to drive (Darwin on annibale); NULL: none. */
 +static struct pipe_screen *
 +osmesa_create_gpu_screen(void)
 +{
@@ -3466,7 +3466,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface);
 +
 +/*
-+ * The memory of an IOSurface as a texture, to draw into and to draw with (Darwin on redwood):
++ * The memory of an IOSurface as a texture, to draw into and to draw with (Darwin on annibale):
 + * the kernel's GPU driver makes a buffer of the surface. NULL: the screen is not the GPU's, or
 + * the surface is not one plane of 32-bit pixels, blue first, in rows the GPU can address.
 + */
@@ -3474,7 +3474,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +osmesa_surface_resource(struct pipe_screen *screen, uint32_t surface)
 +{
 +#ifdef GALLIUM_FREEDRENO
-+   struct redwood_drm_surface s = { .surface = surface };
++   struct annibale_drm_surface s = { .surface = surface };
 +   struct pipe_resource templ = {
 +      .target = PIPE_TEXTURE_2D,
 +      .format = PIPE_FORMAT_B8G8R8A8_UNORM,
@@ -3484,11 +3484,11 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +   };
 +   struct winsys_handle handle = { .type = WINSYS_HANDLE_TYPE_FD };
 +
-+   if (gpu_fd < 0 || redwood_drm_surface(gpu_fd, &s) != 0)
++   if (gpu_fd < 0 || annibale_drm_surface(gpu_fd, &s) != 0)
 +      return NULL;
 +   if (s.pixel_format != 0x42475241 /* 'BGRA' */ || s.planes != 0)
 +      return NULL;
-+   /* (the surface comes in as Linux's buffers come in by file descriptor: see redwood-drm) */
++   /* (the surface comes in as Linux's buffers come in by file descriptor: see annibale-drm) */
 +   templ.width0 = s.width;
 +   templ.height0 = s.height;
 +   handle.handle = surface;
@@ -3535,7 +3535,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +   /* Inject optional trace, debug, etc. wrappers */
 +   return debug_screen_wrap(screen);
 +}
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/test-render.cpp mesa-26.2.5/src/gallium/targets/osmesa/test-render.cpp
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/targets/osmesa/test-render.cpp mesa-26.2.5/src/gallium/targets/osmesa/test-render.cpp
 --- a/src/gallium/targets/osmesa/test-render.cpp	1970-01-01 08:00:00
 +++ b/src/gallium/targets/osmesa/test-render.cpp	2026-10-23 14:09:00
 @@ -0,0 +1,310 @@
@@ -3849,7 +3849,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
 +      EXPECT_EQ(draw2[i], be_bswap32(0x0000ff00));
 +   EXPECT_EQ(draw1[0], be_bswap32(0x000000ff));
 +}
-diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci ref-26.2.5/mesa-26.2.5/src/util/meson.build mesa-26.2.5/src/util/meson.build
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/util/meson.build mesa-26.2.5/src/util/meson.build
 --- a/src/util/meson.build	2026-10-14 23:12:24
 +++ b/src/util/meson.build	2026-10-23 14:20:33
 @@ -314,7 +314,9 @@
@@ -3857,7 +3857,7 @@ diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x redwood-drm -x ci
  ]
  
 -if dep_libdrm.found()
-+# Darwin on redwood: the freedreno stand-in for libdrm (src/redwood-drm) has no syncobj, and
++# Darwin on annibale: the freedreno stand-in for libdrm (src/annibale-drm) has no syncobj, and
 +# nothing in the gallium path asks for the DRM sync provider -- only turnip's virtio KMD does.
 +if dep_libdrm.found() and host_machine.system() != 'darwin'
    files_mesa_util += files('u_sync_provider.c', 'u_sync_provider.h')

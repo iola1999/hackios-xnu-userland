@@ -1,5 +1,5 @@
 /* iOS 26 input service. launchd owns restart after HID reset or transport failure.
- * Run one instance per system: /dev/redwood-touch has one shared input queue. */
+ * Run one instance per system: /dev/annibale-touch has one shared input queue. */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <errno.h>
@@ -17,7 +17,7 @@
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
-#include "redwood_input.h"
+#include "annibale_input.h"
 
 static void say(const char *format, ...)
 {
@@ -29,7 +29,7 @@ static void say(const char *format, ...)
     if (n > 0) write(STDERR_FILENO, line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1);
 }
 
-_Static_assert(sizeof(struct redwood_touch) == 24, "redwood touch record size");
+_Static_assert(sizeof(struct annibale_touch) == 24, "annibale touch record size");
 /* HID APIs and callback layout checked against the local 23G90 IOKit cache. */
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
@@ -95,9 +95,9 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 #define FIELD_ALS_ILLUMINANCE           0xc000a
 #define PROXIMITY_MASK_NEAR             0x41
 
-#define REDWOOD_SENSORS_DEVICE          "/dev/redwood-sensors"
+#define ANNIBALE_SENSORS_DEVICE          "/dev/annibale-sensors"
 
-struct redwood_sensor_sample {
+struct annibale_sensor_sample {
 	uint64_t timestamp;
 	uint32_t als_lux;
 	uint32_t clear_raw;
@@ -108,7 +108,7 @@ struct redwood_sensor_sample {
 	uint8_t  source_flags;
 };
 
-_Static_assert(sizeof(struct redwood_sensor_sample) == 32, "redwood sensor sample size");
+_Static_assert(sizeof(struct annibale_sensor_sample) == 32, "annibale sensor sample size");
 
 #define MAX_FINGERS     10
 
@@ -273,7 +273,7 @@ make_service_ext(IOHIDEventSystemClientRef client, const char *product, int page
 	CFDictionarySetValue(properties, CFSTR("DeviceUsagePairs"), pairs);
 	CFDictionarySetValue(properties, CFSTR("Built-In"), kCFBooleanTrue);
 	CFDictionarySetValue(properties, CFSTR("Transport"), CFSTR("SPI"));
-	CFDictionarySetValue(properties, CFSTR("Manufacturer"), CFSTR("redwood"));
+	CFDictionarySetValue(properties, CFSTR("Manufacturer"), CFSTR("annibale"));
 	CFDictionarySetValue(properties, CFSTR("Product"), name);
 	CFDictionarySetValue(properties, CFSTR("VendorID"), zero);
 	CFDictionarySetValue(properties, CFSTR("ProductID"), zero);
@@ -375,7 +375,7 @@ dispatch_input_event(IOHIDServiceClientRef service, IOHIDEventRef event, struct 
 
 /* One frame of the touch screen: the hand, and under it every finger that is down or has just lifted. */
 static void
-send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t, uint64_t read_at)
+send_touch(IOHIDServiceClientRef screen, const struct annibale_touch *t, uint64_t read_at)
 {
 	uint32_t type = t->type;
 	unsigned f = t->finger;
@@ -384,13 +384,13 @@ send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t, uint64_t
 		return;
 	}
 	if (!fingers[f].touching) {
-		if (type == REDWOOD_TOUCH_MOVE) {
-			type = REDWOOD_TOUCH_DOWN;
-		} else if (type != REDWOOD_TOUCH_DOWN) {
+		if (type == ANNIBALE_TOUCH_MOVE) {
+			type = ANNIBALE_TOUCH_DOWN;
+		} else if (type != ANNIBALE_TOUCH_DOWN) {
 			return;
 		}
 	}
-	uint32_t change = type == REDWOOD_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
+	uint32_t change = type == ANNIBALE_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
 	IOHIDEventRef hand, finger;
 	bool any = false;
     struct touch_timing timing, *sample = NULL;
@@ -400,10 +400,10 @@ send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t, uint64_t
         sample = &timing;
         touch_cpu_snapshot(&sample->cpu[0]);
     }
-	fingers[f].touching = type != REDWOOD_TOUCH_UP;
+	fingers[f].touching = type != ANNIBALE_TOUCH_UP;
 	fingers[f].x = t->x / 65535.0;
 	fingers[f].y = t->y / 65535.0;
-	if (type == REDWOOD_TOUCH_DOWN) {
+	if (type == ANNIBALE_TOUCH_DOWN) {
 		fingers[f].edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE || fingers[f].y < EDGE_TOP ||
 		    fingers[f].y > 1 - EDGE_BOTTOM;
 	}
@@ -460,17 +460,17 @@ send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t, uint64_t
 }
 
 static void
-send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
+send_button(IOHIDServiceClientRef buttons, const struct annibale_touch *t)
 {
-	uint32_t usage = t->finger == REDWOOD_BUTTON_LOCK ? HID_USAGE_POWER : t->finger == REDWOOD_BUTTON_HOME ? HID_USAGE_MENU :
-	    t->finger == REDWOOD_BUTTON_VOLUME_UP ? HID_USAGE_VOLUME_UP : t->finger == REDWOOD_BUTTON_VOLUME_DOWN ?
+	uint32_t usage = t->finger == ANNIBALE_BUTTON_LOCK ? HID_USAGE_POWER : t->finger == ANNIBALE_BUTTON_HOME ? HID_USAGE_MENU :
+	    t->finger == ANNIBALE_BUTTON_VOLUME_UP ? HID_USAGE_VOLUME_UP : t->finger == ANNIBALE_BUTTON_VOLUME_DOWN ?
 	    HID_USAGE_VOLUME_DOWN : 0;
 	IOHIDEventRef event;
 
 	if (usage == 0) {
 		return;
 	}
-	event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_CONSUMER, usage, t->type == REDWOOD_BUTTON_DOWN, 0);
+	event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_CONSUMER, usage, t->type == ANNIBALE_BUTTON_DOWN, 0);
 	if (!event) _exit(1);
 	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
 	dispatch_input_event(buttons, event, NULL);
@@ -495,11 +495,11 @@ start_sensors_poller(dispatch_queue_t queue, IOHIDServiceClientRef als_service, 
 	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
 	    250 * NSEC_PER_MSEC, 25 * NSEC_PER_MSEC);
 	dispatch_source_set_event_handler(timer, ^{
-		struct redwood_sensor_sample sample = { 0 };
+		struct annibale_sensor_sample sample = { 0 };
 		bool have_sample = false;
 
 		if (sensors_fd < 0) {
-			sensors_fd = open(REDWOOD_SENSORS_DEVICE, O_RDONLY | O_NONBLOCK);
+			sensors_fd = open(ANNIBALE_SENSORS_DEVICE, O_RDONLY | O_NONBLOCK);
 		}
 		if (sensors_fd >= 0) {
 			ssize_t n = pread(sensors_fd, &sample, sizeof(sample), 0);
@@ -510,14 +510,14 @@ start_sensors_poller(dispatch_queue_t queue, IOHIDServiceClientRef als_service, 
 		if (!have_sample) {
 			int lux_val = 150, prox_val = 0;
 			size_t sz = sizeof(int);
-			if (sysctlbyname("kern.redwood.als_lux", &lux_val, &sz, NULL, 0) == 0 && lux_val >= 0) {
+			if (sysctlbyname("kern.annibale.als_lux", &lux_val, &sz, NULL, 0) == 0 && lux_val >= 0) {
 				sample.als_lux = (uint32_t)lux_val;
 				sample.clear_raw = sample.als_lux * 4;
 				sample.ir_raw = sample.als_lux;
 				have_sample = true;
 			}
 			sz = sizeof(int);
-			if (sysctlbyname("kern.redwood.prox_near", &prox_val, &sz, NULL, 0) == 0) {
+			if (sysctlbyname("kern.annibale.prox_near", &prox_val, &sz, NULL, 0) == 0) {
 				sample.prox_near = prox_val ? 1 : 0;
 				have_sample = true;
 			}
@@ -566,11 +566,11 @@ input_run(void)
 {
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL, als_service = NULL, prox_service = NULL;
-	struct redwood_touch t;
+	struct annibale_touch t;
 	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
 	int device;
 
-	pthread_setname_np("redwood input");
+	pthread_setname_np("annibale input");
     int qos_set = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     qos_class_t thread_qos = QOS_CLASS_UNSPECIFIED;
     int thread_relative = 0;
@@ -599,20 +599,20 @@ input_run(void)
         say("input26: cannot create HID client\n");
         return 1;
     }
-    dispatch_queue_t queue = dispatch_queue_create("redwood.input", NULL);
+    dispatch_queue_t queue = dispatch_queue_create("annibale.input", NULL);
     if (!queue) return 1;
     IOHIDEventSystemClientScheduleWithDispatchQueue(client, queue);
-    screen = make_service(client, "Redwood touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
+    screen = make_service(client, "Annibale touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
     if (!screen) return 1;
-    buttons = make_service(client, "Redwood buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
+    buttons = make_service(client, "Annibale buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
     if (!buttons) return 1;
-    als_service = make_service_ext(client, "Redwood ambient light sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_ALS, true, false);
-    prox_service = make_service_ext(client, "Redwood proximity sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_PROXIMITY, false, false);
+    als_service = make_service_ext(client, "Annibale ambient light sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_ALS, true, false);
+    prox_service = make_service_ext(client, "Annibale proximity sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_PROXIMITY, false, false);
     start_sensors_poller(queue, als_service, prox_service);
-    say("input26: services registered (als=%p prox=%p); reading %s\n", (void *)als_service, (void *)prox_service, REDWOOD_TOUCH_DEVICE);
-    device = open(REDWOOD_TOUCH_DEVICE, O_RDONLY);
+    say("input26: services registered (als=%p prox=%p); reading %s\n", (void *)als_service, (void *)prox_service, ANNIBALE_TOUCH_DEVICE);
+    device = open(ANNIBALE_TOUCH_DEVICE, O_RDONLY);
     if (device < 0) {
-        say("input26: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
+        say("input26: %s: %s\n", ANNIBALE_TOUCH_DEVICE, strerror(errno));
         return 1;
     }
 
@@ -628,23 +628,23 @@ input_run(void)
 		uint64_t read_at = mach_absolute_time();
 
 		if (count++ < 4) {
-			say("redwood: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
+			say("annibale: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
 		}
-		if (t.type > REDWOOD_TOUCH_UP) {
+		if (t.type > ANNIBALE_TOUCH_UP) {
 			send_button(buttons, &t);
-		} else if (t.type == REDWOOD_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE) {
+		} else if (t.type == ANNIBALE_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE) {
 			/*
 			 * The display is off and a tap is to wake it. The lock button is what wakes it here:
 			 * press it for the finger, and keep the rest of this touch to ourselves.
 			 */
-			struct redwood_touch press = { .time = t.time, .type = REDWOOD_BUTTON_DOWN, .finger = REDWOOD_BUTTON_LOCK };
+			struct annibale_touch press = { .time = t.time, .type = ANNIBALE_BUTTON_DOWN, .finger = ANNIBALE_BUTTON_LOCK };
 
 			send_button(buttons, &press);
-			press.type = REDWOOD_BUTTON_UP;
+			press.type = ANNIBALE_BUTTON_UP;
 			send_button(buttons, &press);
 			waking |= 1u << (t.finger & 31);
 		} else if (waking & (1u << (t.finger & 31))) {
-			if (t.type == REDWOOD_TOUCH_UP) {
+			if (t.type == ANNIBALE_TOUCH_UP) {
 				waking &= ~(1u << (t.finger & 31));
 			}
 		} else {
@@ -660,6 +660,6 @@ _Static_assert(offsetof(struct virtual_service_callbacks, copyMatchingEvent) == 
 
 int main(void)
 {
-    say("input26: standalone pid=%d device=%s callbacks=2\n", getpid(), REDWOOD_TOUCH_DEVICE);
+    say("input26: standalone pid=%d device=%s callbacks=2\n", getpid(), ANNIBALE_TOUCH_DEVICE);
     return input_run();
 }

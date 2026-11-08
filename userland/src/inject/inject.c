@@ -1,5 +1,5 @@
 /*
- * libredwood.dylib: code of ours inside stock iOS programs.
+ * libannibale.dylib: code of ours inside stock iOS programs.
  *
  * launchd starts the jobs named in INJECT (see build.sh / mkjobs.py) with
  * DYLD_INSERT_LIBRARIES pointing here; dyld honours that because the kernel's AMFI stand-in
@@ -11,16 +11,10 @@
  *                entries of their virtual tables.
  *                It is also where input enters the system: backboardd is the HID event server,
  *                and without Apple's multitouch driver it has no touch screen. We give it one:
- *                a "virtual" HID service that turns the samples of /dev/redwood-touch into the
+ *                a "virtual" HID service that turns the samples of /dev/annibale-touch into the
  *                events that driver would have sent.
  *
  *                And it does not wait five seconds for an ambient light sensor.
- *
- *   containermanagerd (both of them)
- *                They ask the user manager for the "personas" of the user, of which this
- *                system has none, twenty times a second apart before they give up -- and
- *                everything that needs a container (the window server, for one) waits with
- *                them. Told that personas are not supported, they do not ask.
  *
  * Addresses of things inside the dyld shared cache are those of iOS 16.5 (20F66) for iPhone10,3;
  * every one is checked against what is expected to be there before it is touched.
@@ -48,13 +42,13 @@
 #include <sys/ucontext.h>
 #include <unistd.h>
 
-#include "redwood_gl.h"
-#include "redwood_input.h"
+#include "annibale_gl.h"
+#include "annibale_input.h"
 
 extern const void *_dyld_get_shared_cache_range(size_t *length);
 
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
-#define REDWOOD_GL "/redwood/lib/libredwood-gl.dylib"
+#define ANNIBALE_GL "/annibale/lib/libannibale-gl.dylib"
 
 static uintptr_t slide;
 
@@ -84,13 +78,13 @@ replace_virtual(const char *what, uintptr_t slot, uintptr_t expected, void *repl
 	void *original;
 
 	if (*entry != expected + slide) {
-		say("redwood: %s: found %#lx, expected %#lx; left alone\n", what, *entry - slide, expected);
+		say("annibale: %s: found %#lx, expected %#lx; left alone\n", what, *entry - slide, expected);
 		return NULL;
 	}
 	/* the tables are in read-only memory shared by every process: get a private writable copy of the page */
 	kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 	if (kr != KERN_SUCCESS) {
-		say("redwood: %s: cannot make the table writable (%d)\n", what, kr);
+		say("annibale: %s: cannot make the table writable (%d)\n", what, kr);
 		return NULL;
 	}
 	original = (void *)*entry;
@@ -124,7 +118,7 @@ my_is_ready(void *display)
 	int ready = orig_is_ready(display);
 
 	if (ready != last_ready || calls_ready < 3) {
-		say("redwood: is_ready -> %d (call %u, flags %#llx, b233 %#x)\n", ready, calls_ready,
+		say("annibale: is_ready -> %d (call %u, flags %#llx, b233 %#x)\n", ready, calls_ready,
 		    (unsigned long long)DISPLAY_FLAGS(display), DISPLAY_B233(display));
 		last_ready = ready;
 	}
@@ -140,9 +134,9 @@ my_ignore_update_p(void *display, void *update)
 	if (ignore != last_ignore || calls_ignore < 3) {
 		uint64_t *q = (uint64_t *)((char *)display + 0x220);
 
-		say("redwood: ignore_update_p -> %d (call %u, flags %#llx, update flags %#x)\n", ignore, calls_ignore,
+		say("annibale: ignore_update_p -> %d (call %u, flags %#llx, update flags %#x)\n", ignore, calls_ignore,
 		    (unsigned long long)DISPLAY_FLAGS(display), *(uint32_t *)((char *)update + 0xf0));
-		say("redwood:   display +0x220: %#llx %#llx %#llx %#llx %#llx %#llx\n", (unsigned long long)q[0],
+		say("annibale:   display +0x220: %#llx %#llx %#llx %#llx %#llx %#llx\n", (unsigned long long)q[0],
 		    (unsigned long long)q[1], (unsigned long long)q[2], (unsigned long long)q[3], (unsigned long long)q[4],
 		    (unsigned long long)q[5]);
 		last_ignore = ignore;
@@ -157,7 +151,7 @@ my_begin_update(void *display, void *update)
 	uintptr_t r = orig_begin_update(display, update);
 
 	if (calls_begin++ < 6) {
-		say("redwood: begin_update -> %#lx (flags %#llx)\n", r, (unsigned long long)DISPLAY_FLAGS(display));
+		say("annibale: begin_update -> %#lx (flags %#llx)\n", r, (unsigned long long)DISPLAY_FLAGS(display));
 	}
 	return r;
 }
@@ -168,7 +162,7 @@ my_finish_update(void *display, void *update, unsigned flags)
 	uintptr_t r = orig_finish_update(display, update, flags);
 
 	if (calls_finish++ < 6) {
-		say("redwood: finish_update(%#x) -> %#lx\n", flags, r);
+		say("annibale: finish_update(%#x) -> %#lx\n", flags, r);
 	}
 	return r;
 }
@@ -190,10 +184,10 @@ my_renderer(void *server)
 	renderer = orig_renderer(server);
 	if (renderer == NULL) {
 		failed = 1;
-		say("redwood: no accelerated renderer; the software one will draw\n");
+		say("annibale: no accelerated renderer; the software one will draw\n");
 	} else if (!said) {
 		said = 1;
-		say("redwood: the server has an accelerated renderer (%p)\n", renderer);
+		say("annibale: the server has an accelerated renderer (%p)\n", renderer);
 	}
 	return renderer;
 }
@@ -204,7 +198,7 @@ my_render_update(void *server, void *update, unsigned *flags)
 	uintptr_t r = orig_render_update(server, update, flags);
 
 	if (calls_render++ < 6) {
-		say("redwood: render_update -> %#lx (flags %#x)\n", r, flags ? *flags : 0);
+		say("annibale: render_update -> %#lx (flags %#x)\n", r, flags ? *flags : 0);
 	}
 	return r;
 }
@@ -277,7 +271,7 @@ say_the_fault(int signal_number, siginfo_t *info, void *context_in)
 		used += (size_t)snprintf(frames + used, sizeof(frames) - used, " %#lx", ret - slide);
 		fp = next > fp ? next : 0;      /* the chain only ever goes up the stack */
 	}
-	say("redwood: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n", signal_number,
+	say("annibale: signal %d at %p, pc %#lx, lr %#lx, called from%s (unslid)\n", signal_number,
 	    info != NULL ? info->si_addr : NULL, pc - slide, lr - slide, frames);
 	signal(signal_number, SIG_DFL);
 	raise(signal_number);
@@ -355,18 +349,18 @@ give_the_renderer_a_shader(unsigned function, const char *source)
 	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
 
 	if (*entry != 0) {
-		say("redwood: CoreAnimation's function %u has a shader of its own; left alone\n", function);
+		say("annibale: CoreAnimation's function %u has a shader of its own; left alone\n", function);
 		return;
 	}
 	/* the table is read-only memory shared by every process: a private writable copy of the page */
 	if (vm_protect(mach_task_self(), page, vm_page_size, FALSE,
 	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
-		say("redwood: CoreAnimation's function %u: cannot make the table of shaders writable\n", function);
+		say("annibale: CoreAnimation's function %u: cannot make the table of shaders writable\n", function);
 		return;
 	}
 	*entry = (uintptr_t)source;
 	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
-	say("redwood: CoreAnimation's function %u (\"sb3\") is given a shader of ours\n", function);
+	say("annibale: CoreAnimation's function %u (\"sb3\") is given a shader of ours\n", function);
 }
 
 static uint8_t say_yes[90];
@@ -375,7 +369,7 @@ static int compile_shaders_said;                /* boot-arg glcompile=1: write d
 static void
 functions_said_yes(const char *arguments)
 {
-	static const char names[] = REDWOOD_CA_FUNCTIONS;
+	static const char names[] = ANNIBALE_CA_FUNCTIONS;
 	const char *argument = strstr(arguments, "glno=");
 
 	/* glno=N[,N...]: and the other way about, for seeing what a function of ours stands in for */
@@ -384,7 +378,7 @@ functions_said_yes(const char *arguments)
 
 		if (function < 90) {
 			say_yes[function] = 0;
-			say("redwood: the renderer will not answer that it has CoreAnimation's function %u (\"%.3s\")\n",
+			say("annibale: the renderer will not answer that it has CoreAnimation's function %u (\"%.3s\")\n",
 			    function, names + 4 * function);
 		}
 		argument = *argument == ',' ? argument + 1 : NULL;
@@ -395,7 +389,7 @@ functions_said_yes(const char *arguments)
 
 		if (function < 90) {
 			say_yes[function] = 1;
-			say("redwood: the renderer will answer that it has CoreAnimation's function %u (\"%.3s\")\n",
+			say("annibale: the renderer will answer that it has CoreAnimation's function %u (\"%.3s\")\n",
 			    function, names + 4 * function);
 		}
 		argument = *argument == ',' ? argument + 1 : NULL;
@@ -422,14 +416,14 @@ my_compile_shader(void *context, const char *source)
 	/* that it is called at all is worth one line, because a renderer that compiles nothing here
 	   would mean the text is assembled and compiled somewhere this table does not reach */
 	if (seen++ == 0) {
-		say("redwood: CoreAnimation compiles its shaders through the table (the first of them, %zu characters)\n",
+		say("annibale: CoreAnimation compiles its shaders through the table (the first of them, %zu characters)\n",
 		    source != NULL ? strlen(source) : 0);
 	}
 	if (compile_shaders_said && told < 24) {
 		told++;
-		say("redwood: CoreAnimation compiles a shader, %zu characters:\n", source != NULL ? strlen(source) : 0);
+		say("annibale: CoreAnimation compiles a shader, %zu characters:\n", source != NULL ? strlen(source) : 0);
 		for (size_t at = 0, length = source != NULL ? strlen(source) : 0; at < length; at += 700) {
-			say("redwood:  %.700s\n", source + at);
+			say("annibale:  %.700s\n", source + at);
 		}
 	}
 	return orig_compile_shader(context, source);
@@ -438,7 +432,7 @@ my_compile_shader(void *context, const char *source)
 static int
 my_function_supported(void *context)
 {
-	static const char names[] = REDWOOD_CA_FUNCTIONS;
+	static const char names[] = ANNIBALE_CA_FUNCTIONS;
 	static uint8_t said[256];
 	int supported = orig_function_supported(context);
 	uint8_t function = *(*(uint8_t **)((char *)context + 0x10) + 0x10);
@@ -446,7 +440,7 @@ my_function_supported(void *context)
 	if (!supported && function < 90 && say_yes[function] && gl_loaded) {
 		if (!said[function]) {
 			said[function] = 1;
-			say("redwood: CoreAnimation's function %u (\"%.3s\"): the renderer is made to say it has it\n",
+			say("annibale: CoreAnimation's function %u (\"%.3s\"): the renderer is made to say it has it\n",
 			    function, names + 4 * function);
 		}
 		return 1;
@@ -456,7 +450,7 @@ my_function_supported(void *context)
 	}
 	if (!supported && !said[function]) {
 		said[function] = 1;
-		say("redwood: CoreAnimation's OpenGL ES renderer has no function %u (\"%.3s\"): what needs it is not drawn\n",
+		say("annibale: CoreAnimation's OpenGL ES renderer has no function %u (\"%.3s\"): what needs it is not drawn\n",
 		    function, function < 90 ? names + 4 * function : "?");
 	}
 	return supported;
@@ -492,7 +486,7 @@ my_function_uniform(void *context, unsigned index, size_t components, size_t cou
 
 		if (function < 90 && !told[function]) {
 			told[function] = 1;
-			say("redwood: function %u takes its numbers from %#lx %#lx %#lx\n", function,
+			say("annibale: function %u takes its numbers from %#lx %#lx %#lx\n", function,
 			    (uintptr_t)__builtin_return_address(0) - slide,
 			    (uintptr_t)__builtin_return_address(1) - slide,
 			    (uintptr_t)__builtin_return_address(2) - slide);
@@ -559,28 +553,28 @@ keep_metal_from_core_animation(void)
 	unsigned long held;
 
 	if (create == NULL) {
-		say("redwood: metal: this process has no MTLCreateSystemDefaultDevice; nothing to keep\n");
+		say("annibale: metal: this process has no MTLCreateSystemDefaultDevice; nothing to keep\n");
 		return;
 	}
 	if ((device = create()) == NULL) {
-		say("redwood: metal: no device in this process; CoreAnimation keeps OpenGL ES by itself\n");
+		say("annibale: metal: no device in this process; CoreAnimation keeps OpenGL ES by itself\n");
 		return;
 	}
 	if ((array = *slot) == NULL) {
-		say("redwood: metal: a device, but nothing at %#lx; the device list is NOT emptied\n",
+		say("annibale: metal: a device, but nothing at %#lx; the device list is NOT emptied\n",
 		    MTL_DEVICE_ARRAY);
 		return;
 	}
 	if (!((BOOL (*)(id, SEL, Class))objc_msgSend)(array, sel_registerName("isKindOfClass:"),
 	    objc_getClass("NSMutableArray"))) {
-		say("redwood: metal: %#lx holds a %s, not Metal's device array; left alone\n", MTL_DEVICE_ARRAY,
+		say("annibale: metal: %#lx holds a %s, not Metal's device array; left alone\n", MTL_DEVICE_ARRAY,
 		    object_getClassName(array));
 		return;
 	}
 	held = ask(array, sel_registerName("count"));
 	objc_retain(device);
 	tell(array, sel_registerName("removeAllObjects"));
-	say("redwood: metal: %s taken out of the window server (%lu in the list, %lu now); "
+	say("annibale: metal: %s taken out of the window server (%lu in the list, %lu now); "
 	    "MTLCreateSystemDefaultDevice() = %s\n", object_getClassName(device), held,
 	    ask(array, sel_registerName("count")), create() != NULL ? "A DEVICE STILL" : "nil");
 }
@@ -612,7 +606,7 @@ window_server_keeps_opengl_es(void)
 	IMP original;
 
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "camtl=1") != NULL) {
-		say("redwood: camtl=1: CoreAnimation may have the Metal device (it needs "
+		say("annibale: camtl=1: CoreAnimation may have the Metal device (it needs "
 		    "QuartzCore.framework/default.metallib in the image)\n");
 		return;
 	}
@@ -620,7 +614,7 @@ window_server_keeps_opengl_es(void)
 	method = cls ? class_getInstanceMethod(cls, sel_registerName("_detectDisplays")) : NULL;
 	original = method ? method_getImplementation(method) : NULL;
 	if (original == NULL || (uintptr_t)original != CA_DETECT_DISPLAYS + slide) {
-		say("redwood: -[CAWindowServer _detectDisplays]: found %#lx, not what was expected; left alone, "
+		say("annibale: -[CAWindowServer _detectDisplays]: found %#lx, not what was expected; left alone, "
 		    "and CoreAnimation may take the Metal road\n", original ? (uintptr_t)original - slide : 0);
 		return;
 	}
@@ -653,7 +647,7 @@ window_server_fixes(void)
 		   two is not ours to rely on; the hook writes nothing unless glcompile=1 */
 		orig_compile_shader = (uintptr_t (*)(void *, const char *))replace_virtual("compile_shader",
 		    VSLOT(VT_GLES_CONTEXT, 0x060), 0x1883fc808UL, my_compile_shader);
-		say("redwood: the shader compiler of CoreAnimation is %s\n", orig_compile_shader ? "watched" : "NOT watched");
+		say("annibale: the shader compiler of CoreAnimation is %s\n", orig_compile_shader ? "watched" : "NOT watched");
 		watch_for_faults();
 		{
 			char arguments[1024] = "";
@@ -665,7 +659,7 @@ window_server_fixes(void)
 			}
 		}
 	}
-	say("redwood: window server hooks %s\n", orig_is_ready && orig_ignore_update_p && orig_begin_update &&
+	say("annibale: window server hooks %s\n", orig_is_ready && orig_ignore_update_p && orig_begin_update &&
 	    orig_finish_update && orig_renderer && orig_render_update ? "installed" : "INCOMPLETE");
 }
 
@@ -688,7 +682,7 @@ wait_for_als_arrival(__unused id self, __unused SEL selector)
 {
 	if (input_services_made != NULL &&
 	    dispatch_semaphore_wait(input_services_made, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
-		say("redwood: input: no touch screen service after five seconds; going on without\n");
+		say("annibale: input: no touch screen service after five seconds; going on without\n");
 	}
 }
 
@@ -700,7 +694,7 @@ brightness_fixes(void)
 	IMP original = method ? method_getImplementation(method) : NULL;
 
 	if (original == NULL || (uintptr_t)original != 0x1af043734UL + slide) {
-		say("redwood: -[BLControl waitForALSArrival]: found %#lx, not what was expected; left alone\n",
+		say("annibale: -[BLControl waitForALSArrival]: found %#lx, not what was expected; left alone\n",
 		    original ? (uintptr_t)original - slide : 0);
 		return;
 	}
@@ -805,7 +799,7 @@ service_copy_property(__unused void *target, void *refcon, __unused IOHIDService
 
 		CFSetAddValue(asked, key);
 		CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
-		say("redwood: input: the event server asks for property \"%s\", which we do not have\n", name);
+		say("annibale: input: the event server asks for property \"%s\", which we do not have\n", name);
 	}
 	return value ? CFRetain(value) : NULL;
 }
@@ -840,7 +834,7 @@ service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceC
 
 		CFNumberGetValue(value, kCFNumberIntType, &mode);
 		if (mode != touch_mode) {
-			say("redwood: input: touch detection mode %#x\n", mode);
+			say("annibale: input: touch detection mode %#x\n", mode);
 		}
 		touch_mode = mode;
 	}
@@ -855,7 +849,7 @@ service_set_property(__unused void *target, void *refcon, __unused IOHIDServiceC
 			CFStringGetCString(description, text, sizeof(text), kCFStringEncodingUTF8);
 			CFRelease(description);
 		}
-		say("redwood: input: the event server sets \"%s\" = %s\n", name, text);
+		say("annibale: input: the event server sets \"%s\" = %s\n", name, text);
 	}
 	return true;
 }
@@ -905,7 +899,7 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 	CFDictionarySetValue(properties, CFSTR("DeviceUsagePairs"), pairs);
 	CFDictionarySetValue(properties, CFSTR("Built-In"), kCFBooleanTrue);
 	CFDictionarySetValue(properties, CFSTR("Transport"), CFSTR("SPI"));
-	CFDictionarySetValue(properties, CFSTR("Manufacturer"), CFSTR("redwood"));
+	CFDictionarySetValue(properties, CFSTR("Manufacturer"), CFSTR("annibale"));
 	CFDictionarySetValue(properties, CFSTR("Product"), name);
 	CFDictionarySetValue(properties, CFSTR("VendorID"), zero);
 	CFDictionarySetValue(properties, CFSTR("ProductID"), zero);
@@ -926,7 +920,7 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 		if (made->opened) {
 			break;
 		}
-		say("redwood: input: the event server has not opened \"%s\" (attempt %d): making it again\n", product, attempt);
+		say("annibale: input: the event server has not opened \"%s\" (attempt %d): making it again\n", product, attempt);
 		IOHIDVirtualServiceClientRemove(service);
 		CFRelease(service);
 		service = NULL;
@@ -936,20 +930,20 @@ make_service(IOHIDEventSystemClientRef client, const char *product, int page, in
 
 /* One frame of the touch screen: the hand, and under it every finger that is down or has just lifted. */
 static void
-send_touch(IOHIDServiceClientRef screen, const struct redwood_touch *t)
+send_touch(IOHIDServiceClientRef screen, const struct annibale_touch *t)
 {
-	uint32_t change = t->type == REDWOOD_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
+	uint32_t change = t->type == ANNIBALE_TOUCH_MOVE ? DIGITIZER_POSITION : DIGITIZER_RANGE | DIGITIZER_TOUCH;
 	IOHIDEventRef hand, finger;
 	bool any = false;
 	unsigned f = t->finger;
 
-	if (f >= MAX_FINGERS || (t->type != REDWOOD_TOUCH_DOWN && !fingers[f].touching)) {
+	if (f >= MAX_FINGERS || (t->type != ANNIBALE_TOUCH_DOWN && !fingers[f].touching)) {
 		return;
 	}
-	fingers[f].touching = t->type != REDWOOD_TOUCH_UP;
+	fingers[f].touching = t->type != ANNIBALE_TOUCH_UP;
 	fingers[f].x = t->x / 65535.0;
 	fingers[f].y = t->y / 65535.0;
-	if (t->type == REDWOOD_TOUCH_DOWN) {
+	if (t->type == ANNIBALE_TOUCH_DOWN) {
 		fingers[f].edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE || fingers[f].y < EDGE_TOP ||
 		    fingers[f].y > 1 - EDGE_BOTTOM;
 	}
@@ -986,7 +980,7 @@ publish_lock_button(bool down)
 {
 	static int token = NOTIFY_TOKEN_INVALID;
 
-	if (token == NOTIFY_TOKEN_INVALID && notify_register_check("com.redwood.button.lock", &token) != NOTIFY_STATUS_OK) {
+	if (token == NOTIFY_TOKEN_INVALID && notify_register_check("com.annibale.button.lock", &token) != NOTIFY_STATUS_OK) {
 		token = NOTIFY_TOKEN_INVALID;
 		return;
 	}
@@ -994,20 +988,20 @@ publish_lock_button(bool down)
 }
 
 static void
-send_button(IOHIDServiceClientRef buttons, const struct redwood_touch *t)
+send_button(IOHIDServiceClientRef buttons, const struct annibale_touch *t)
 {
-	uint32_t usage = t->finger == REDWOOD_BUTTON_LOCK ? HID_USAGE_POWER : t->finger == REDWOOD_BUTTON_HOME ? HID_USAGE_MENU :
-	    t->finger == REDWOOD_BUTTON_VOLUME_UP ? HID_USAGE_VOLUME_UP : t->finger == REDWOOD_BUTTON_VOLUME_DOWN ?
+	uint32_t usage = t->finger == ANNIBALE_BUTTON_LOCK ? HID_USAGE_POWER : t->finger == ANNIBALE_BUTTON_HOME ? HID_USAGE_MENU :
+	    t->finger == ANNIBALE_BUTTON_VOLUME_UP ? HID_USAGE_VOLUME_UP : t->finger == ANNIBALE_BUTTON_VOLUME_DOWN ?
 	    HID_USAGE_VOLUME_DOWN : 0;
 	IOHIDEventRef event;
 
 	if (usage == 0) {
 		return;
 	}
-	if (t->finger == REDWOOD_BUTTON_LOCK) {
-		publish_lock_button(t->type == REDWOOD_BUTTON_DOWN);
+	if (t->finger == ANNIBALE_BUTTON_LOCK) {
+		publish_lock_button(t->type == ANNIBALE_BUTTON_DOWN);
 	}
-	event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_CONSUMER, usage, t->type == REDWOOD_BUTTON_DOWN, 0);
+	event = IOHIDEventCreateKeyboardEvent(NULL, t->time, HID_PAGE_CONSUMER, usage, t->type == ANNIBALE_BUTTON_DOWN, 0);
 	IOHIDEventSetIntegerValue(event, FIELD_IS_BUILT_IN, 1);
 	IOHIDVirtualServiceClientDispatchEvent(buttons, event);
 	CFRelease(event);
@@ -1033,11 +1027,11 @@ input_thread(__unused void *arg)
 	static const int types[] = { HID_CLIENT_SIMPLE, HID_CLIENT_RATE_CONTROLLED };
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
-	struct redwood_touch t;
+	struct annibale_touch t;
 	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
 	int device;
 
-	pthread_setname_np("redwood input");
+	pthread_setname_np("annibale input");
 	{
 		char arguments[1024] = "";
 		size_t size = sizeof(arguments) - 1;
@@ -1047,9 +1041,9 @@ input_thread(__unused void *arg)
 		}
 		mach_timebase_info(&timebase);
 	}
-	device = open(REDWOOD_TOUCH_DEVICE, O_RDONLY);
+	device = open(ANNIBALE_TOUCH_DEVICE, O_RDONLY);
 	if (device < 0) {
-		say("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
+		say("annibale: input: %s: %s\n", ANNIBALE_TOUCH_DEVICE, strerror(errno));
 		return NULL;
 	}
 	sleep(3);                       /* let backboardd get as far as starting its event server */
@@ -1057,19 +1051,19 @@ input_thread(__unused void *arg)
 		/* this waits until the server (this very program) answers */
 		client = IOHIDEventSystemClientCreateWithType(NULL, types[i], NULL);
 		if (client == NULL) {
-			say("redwood: input: no HID client of type %d\n", types[i]);
+			say("annibale: input: no HID client of type %d\n", types[i]);
 			continue;
 		}
-		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("redwood.input", NULL));
-		screen = make_service(client, "Redwood touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
+		IOHIDEventSystemClientScheduleWithDispatchQueue(client, dispatch_queue_create("annibale.input", NULL));
+		screen = make_service(client, "Annibale touch screen", HID_PAGE_DIGITIZER, HID_USAGE_TOUCH_SCREEN, true);
 		if (screen == NULL) {
-			say("redwood: input: a HID client of type %d may not create services\n", types[i]);
+			say("annibale: input: a HID client of type %d may not create services\n", types[i]);
 		}
 	}
 	if (screen != NULL) {
-		buttons = make_service(client, "Redwood buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
+		buttons = make_service(client, "Annibale buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
 	}
-	say("redwood: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
+	say("annibale: input: touch screen service %p, buttons %p\n", (void *)screen, (void *)buttons);
 	dispatch_semaphore_signal(input_services_made); /* see wait_for_als_arrival() */
 	if (screen == NULL) {
 		return NULL;
@@ -1079,25 +1073,25 @@ input_thread(__unused void *arg)
 		uint64_t read_at = mach_absolute_time();
 
 		if (count++ < 4) {
-			say("redwood: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
+			say("annibale: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
 		}
-		if (t.type > REDWOOD_TOUCH_UP) {
+		if (t.type > ANNIBALE_TOUCH_UP) {
 			if (buttons != NULL) {
 				send_button(buttons, &t);
 			}
-		} else if (t.type == REDWOOD_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
+		} else if (t.type == ANNIBALE_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
 			/*
 			 * The display is off and a tap is to wake it. The lock button is what wakes it here:
 			 * press it for the finger, and keep the rest of this touch to ourselves.
 			 */
-			struct redwood_touch press = { .time = t.time, .type = REDWOOD_BUTTON_DOWN, .finger = REDWOOD_BUTTON_LOCK };
+			struct annibale_touch press = { .time = t.time, .type = ANNIBALE_BUTTON_DOWN, .finger = ANNIBALE_BUTTON_LOCK };
 
 			send_button(buttons, &press);
-			press.type = REDWOOD_BUTTON_UP;
+			press.type = ANNIBALE_BUTTON_UP;
 			send_button(buttons, &press);
 			waking |= 1u << (t.finger & 31);
 		} else if (waking & (1u << (t.finger & 31))) {
-			if (t.type == REDWOOD_TOUCH_UP) {
+			if (t.type == ANNIBALE_TOUCH_UP) {
 				waking &= ~(1u << (t.finger & 31));
 			}
 		} else {
@@ -1108,7 +1102,7 @@ input_thread(__unused void *arg)
 			}
 		}
 	}
-	say("redwood: input: %s: %s\n", REDWOOD_TOUCH_DEVICE, strerror(errno));
+	say("annibale: input: %s: %s\n", ANNIBALE_TOUCH_DEVICE, strerror(errno));
 	return NULL;
 }
 
@@ -1126,7 +1120,7 @@ input_start(void)
 /* ---- the window server's main run loop ------------------------------------------------------------ */
 
 /*
- * Boot-arg touch_lat=1: the three times of the window server's main run loop that libredwood-sb
+ * Boot-arg touch_lat=1: the three times of the window server's main run loop that libannibale-sb
  * writes for SpringBoard's, under a name of its own so that the two read side by side in one log:
  *   tl: b WOKE COMMIT DONE
  * WOKE is when the turn came round, COMMIT when CoreAnimation's commit of what it changed began and
@@ -1172,37 +1166,13 @@ watch_window_server_loop(void)
 	    COMMIT_ORDER + 1, window_server_turn, &after), kCFRunLoopCommonModes);
 }
 
-/* ---- containermanagerd ---------------------------------------------------------------------------- */
-
-static BOOL
-personas_are_supported(__unused id self, __unused SEL selector)
-{
-	return NO;
-}
-
-static void
-container_manager_fixes(void)
-{
-	Class cls = objc_getClass("MCMUserIdentityCache");
-	Method method = cls ? class_getClassMethod(cls, sel_registerName("personasAreSupported")) : NULL;
-	IMP original = method ? method_getImplementation(method) : NULL;
-
-	if (original == NULL || (uintptr_t)original != 0x1c3ea6298UL + slide) {
-		say("redwood: +[MCMUserIdentityCache personasAreSupported]: found %#lx, not what was expected; left alone\n",
-		    original ? (uintptr_t)original - slide : 0);
-		return;
-	}
-	method_setImplementation(method, (IMP)personas_are_supported);
-	say("redwood: container manager: no personas\n");
-}
-
 /* ---------------------------------------------------------------------------------------------- */
 
 /*
  * An OpenGL ES implementation for CoreAnimation (src/eagl.c, Mesa behind it): loaded, it puts
  * itself behind EAGLContext, and the renderer the server then gets is the OpenGL ES one. That
  * is worth it where a GPU does the drawing, and only there: on the phone, when the kernel has
- * started the GPU and keeps it (boot-arg gpu=1), which the service RedwoodGPU says (it is there
+ * started the GPU and keeps it (boot-arg gpu=1), which the service AnnibaleGPU says (it is there
  * before the first program runs, or not at all). Everywhere else -- QEMU, a run without the
  * boot-arg, a phone without the GPU's firmware in the image, a GPU that did not start --
  * nothing is loaded, and CoreAnimation draws with its own software renderer as in an image
@@ -1220,7 +1190,7 @@ opengl_es(void)
 	void *library;
 	int wanted = -1, told = 0;
 
-	if (access(REDWOOD_GL, R_OK) != 0) {
+	if (access(ANNIBALE_GL, R_OK) != 0) {
 		return;                                 /* (an image built without it) */
 	}
 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
@@ -1234,34 +1204,34 @@ opengl_es(void)
 		}
 	}
 	if (wanted < 0) {
-		gpu = IOServiceGetMatchingService(0, IOServiceMatching("RedwoodGPU"));
+		gpu = IOServiceGetMatchingService(0, IOServiceMatching("AnnibaleGPU"));
 		wanted = gpu != 0;
 		if (gpu != 0) {
 			IOObjectRelease(gpu);
 		}
 	}
 	if (!wanted) {
-		say("redwood: %s: CoreAnimation keeps its software renderer\n", told ? "gl=0" : "no GPU to draw with");
+		say("annibale: %s: CoreAnimation keeps its software renderer\n", told ? "gl=0" : "no GPU to draw with");
 		return;
 	}
-	if ((library = dlopen(REDWOOD_GL, RTLD_NOW)) == NULL) {
-		say("redwood: %s: %s\n", REDWOOD_GL, dlerror());
+	if ((library = dlopen(ANNIBALE_GL, RTLD_NOW)) == NULL) {
+		say("annibale: %s: %s\n", ANNIBALE_GL, dlerror());
 		return;
 	}
 	gl_loaded = 1;
 	gl_function_values = (void (*)(void *, unsigned, unsigned, size_t, size_t, const float *))dlsym(library,
-	    "redwood_gl_function_values");
-	gl_function_refused = (void (*)(unsigned))dlsym(library, "redwood_gl_function_refused");
+	    "annibale_gl_function_values");
+	gl_function_refused = (void (*)(unsigned))dlsym(library, "annibale_gl_function_refused");
 }
 
 __attribute__((constructor))
 static void
-redwood_init(void)
+annibale_init(void)
 {
 	/* On stdout, the channel the driver's own lines use: say() below writes to fd 2, so a library
 	 * that loaded but whose stderr never reached the log would have looked like one that did not
 	 * load at all. One line at the first instruction answers which. */
-	printf("redwood lib loaded pid %d name %s\n", getpid(), getprogname());
+	printf("annibale lib loaded pid %d name %s\n", getpid(), getprogname());
 	fflush(stdout);
 
 	const char *name = getprogname();
@@ -1285,7 +1255,7 @@ redwood_init(void)
 		 */
 		if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0 && strstr(arguments, "ca_vbl=1") != NULL) {
 			setenv("CA_FORCE_TIMER", "1", 1);
-			say("redwood: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
+			say("annibale: ca_vbl=1: CoreAnimation is to take the display driver's refresh notifications\n");
 		}
 		/*
 		 * Boot-arg caenv=NAME=VALUE (as many as wanted): into the window server's environment, for
@@ -1304,7 +1274,7 @@ redwood_init(void)
 			if ((equals = strchr(setting, '=')) != NULL) {
 				*equals = 0;
 				setenv(setting, equals + 1, 1);
-				say("redwood: caenv: %s=%s for the window server\n", setting, equals + 1);
+				say("annibale: caenv: %s=%s for the window server\n", setting, equals + 1);
 			}
 		}
 		opengl_es();
@@ -1317,18 +1287,16 @@ redwood_init(void)
 		 * survive; not tried again since, and until it is, the five seconds stay.)
 		 *
 		 * Where the input26-service job exists (the iOS 26 images), that service reads
-		 * /dev/redwood-touch, and the queue has one reader: a second one here takes whichever
+		 * /dev/annibale-touch, and the queue has one reader: a second one here takes whichever
 		 * samples it reads first. On kernel-12377-cmd44-bo21 backboardd had two touch screens
 		 * (senders 1443E56000000 and 1443E58000002), and swipes whose lift went to the other
 		 * one had no answer or turned into a long press.
 		 */
-		if (access("/redwood/LaunchDaemons/com.redwood.input26.plist", F_OK) == 0) {
-			say("redwood: input: input26-service reads the touch queue, so no service of ours\n");
+		if (access("/annibale/LaunchDaemons/com.annibale.input26.plist", F_OK) == 0) {
+			say("annibale: input: input26-service reads the touch queue, so no service of ours\n");
 		} else {
 			input_start();
 		}
 		watch_window_server_loop();
-	} else if (strncmp(name, "containermanagerd", 17) == 0) {
-		container_manager_fixes();
 	}
 }

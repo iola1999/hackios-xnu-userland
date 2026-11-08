@@ -5,7 +5,7 @@
        bo = fd_bo_from_name(screen->dev, whandle->handle);
     } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
 -      bo = fd_bo_from_handle(screen->dev, whandle->handle, 0);
-+      /* HackiOS: AIR imports a buffer over the caller's memory (kRedwoodMemory) by its handle and
++      /* HackiOS: AIR imports a buffer over the caller's memory (kAnnibaleMemory) by its handle and
 +       * passes its size here. With 0 the bo has no size, and every texture laid over that buffer
 +       * fails the layout's size check. */
 +      bo = fd_bo_from_handle(screen->dev, whandle->handle, whandle->size);
@@ -55,7 +55,7 @@
     began = os_time_get_nano() / 1000;
 -   for (unsigned off = 0; off < bo->size; off += page)
 -      bytes[off] = bytes[off];   /* read then write the same byte: the write is what faults it in */
-+   /* An imported bo can be memory the caller mapped read-only (kRedwoodMemory with
++   /* An imported bo can be memory the caller mapped read-only (kAnnibaleMemory with
 +    * MSM_BO_GPU_READONLY), whose mapping here is read-only too: it is only read. */
 +   for (unsigned off = 0; off < bo->size; off += page) {
 +      if (bo->alloc_flags & FD_BO_SHARED)

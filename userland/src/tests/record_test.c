@@ -11,8 +11,8 @@
  * motor's resonance (175.5 Hz on the POCO X5 Pro). Then the file is read back: how loud each tenth
  * of a second is, and how strong 175.5 Hz is before the vibration and while it lasts.
  *
- * On this machine the samples come from the kernel's /dev/redwood-mic (boot-arg mic=4), through
- * RedwoodAudio.driver's device "Codec" (audio_plugin.c), of which the virtual audio device makes
+ * On this machine the samples come from the kernel's /dev/annibale-mic (boot-arg mic=4), through
+ * AnnibaleAudio.driver's device "Codec" (audio_plugin.c), of which the virtual audio device makes
  * the built-in microphone.
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -260,10 +260,10 @@ analyse(double seconds, double vibrate_at)
 static int
 record_raw(double seconds)
 {
-	const char *dev = "/dev/redwood-mic";
+	const char *dev = "/dev/annibale-mic";
 	int fd = open(dev, O_RDONLY);
 	if (fd < 0) {
-		dev = "/dev/redwood-audio";
+		dev = "/dev/annibale-audio";
 		fd = open(dev, O_RDONLY);
 	}
 	if (fd < 0) {

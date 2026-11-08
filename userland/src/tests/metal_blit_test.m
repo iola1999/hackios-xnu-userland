@@ -1,5 +1,5 @@
 /* Host test of the production encoder, Work ownership and copy executor against
- * libredwoodair's software device. The small command-buffer fixture drains the
+ * libannibaleair's software device. The small command-buffer fixture drains the
  * recorded list; Apple's Metal queue and GPU fences need device validation. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -9,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../../../tools/mesa/air/air_metal.h"
-#include "../gfx/redwoodmetal_work_private.h"
-#include "../gfx/redwoodmetal_work.inc"
+#include "../gfx/annibalemetal_work_private.h"
+#include "../gfx/annibalemetal_work.inc"
 
 static char why[512];
 static unsigned destroyed_buffers, buffer_calls, texture_calls;
@@ -47,7 +47,7 @@ static const struct rwa_texture_shape test_shape = { .pixel_format = 80, .type =
 - (void)dealloc { rwa_device_close(raw); [super dealloc]; }
 @end
 
-@interface RedwoodMetalBuffer : NSObject {
+@interface AnnibaleMetalBuffer : NSObject {
 	CopyDevice *_device;
 @public
 	struct rwa_buffer *raw;
@@ -56,7 +56,7 @@ static const struct rwa_texture_shape test_shape = { .pixel_format = 80, .type =
 - (id)device;
 - (struct rwa_buffer *)mesaBuffer;
 @end
-@implementation RedwoodMetalBuffer
+@implementation AnnibaleMetalBuffer
 - (instancetype)initWithDevice:(CopyDevice *)device
 {
 	self = [super init];
@@ -78,7 +78,7 @@ static const struct rwa_texture_shape test_shape = { .pixel_format = 80, .type =
 }
 @end
 
-@interface RedwoodMetalTexture : NSObject {
+@interface AnnibaleMetalTexture : NSObject {
 	CopyDevice *_device;
 @public
 	struct rwa_texture *raw;
@@ -91,7 +91,7 @@ static const struct rwa_texture_shape test_shape = { .pixel_format = 80, .type =
 - (NSUInteger)mipmapLevelCount;
 - (NSUInteger)pixelFormat;
 @end
-@implementation RedwoodMetalTexture
+@implementation AnnibaleMetalTexture
 - (instancetype)initWithDevice:(CopyDevice *)device
 {
 	self = [super init];
@@ -111,13 +111,13 @@ static const struct rwa_texture_shape test_shape = { .pixel_format = 80, .type =
 - (void)dealloc { rwa_texture_destroy(raw); [_device release]; [super dealloc]; }
 @end
 
-@interface RedwoodMetalCommandBuffer : NSObject {
+@interface AnnibaleMetalCommandBuffer : NSObject {
 	CopyDevice *_device;
 @public
 	NSMutableArray *work;
 }
 - (instancetype)initWithDevice:(CopyDevice *)device;
-- (void)recordWork:(RedwoodMetalWork *)item;
+- (void)recordWork:(AnnibaleMetalWork *)item;
 - (id)device;
 - (BOOL)drainCopies;
 @end
@@ -145,10 +145,10 @@ static struct {
 	__typeof__(&rwa_texture_copy) texture_copy;
 	__typeof__(&rwa_texture_generate_mipmaps) texture_generate_mipmaps;
 } mesa = { rwa_buffer_copy, rwa_texture_copy, rwa_texture_generate_mipmaps };
-#include "../gfx/redwoodmetal_blit.inc"
+#include "../gfx/annibalemetal_blit.inc"
 #undef _MTLCommandEncoder
 
-@implementation RedwoodMetalCommandBuffer
+@implementation AnnibaleMetalCommandBuffer
 - (instancetype)initWithDevice:(CopyDevice *)device
 {
 	self = [super init];
@@ -159,10 +159,10 @@ static struct {
 	return self;
 }
 - (id)device { return _device; }
-- (void)recordWork:(RedwoodMetalWork *)item { [item retainResources]; [work addObject:item]; }
+- (void)recordWork:(AnnibaleMetalWork *)item { [item retainResources]; [work addObject:item]; }
 - (BOOL)drainCopies
 {
-	for (RedwoodMetalWork *item in work) {
+	for (AnnibaleMetalWork *item in work) {
 		buffer_calls += item->copyKind == RW_COPY_BUFFER && mesa.buffer_copy != NULL;
 		texture_calls += item->copyKind == RW_COPY_TEXTURE && mesa.texture_copy != NULL;
 		if (rw_run_copy(item, why, sizeof(why)) != 0) return NO;
@@ -172,22 +172,22 @@ static struct {
 - (void)dealloc { [work release]; [_device release]; [super dealloc]; }
 @end
 
-static RedwoodMetalBlitEncoder *encoder(RedwoodMetalCommandBuffer *command)
+static AnnibaleMetalBlitEncoder *encoder(AnnibaleMetalCommandBuffer *command)
 {
-	return [[[RedwoodMetalBlitEncoder alloc] initWithRedwoodCommandBuffer:command] autorelease];
+	return [[[AnnibaleMetalBlitEncoder alloc] initWithAnnibaleCommandBuffer:command] autorelease];
 }
 
 static void ordering_and_lifetime(CopyDevice *device)
 {
-	RedwoodMetalBuffer *a = [[RedwoodMetalBuffer alloc] initWithDevice:device];
-	RedwoodMetalBuffer *b = [[RedwoodMetalBuffer alloc] initWithDevice:device];
-	RedwoodMetalBuffer *c = [[RedwoodMetalBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBuffer *a = [[AnnibaleMetalBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBuffer *b = [[AnnibaleMetalBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBuffer *c = [[AnnibaleMetalBuffer alloc] initWithDevice:device];
 	for (unsigned i = 0; i < 1024; i++) ((uint8_t *)rwa_buffer_map(a->raw))[i] = i * 7 + i / 13;
 	memset(rwa_buffer_map(b->raw), 0x22, 1024);
 	memset(rwa_buffer_map(c->raw), 0x33, 1024);
-	RedwoodMetalCommandBuffer *first = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
-	RedwoodMetalCommandBuffer *second = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
-	RedwoodMetalBlitEncoder *one = encoder(first), *two = encoder(second);
+	AnnibaleMetalCommandBuffer *first = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
+	AnnibaleMetalCommandBuffer *second = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBlitEncoder *one = encoder(first), *two = encoder(second);
 	[one copyFromBuffer:b sourceOffset:53 toBuffer:c destinationOffset:100 size:257];
 	[two copyFromBuffer:a sourceOffset:29 toBuffer:b destinationOffset:53 size:257];
 	[one endEncoding];
@@ -205,8 +205,8 @@ static void ordering_and_lifetime(CopyDevice *device)
 	[second release];
 	assert(destroyed_buffers == 1);
 	[first release];
-	RedwoodMetalCommandBuffer *chain = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
-	RedwoodMetalBlitEncoder *three = encoder(chain);
+	AnnibaleMetalCommandBuffer *chain = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBlitEncoder *three = encoder(chain);
 	[three copyFromBuffer:c sourceOffset:100 toBuffer:b destinationOffset:500 size:20];
 	[three copyFromBuffer:b sourceOffset:500 toBuffer:c destinationOffset:600 size:20];
 	[three endEncoding];
@@ -224,18 +224,18 @@ static void ordering_and_lifetime(CopyDevice *device)
 
 static void refusals(CopyDevice *device)
 {
-	RedwoodMetalBuffer *b = [[RedwoodMetalBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBuffer *b = [[AnnibaleMetalBuffer alloc] initWithDevice:device];
 	memset(rwa_buffer_map(b->raw), 0x19, 1024);
 	((uint8_t *)rwa_buffer_map(b->raw))[0] = 0xaa;
-	RedwoodMetalCommandBuffer *command = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
-	RedwoodMetalBlitEncoder *blit = encoder(command);
+	AnnibaleMetalCommandBuffer *command = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBlitEncoder *blit = encoder(command);
 	[blit copyFromBuffer:nil sourceOffset:0 toBuffer:b destinationOffset:0 size:4];
 	[blit copyFromBuffer:b sourceOffset:0 toBuffer:b destinationOffset:32 size:4];
 	[blit endEncoding];
 	assert([command->work count] == 2 && ![command drainCopies]);
 	assert(((uint8_t *)rwa_buffer_map(b->raw))[32] == 0x19);
 	[command release];
-	command = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
+	command = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
 	blit = encoder(command);
 	[blit copyFromBuffer:b sourceOffset:SIZE_MAX toBuffer:b destinationOffset:32 size:4];
 	[blit endEncoding];
@@ -249,16 +249,16 @@ static void refusals(CopyDevice *device)
 
 static void texture_encoding(CopyDevice *device)
 {
-	RedwoodMetalTexture *source = [[RedwoodMetalTexture alloc] initWithDevice:device];
-	RedwoodMetalTexture *target = [[RedwoodMetalTexture alloc] initWithDevice:device];
+	AnnibaleMetalTexture *source = [[AnnibaleMetalTexture alloc] initWithDevice:device];
+	AnnibaleMetalTexture *target = [[AnnibaleMetalTexture alloc] initWithDevice:device];
 	uint8_t input[12][80], output[12][96], clear[12][80] = { 0 };
 	for (unsigned y = 0; y < 12; y++) {
 		for (unsigned x = 0; x < 80; x++) input[y][x] = x + y * 19;
 	}
 	assert(rwa_texture_write(source->raw, 1, 1, NULL, NULL, input, 80, why, sizeof(why)) == 0);
 	assert(rwa_texture_write(target->raw, 0, 0, NULL, NULL, clear, 80, why, sizeof(why)) == 0);
-	RedwoodMetalCommandBuffer *command = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
-	RedwoodMetalBlitEncoder *blit = encoder(command);
+	AnnibaleMetalCommandBuffer *command = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
+	AnnibaleMetalBlitEncoder *blit = encoder(command);
 	[blit copyFromTexture:source sourceSlice:1 sourceLevel:1 sourceOrigin:MTLOriginMake(2, 1, 0)
 		sourceSize:MTLSizeMake(3, 4, 1) toTexture:target destinationSlice:0
 		destinationLevel:0 destinationOrigin:MTLOriginMake(5, 3, 0)];
@@ -275,7 +275,7 @@ static void texture_encoding(CopyDevice *device)
 		}
 	}
 	[command release];
-	command = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
+	command = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
 	blit = encoder(command);
 	[blit copyFromTexture:target sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(SIZE_MAX, 0, 0)
 		sourceSize:MTLSizeMake(1, 1, 1) toTexture:target destinationSlice:0
@@ -299,8 +299,8 @@ static void texture_encoding(CopyDevice *device)
  * so the process survives it; a selector no protocol declares still raises. */
 static void mipmap_generation(CopyDevice *device)
 {
-	RedwoodMetalTexture *target = [[RedwoodMetalTexture alloc] initWithDevice:device];
-	RedwoodMetalCommandBuffer *command = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
+	AnnibaleMetalTexture *target = [[AnnibaleMetalTexture alloc] initWithDevice:device];
+	AnnibaleMetalCommandBuffer *command = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
 	id<MTLBlitCommandEncoder> blit = (id<MTLBlitCommandEncoder>)encoder(command);
 	const unsigned origin[3] = { 0, 0, 0 };
 	const unsigned full[3] = { 16, 12, 1 };
@@ -325,7 +325,7 @@ static void mipmap_generation(CopyDevice *device)
 	[blit generateMipmapsForTexture:(id<MTLTexture>)target];
 	[blit endEncoding];
 	assert([command->work count] == 1);
-	assert(((RedwoodMetalWork *)[command->work objectAtIndex:0])->copyKind == RW_COPY_MIPMAP);
+	assert(((AnnibaleMetalWork *)[command->work objectAtIndex:0])->copyKind == RW_COPY_MIPMAP);
 	assert([command drainCopies]);
 
 	for (unsigned layer = 0; layer < 2; layer++) {
@@ -359,9 +359,9 @@ static void mipmap_generation(CopyDevice *device)
 
 static void unimplemented_selectors(CopyDevice *device)
 {
-	RedwoodMetalTexture *target = [[RedwoodMetalTexture alloc] initWithDevice:device];
-	RedwoodMetalBuffer *buffer = [[RedwoodMetalBuffer alloc] initWithDevice:device];
-	RedwoodMetalCommandBuffer *command = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
+	AnnibaleMetalTexture *target = [[AnnibaleMetalTexture alloc] initWithDevice:device];
+	AnnibaleMetalBuffer *buffer = [[AnnibaleMetalBuffer alloc] initWithDevice:device];
+	AnnibaleMetalCommandBuffer *command = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
 	id<MTLBlitCommandEncoder> blit = (id<MTLBlitCommandEncoder>)encoder(command);
 	blit = (id<MTLBlitCommandEncoder>)encoder(command);
 	[blit fillBuffer:(id<MTLBuffer>)buffer range:NSMakeRange(0, 16) value:0x5a];
@@ -371,10 +371,10 @@ static void unimplemented_selectors(CopyDevice *device)
 	assert(((uint8_t *)rwa_buffer_map(buffer->raw))[0] != 0x5a);
 	[command release];
 
-	command = [[RedwoodMetalCommandBuffer alloc] initWithDevice:device];
+	command = [[AnnibaleMetalCommandBuffer alloc] initWithDevice:device];
 	blit = (id<MTLBlitCommandEncoder>)encoder(command);
 	BOOL raised = NO;
-	@try { [(id)blit performSelector:sel_registerName("redwoodSelectorNoProtocolDeclares")]; }
+	@try { [(id)blit performSelector:sel_registerName("annibaleSelectorNoProtocolDeclares")]; }
 	@catch (NSException *exception) { raised = [exception.name isEqualToString:NSInvalidArgumentException]; }
 	assert(raised);
 	[blit endEncoding];

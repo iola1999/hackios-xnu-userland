@@ -362,9 +362,9 @@ restore_var(void)
 	char *argv[3];
 	pid_t pid;
 
-	if (sysctlbyname("kern.redwood.var_disk_loaded", &disk_loaded, &len, NULL, 0) == 0 && disk_loaded != 0) {
+	if (sysctlbyname("kern.annibale.var_disk_loaded", &disk_loaded, &len, NULL, 0) == 0 && disk_loaded != 0) {
 		printf("\n-- the data volume of the last boot --\n");
-		printf("  /private/var loaded directly from persistent disk (RDWFS001)\n");
+		printf("  /private/var loaded directly from persistent disk (ANNFS001)\n");
 	} else if (wanted != NULL && strcmp(wanted, "1") == 0) {
 		printf("\n-- the data volume of the last boot --\n");
 		argv[0] = (char *)in_image("/bin/var_store");
@@ -388,10 +388,10 @@ restore_var(void)
 	chown("/private/var/mobile/Library/Weather", 501, 501);
 	mkdir("/private/var/db/locationd", 0755);
 	chown("/private/var/db/locationd", 205, 205);
-	mkdir("/private/var/db/redwood-aircache", 0777);
-	chmod("/private/var/db/redwood-aircache", 0777);
-	mkdir("/private/var/db/redwood-ir3cache", 0777);
-	chmod("/private/var/db/redwood-ir3cache", 0777);
+	mkdir("/private/var/db/annibale-aircache", 0777);
+	chmod("/private/var/db/annibale-aircache", 0777);
+	mkdir("/private/var/db/annibale-ir3cache", 0777);
+	chmod("/private/var/db/annibale-ir3cache", 0777);
 	mkdir("/private/var/preferences", 0755);
 	mkdir("/private/var/root", 0750);
 	mkdir("/private/var/root/Library", 0750);
@@ -407,7 +407,7 @@ restore_var(void)
 	}
 
 	int seed_done = 1;
-	(void)sysctlbyname("kern.redwood.var_seed_done", NULL, NULL, &seed_done, sizeof(seed_done));
+	(void)sysctlbyname("kern.annibale.var_seed_done", NULL, NULL, &seed_done, sizeof(seed_done));
 
 	vfd = open("/private/var", O_RDONLY | O_DIRECTORY, 0);
 	if (vfd >= 0) {

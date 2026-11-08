@@ -7,29 +7,29 @@
 #   DRIVERS="softpipe,freedreno"
 #                        the gallium drivers to build. softpipe: a rasterizer in plain C; it needs no
 #                        LLVM and nothing of the machine but its processor. freedreno: the Adreno's;
-#                        it talks to the kernel's GPU driver (the service RedwoodGPU) through
-#                        tools/mesa/redwood-drm, which stands in for libdrm (tools/mesa/freedreno-darwin.patch
+#                        it talks to the kernel's GPU driver (the service AnnibaleGPU) through
+#                        tools/mesa/annibale-drm, which stands in for libdrm (tools/mesa/freedreno-darwin.patch
 #                        makes Mesa build it where there is no DRM). The library takes the GPU when the
 #                        kernel has one and the environment does not say OSMESA_SOFTWARE=1.
 #
 # What comes out, in xnu-deps/build/mesa/out:
-#   libOSMesa.8.dylib    everything in one library (install name /redwood/lib/libOSMesa.8.dylib): the
+#   libOSMesa.8.dylib    everything in one library (install name /annibale/lib/libOSMesa.8.dylib): the
 #                        OpenGL (ES) entry points gl*, the compiler of the shading language, the drivers,
 #                        and the off-screen interface that hands out contexts
 #   exported-gl.txt      the gl* functions it exports, and
 #   gl.xml               their prototypes (the Khronos registry as Mesa has it): for userland/mkeagl.py
 # and with AIR=1, the two things the Metal subsystem needs (docs/air.md, docs/metal.md 10.12):
 #   air_run              the test program: a Metal shader translated, drawn or dispatched, read back
-#   libredwoodair.dylib  the same path as a library (tools/mesa/air/air_metal.h), install name
-#                        /redwood/lib/libredwoodair.dylib, which is what userland's Metal driver
+#   libannibaleair.dylib  the same path as a library (tools/mesa/air/air_metal.h), install name
+#                        /annibale/lib/libannibaleair.dylib, which is what userland's Metal driver
 #                        links against to compile a function Metal hands it
 # With PREPARE=1 nothing is built: the script stops once mesa-$VERSION is unpacked, patched and has
-# src/redwood-drm and src/compiler/air copied in.
+# src/annibale-drm and src/compiler/air copied in.
 # and with TURNIP=1 (26.x only, REBASE=26), Mesa's Vulkan driver for the Adreno instead of all of the above:
 #   libvulkan_freedreno.dylib
-#                        Turnip on its msm backend, through tools/mesa/redwood-drm like freedreno
+#                        Turnip on its msm backend, through tools/mesa/annibale-drm like freedreno
 #                        (tools/mesa/rebase-26/0004-turnip-msm-darwin.patch), install name
-#                        /redwood/lib/libvulkan_freedreno.dylib; loaded as an ICD (vk_icdGetInstanceProcAddr)
+#                        /annibale/lib/libvulkan_freedreno.dylib; loaded as an ICD (vk_icdGetInstanceProcAddr)
 #   tu_probe             tools/mesa/turnip-probe: enumerates the GPU, creates a device, and checks a buffer
 #                        fill and copy, a compute shader and a drawn triangle by reading them back
 # Needs on this machine: bison, flex, python3 with venv (Mako and a pinned Meson are installed into a
@@ -104,9 +104,9 @@ REBASE_PATCHES=""
 if [ "$REBASE" = 26 ]; then REBASE_PATCHES="$ROOT"/tools/mesa/rebase-26/*.patch; fi
 # LC_ALL=C inside the substitution, before the globs expand: a shell sorts a glob in the locale's
 # collation, the same 23 October trap the stamp hashed around -- only here it decides
-# .redwood-patches, and a host/container disagreement costs an unpack and re-patch of the tree.
+# .annibale-patches, and a host/container disagreement costs an unpack and re-patch of the tree.
 PATCHES=$(LC_ALL=C; export LC_ALL; cat "$ROOT"/tools/mesa/*.patch $REBASE_PATCHES | sha256sum | cut -d' ' -f1)
-if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null)" != "$PATCHES" ]; then
+if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.annibale-patches 2>/dev/null)" != "$PATCHES" ]; then
 	[ -f mesa-$VERSION.tar.xz ] || curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf mesa-$VERSION build-*
@@ -134,7 +134,7 @@ if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null
 		grep -nE 'File to patch:|malformed patch' "$PATCHLOG" >&2 || true
 		[ "$REBASE" = 26 ] || exit 1
 	fi
-	echo "$PATCHES" > mesa-$VERSION/.redwood-patches
+	echo "$PATCHES" > mesa-$VERSION/.annibale-patches
 	# The log goes next to the artifacts: what a round's manifest records has to be readable from
 	# the same place as the library it describes, or "which patch dropped what" is answered from a
 	# file only the build machine's build directory holds.
@@ -145,8 +145,8 @@ if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.redwood-patches 2>/dev/null
 	if [ -n "$REJECTS" ]; then printf '%s\n' "$REJECTS" > out/patch-rejects.txt; else : > out/patch-rejects.txt; fi
 fi
 # ours, kept in the repository: always the current ones
-rm -rf mesa-$VERSION/src/redwood-drm
-cp -r "$ROOT/tools/mesa/redwood-drm" mesa-$VERSION/src/redwood-drm
+rm -rf mesa-$VERSION/src/annibale-drm
+cp -r "$ROOT/tools/mesa/annibale-drm" mesa-$VERSION/src/annibale-drm
 # the AIR frontend (docs/air.md): the Metal runtime will call it in this
 # library's own process, and tools/mesa/air-frontend.patch is the meson that
 # reaches it. Copied rather than linked, because this tree is cross-built.
@@ -197,7 +197,7 @@ if [ "${TURNIP:-}" = 1 ]; then
 	# entry points this build omits to dyld (0004's meson.build); a global -undefined dynamic_lookup
 	# would instead make meson's function checks pass for functions iOS lacks, secure_getenv first.
 	[ -f build-turnip/build.ninja ] || meson setup build-turnip mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
-		--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
+		--prefix=/annibale --libdir=lib --buildtype=release -Db_ndebug=true \
 		-Dplatforms= -Dgallium-drivers= -Dfreedreno-kmds=msm -Dvulkan-drivers=freedreno -Dglx=disabled -Degl=disabled -Dgbm=disabled \
 		-Dosmesa=false -Dllvm=disabled -Dgles1=disabled -Dgles2=disabled -Dopengl=false \
 		-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
@@ -206,9 +206,9 @@ if [ "${TURNIP:-}" = 1 ]; then
 		> meson-setup-turnip.log
 	ninja -C build-turnip src/freedreno/vulkan/libvulkan_freedreno.dylib > ninja-turnip.log
 	llvm-strip -x -o out/libvulkan_freedreno.dylib build-turnip/src/freedreno/vulkan/libvulkan_freedreno.dylib
-	"$INTOOL" -id /redwood/lib/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib
-	[ "$(dylib_id out/libvulkan_freedreno.dylib)" = /redwood/lib/libvulkan_freedreno.dylib ] || {
-		echo "mk-mesa.sh: libvulkan_freedreno.dylib does not carry the install name /redwood/lib/libvulkan_freedreno.dylib"; exit 1; }
+	"$INTOOL" -id /annibale/lib/libvulkan_freedreno.dylib out/libvulkan_freedreno.dylib
+	[ "$(dylib_id out/libvulkan_freedreno.dylib)" = /annibale/lib/libvulkan_freedreno.dylib ] || {
+		echo "mk-mesa.sh: libvulkan_freedreno.dylib does not carry the install name /annibale/lib/libvulkan_freedreno.dylib"; exit 1; }
 	llvm-nm -gU out/libvulkan_freedreno.dylib | grep -q ' _vk_icdGetInstanceProcAddr$' || {
 		echo "mk-mesa.sh: libvulkan_freedreno.dylib does not export vk_icdGetInstanceProcAddr"; exit 1; }
 	mkdir -p turnip-probe/shaders
@@ -230,7 +230,7 @@ case "$VERSION" in
 	*) LEGACY_TRACKERS="" ;;
 esac
 [ -f $BUILD/build.ninja ] || meson setup $BUILD mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
-	--prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
+	--prefix=/annibale --libdir=lib --buildtype=release -Db_ndebug=true \
 	-Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled -Degl=disabled -Dgbm=disabled \
 	-Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
 	-Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
@@ -249,20 +249,20 @@ if [ "${AIR:-}" = 1 ]; then
 	# libOSMesa is below -- -x keeps the global symbols, which here are the rwa_* of
 	# tools/mesa/air/air_metal.h, and the install name has to be the path on the device
 	# because meson's own is @rpath.
-	ninja -C $BUILD src/gallium/drivers/freedreno/libredwoodair.dylib >> ninja.log
-	llvm-strip -x -o out/libredwoodair.dylib $BUILD/src/gallium/drivers/freedreno/libredwoodair.dylib
-	"$INTOOL" -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
+	ninja -C $BUILD src/gallium/drivers/freedreno/libannibaleair.dylib >> ninja.log
+	llvm-strip -x -o out/libannibaleair.dylib $BUILD/src/gallium/drivers/freedreno/libannibaleair.dylib
+	"$INTOOL" -id /annibale/lib/libannibaleair.dylib out/libannibaleair.dylib
 	# the interface the driver calls, kept as a manifest beside the library: the count printed
 	# here used to be allowed to be 0 (a strip that took rwa_* with it, or a meson that stopped
 	# building the sources, left a green build and a driver that dlopens a library it cannot
 	# call), and the 31 of docs/analysis/mesa-rebase-2026-10.md 9 is a ledger, not an assertion --
 	# so the list itself lands in out/exports-rwa.txt, its hash beside the size in the echo.
-	llvm-nm -gU out/libredwoodair.dylib | awk '{ print $NF }' | LC_ALL=C sort > out/exports-rwa.txt
+	llvm-nm -gU out/libannibaleair.dylib | awk '{ print $NF }' | LC_ALL=C sort > out/exports-rwa.txt
 	RWA=$(grep -c '^_rwa_' out/exports-rwa.txt)
-	[ "$RWA" -gt 0 ] || { echo "mk-mesa.sh: libredwoodair.dylib exports no rwa_* at all: the interface of tools/mesa/air/air_metal.h is not in the library"; exit 1; }
-	[ "$(dylib_id out/libredwoodair.dylib)" = /redwood/lib/libredwoodair.dylib ] || {
-		echo "mk-mesa.sh: libredwoodair.dylib does not carry the install name /redwood/lib/libredwoodair.dylib"; exit 1; }
-	echo "mk-mesa.sh: $B/out/libredwoodair.dylib ($(stat -c %s out/libredwoodair.dylib) bytes," \
+	[ "$RWA" -gt 0 ] || { echo "mk-mesa.sh: libannibaleair.dylib exports no rwa_* at all: the interface of tools/mesa/air/air_metal.h is not in the library"; exit 1; }
+	[ "$(dylib_id out/libannibaleair.dylib)" = /annibale/lib/libannibaleair.dylib ] || {
+		echo "mk-mesa.sh: libannibaleair.dylib does not carry the install name /annibale/lib/libannibaleair.dylib"; exit 1; }
+	echo "mk-mesa.sh: $B/out/libannibaleair.dylib ($(stat -c %s out/libannibaleair.dylib) bytes," \
 		"$RWA rwa_* functions, interface $(sha256sum < out/exports-rwa.txt | cut -d' ' -f1))"
 	# what this library was built from, so userland/build.sh can tell that it is older than the
 	# sources and come back here instead of shipping it beside a driver that disagrees with it;
@@ -273,9 +273,9 @@ if [ "${AIR:-}" = 1 ]; then
 fi
 
 llvm-strip -x -o out/libOSMesa.8.dylib $BUILD/src/gallium/targets/osmesa/libOSMesa.8.dylib
-"$INTOOL" -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
-[ "$(dylib_id out/libOSMesa.8.dylib)" = /redwood/lib/libOSMesa.8.dylib ] || {
-	echo "mk-mesa.sh: libOSMesa.8.dylib does not carry the install name /redwood/lib/libOSMesa.8.dylib"; exit 1; }
+"$INTOOL" -id /annibale/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
+[ "$(dylib_id out/libOSMesa.8.dylib)" = /annibale/lib/libOSMesa.8.dylib ] || {
+	echo "mk-mesa.sh: libOSMesa.8.dylib does not carry the install name /annibale/lib/libOSMesa.8.dylib"; exit 1; }
 llvm-nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
 # mkeagl.py consumes this list next and the whole table of eagl_gen.h is only as good as it is:
 # an empty one is a library exporting no gl* at all, and one without glDrawArrays is a build of

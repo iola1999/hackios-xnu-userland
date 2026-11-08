@@ -29,7 +29,7 @@
  *   rwsig: phase stop|resume round N at <us>
  *
  * Five seconds into every frozen phase it also asks the kernel for a thread dump of backboardd
- * (kern.redwood.thread_dump, osfmk/kern/redwood_threads.c). The library's own watcher only dumps
+ * (kern.annibale.thread_dump, osfmk/kern/annibale_threads.c). The library's own watcher only dumps
  * when a commit has not moved for 2.5 s, which cannot happen while backboardd is not committing
  * at all: the stall it is meant to catch leaves nothing to watch. One dump per frozen phase, and
  * another if backboardd's pid changes within it (a restarted compositor is a different stack).
@@ -82,7 +82,7 @@ now_us(void)
 }
 
 /* Frames put on the panel since boot, from the framebuffer's own counter through
- * kern.redwood.frames. Zero when the sysctl is absent, which is a kernel without it: the guard
+ * kern.annibale.frames. Zero when the sysctl is absent, which is a kernel without it: the guard
  * then cannot fire and every line says so. */
 static uint32_t
 frames_shown(void)
@@ -90,7 +90,7 @@ frames_shown(void)
 	uint32_t frames = 0;
 	size_t size = sizeof(frames);
 
-	if (sysctlbyname("kern.redwood.frames", &frames, &size, NULL, 0) != 0) {
+	if (sysctlbyname("kern.annibale.frames", &frames, &size, NULL, 0) != 0) {
 		return 0;
 	}
 	return frames;
@@ -137,7 +137,7 @@ dump_threads(void)
 		return;
 	}
 	value = pid;
-	if (sysctlbyname("kern.redwood.thread_dump", NULL, NULL, &value, sizeof(value)) != 0) {
+	if (sysctlbyname("kern.annibale.thread_dump", NULL, NULL, &value, sizeof(value)) != 0) {
 		error = errno;
 		say("rwsig: thread dump refused errno %d (%s) for pid %d at %llu\n", error,
 		    strerror(error), pid, (unsigned long long)now_us());
@@ -296,7 +296,7 @@ main(int argc, char **argv)
 	signal(SIGQUIT, on_signal);
 
 	if (frames_shown() == 0) {
-		say("rwsig: kern.redwood.frames is not there: the 90 s guard cannot fire this run\n");
+		say("rwsig: kern.annibale.frames is not there: the 90 s guard cannot fire this run\n");
 	}
 	if (frozen_seconds >= abort_after) {
 		say("rwsig: the frozen phase is %d s, at or beyond the guard's %d s: it will fire\n",

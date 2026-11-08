@@ -17,8 +17,8 @@ REPO_ROOT = HERE.parents[1]
 
 class TestVarStoreConfig(unittest.TestCase):
     def test_varstore_plist_removed(self):
-        plist_path = HERE / "com.redwood.varstore.plist"
-        self.assertFalse(plist_path.exists(), f"{plist_path} should be removed (RDWFS001 handles persistence)")
+        plist_path = HERE / "com.annibale.varstore.plist"
+        self.assertFalse(plist_path.exists(), f"{plist_path} should be removed (ANNFS001 handles persistence)")
 
     def test_cycle_boot_args(self):
         cycle_path = REPO_ROOT / "tools/k90auto/cycle.py"
@@ -31,7 +31,7 @@ class TestVarStoreConfig(unittest.TestCase):
         pkg_path = REPO_ROOT / "tools/k90auto/package.py"
         self.assertTrue(pkg_path.is_file(), f"{pkg_path} missing")
         text = pkg_path.read_text()
-        self.assertIn("com.redwood.varstore.plist", text)
+        self.assertIn("com.annibale.varstore.plist", text)
 
     def test_file_line_limits(self):
         checked_files = [
@@ -347,7 +347,7 @@ int main(int argc, char **argv) {
         self.assertIn("FILTERING_OK", res.stdout)
 
     def test_notify_trigger_file(self):
-        trigger = Path("/tmp/com.redwood.var_save")
+        trigger = Path("/tmp/com.annibale.var_save")
         trigger.write_text("1")
         self.assertTrue(trigger.is_file())
         # In var_store_stamp.inc, notify_check unlinks the trigger file

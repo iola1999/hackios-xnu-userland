@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleIdentifier</key>
-	<string>com.redwood.installer</string>
+	<string>com.annibale.installer</string>
 	<key>CFBundleExecutable</key>
-	<string>RedwoodInstaller</string>
+	<string>AnnibaleInstaller</string>
 	<key>CFBundleName</key>
-	<string>RedwoodInstaller</string>
+	<string>AnnibaleInstaller</string>
 	<key>CFBundleDisplayName</key>
 	<string>IPA 管理器</string>
 	<key>CFBundlePackageType</key>

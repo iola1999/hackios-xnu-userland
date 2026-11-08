@@ -209,7 +209,7 @@ texture_copy(id<MTLDevice> device, id<MTLCommandQueue> queue, MTLPixelFormat for
 int main(int argc, char **argv)
 {
 	BOOL software = NO;
-	const char *library = "/redwood/lib/libredwoodmetal.dylib";
+	const char *library = "/annibale/lib/libannibalemetal.dylib";
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--software")) software = YES;
 		else if (!strcmp(argv[i], "--library") && i + 1 < argc) library = argv[++i];
@@ -242,10 +242,10 @@ int main(int argc, char **argv)
 			stage("dlopen Metal candidate");
 			plugin = dlopen(library, RTLD_NOW | RTLD_LOCAL);
 			if (!plugin) { fail("dlopen: %s", dlerror()); goto finished; }
-			Class cls = objc_getClass("RedwoodMetalDevice");
+			Class cls = objc_getClass("AnnibaleMetalDevice");
 			SEL init = sel_registerName("initWithAcceleratorPort:");
 			if (!cls || ![cls instancesRespondToSelector:init]) {
-				fail("RedwoodMetalDevice initializer is unavailable"); goto finished;
+				fail("AnnibaleMetalDevice initializer is unavailable"); goto finished;
 			}
 			stage("initWithAcceleratorPort:0");
 			device = ((id (*)(id, SEL, uint32_t))objc_msgSend)([cls alloc], init, 0);
@@ -254,7 +254,7 @@ int main(int argc, char **argv)
 			if (![device respondsToSelector:raw_device_selector]) { fail("mesaDevice is unavailable"); goto finished; }
 			void *raw_device = ((void *(*)(id, SEL))objc_msgSend)(device, raw_device_selector);
 			if (!raw_device) { fail("the candidate has no Mesa device"); goto finished; }
-			backend = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW | RTLD_NOLOAD);
+			backend = dlopen("/annibale/lib/libannibaleair.dylib", RTLD_NOW | RTLD_NOLOAD);
 			const char *(*backend_name)(void *) = backend ? dlsym(backend, "rwa_device_name") : NULL;
 			if (!backend_name) { fail("cannot identify the loaded Mesa backend"); goto finished; }
 			const char *name = backend_name(raw_device);

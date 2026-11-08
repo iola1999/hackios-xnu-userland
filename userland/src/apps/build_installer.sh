@@ -1,27 +1,27 @@
 #!/bin/sh
-# Build script for RedwoodInstaller.app (IPA 管理器)
+# Build script for AnnibaleInstaller.app (IPA 管理器)
 set -e
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 USERLAND_DIR="$(cd "$HERE/../.." && pwd)"
 OBJ_DIR="$USERLAND_DIR/obj"
-APP_DIR="$OBJ_DIR/RedwoodInstaller.app"
+APP_DIR="$OBJ_DIR/AnnibaleInstaller.app"
 
 mkdir -p "$OBJ_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR"
 
-echo "build_installer.sh: compiling RedwoodInstaller binary..."
+echo "build_installer.sh: compiling AnnibaleInstaller binary..."
 if [ "$(uname -s)" = Darwin ]; then
 	/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -Os -fobjc-arc \
 		-Wno-deprecated-declarations -Wno-unused-command-line-argument \
 		-framework UIKit -framework Foundation -framework CoreGraphics -lobjc \
-		"$HERE/installer_app.m" -o "$APP_DIR/RedwoodInstaller"
+		"$HERE/installer_app.m" -o "$APP_DIR/AnnibaleInstaller"
 else
 	${CC:-xnu-clang} -arch arm64e -miphoneos-version-min=26.0 -Os -fobjc-arc \
 		-Wno-deprecated-declarations \
 		-framework UIKit -framework Foundation -framework CoreGraphics -lobjc \
-		"$HERE/installer_app.m" -o "$APP_DIR/RedwoodInstaller"
+		"$HERE/installer_app.m" -o "$APP_DIR/AnnibaleInstaller"
 fi
 
 cp "$HERE/installer_app.plist" "$APP_DIR/Info.plist"
@@ -116,10 +116,10 @@ PY
 
 echo "build_installer.sh: signing bundle with entitlements..."
 if [ "$(uname -s)" = Darwin ]; then
-	/usr/bin/codesign --force --sign - --entitlements "$HERE/installer_app.entitlements" "$APP_DIR/RedwoodInstaller"
+	/usr/bin/codesign --force --sign - --entitlements "$HERE/installer_app.entitlements" "$APP_DIR/AnnibaleInstaller"
 	/usr/bin/codesign --force --sign - --entitlements "$HERE/installer_app.entitlements" "$APP_DIR"
 else
-	${LDID:-ldid} -S"$HERE/installer_app.entitlements" "$APP_DIR/RedwoodInstaller"
+	${LDID:-ldid} -S"$HERE/installer_app.entitlements" "$APP_DIR/AnnibaleInstaller"
 fi
 
 echo "build_installer.sh: compiling appinst CLI..."
@@ -142,4 +142,4 @@ if [ -d "$USERLAND_DIR/../out/ios26-resume" ]; then
 	cp -f "$OBJ_DIR/appinst" "$USERLAND_DIR/../out/ios26-resume/appinst/appinst"
 fi
 
-echo "build_installer.sh: successfully built RedwoodInstaller.app ($(du -sk "$APP_DIR" | cut -f1) KB) and appinst"
+echo "build_installer.sh: successfully built AnnibaleInstaller.app ($(du -sk "$APP_DIR" | cut -f1) KB) and appinst"

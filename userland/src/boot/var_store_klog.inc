@@ -5,7 +5,7 @@
 #define KLOG_OFFSET     0xFF000000LL
 #define KLOG_RESERVE_SZ (16u << 20)
 #define KLOG_MAX_BYTES  (KLOG_RESERVE_SZ - BLOCK)
-#define KLOG_MAGIC      "RDWKLOG\0"
+#define KLOG_MAGIC      "ANNKLOG\0"
 #define KLOG_VERSION    1
 #define LAST_BOOT_LOG   "/private/var/db/last-boot.log"
 

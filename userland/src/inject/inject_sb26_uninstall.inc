@@ -247,8 +247,8 @@ sb26_perform_full_uninstall(const char *bundle_id)
     }
 
     /* 5. Trigger var_store persistence sync so uninstall persists across reboot */
-    notify_post("com.redwood.var_save");
-    fprintf(stderr, "sb26: posted com.redwood.var_save for %s uninstall\n", bundle_id);
+    notify_post("com.annibale.var_save");
+    fprintf(stderr, "sb26: posted com.annibale.var_save for %s uninstall\n", bundle_id);
 
     return 0;
 }

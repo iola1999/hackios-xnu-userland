@@ -2,8 +2,8 @@
  * xcrun clang -fno-objc-arc -Wall -Wextra -Werror -framework Foundation
  *   userland/src/metal_work_test.m -o /tmp/metal_work_test
  * No Metal device is used; GPU completion and fence behavior are outside this test. */
-#include "../gfx/redwoodmetal_work_private.h"
-#include "../gfx/redwoodmetal_work.inc"
+#include "../gfx/annibalemetal_work_private.h"
+#include "../gfx/annibalemetal_work.inc"
 #include <assert.h>
 #include <stdio.h>
 
@@ -34,12 +34,12 @@ struct counts {
 @end
 
 enum {
-	ColorSlots = sizeof(((RedwoodMetalWork *)0)->color) / sizeof(id),
+	ColorSlots = sizeof(((AnnibaleMetalWork *)0)->color) / sizeof(id),
 	SlotCount = 5 + ColorSlots + 4 * RW_MAX_BUFFERS
 };
 
 static void
-slots(RedwoodMetalWork *work, id **out)
+slots(AnnibaleMetalWork *work, id **out)
 {
 	unsigned n = 0;
 	out[n++] = (id *)&work->pipeline;
@@ -72,7 +72,7 @@ distinct_references(void)
 {
 	struct counts counts[SlotCount] = { 0 };
 	id *fields[SlotCount];
-	RedwoodMetalWork *work = [[RedwoodMetalWork alloc] init];
+	AnnibaleMetalWork *work = [[AnnibaleMetalWork alloc] init];
 	slots(work, fields);
 	@autoreleasepool {
 		for (unsigned i = 0; i < SlotCount; i++) {
@@ -96,8 +96,8 @@ repeated_references(void)
 {
 	struct counts counts = { 0 };
 	id *fields[SlotCount];
-	RedwoodMetalWork *first = [[RedwoodMetalWork alloc] init];
-	RedwoodMetalWork *second = [[RedwoodMetalWork alloc] init];
+	AnnibaleMetalWork *first = [[AnnibaleMetalWork alloc] init];
+	AnnibaleMetalWork *second = [[AnnibaleMetalWork alloc] init];
 	WorkProbe *probe = [[WorkProbe alloc] initWithCounts:&counts];
 	slots(first, fields);
 	for (unsigned i = 0; i < SlotCount; i++) {
@@ -120,11 +120,11 @@ discarded_and_sparse(void)
 {
 	struct counts counts = { 0 };
 	WorkProbe *probe = [[WorkProbe alloc] initWithCounts:&counts];
-	RedwoodMetalWork *discarded = [[RedwoodMetalWork alloc] init];
+	AnnibaleMetalWork *discarded = [[AnnibaleMetalWork alloc] init];
 	discarded->depth = probe;
 	[discarded release];
 	assert(counts.retained == 0 && counts.released == 0 && [probe probeValue] == 0x1234);
-	RedwoodMetalWork *sparse = [[RedwoodMetalWork alloc] init];
+	AnnibaleMetalWork *sparse = [[AnnibaleMetalWork alloc] init];
 	sparse->count = RW_MAX_BUFFERS;
 	sparse->buffers[RW_MAX_BUFFERS - 1] = probe;
 	[sparse retainResources];
@@ -132,7 +132,7 @@ discarded_and_sparse(void)
 	assert(counts.destroyed == 0 && [sparse->buffers[RW_MAX_BUFFERS - 1] probeValue] == 0x1234);
 	[sparse release];
 	assert(counts.retained == 1 && counts.released == 2 && counts.destroyed == 1);
-	RedwoodMetalWork *empty = [[RedwoodMetalWork alloc] init];
+	AnnibaleMetalWork *empty = [[AnnibaleMetalWork alloc] init];
 	[empty retainResources];
 	[empty release];
 }

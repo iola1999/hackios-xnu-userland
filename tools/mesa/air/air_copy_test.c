@@ -1,4 +1,4 @@
-/* Standalone copy checks against libredwoodair. Pass --software on a host;
+/* Standalone copy checks against libannibaleair. Pass --software on a host;
  * without it, the library uses its normal GPU selection. Hardware submission
  * counters are still required to distinguish Gallium's CPU fallback. */
 #include "air_metal.h"

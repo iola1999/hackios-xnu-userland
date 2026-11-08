@@ -1,5 +1,5 @@
 /*
- * RedwoodAudio.driver: the output device of iOS on this machine.
+ * AnnibaleAudio.driver: the output device of iOS on this machine.
  *
  * Audio devices reach the audio server's hardware layer (the "HAL" of CoreAudio, inside
  * mediaserverd) in two ways: kernel drivers through IOAudio2 -- that is how an iPhone's own
@@ -16,8 +16,8 @@
  * with nothing plugged in plays through, with a volume, the volume display and the place in
  * Control Center that go with it. So this presents four devices under those names:
  *
- *   "Speaker"   a stereo output whose samples are written to /dev/redwood-audio, where the
- *               kernel takes them to whatever can play them (see sys/redwood_audio.h), and a
+ *   "Speaker"   a stereo output whose samples are written to /dev/annibale-audio, where the
+ *               kernel takes them to whatever can play them (see sys/annibale_audio.h), and a
  *               stereo input that is always silent (on an iPhone: what the amplifiers measure)
  *   "Hawking"   one silent input and nothing else. The virtual audio device will not build the
  *               speaker route without a second virtual device of its own (its type 'vhaw', a
@@ -25,10 +25,10 @@
  *               only port is this input; without it everything stays on the null port.
  *   "Actuator"  one output of one channel: the iPhone's Taptic Engine, on which iOS plays its
  *               haptics as waveforms (through the chain 'd22_actuator_general'); its samples go to
- *               the kernel's motor driver, /dev/redwood-haptic (see actuator_write())
+ *               the kernel's motor driver, /dev/annibale-haptic (see actuator_write())
  *   "Codec"     one input of one channel: on an iPhone, the audio codec that the built-in
  *               microphones are on, of which the virtual audio device makes the built-in microphone
- *               port; its samples come from the kernel, /dev/redwood-mic (the phone's main
+ *               port; its samples come from the kernel, /dev/annibale-mic (the phone's main
  *               microphone, boot-arg mic=4), which listens only while this input runs (see codec_read())
  *
  * CoreAudio's own null device ("Null_Device", described in the framework's Info.plist, playing
@@ -39,11 +39,11 @@
  * speakers first ('d22_speaker_general', from /Library/Audio/Tunings/D22: equalisers,
  * compressors, speaker protection), at the volume iOS has set.
  *
- * The device has no clock but the system's: it claims to play exactly REDWOOD_AUDIO_RATE frames
+ * The device has no clock but the system's: it claims to play exactly ANNIBALE_AUDIO_RATE frames
  * a second of mach_absolute_time(), and the HAL's I/O thread paces itself by that.
  *
  * The speaker's output has a volume control, as the iPhone's own speaker has: what is set on it
- * goes to the kernel (ioctl REDWOOD_AUDIO_SET_VOLUME), which sets the amplifiers' level by it -- on
+ * goes to the kernel (ioctl ANNIBALE_AUDIO_SET_VOLUME), which sets the amplifiers' level by it -- on
  * the phone, so far under the loudest it allows. Its scale is 48 dB in a straight line of
  * decibels, 3 dB for each of iOS's sixteen steps; 0 is silence. What iOS does with it (the phone,
  * 15 October): the virtual audio device sets it once, to its top (0 dB), when it takes the
@@ -65,7 +65,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "redwood_audio.h"
+#include "annibale_audio.h"
 
 /* ---- the AudioServerPlugIn interface (macOS: CoreAudio/AudioServerPlugIn.h, AudioHardwareBase.h) ---- */
 
@@ -220,7 +220,7 @@ struct device {
 
 static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
-	  .output_channels = REDWOOD_AUDIO_CHANNELS, .input_channels = 2 },
+	  .output_channels = ANNIBALE_AUDIO_CHANNELS, .input_channels = 2 },
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
 	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 1 },
 	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
@@ -238,13 +238,13 @@ static struct device devices[] = {
 #define MIC_SOURCE              'imic'
 #define MIC_SOURCE_EXT          'emic'
 #define PROP_VIRTUAL_MASTER_VOL 'vmvc'
-#define MANUFACTURER            CFSTR("redwood")
+#define MANUFACTURER            CFSTR("annibale")
 /* how often a device says where its clock is, in frames: also the largest I/O buffer the HAL will use */
 #define TIMESTAMP_PERIOD        16384
 
 static AudioServerPlugInHostRef host;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static int sink = -1;                   /* /dev/redwood-audio */
+static int sink = -1;                   /* /dev/annibale-audio */
 static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
@@ -288,16 +288,16 @@ db_to_scalar(Float32 db)
 static void
 volume_to_kernel(void)
 {
-	struct redwood_audio_volume v = {
+	struct annibale_audio_volume v = {
 		(uint32_t)lround(-scalar_to_db(volume) * 8),
 		(speaker_muted != 0 || volume <= 0) ? 1u : 0u
 	};
 
-	if (sink < 0 || ioctl(sink, REDWOOD_AUDIO_SET_VOLUME, &v) < 0) {
-		say("redwood: audio: the volume %.3f could not be given to the kernel (%s)\n", volume, strerror(errno));
+	if (sink < 0 || ioctl(sink, ANNIBALE_AUDIO_SET_VOLUME, &v) < 0) {
+		say("annibale: audio: the volume %.3f could not be given to the kernel (%s)\n", volume, strerror(errno));
 		return;
 	}
-	say("redwood: audio: the volume is %.3f: %s%.1f dB under the loudest\n", volume, v.muted ? "silence, " : "",
+	say("annibale: audio: the volume is %.3f: %s%.1f dB under the loudest\n", volume, v.muted ? "silence, " : "",
 	    v.below / 8.0);
 }
 
@@ -313,7 +313,7 @@ device_of(AudioObjectID object)
 	return NULL;
 }
 
-/* The one format of a stream: 16-bit samples at REDWOOD_AUDIO_RATE, so many channels. */
+/* The one format of a stream: 16-bit samples at ANNIBALE_AUDIO_RATE, so many channels. */
 static AudioStreamBasicDescription
 format_of(AudioObjectID stream)
 {
@@ -321,7 +321,7 @@ format_of(AudioObjectID stream)
 	UInt32 channels = stream == d->output ? d->output_channels : d->input_channels;
 
 	return (AudioStreamBasicDescription) {
-		       .mSampleRate = REDWOOD_AUDIO_RATE, .mFormatID = kAudioFormatLinearPCM,
+		       .mSampleRate = ANNIBALE_AUDIO_RATE, .mFormatID = kAudioFormatLinearPCM,
 		       .mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
 		       .mBytesPerPacket = 2 * channels, .mFramesPerPacket = 1, .mBytesPerFrame = 2 * channels,
 		       .mChannelsPerFrame = channels, .mBitsPerChannel = 16,
@@ -361,12 +361,12 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 
 	host = the_host;
 	mach_timebase_info(&timebase);
-	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / REDWOOD_AUDIO_RATE;
-	sink = open(REDWOOD_AUDIO_DEVICE, O_RDWR);
+	ticks_per_frame = 1e9 * timebase.denom / timebase.numer / ANNIBALE_AUDIO_RATE;
+	sink = open(ANNIBALE_AUDIO_DEVICE, O_RDWR);
 	if (sink < 0) {
-		sink = open(REDWOOD_AUDIO_DEVICE, O_WRONLY);
+		sink = open(ANNIBALE_AUDIO_DEVICE, O_WRONLY);
 	}
-	say("redwood: audio: the speaker is with the HAL (%s: %s)\n", REDWOOD_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
+	say("annibale: audio: the speaker is with the HAL (%s: %s)\n", ANNIBALE_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
 	return 0;
 }
 
@@ -640,11 +640,11 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			v.empty = v.size == 0;
 			break;
 		case kAudioDevicePropertyNominalSampleRate:
-			v.u.number = REDWOOD_AUDIO_RATE;
+			v.u.number = ANNIBALE_AUDIO_RATE;
 			v.size = sizeof(Float64);
 			break;
 		case kAudioDevicePropertyAvailableNominalSampleRates:
-			v.u.range.mMinimum = v.u.range.mMaximum = REDWOOD_AUDIO_RATE;
+			v.u.range.mMinimum = v.u.range.mMaximum = ANNIBALE_AUDIO_RATE;
 			v.size = sizeof(AudioValueRange);
 			break;
 		case kAudioDevicePropertyPreferredChannelsForStereo:
@@ -681,7 +681,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 		case kAudioStreamPropertyAvailableVirtualFormats:
 		case kAudioStreamPropertyAvailablePhysicalFormats:
 			v.u.ranged.mFormat = format_of(object);
-			v.u.ranged.mSampleRateRange.mMinimum = v.u.ranged.mSampleRateRange.mMaximum = REDWOOD_AUDIO_RATE;
+			v.u.ranged.mSampleRateRange.mMinimum = v.u.ranged.mSampleRateRange.mMaximum = ANNIBALE_AUDIO_RATE;
 			v.size = sizeof(AudioStreamRangedDescription);
 			break;
 		}
@@ -718,7 +718,7 @@ unknown(AudioObjectID object, const AudioObjectPropertyAddress *address)
 	unknown_told[unknown_count][1] = s;
 	unknown_told[unknown_count][2] = c;
 	unknown_count++;
-	say("redwood: audio: asked of object %u (%s) what it does not have: '%c%c%c%c' (%#x), scope '%c%c%c%c', element %u\n",
+	say("annibale: audio: asked of object %u (%s) what it does not have: '%c%c%c%c' (%#x), scope '%c%c%c%c', element %u\n",
 	    (unsigned)object, device_of(object) ? CFStringGetCStringPtr(device_of(object)->uid, kCFStringEncodingUTF8) : "-",
 	    (int)(s >> 24 & 0xff), (int)(s >> 16 & 0xff), (int)(s >> 8 & 0xff), (int)(s & 0xff), (unsigned)s,
 	    (int)(c >> 24 & 0xff), (int)(c >> 16 & 0xff), (int)(c >> 8 & 0xff), (int)(c & 0xff), (unsigned)address->mElement);
@@ -895,7 +895,7 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		return 0;
 	}
 	if (address->mSelector == kAudioDevicePropertyNominalSampleRate) {
-		return size == sizeof(Float64) && *(const Float64 *)data == REDWOOD_AUDIO_RATE ? 0 : kAudioDeviceUnsupportedFormatError;
+		return size == sizeof(Float64) && *(const Float64 *)data == ANNIBALE_AUDIO_RATE ? 0 : kAudioDeviceUnsupportedFormatError;
 	}
 	/* a format: the one we have, or nothing */
 	if (size != sizeof(AudioStreamBasicDescription)) {
@@ -910,7 +910,7 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 }
 
 /*
- * The microphone (the device "Codec"): /dev/redwood-mic is open while the input runs, and the kernel
+ * The microphone (the device "Codec"): /dev/annibale-mic is open while the input runs, and the kernel
  * listens only while it is open. A read gives what has come and never waits; what it does not
  * give is silence. Said when it starts and stops, with how much came.
  */
@@ -921,23 +921,23 @@ static int mic_peak;
 static void
 codec_open(void)
 {
-	const char *dev_path = "/dev/redwood-mic";
+	const char *dev_path = "/dev/annibale-mic";
 	mic = open(dev_path, O_RDONLY | O_NONBLOCK);
 	if (mic < 0) {
-		dev_path = REDWOOD_AUDIO_DEVICE;
+		dev_path = ANNIBALE_AUDIO_DEVICE;
 		mic = open(dev_path, O_RDONLY | O_NONBLOCK);
 	}
 	mic_frames = mic_heard = mic_short = 0;
 	mic_peak = 0;
-	say("redwood: audio: the microphone is listened to (%s: %s)\n", dev_path, mic < 0 ? strerror(errno) : "open");
+	say("annibale: audio: the microphone is listened to (%s: %s)\n", dev_path, mic < 0 ? strerror(errno) : "open");
 }
 
 static void
 codec_close(void)
 {
-	say("redwood: audio: the microphone stops: %llu.%02llu s asked for, %llu.%02llu s of it from the kernel (peak %d of 32768), "
-	    "%llu reads short\n", mic_frames / REDWOOD_AUDIO_RATE, mic_frames % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE,
-	    mic_heard / REDWOOD_AUDIO_RATE, mic_heard % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, mic_peak, mic_short);
+	say("annibale: audio: the microphone stops: %llu.%02llu s asked for, %llu.%02llu s of it from the kernel (peak %d of 32768), "
+	    "%llu reads short\n", mic_frames / ANNIBALE_AUDIO_RATE, mic_frames % ANNIBALE_AUDIO_RATE * 100 / ANNIBALE_AUDIO_RATE,
+	    mic_heard / ANNIBALE_AUDIO_RATE, mic_heard % ANNIBALE_AUDIO_RATE * 100 / ANNIBALE_AUDIO_RATE, mic_peak, mic_short);
 	if (mic >= 0) {
 		close(mic);
 	}
@@ -951,8 +951,8 @@ codec_read(int16_t *samples, UInt32 frames)
 	UInt32 have = got > 0 ? (UInt32)got / 2 : 0;
 
 	if (have > 0 && mic_heard == 0) {
-		say("redwood: audio: the microphone's first samples, %llu.%02llu s after the input started\n",
-		    mic_frames / REDWOOD_AUDIO_RATE, mic_frames % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE);
+		say("annibale: audio: the microphone's first samples, %llu.%02llu s after the input started\n",
+		    mic_frames / ANNIBALE_AUDIO_RATE, mic_frames % ANNIBALE_AUDIO_RATE * 100 / ANNIBALE_AUDIO_RATE);
 	}
 	for (UInt32 i = 0; i < have; i++) {
 		int v = samples[i] < 0 ? -samples[i] : samples[i];
@@ -982,7 +982,7 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		d->seed++;
 		if (d->object == OBJECT_SPEAKER) {
 			written = refused = 0;
-			say("redwood: audio: playing\n");
+			say("annibale: audio: playing\n");
 		}
 		if (d->object == OBJECT_CODEC) {
 			codec_open();
@@ -1005,8 +1005,8 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
 		} else if (d->object == OBJECT_SPEAKER) {
-			say("redwood: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / REDWOOD_AUDIO_RATE,
-			    written % REDWOOD_AUDIO_RATE * 100 / REDWOOD_AUDIO_RATE, refused, REDWOOD_AUDIO_DEVICE);
+			say("annibale: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / ANNIBALE_AUDIO_RATE,
+			    written % ANNIBALE_AUDIO_RATE * 100 / ANNIBALE_AUDIO_RATE, refused, ANNIBALE_AUDIO_DEVICE);
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -1055,7 +1055,7 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
 /*
  * What iOS plays on the actuator -- the haptics: the system's feedbacks and the ringer's vibration,
  * CoreHaptics' patterns, UIKit's feedbacks, as waveforms of one channel -- goes to the kernel's motor
- * driver (/dev/redwood-haptic, bsd/dev/redwood_haptic.c, haptic=5), which plays Android's own
+ * driver (/dev/annibale-haptic, bsd/dev/annibale/annibale_haptic.c, haptic=5), which plays Android's own
  * waveforms on the phone's motor by it. (iOS plays on this device at all only because the device
  * tree says the phone's haptics are "closed-loop": see mkidentity.py.) Said the first times, with
  * how loud.
@@ -1074,7 +1074,7 @@ actuator_write(const int16_t *samples, UInt32 frames)
 		peak = v > peak ? v : peak;
 	}
 	if (haptic == -1) {
-		haptic = open("/dev/redwood-haptic", O_WRONLY | O_NONBLOCK);
+		haptic = open("/dev/annibale-haptic", O_WRONLY | O_NONBLOCK);
 		haptic = haptic >= 0 ? haptic : -2;
 	}
 	if (haptic >= 0) {
@@ -1082,8 +1082,8 @@ actuator_write(const int16_t *samples, UInt32 frames)
 	}
 	if (peak > 0 && haptic_said < 12) {
 		haptic_said++;
-		say("redwood: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
-		    haptic >= 0 ? "" : " (no /dev/redwood-haptic: not felt)");
+		say("annibale: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
+		    haptic >= 0 ? "" : " (no /dev/annibale-haptic: not felt)");
 	}
 }
 
@@ -1106,12 +1106,12 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
 		/* Report incomplete writes to the HAL without retrying on its real-time thread. */
-		size_t wanted = (size_t)frames * REDWOOD_AUDIO_FRAME;
+		size_t wanted = (size_t)frames * ANNIBALE_AUDIO_FRAME;
 		ssize_t bytes = sink < 0 ? -1 : write(sink, buffer, wanted);
 
 		written += frames;
 		if (bytes < 0 || (size_t)bytes != wanted) {
-			refused += frames - (bytes > 0 ? (UInt64)bytes / REDWOOD_AUDIO_FRAME : 0);
+			refused += frames - (bytes > 0 ? (UInt64)bytes / ANNIBALE_AUDIO_FRAME : 0);
 			return kAudioHardwareUnspecifiedError;
 		}
 	}
@@ -1128,7 +1128,7 @@ static AudioServerPlugInDriverInterface *driver = &interface;
 
 /* The factory named in the bundle's Info.plist. */
 void *
-RedwoodAudio_Create(__unused CFAllocatorRef allocator, CFUUIDRef type)
+AnnibaleAudio_Create(__unused CFAllocatorRef allocator, CFUUIDRef type)
 {
 	return CFEqual(type, kAudioServerPlugInTypeUUID) ? &driver : NULL;
 }

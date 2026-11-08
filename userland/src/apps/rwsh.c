@@ -2,9 +2,9 @@
  * rwsh: run the commands the host sends while iOS runs, and put their output into the console log.
  *
  * The host sends "fastboot oem sh TEXT"; the loader writes TEXT into the running kernel's mailbox
- * (struct loader_live in osfmk/arm64/loader_return.c) and the kernel shows it as kern.redwood.cmd,
+ * (struct loader_live in osfmk/arm64/loader_return.c) and the kernel shows it as kern.annibale.cmd,
  * "SEQ TEXT". This program looks at that every 250 ms and runs each new SEQ once. It is started from
- * rc.jobs ("/redwood/bin/rwsh &") and so runs as root, outside any sandbox.
+ * rc.jobs ("/annibale/bin/rwsh &") and so runs as root, outside any sandbox.
  *
  * Every line of output goes to stderr, which init leaves on the console:
  *   rwsh SEQ start TEXT
@@ -16,22 +16,22 @@
  *   ps                         pid, ppid, uid, user and system CPU seconds, threads, name
  *   threads PID                per thread: id, run state, current/base priority, user and system
  *                              CPU seconds, name
- *   dump PID                   kern.redwood.thread_dump: one kernel log line per thread of PID
+ *   dump PID                   kern.annibale.thread_dump: one kernel log line per thread of PID
  *   kill SIGNAL PID            kill(2)
  *   notify NAME                notify_post(3)
  *   sysctl NAME                the value as a string, or as integers when it is not printable
  *   sysctl NAME=NUMBER         set an integer sysctl
- *   setenv WORD...             kern.redwood.env becomes the words, each PROCESS:NAME=VALUE or
- *                              PROCESS:-NAME; libredwoodmetal applies its process's words when the
+ *   setenv WORD...             kern.annibale.env becomes the words, each PROCESS:NAME=VALUE or
+ *                              PROCESS:-NAME; libannibalemetal applies its process's words when the
  *                              process loads it
- *   addenv WORD...             the words are added to kern.redwood.env (a command is at most 119
+ *   addenv WORD...             the words are added to kern.annibale.env (a command is at most 119
  *                              characters, so a long setting is sent in pieces)
  *   restart NAME...            SIGKILL to every process of that name, for launchd to start again
- *   pull PATH                  kern.redwood.inbox, the last file the host pushed ("oem push"),
+ *   pull PATH                  kern.annibale.inbox, the last file the host pushed ("oem push"),
  *                              written to PATH (mode 755) through a temporary file and a rename
  *   pull PATH OFFSET           ... written into PATH at OFFSET, PATH kept otherwise: a file larger
  *                              than the 16 MB inbox arrives in pieces (tools/k90auto/install-ipa.py)
- *   outbox PATH                the file into kern.redwood.outbox: after the run the loader stages it
+ *   outbox PATH                the file into kern.annibale.outbox: after the run the loader stages it
  *                              ("oem recording") and run-auto.py fetches it as run/outbox.bin
  *   cat PATH [OFFSET]          the file from OFFSET on, 48 bytes a line in base64 ("cat AT DATA"),
  *                              as many lines as fit, then "cat end SIZE next AT" (fetch.py on the host)
@@ -186,7 +186,7 @@ do_threads(int pid)
 static int
 do_sysctl(char *name)
 {
-	static unsigned char value[128 * 1024];         /* kern.redwood.prof prints up to 96 KB */
+	static unsigned char value[128 * 1024];         /* kern.annibale.prof prints up to 96 KB */
 	size_t size = sizeof(value) - 1;
 	size_t printable = 0;
 	char *equals = strchr(name, '=');
@@ -303,8 +303,8 @@ do_env(int argc, char **argv, int append)
 	char value[1024] = "";
 	size_t size = sizeof(value) - 1, at;
 
-	if (append && sysctlbyname("kern.redwood.env", value, &size, NULL, 0) != 0) {
-		out("%s: kern.redwood.env: %s", argv[0], strerror(errno));
+	if (append && sysctlbyname("kern.annibale.env", value, &size, NULL, 0) != 0) {
+		out("%s: kern.annibale.env: %s", argv[0], strerror(errno));
 		return 1;
 	}
 	value[append ? size : 0] = 0;
@@ -313,16 +313,16 @@ do_env(int argc, char **argv, int append)
 		int n = snprintf(value + at, sizeof(value) - at, "%s%s", at ? " " : "", argv[i]);
 
 		if (n < 0 || (size_t)n >= sizeof(value) - at) {
-			out("%s: kern.redwood.env holds %zu characters", argv[0], sizeof(value) - 1);
+			out("%s: kern.annibale.env holds %zu characters", argv[0], sizeof(value) - 1);
 			return 1;
 		}
 		at += (size_t)n;
 	}
-	if (sysctlbyname("kern.redwood.env", NULL, NULL, value, at + 1) != 0) {
-		out("%s: kern.redwood.env: %s", argv[0], strerror(errno));
+	if (sysctlbyname("kern.annibale.env", NULL, NULL, value, at + 1) != 0) {
+		out("%s: kern.annibale.env: %s", argv[0], strerror(errno));
 		return 1;
 	}
-	out("kern.redwood.env = %s", value);
+	out("kern.annibale.env = %s", value);
 	return 0;
 }
 
@@ -373,7 +373,7 @@ do_outbox(const char *path)
 		if (n <= 0)
 			break;
 		memcpy(piece, head, sizeof(head));
-		if (sysctlbyname("kern.redwood.outbox", NULL, NULL, piece, sizeof(head) + (size_t)n) != 0) {
+		if (sysctlbyname("kern.annibale.outbox", NULL, NULL, piece, sizeof(head) + (size_t)n) != 0) {
 			out("outbox %s: at %llu: %s", path, (unsigned long long)head[1], strerror(errno));
 			break;
 		}
@@ -392,9 +392,9 @@ do_pull(const char *path, long long at)
 	uint64_t seq;
 	int fd, ok;
 
-	if (sysctlbyname("kern.redwood.inbox", NULL, &size, NULL, 0) != 0 || size < sizeof(seq) ||
-	    (data = malloc(size)) == NULL || sysctlbyname("kern.redwood.inbox", data, &size, NULL, 0) != 0) {
-		out("pull: kern.redwood.inbox: %s", strerror(errno));
+	if (sysctlbyname("kern.annibale.inbox", NULL, &size, NULL, 0) != 0 || size < sizeof(seq) ||
+	    (data = malloc(size)) == NULL || sysctlbyname("kern.annibale.inbox", data, &size, NULL, 0) != 0) {
+		out("pull: kern.annibale.inbox: %s", strerror(errno));
 		return 1;
 	}
 	memcpy(&seq, data, sizeof(seq));
@@ -529,7 +529,7 @@ do_maps_pid(int pid)
 static int
 do_dump_pid(int pid)
 {
-	if (sysctlbyname("kern.redwood.thread_dump", NULL, NULL, &pid, sizeof(pid)) != 0) {
+	if (sysctlbyname("kern.annibale.thread_dump", NULL, NULL, &pid, sizeof(pid)) != 0) {
 		out("dump %d: %s", pid, strerror(errno));
 		return 1;
 	}
@@ -633,8 +633,8 @@ main(void)
 	size_t size = sizeof(value);
 
 	/* The number already there when this starts was meant for an earlier run of the program. */
-	if (sysctlbyname("kern.redwood.cmd", value, &size, NULL, 0) != 0) {
-		emit("rwsh: no kern.redwood.cmd (%s): this kernel has no command mailbox", strerror(errno));
+	if (sysctlbyname("kern.annibale.cmd", value, &size, NULL, 0) != 0) {
+		emit("rwsh: no kern.annibale.cmd (%s): this kernel has no command mailbox", strerror(errno));
 		return 1;
 	}
 	done = strtoull(value, NULL, 10);
@@ -647,7 +647,7 @@ main(void)
 
 		usleep(RWSH_POLL_US);
 		size = sizeof(value) - 1;
-		if (sysctlbyname("kern.redwood.cmd", value, &size, NULL, 0) != 0)
+		if (sysctlbyname("kern.annibale.cmd", value, &size, NULL, 0) != 0)
 			continue;
 		value[size] = 0;
 		seq = strtoull(value, &text, 10);

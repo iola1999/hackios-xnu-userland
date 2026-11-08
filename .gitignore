@@ -8,7 +8,6 @@
 !/userland/
 !/ios165/
 !/ios26/
-!/prebuilt/
 !/tools/
 !/docs/
 
@@ -18,8 +17,6 @@ __pycache__/
 *.orig
 *.rej
 
-/prebuilt/*
-!/prebuilt/userland/
 /docs/*
 !/docs/air.md
 !/docs/air-report.md
@@ -41,7 +38,7 @@ __pycache__/
 !/userland/*.py
 !/userland/rc.*
 !/userland/jobs/
-!/userland/com.redwood.*.plist
+!/userland/com.annibale.*.plist
 !/userland/src/
 !/userland/libmini/
 !/userland/var/

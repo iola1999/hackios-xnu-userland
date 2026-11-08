@@ -206,7 +206,7 @@
 +      }
 +   }
 +
-+   /* Round air-d: the resource this copy fills, for the ring libredwoodair prints on SIGSEGV. The
++   /* Round air-d: the resource this copy fills, for the ring libannibaleair prints on SIGSEGV. The
 +    * source here is the caller's memory and belongs to no resource, so the texture is what gets
 +    * recorded. Row bytes are what util_copy_rect will copy, which is util_format_get_stride's answer
 +    * by definition: nblocks times the block size.
@@ -267,7 +267,7 @@
           goto no_dst_map;
 +      }
 +
-+      /* Round air-d: the resource this copy reads, for the ring libredwoodair prints on SIGSEGV. */
++      /* Round air-d: the resource this copy reads, for the ring libannibaleair prints on SIGSEGV. */
 +      void rwa_copy_record(const void *res, const void *buf, const void *src, unsigned level,
 +                           unsigned box_y, unsigned rows, unsigned len);
 +      rwa_copy_record(src, dst_map, src_map, src_level, src_box.y, src_box.height,

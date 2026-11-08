@@ -1,7 +1,7 @@
 /*
  * Request diagnostics preserve URLSession behavior and object ownership. Logs contain
  * host/path hashes, HTTP status and error domain/code; URL text and userInfo stay private.
- * REDWOOD_NET_TRACE=1 observes the local, background and background-download completion methods
+ * ANNIBALE_NET_TRACE=1 observes the local, background and background-download completion methods
  * present in 23G90 CFNetwork.
  */
 static void (*finish_local_task)(id, SEL, id), (*finish_background_task)(id, SEL, id);
@@ -78,7 +78,7 @@ network_task_record(id task, id error, const char *stage)
 	uint64_t path = network_hash(network_text(network_object(url, "path")));
 	char line[384];
 	int n = snprintf(line, sizeof(line),
-	    "redwood: %.64s: network stage=%s task=%lld scheme=%s host_hash=%016llx path_hash=%016llx "
+	    "annibale: %.64s: network stage=%s task=%lld scheme=%s host_hash=%016llx path_hash=%016llx "
 	    "http_status=%lld error_present=%u error_domain=%s error_code=%lld received=%lld\n",
 	    who, stage, network_number(task, "taskIdentifier"), kind, (unsigned long long)host,
 	    (unsigned long long)path, network_number(response, "statusCode"), error != NULL,
@@ -134,7 +134,7 @@ watch_network_finish(const char *name, IMP replacement, void *original)
 static void
 watch_network_completion(void)
 {
-	const char *enabled = getenv("REDWOOD_NET_TRACE");
+	const char *enabled = getenv("ANNIBALE_NET_TRACE");
 	if (enabled == NULL || strcmp(enabled, "1") != 0) {
 		return;
 	}
@@ -145,7 +145,7 @@ watch_network_completion(void)
 	char line[192];
 	int install_errno = errno;
 	int n = snprintf(line, sizeof(line),
-	    "redwood: %.64s: network completion hooks local=%u background=%u background_download=%u\n",
+	    "annibale: %.64s: network completion hooks local=%u background=%u background_download=%u\n",
 	    who, finish_local_task != NULL, finish_background_task != NULL, finish_background_download_task != NULL);
 	if (n > 0) {
 		say(line, (size_t)n < sizeof(line) ? (size_t)n : sizeof(line) - 1);

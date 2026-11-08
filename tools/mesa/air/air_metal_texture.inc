@@ -80,7 +80,7 @@ rwa_buffer_set_mirror(struct rwa_buffer *buffer, void *mirror)
 
 /*
  * A buffer that is the caller's own memory, for -newBufferWithBytesNoCopy: in place of a copy with a
- * mirror. The kernel wires the pages and enters them into the GPU's address space (RedwoodGPU's
+ * mirror. The kernel wires the pages and enters them into the GPU's address space (AnnibaleGPU's
  * request 0x7c, which drmIoctl passes on by the request's low byte), and the buffer object is
  * imported by its handle: the GPU reads what the caller writes, and no batch reads, hashes or
  * copies the memory first. A texture over such a buffer can be laid over it (buffer_texture_alias).
@@ -90,7 +90,7 @@ rwa_buffer_set_mirror(struct rwa_buffer *buffer, void *mirror)
 #include <errno.h>
 #include <sys/ioccom.h>
 
-struct redwood_memory_request {
+struct annibale_memory_request {
    uint64_t address, size;
    uint32_t handle, pad;
 };
@@ -103,7 +103,7 @@ rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char
                        size_t why_size)
 {
    RWA_LOCKED;
-   struct redwood_memory_request request = { (uint64_t)(uintptr_t)bytes, size, 0, 0 };
+   struct annibale_memory_request request = { (uint64_t)(uintptr_t)bytes, size, 0, 0 };
    struct pipe_resource templ = {
       .target = PIPE_BUFFER, .format = PIPE_FORMAT_R8_UNORM, .usage = PIPE_USAGE_STAGING,
       .bind = PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_INDEX_BUFFER |
@@ -122,7 +122,7 @@ rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char
       say(why, why_size, "%zu bytes at %p are not whole 4 KB pages", size, bytes);
       return NULL;
    }
-   if (drmIoctl(-1, _IOWR('d', 0x7c, struct redwood_memory_request), &request) != 0) {
+   if (drmIoctl(-1, _IOWR('d', 0x7c, struct annibale_memory_request), &request) != 0) {
       /* what kind of memory the kernel would not wire: its region, protection, tag and sharing */
       int error = errno;
       vm_address_t at = (vm_address_t)(uintptr_t)bytes;
@@ -254,9 +254,9 @@ buffer_texture_download(struct rwa_buffer_texture *backing, char *why, size_t wh
    }
    backing->hashed = true;
    backing->hash = rows_hash(bytes, span);
-   /* REDWOOD_THUMBS diagnostic: what the first writebacks carried, and where to */
+   /* ANNIBALE_THUMBS diagnostic: what the first writebacks carried, and where to */
    static unsigned said;
-   if (said < 64 && getenv("REDWOOD_THUMBS")) {
+   if (said < 64 && getenv("ANNIBALE_THUMBS")) {
       size_t nonzero = 0;
       for (size_t i = 0; i < span; i++)
          nonzero += bytes[i] != 0;

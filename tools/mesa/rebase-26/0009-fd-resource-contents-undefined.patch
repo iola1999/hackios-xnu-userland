@@ -6,7 +6,7 @@ diff --color -ru a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gall
  }
  
 +/*
-+ * HackiOS (libredwoodair, a Metal pass whose attachment is MTLLoadActionDontCare): the
++ * HackiOS (libannibaleair, a Metal pass whose attachment is MTLLoadActionDontCare): the
 + * resource's contents stop mattering to the next batch that draws into it, so that batch does
 + * not read it back into GMEM. Unlike fd_invalidate_resource(), the batch that wrote it last
 + * keeps its resolve: a batch recorded since may still sample what it wrote. The framebuffer

@@ -48,7 +48,7 @@ sb26_airdrop_init(id self, SEL cmd)
     return self;
 }
 
-static const char *const kAirDropModeFile = "/private/var/mobile/Library/Preferences/com.redwood.airdrop.mode";
+static const char *const kAirDropModeFile = "/private/var/mobile/Library/Preferences/com.annibale.airdrop.mode";
 static long long g_airdrop_mode = -1;
 
 static long long

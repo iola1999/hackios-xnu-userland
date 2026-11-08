@@ -3,10 +3,10 @@
  * draw: a missing icon is either a layer with no contents (nothing was rendered into it) or one
  * whose contents are there and did not reach the screen.
  *
- * `notify com.redwood.layers.<filter>` prints, to stderr and so to the console, every layer whose
+ * `notify com.annibale.layers.<filter>` prints, to stderr and so to the console, every layer whose
  * own class or whose view's class contains <filter> (case sensitive), at any depth, with the layers
- * below it up to LAYER_BELOW levels. `com.redwood.layers.all` prints the whole tree.
- * `com.redwood.layers.full` prints the full subtree without truncation and exports layer visual
+ * below it up to LAYER_BELOW levels. `com.annibale.layers.all` prints the whole tree.
+ * `com.annibale.layers.full` prints the full subtree without truncation and exports layer visual
  * styling (background, border, corner, masks, and filter parameters) to /private/var/tmp/layers-dump.txt.
  * Each line contains depth, layer class, view class, bounds and position, hidden/opacity, visual styles,
  * contents (CGImage/IOSurface with dimensions, mean colour and black ratio) and effects/filters.
@@ -54,7 +54,7 @@ static size_t (*color_count)(const void *);
 static const double *(*color_components)(const void *);
 
 static unsigned lines;
-static int to_say;      /* a process whose stderr goes nowhere: lines go to kern.redwood.say */
+static int to_say;      /* a process whose stderr goes nowhere: lines go to kern.annibale.say */
 static FILE *dump_fp;
 
 /* One line of the dump: to stderr, to dump file if full, and in a process whose stderr goes
@@ -74,7 +74,7 @@ out(const char *format, ...)
         char piece[248];
 
         snprintf(piece, sizeof(piece), "%s%.240s", at ? "+ " : "", line + at);
-        sysctlbyname("kern.redwood.say", NULL, NULL, piece, strlen(piece) + 1);
+        sysctlbyname("kern.annibale.say", NULL, NULL, piece, strlen(piece) + 1);
         usleep(6000);
     }
 }
@@ -717,7 +717,7 @@ sb26_install_layer_dump(void)
         char name[64];
         int token;
         const char *filter = i ? filters[i] : NULL;
-        snprintf(name, sizeof(name), "com.redwood.layers.%s", filters[i]);
+        snprintf(name, sizeof(name), "com.annibale.layers.%s", filters[i]);
         notify_register_dispatch(name, &token, dispatch_get_main_queue(), ^(int t) {
             static dispatch_once_t once;
             (void)t;
@@ -726,17 +726,17 @@ sb26_install_layer_dump(void)
         });
     }
     int token;
-    notify_register_dispatch("com.redwood.layers.full", &token, dispatch_get_main_queue(), ^(int t) {
+    notify_register_dispatch("com.annibale.layers.full", &token, dispatch_get_main_queue(), ^(int t) {
         static dispatch_once_t once;
         (void)t;
         dispatch_once_f(&once, NULL, resolve);
         dump(NULL, 1);
     });
-    notify_register_dispatch("com.redwood.battery.nofx", &token, dispatch_get_main_queue(), ^(int t) {
+    notify_register_dispatch("com.annibale.battery.nofx", &token, dispatch_get_main_queue(), ^(int t) {
         (void)t;
         clear_battery_filters();
     });
-    notify_register_dispatch("com.redwood.shapes.test", &token, dispatch_get_main_queue(), ^(int t) {
+    notify_register_dispatch("com.annibale.shapes.test", &token, dispatch_get_main_queue(), ^(int t) {
         (void)t;
         add_test_layers();
     });

@@ -26,7 +26,7 @@ and an imported resource carries a linear modifier.
 Measured facts this change rests on. Two rounds (E with fb_hz=120, F with the
 default 60) produced the same fault at the same call site: 28 of 28 link
 registers satisfy (lr - 0x27000c) mod 0x4000 == 0, which is the return address of
-the bl to _memcpy at libredwoodair.dylib + 0x270008, inside _util_copy_rect, the
+the bl to _memcpy at libannibaleair.dylib + 0x270008, inside _util_copy_rect, the
 row-loop memcpy at u_format.c:94. pc minus the cache slide is 0x2a53619c0 in both
 rounds. The destination is memory a client is using: each faulting x0 sits inside
 a burst of same-pid "rwa buffer: copied ... buffer at <x0>" lines, 2 to 8 lines
@@ -39,7 +39,7 @@ freed memory reused by the process's own allocator: ObjC selector fragments
 blocksize, so 355 pins a single-channel 8-bit format while 192 and 38 do not.
 The row is the mapped box's, not the resource's: u_surface.c:231 takes the box
 from the caller, and both AIR read-backs pass the region the client asked for
-(air_metal.c:1652 and :1745, from redwoodmetal_texture.inc:140-142 and
+(air_metal.c:1652 and :1745, from annibalemetal_texture.inc:140-142 and
 :165-168), so the resource can be much wider than any of the three lengths.
 None of the three divides 32768, the buffer size those copies run against, so
 bytesPerRow and the row length are not the same quantity and the buffer size only
@@ -76,7 +76,7 @@ to apply does not stop the build. Confirm the guard is in the built tree with
 `grep -c 'if (rsc->b.is_shared)' <tree>/src/gallium/drivers/freedreno/freedreno_resource.c`,
 0 before and 1 after. Counting every occurrence of the expression instead gives 4
 before and 5 after, because the assignments at :1097, :1391, :1527 and :1742
-already use it. Also confirm the rebuilt libredwoodair.dylib sha256 differs from
+already use it. Also confirm the rebuilt libannibaleair.dylib sha256 differs from
 the frozen one. Check this file with `git apply --check` rather than BSD patch:
 macOS patch 2.0-12u11-Apple reports it malformed at the first added line because
 of the prose above, while the container's GNU patch, which is what mk-mesa.sh:115

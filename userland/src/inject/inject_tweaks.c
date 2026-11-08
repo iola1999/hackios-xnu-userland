@@ -1,5 +1,5 @@
 /*
- * libredwood-tweaks.dylib: the tweak loader of this port.
+ * libannibale-tweaks.dylib: the tweak loader of this port.
  *
  * A tweak is a dylib that a package manager put in /var/jb/usr/lib/TweakInject, beside a property
  * list of the same name whose Filter says which programs it belongs in. Something has to be inside
@@ -177,7 +177,7 @@ wanted_here(const char *path, const char *name, const char *identifier)
 		if (plist != NULL) {
 			CFRelease(plist);
 		}
-		say("redwood: tweaks: %s is not a property list\n", path);
+		say("annibale: tweaks: %s is not a property list\n", path);
 		return false;
 	}
 	filter_key = CFSTR("Filter");
@@ -246,22 +246,22 @@ load_the_tweaks(void)
 			tried++;
 			if (dlopen(dylib, RTLD_NOW | RTLD_GLOBAL) != NULL) {
 				opened++;
-				say("redwood: tweaks: %s\n", dylib);
+				say("annibale: tweaks: %s\n", dylib);
 			} else {
-				say("redwood: tweaks: %s: %s\n", dylib, dlerror());
+				say("annibale: tweaks: %s: %s\n", dylib, dlerror());
 			}
 		}
 		closedir(dir);
 	}
 	if (tried > 0) {
-		say("redwood: tweaks: %s (%s): %d of %d opened\n", name != NULL ? name : "?",
+		say("annibale: tweaks: %s (%s): %d of %d opened\n", name != NULL ? name : "?",
 		    who != NULL ? who : "no bundle", opened, tried);
 	}
 }
 
 __attribute__((constructor))
 static void
-redwood_tweaks_init(void)
+annibale_tweaks_init(void)
 {
 	static bool done;
 

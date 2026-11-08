@@ -67,7 +67,7 @@
 + * 9a61305). Private memory also holds scratch arrays, which the second compile keeps too, so it is
 + * taken only when it needs less of it, or as much with fewer registers. Stages with a binning variant
 + * (vertex shaders under binning) are left as they are. Every other stage that uses private memory gets
-+ * one line on stdout (the first SPILL_LINES of a process), with or without REDWOOD_IR3_SPILL_RETRY=1,
++ * one line on stdout (the first SPILL_LINES of a process), with or without ANNIBALE_IR3_SPILL_RETRY=1,
 + * the switch for the second compile, which is made only for a stage that has a preamble.
 + */
 +#define SPILL_LINES 64
@@ -81,7 +81,7 @@
 +   const char *taken = "";
 +
 +   if (retry < 0)
-+      retry = debug_get_bool_option("REDWOOD_IR3_SPILL_RETRY", false);
++      retry = debug_get_bool_option("ANNIBALE_IR3_SPILL_RETRY", false);
 +   if (retry && v->info.preamble_instrs_count > 0) {
 +      other = alloc_variant(shader, &v->key, NULL, mem_ctx);
 +      if (other) {
@@ -160,7 +160,7 @@
     bool binning_pass;
 +
 +   /* Compiled with the preamble pass off: the second compile of a stage that used private memory
-+    * with it (create_variant, REDWOOD_IR3_SPILL_RETRY=1). Not part of the disk cache's range.
++    * with it (create_variant, ANNIBALE_IR3_SPILL_RETRY=1). Not part of the disk cache's range.
 +    */
 +   bool no_preamble;
     //	union {

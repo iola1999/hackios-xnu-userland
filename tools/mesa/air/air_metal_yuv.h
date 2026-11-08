@@ -1,4 +1,4 @@
-/* Copyright © 2026 Darwin on redwood contributors
+/* Copyright © 2026 Darwin on annibale contributors
  * SPDX-License-Identifier: MIT
  */
 #ifndef AIR_METAL_YUV_H

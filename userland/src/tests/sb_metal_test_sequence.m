@@ -15,7 +15,7 @@ static void check(const char *p,const char *b,const char *f,int t,const char *ex
         assert((bundle==NULL)==(want==NULL));
         assert(!want || !strcmp(bundle,want));
     }
-    if (strchr(expected,'B')) assert(!strcmp(loaded,"/redwood/lib/libredwood-sb26.dylib"));
+    if (strchr(expected,'B')) assert(!strcmp(loaded,"/annibale/lib/libannibale-sb26.dylib"));
 }
 int main(void) { @autoreleasepool {
  check("SpringBoard","23G90","1",0,"RB","com.apple.springboard");

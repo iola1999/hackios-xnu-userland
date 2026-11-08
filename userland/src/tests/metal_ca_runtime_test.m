@@ -74,7 +74,7 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
     id<MTLDevice> before = MTLCreateSystemDefaultDevice();
     printf("metalca26: default_before=%s\n", before ? object_getClassName(before) : "nil");
     if (before) { [before release]; fail("default device already registered"); return nil; }
-    if (objc_getClass("RedwoodMetalDevice")) { fail("candidate class already loaded"); return nil; }
+    if (objc_getClass("AnnibaleMetalDevice")) { fail("candidate class already loaded"); return nil; }
 
     stage("resolve MTLAddDevice");
     void (*add_device)(id) = dlsym(RTLD_DEFAULT, "MTLAddDevice");
@@ -87,7 +87,7 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
 
     stage("load candidate");
     if (!dlopen(path, RTLD_NOW | RTLD_LOCAL)) { fail(dlerror()); return nil; }
-    Class cls = objc_getClass("RedwoodMetalDevice");
+    Class cls = objc_getClass("AnnibaleMetalDevice");
     if (!cls || !method_matches(cls, NO, "initWithAcceleratorPort:", "@20@0:8I16")) {
         fail("candidate initializer mismatch"); return nil;
     }
@@ -106,7 +106,7 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
         fail("candidate does not conform to MTLDevice and MTLDeviceSPI"); return nil;
     }
     SEL mesa_selector = sel_registerName("mesaDevice");
-    void *backend = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW | RTLD_NOLOAD);
+    void *backend = dlopen("/annibale/lib/libannibaleair.dylib", RTLD_NOW | RTLD_NOLOAD);
     const char *(*backend_name)(void *) = backend ? dlsym(backend, "rwa_device_name") : NULL;
     void *mesa = [device respondsToSelector:mesa_selector] ?
         ((void *(*)(id, SEL))objc_msgSend)(device, mesa_selector) : NULL;

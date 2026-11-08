@@ -5,13 +5,13 @@
 # the copies is either a rebuild every build or a stale library shipped quietly.
 #
 #   mesa_from_stamp <root> <version> <rebase>
-#                        the patches and the redwood-drm the library is built from, plus the
+#                        the patches and the annibale-drm the library is built from, plus the
 #                        baseline they were meant for -- the caller names VERSION/REBASE, which is
 #                        where the baseline is pinned (userland/build.sh pins the branch's,
 #                        mk-mesa.sh defaults to the historical one)
 #   mesa_air_stamp <root>
 #                        the AIR frontend tools/mesa/air/, which the hash above does not mention:
-#                        libredwoodair.dylib is built from those sources and from nothing else
+#                        libannibaleair.dylib is built from those sources and from nothing else
 #
 # LC_ALL=C on the sort: the file list is hashed in byte order, not in the locale's collation -- a
 # 23 October check on macOS (en_US.UTF-8) read this contract as changed when it was not (bash
@@ -29,7 +29,7 @@ mesa_from_stamp() {
 			# not as `[ ... ] && find`: under mk-mesa's `set -e` the latter ended the pipeline's
 			# subshell on a 25.x run, hashing a list missing everything after the guard.
 			if [ "$3" = 26 ]; then find "$1"/tools/mesa/rebase-26 -maxdepth 1 -type f -name '*.patch' -print; fi
-			find "$1"/tools/mesa/redwood-drm -maxdepth 1 -type f -print; } |
+			find "$1"/tools/mesa/annibale-drm -maxdepth 1 -type f -print; } |
 			LC_ALL=C sort | xargs cat
 		echo "mesa-$2 REBASE=$3"; } | sha256sum
 }

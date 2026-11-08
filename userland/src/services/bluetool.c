@@ -1,14 +1,14 @@
 /*
- * BlueTool replacement for the REDMI K90's WCN7850 Bluetooth controller (/redwood/bin/bluetool,
+ * BlueTool replacement for the REDMI K90's WCN7850 Bluetooth controller (/annibale/bin/bluetool,
  * launchd job com.apple.BlueTool).
  *
  * bluetoothd asks BlueTool over XPC to run the "boot" and "init" scripts before opening the H4
  * transport: a dictionary with kMsgId = "RunBuiltinScript" (or "RunExternalScript", "RunCommand")
  * and kMsgArgs = { script = "boot" | "init" | "deepsleep", btaddress = ... }. Stock BlueTool only
  * knows Apple PCIe and Broadcom UART controllers. Here the kernel's annibale_bt_hci.c downloads
- * the WCN7850 TLV rampatch and NVM over SE14 and runs HCI Reset, then sets kern.redwood.bt_ready=1.
+ * the WCN7850 TLV rampatch and NVM over SE14 and runs HCI Reset, then sets kern.annibale.bt_ready=1.
  *
- * Waiting for kern.redwood.bt_ready before answering holds bluetoothd until the controller and its
+ * Waiting for kern.annibale.bt_ready before answering holds bluetoothd until the controller and its
  * local-mac-address on the IOKit "bluetooth" service are ready. The reply carries result = 0,
  * manufacturer = 15 (Broadcom, whose vendor commands annibale_bt_ios.c answers locally), and a
  * firmware description string.
@@ -33,7 +33,7 @@ wait_bt_ready(int *waited_ms)
 	for (waited = 0; waited < 40000; waited += 50) {
 		size_t len = sizeof(ready);
 
-		if (sysctlbyname("kern.redwood.bt_ready", &ready, &len, NULL, 0) == 0 && ready != 0) {
+		if (sysctlbyname("kern.annibale.bt_ready", &ready, &len, NULL, 0) == 0 && ready != 0) {
 			break;
 		}
 		usleep(50 * 1000);

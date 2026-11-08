@@ -270,7 +270,7 @@ set_accessibility(const char *argument, const char *setter)
  * SpringBoard main thread RunLoop stall watcher (adapted for arm64e with touch_lat=1).
  * When a turn takes >25 ms, stall_watch wakes up, suspends the main thread,
  * walks up to 14 frames, strips arm64e PAC from lr using ptrauth_strip,
- * resolves symbols with dladdr(), and logs via kern.redwood.say.
+ * resolves symbols with dladdr(), and logs via kern.annibale.say.
  */
 static volatile uint64_t turn_began;
 static uintptr_t main_stack_top, main_stack_bottom;
@@ -285,7 +285,7 @@ say(const char *format, ...)
     va_start(args, format);
     vsnprintf(line, sizeof(line), format, args);
     va_end(args);
-    sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line) + 1);
+    sysctlbyname("kern.annibale.say", NULL, NULL, line, strlen(line) + 1);
 }
 
 static void

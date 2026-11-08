@@ -9,7 +9,7 @@
  * the stop and asks for the dump during it.
  *
  * usage: framewatch STILL_SECONDS MAX_DUMPS [NAME...]
- *   poll kern.redwood.frames once a second; when it has not grown for STILL_SECONDS, ask for a
+ *   poll kern.annibale.frames once a second; when it has not grown for STILL_SECONDS, ask for a
  *   thread dump of every NAME (default backboardd and SpringBoard), then keep counting. After
  *   MAX_DUMPS dumps it keeps watching and prints one line a second, which is what tells a lasting
  *   stop from an intermittent one. NAME matches p_comm exactly first, then as a prefix.
@@ -22,7 +22,7 @@
  *   format so a log can be read without knowing which produced it.
  *
  * Two readings, both from counters that do not throttle:
- *   - "stopped" is frames that did not grow (kern.redwood.frames counts every swap);
+ *   - "stopped" is frames that did not grow (kern.annibale.frames counts every swap);
  *   - "for how long" is mach_absolute_time, the clock the tl: lines carry, so a framewatch line and
  *     a frame log line can be placed on one axis.
  * The touch samples (tl: p) are printed on powers of two, so a log line count there is not an event
@@ -86,7 +86,7 @@ frames_shown(uint32_t *frames)
 	size_t size = sizeof(*frames);
 
 	*frames = 0;
-	return sysctlbyname("kern.redwood.frames", frames, &size, NULL, 0) == 0;
+	return sysctlbyname("kern.annibale.frames", frames, &size, NULL, 0) == 0;
 }
 
 static pid_t
@@ -123,7 +123,7 @@ dump_one(const char *name, int stalled)
 		return;
 	}
 	value = pid;
-	if (sysctlbyname("kern.redwood.thread_dump", NULL, NULL, &value, sizeof(value)) != 0) {
+	if (sysctlbyname("kern.annibale.thread_dump", NULL, NULL, &value, sizeof(value)) != 0) {
 		error = errno;
 		say("framewatch: dump refused errno %d (%s) for %s pid %d\n", error, strerror(error),
 		    name, pid);
@@ -179,7 +179,7 @@ every(int every_seconds, int count)
 			{
 				int value = pid;
 
-				if (sysctlbyname("kern.redwood.thread_dump", NULL, NULL, &value,
+				if (sysctlbyname("kern.annibale.thread_dump", NULL, NULL, &value,
 				                 sizeof(value)) != 0) {
 					say("framewatch: dump refused errno %d (%s) for %s pid %d\n",
 					    errno, strerror(errno), names[k], pid);
@@ -231,7 +231,7 @@ main(int argc, char **argv)
 		return every(every_seconds, count);
 	}
 	if (!frames_shown(&last)) {
-		fprintf(stderr, "framewatch: kern.redwood.frames is not there: nothing to watch\n");
+		fprintf(stderr, "framewatch: kern.annibale.frames is not there: nothing to watch\n");
 		return 1;
 	}
 	atexit(on_exit);
@@ -239,7 +239,7 @@ main(int argc, char **argv)
 	signal(SIGTERM, on_signal);
 	signal(SIGHUP, on_signal);
 	signal(SIGQUIT, on_signal);
-	say("framewatch: watching kern.redwood.frames from %u, still after %d s, at most %d dumps\n",
+	say("framewatch: watching kern.annibale.frames from %u, still after %d s, at most %d dumps\n",
 	    last, still_seconds, max_dumps);
 
 	while (!finish) {
@@ -248,7 +248,7 @@ main(int argc, char **argv)
 			break;
 		}
 		if (!frames_shown(&frames)) {
-			say("framewatch: kern.redwood.frames went away at %llu\n",
+			say("framewatch: kern.annibale.frames went away at %llu\n",
 			    (unsigned long long)now_us());
 			break;
 		}

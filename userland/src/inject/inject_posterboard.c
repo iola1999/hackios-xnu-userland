@@ -300,17 +300,17 @@ install_posterboard(void)
  * MercuryPosterExtension, the provider of the default wallpaper, is an ExtensionKit extension
  * whose standard error is /dev/null, so its os_log lines and the Metal library's printf output are
  * lost. Here its standard error goes into a pipe and a thread passes each line to
- * kern.redwood.say ("say PID MercuryPosterExtension: ...").
+ * kern.annibale.say ("say PID MercuryPosterExtension: ...").
  *
- * It has no launchd job for JOB_ENV to give variables to: /redwood/etc/env/MercuryPosterExtension
+ * It has no launchd job for JOB_ENV to give variables to: /annibale/etc/env/MercuryPosterExtension
  * (EXT_ENV in tools/k90auto/package.py), one KEY=VALUE a line, is put in its environment here and
  * the process executes itself again, because some variables are read once while libSystem starts,
  * before any inserted library runs: OS_ACTIVITY_DT_MODE=YES, the copy of os_log on standard error,
  * set here and not again in kernel-12377-cmd44-bo25 printed none of the extension's os_log lines.
- * REDWOOD_EXT_ENV marks the second start. The kernel inserts this library again at that exec
+ * ANNIBALE_EXT_ENV marks the second start. The kernel inserts this library again at that exec
  * (kern.exec_inject matches the program name).
  */
-#define EXT_ENV_FILE "/redwood/etc/env/MercuryPosterExtension"
+#define EXT_ENV_FILE "/annibale/etc/env/MercuryPosterExtension"
 
 static int
 read_env(const char *path)
@@ -340,7 +340,7 @@ forward_stderr(void *arg)
 
     /* paced under the 200 lines a second the kernel keeps; a full pipe makes the writer wait */
     while (in != NULL && fgets(line, sizeof(line), in) != NULL) {
-        sysctlbyname("kern.redwood.say", NULL, NULL, line, strlen(line));
+        sysctlbyname("kern.annibale.say", NULL, NULL, line, strlen(line));
         usleep(5000);
     }
     return NULL;
@@ -454,13 +454,13 @@ install_mercury_hooks(void)
     }
 
     int token_suspend = 0;
-    notify_register_dispatch("com.redwood.wallpaper.suspend", &token_suspend, dispatch_get_main_queue(), ^(int t) {
+    notify_register_dispatch("com.annibale.wallpaper.suspend", &token_suspend, dispatch_get_main_queue(), ^(int t) {
         (void)t;
         mercury_set_suspended(1);
     });
 
     int token_resume = 0;
-    notify_register_dispatch("com.redwood.wallpaper.resume", &token_resume, dispatch_get_main_queue(), ^(int t) {
+    notify_register_dispatch("com.annibale.wallpaper.resume", &token_resume, dispatch_get_main_queue(), ^(int t) {
         (void)t;
         mercury_set_suspended(0);
     });
@@ -486,11 +486,11 @@ install_mercury(void)
     pthread_t thread;
 
     if (!getprogname() || strcmp(getprogname(), "MercuryPosterExtension")) return;
-    if (getenv("REDWOOD_EXT_ENV") == NULL && read_env(EXT_ENV_FILE) > 0) {
+    if (getenv("ANNIBALE_EXT_ENV") == NULL && read_env(EXT_ENV_FILE) > 0) {
         char path[1024];
         uint32_t size = sizeof(path);
 
-        setenv("REDWOOD_EXT_ENV", EXT_ENV_FILE, 1);
+        setenv("ANNIBALE_EXT_ENV", EXT_ENV_FILE, 1);
         if (_NSGetExecutablePath(path, &size) == 0)
             execve(path, *_NSGetArgv(), *_NSGetEnviron());
     }
@@ -507,7 +507,7 @@ install_mercury(void)
     pthread_detach(thread);
     dup2(ends[1], STDERR_FILENO);
     close(ends[1]);
-    if (getenv("REDWOOD_EXT_ENV") != NULL)
+    if (getenv("ANNIBALE_EXT_ENV") != NULL)
         fprintf(stderr, "pb26: started again with the variables of %s\n", EXT_ENV_FILE);
 }
 

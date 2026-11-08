@@ -39,11 +39,11 @@ int main(int argc,char **argv) { @autoreleasepool { @try {
         int console=open("/dev/console",O_WRONLY|O_NOCTTY);
         if(console>=0) {dup2(console,STDOUT_FILENO);dup2(console,STDERR_FILENO);if(console>STDERR_FILENO)close(console);}
         unsetenv("RWA_SOFTWARE");
-        if(!dlopen("/redwood/lib/libredwoodmetal.dylib",RTLD_NOW|RTLD_LOCAL)) {printf("video_combined: driver load failed\n");return 2;}
-        Class cls=objc_getClass("RedwoodMetalDevice");SEL init=sel_registerName("initWithAcceleratorPort:");
+        if(!dlopen("/annibale/lib/libannibalemetal.dylib",RTLD_NOW|RTLD_LOCAL)) {printf("video_combined: driver load failed\n");return 2;}
+        Class cls=objc_getClass("AnnibaleMetalDevice");SEL init=sel_registerName("initWithAcceleratorPort:");
         if(!cls || ![cls instancesRespondToSelector:init])return 2;
         device=((id(*)(id,SEL,uint32_t))objc_msgSend)([cls alloc],init,0);
-        void *air=dlopen("/redwood/lib/libredwoodair.dylib",RTLD_NOW|RTLD_NOLOAD);
+        void *air=dlopen("/annibale/lib/libannibaleair.dylib",RTLD_NOW|RTLD_NOLOAD);
         const char *(*device_name)(void *)=air?dlsym(air,"rwa_device_name"):NULL;
         SEL mesa=sel_registerName("mesaDevice");
         if(!device_name || ![device respondsToSelector:mesa])return 2;

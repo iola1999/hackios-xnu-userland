@@ -42,7 +42,7 @@ static char created[12][128];
 static int fake_lstat(const char *p, struct stat *s) {
     memset(s, 0, sizeof(*s));
     s->st_mode = S_IFDIR;
-    if (!strcmp(p, "/fw") || !strcmp(p, "/jb-bin") || strstr(p, "RedwoodMetal.bundle")) {
+    if (!strcmp(p, "/fw") || !strcmp(p, "/jb-bin") || strstr(p, "AnnibaleMetal.bundle")) {
         errno = ENOENT;
         return -1;
     }
@@ -83,7 +83,7 @@ static int fake_mount(const char *type, const char *to, int flags, void *data) {
         errno = EIO;
         return -1;
     }
-    if (scenario == HELPER_FAILURE && !strcmp(to, "/redwood")) {
+    if (scenario == HELPER_FAILURE && !strcmp(to, "/annibale")) {
         errno = EIO;
         return -1;
     }
@@ -101,7 +101,7 @@ static int fake_sysctl(const char *name, void *a, size_t *b, void *data, size_t 
         strcpy(created[synths++], data);
         return 0;
     }
-    if (!strcmp(name, "kern.redwood_switch_root")) {
+    if (!strcmp(name, "kern.annibale_switch_root")) {
         switches++;
         if (scenario == SWITCH_FAILURE) {
             errno = EIO;
@@ -139,7 +139,7 @@ static int fake_chdir(const char *p) {
 TEST_MAIN = r'''
 
 int main(void) {
-    base = "/redwood";
+    base = "/annibale";
     for (scenario = SINGLE_CONTAINER; scenario < SCENARIO_COUNT; scenario++) {
         checks = failures = flash_root_mode = switches = binds = xpc_bound = synths = cryptexes = 0;
         int ok = flash_root("ufs_darwin");

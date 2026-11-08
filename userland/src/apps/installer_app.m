@@ -1,5 +1,5 @@
 /*
- * RedwoodInstaller: Native iOS application manager and IPA installer for HackiOS.
+ * AnnibaleInstaller: Native iOS application manager and IPA installer for HackiOS.
  *
  * Provides a graphical interface to:
  * 1. View all installed third-party applications with bundle ID, version, and disk size.
@@ -93,10 +93,10 @@ static NSString *format_size_string(unsigned long long bytes)
 
 static BOOL is_test_identifier(NSString *bid)
 {
-	if ([bid isEqualToString:@"com.redwood.installer"]) {
+	if ([bid isEqualToString:@"com.annibale.installer"]) {
 		return NO;
 	}
-	if ([bid isEqualToString:@"com.redwood.hello"] ||
+	if ([bid isEqualToString:@"com.annibale.hello"] ||
 	    [bid hasPrefix:@"com.example."] ||
 	    [bid hasPrefix:@"com.test."] ||
 	    [bid rangeOfString:@"test" options:NSCaseInsensitiveSearch].location != NSNotFound ||
@@ -122,7 +122,7 @@ int posix_spawnattr_set_persona_gid_np(const posix_spawnattr_t *, gid_t);
 static int run_external_appinst(const char *action, const char *arg, NSString **output)
 {
 	const char *candidates[] = {
-		"/redwood/bin/appinst",
+		"/annibale/bin/appinst",
 		"/bin/appinst",
 		"/usr/bin/appinst",
 		NULL
@@ -135,7 +135,7 @@ static int run_external_appinst(const char *action, const char *arg, NSString **
 		}
 	}
 	if (bin_path == NULL) {
-		bin_path = "/redwood/bin/appinst";
+		bin_path = "/annibale/bin/appinst";
 	}
 
 	int pipe_fd[2];
@@ -417,7 +417,7 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 - (void)cleanTestAppsClicked
 {
 	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清理残留测试应用"
-	                                                               message:@"将扫描并清理开发测试过程中遗留的应用（如 com.example.*、com.test.*、com.redwood.hello 等）。是否继续？"
+	                                                               message:@"将扫描并清理开发测试过程中遗留的应用（如 com.example.*、com.test.*、com.annibale.hello 等）。是否继续？"
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
 
 	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];

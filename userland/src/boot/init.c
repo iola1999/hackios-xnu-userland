@@ -1,7 +1,7 @@
 /*
  * Process 1 of the Darwin bring-up, until it hands over to the real launchd.
  *
- * It lives in the small image mounted on /redwood (see stage0.c) and
+ * It lives in the small image mounted on /annibale (see stage0.c) and
  *   - mounts the writable data volume on /private/var and creates the directories
  *     a system expects there;
  *   - checks what the kernel can do for user space, one line per check;
@@ -10,7 +10,7 @@
  *   - halts the machine if it is still process 1 after that.
  *
  * Started with a file name by anything else, it is a command runner: that is
- * how a launchd job (LaunchDaemons/com.redwood.demo.plist) runs a list of
+ * how a launchd job (LaunchDaemons/com.annibale.demo.plist) runs a list of
  * commands.
  */
 #include "mini.h"
@@ -133,7 +133,7 @@ mount_dir(const char *path)
  * root_apfs=DEV mounts the read-only iOS volume and binds the boot image's launchd jobs, xpc
  * cache, HAL plug-ins and Metal bundle over its system paths. Staged applications get synthetic
  * names in /Applications before /private/var is mounted. No system-volume data is written.
- * After switching the root, the boot volume moves to /private/preboot, md1 is rebound on /redwood,
+ * After switching the root, the boot volume moves to /private/preboot, md1 is rebound on /annibale,
  * and OS/App cryptexes mount beneath /private/preboot/Cryptexes. The kernel uses the OS shared cache.
  * rd=md0 stays on the command line so launchd skips the real-device boot tasks.
  */
@@ -202,7 +202,7 @@ flash_root(const char *dev)
 	if (!ok) {
 		return 0;
 	}
-	check(mount_dir("/flash/redwood"), "prepare /redwood");
+	check(mount_dir("/flash/annibale"), "prepare /annibale");
 	check(mount_dir("/flash/private/preboot"), "prepare /private/preboot");
 	static const struct { const char *from, *to; } mounts[] = {
 		{ "/LaunchDaemons", "/flash/System/Library/LaunchDaemons" },
@@ -214,12 +214,12 @@ flash_root(const char *dev)
 	for (unsigned i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
 		check(mount_dir(mounts[i].to) && bind_dir(in_image(mounts[i].from), mounts[i].to), mounts[i].to);
 	}
-	if (stat(in_image("/lib/RedwoodMetal.bundle"), &fw_st) == 0) {
-		if (lstat("/flash/System/Library/Extensions/RedwoodMetal.bundle", &fw_st) != 0) {
-			(void)synthetic_dir("/flash/System/Library/Extensions/RedwoodMetal.bundle");
+	if (stat(in_image("/lib/AnnibaleMetal.bundle"), &fw_st) == 0) {
+		if (lstat("/flash/System/Library/Extensions/AnnibaleMetal.bundle", &fw_st) != 0) {
+			(void)synthetic_dir("/flash/System/Library/Extensions/AnnibaleMetal.bundle");
 		}
-		check(bind_dir(in_image("/lib/RedwoodMetal.bundle"),
-		    "/flash/System/Library/Extensions/RedwoodMetal.bundle"),
+		check(bind_dir(in_image("/lib/AnnibaleMetal.bundle"),
+		    "/flash/System/Library/Extensions/AnnibaleMetal.bundle"),
 		    "our Metal driver bundle in /System/Library/Extensions");
 	}
 	if (stat("/fw", &fw_st) == 0 && lstat("/flash/fw", &fw_st) != 0) {
@@ -276,7 +276,7 @@ flash_root(const char *dev)
 	if (failures != before) {
 		return 0;
 	}
-	ok = sysctlbyname("kern.redwood_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
+	ok = sysctlbyname("kern.annibale_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
 	if (!ok) {
 		printf("  switching the root: %s\n", strerror(errno));
 	}
@@ -295,7 +295,7 @@ flash_root(const char *dev)
 	 */
 	mount_cryptex("OS", ",c=1", devpath);
 	mount_cryptex("App", ",c=2", devpath);
-	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
+	check(bind_dir("/private/preboot/annibale", "/annibale"), "this image back on /annibale");
 	if (failures != before) {
 		return 0;
 	}
@@ -1066,7 +1066,7 @@ test_time(void)
 
 /*
  * etc/inject.conf is one line, "LIBRARY NAME NAME ...": the kernel starts the programs with
- * these file names with the library inserted (sysctl kern.exec_inject, see libredwood).
+ * these file names with the library inserted (sysctl kern.exec_inject, see libannibale).
  */
 static void
 configure_inject(void)
@@ -1142,8 +1142,8 @@ main(int argc, char **argv, char **envp)
 	if (fd > 2)
 		close(fd);
 	(void)envp;
-	if (argc > 0 && strncmp(argv[0], "/redwood/", 9) == 0)
-		base = "/redwood";
+	if (argc > 0 && strncmp(argv[0], "/annibale/", 9) == 0)
+		base = "/annibale";
 	/* Not process 1: a command runner, "init FILE" (this is how a launchd job runs a list of commands). */
 	if (getpid() != 1) {
 		if (argc > 1)

@@ -35,7 +35,7 @@ AIR2NIR = os.environ.get(
     "AIR2NIR", os.path.join(ROOT, "build/mesa-host/build/src/compiler/air/air2nir"))
 IR3 = os.environ.get(
     "IR3", os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler"))
-# the redwood's Adreno 7c+ Gen 3 (A635), as freedreno names it
+# the POCO X5 Pro's Adreno 7c+ Gen 3 (A635), as freedreno names it
 CHIP_ID = os.environ.get("AIR_CHIP_ID", "0x007506030500")
 
 
@@ -48,7 +48,7 @@ TOOL_MAINS = {"air2nir.c": "air2nir", "air_run.c": "air_run",
               # the library the Metal driver links and its test (air_metal.h):
               # in no binary whose numbers this script reports, so a change to
               # them makes none of those stale.
-              "air_metal.c": "libredwoodair", "air_metal.h": "libredwoodair",
+              "air_metal.c": "libannibaleair", "air_metal.h": "libannibaleair",
               "air_metal_test.c": "air_metal_test"}
 
 

@@ -1,12 +1,12 @@
 /*
- * libredwood-xpcwatch.dylib: which named services a process connects to, and how often.
+ * libannibale-xpcwatch.dylib: which named services a process connects to, and how often.
  *
  * Several processes of the desktop keep two or three processors busy minutes after boot
  * (SpringBoard, appprotectiond, com.apple.MapKit.SnapshotService; kernel-12377-cmd23-state1), and
  * their samples sit in XPC connection setup and teardown, with launchd answering. A client that
  * reconnects in a loop to a service that cannot answer looks like that. This library is inserted
  * into such processes (etc/inject.conf) and interposes the calls that name a service, so the names
- * and their counts reach the kernel log (kern.redwood.say, which any process may write, because
+ * and their counts reach the kernel log (kern.annibale.say, which any process may write, because
  * the standard error of an XPC service goes nowhere): the first connection to each name, then at
  * every power of two, "xpcwatch NAME N".
  */
@@ -35,7 +35,7 @@ static os_unfair_lock names_lock = OS_UNFAIR_LOCK_INIT;
 static void
 say(const char *text)
 {
-	(void)sysctlbyname("kern.redwood.say", NULL, NULL, (void *)text, strlen(text) + 1);
+	(void)sysctlbyname("kern.annibale.say", NULL, NULL, (void *)text, strlen(text) + 1);
 }
 
 static void

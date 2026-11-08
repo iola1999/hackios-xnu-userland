@@ -10,7 +10,7 @@
 +#include <mach-o/loader.h>
 +#include <sys/stat.h>
 +
-+#define REDWOOD_IR3_CACHE_DIR "/private/var/db/redwood-ir3cache"
++#define ANNIBALE_IR3_CACHE_DIR "/private/var/db/annibale-ir3cache"
 +
 +static const uint8_t *
 +get_darwin_macho_uuid(const void *addr, unsigned *uuid_len)
@@ -65,8 +65,8 @@
 +               build_id_bytes[8], build_id_bytes[9], build_id_bytes[10], build_id_bytes[11],
 +               build_id_bytes[12], build_id_bytes[13], build_id_bytes[14], build_id_bytes[15]);
 +      char cache_dir[256];
-+      snprintf(cache_dir, sizeof(cache_dir), "%s/%s", REDWOOD_IR3_CACHE_DIR, uuid_str);
-+      mkdir(REDWOOD_IR3_CACHE_DIR, 0777);
++      snprintf(cache_dir, sizeof(cache_dir), "%s/%s", ANNIBALE_IR3_CACHE_DIR, uuid_str);
++      mkdir(ANNIBALE_IR3_CACHE_DIR, 0777);
 +      mkdir(cache_dir, 0777);
 +      setenv("MESA_SHADER_CACHE_DIR", cache_dir, 1);
 +   }

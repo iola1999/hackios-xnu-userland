@@ -5,8 +5,8 @@
  * object layout are specific to the checked 23G90 shared cache.
  *
  * The lock screen is dismissed once after boot, as 16.5's inject_sb.c does, and
- * again whenever the Darwin notification com.redwood.unlock is posted
- * (rwtouch notify com.redwood.unlock). autounlock=0 among the boot arguments
+ * again whenever the Darwin notification com.annibale.unlock is posted
+ * (rwtouch notify com.annibale.unlock). autounlock=0 among the boot arguments
  * keeps the lock screen until it is swiped away.
  */
 #include <CoreFoundation/CoreFoundation.h>
@@ -189,14 +189,14 @@ unlock_once(const char *why)
     id manager = lock_screen_manager();
     if (!manager) return -1;
     if (!((BOOL (*)(id, SEL))objc_msgSend)(manager, locked)) {
-        notify_post("com.redwood.wallpaper.suspend");
+        notify_post("com.annibale.wallpaper.suspend");
         return 0;
     }
     BOOL answer = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, nil);
     int locked_after = ((BOOL (*)(id, SEL))objc_msgSend)(manager, locked);
     fprintf(stderr, "sb26: unlock %s: answer=%d locked_after=%d\n", why, answer, locked_after);
     if (!locked_after) {
-        notify_post("com.redwood.wallpaper.suspend");
+        notify_post("com.annibale.wallpaper.suspend");
         sb26_schedule_stepped_refresh();
     }
     return 1;
@@ -353,7 +353,7 @@ boot_unlock(void *context)
     if (state == 1) boot_unlock_seen_locked = 1;
     if (state == 0 && boot_unlock_seen_locked) {
         fprintf(stderr, "sb26: boot unlock done after %lu attempts\n", (unsigned long)attempt);
-        notify_post("com.redwood.wallpaper.suspend");
+        notify_post("com.annibale.wallpaper.suspend");
         sb26_schedule_stepped_refresh();
         return;
     }
@@ -373,7 +373,7 @@ sb26_hook_unlock_ui(id self, SEL cmd, long source, id options)
     BOOL ans = orig_unlock_ui ? orig_unlock_ui(self, cmd, source, options) : NO;
     SEL locked = sel_registerName("isUILocked");
     if (!((BOOL (*)(id, SEL))objc_msgSend)(self, locked)) {
-        notify_post("com.redwood.wallpaper.suspend");
+        notify_post("com.annibale.wallpaper.suspend");
         sb26_schedule_stepped_refresh();
     }
     return ans;
@@ -395,11 +395,11 @@ static void
 install_unlock(void)
 {
     int token;
-    notify_register_dispatch("com.redwood.unlock", &token, dispatch_get_main_queue(), ^(int t) {
+    notify_register_dispatch("com.annibale.unlock", &token, dispatch_get_main_queue(), ^(int t) {
         (void)t;
         if (unlock_once("notification") == 0) {
             fprintf(stderr, "sb26: unlock notification: not locked\n");
-            notify_post("com.redwood.wallpaper.suspend");
+            notify_post("com.annibale.wallpaper.suspend");
             sb26_schedule_stepped_refresh();
         }
     });
@@ -547,8 +547,9 @@ is_build_23g90(void)
  * Preferences reads total capacity from MGCopyAnswer(CFSTR("DiskUsage")) or
  * MGCopyAnswer(CFSTR("TotalDiskCapacity")). Because HackiOS lacks Apple NVMe
  * controller driver, MobileGestalt returns 0 KB.
- * We interpose MGCopyAnswer to report a standard 256 GB capacity with
- * real free space read from statfs("/private/var").
+ * We interpose MGCopyAnswer to report the darwin and darwin_var partition sizes
+ * (kern.annibale.darwin_bytes, kern.annibale.darwin_var_bytes) with the free
+ * space read from statfs("/private/var").
  */
 extern CFTypeRef MGCopyAnswer(CFStringRef property);
 
@@ -559,9 +560,9 @@ sb26_query_capacities(int64_t *total_disk, int64_t *total_sys, int64_t *total_da
     size_t sz = sizeof(uint64_t);
     struct statfs st;
 
-    (void)sysctlbyname("kern.redwood.darwin_bytes", &sys_b, &sz, NULL, 0);
+    (void)sysctlbyname("kern.annibale.darwin_bytes", &sys_b, &sz, NULL, 0);
     sz = sizeof(uint64_t);
-    (void)sysctlbyname("kern.redwood.darwin_var_bytes", &data_b, &sz, NULL, 0);
+    (void)sysctlbyname("kern.annibale.darwin_var_bytes", &data_b, &sz, NULL, 0);
     if (sys_b == 0) sys_b = 8ULL << 30;
     if (data_b == 0) data_b = 112ULL << 30;
     if (statfs("/private/var", &st) == 0 && st.f_blocks > st.f_bavail) {
@@ -880,7 +881,7 @@ sb26_trigger_poweroff(id self, SEL _cmd, id arg1, id arg2)
     fprintf(stderr, "sb26: poweroff requested via %s, syncing and halting\n",
         _cmd ? sel_getName(_cmd) : "unknown");
     sync();
-    sysctlbyname("kern.redwood.halt", NULL, NULL, &one, sizeof(one));
+    sysctlbyname("kern.annibale.halt", NULL, NULL, &one, sizeof(one));
 }
 
 static void

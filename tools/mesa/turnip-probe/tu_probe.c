@@ -1,5 +1,5 @@
 /*
- * tu_probe [library]: load Turnip as a Vulkan ICD (by default /redwood/lib/libvulkan_freedreno.dylib,
+ * tu_probe [library]: load Turnip as a Vulkan ICD (by default /annibale/lib/libvulkan_freedreno.dylib,
  * built by TURNIP=1 tools/mk-mesa.sh), list its physical devices and create a device with one queue.
  * On that device it fills a 1 MB buffer and copies it to another (three rounds), writes 4096 words
  * from a compute shader and draws a triangle over half of a 64x64 image, reading each result back
@@ -416,7 +416,7 @@ main(int argc, char **argv)
 	sigaction(SIGTRAP, &sa, NULL);
 	sigaction(SIGABRT, &sa, NULL);
 	setvbuf(stdout, NULL, _IONBF, 0);
-	const char *path = argc > 1 ? argv[1] : "/redwood/lib/libvulkan_freedreno.dylib";
+	const char *path = argc > 1 ? argv[1] : "/annibale/lib/libvulkan_freedreno.dylib";
 	setenv("TU_DEBUG", "startup", 0);
 	void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (lib == NULL) {

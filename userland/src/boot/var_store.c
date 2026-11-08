@@ -10,7 +10,7 @@
  * and the archive is written into the one place on the phone's flash this port owns: the last
  * 4 GiB of the slot Android's DSU installer keeps the iOS system image in, past the image. The
  * loader lists it as a partition of its own (xnuloader/loader_dsu.inc), and the kernel takes
- * writes on /dev/rufs_dsu_store alone and refuses anything else (bsd/dev/redwood_ufs.c,
+ * writes on /dev/rufs_dsu_store alone and refuses anything else (bsd/dev/annibale_ufs.c,
  * ufs_write=1). Installing the DSU again (tools/k90auto/dsu.py install) zeroes the store.
  *
  *   var_store save          pack /private/var into the store
@@ -27,7 +27,7 @@
  * minutes building.
  *
  * One saver at a time: a write to the store is refused unless the writer holds the claim
- * (kern.redwood.var_busy), so two of them cannot interleave into one slot. Even if they did, the
+ * (kern.annibale.var_busy), so two of them cannot interleave into one slot. Even if they did, the
  * slot being written is never the one holding the newest good archive, and a header is written
  * last and over a zeroed one -- so the worst an interrupted or doubled save can do is lose itself.
  *
@@ -83,7 +83,7 @@ static const char *const SKIP[] = {
 
 enum { ENT_DIR = 1, ENT_FILE = 2, ENT_SYMLINK = 3, ENT_HARDLINK = 4, ENT_DIRTIME = 5, ENT_DELETE = 6 };
 
-#define HEAD_MAGIC      "RDWVAR\0"
+#define HEAD_MAGIC      "ANNVAR\0"
 #define HEAD_VERSION    1
 
 struct head {
@@ -122,7 +122,7 @@ sysctl_set_int(const char *name, int value)
 static int
 claim(void)
 {
-	if (sysctl_set_int("kern.redwood.var_busy", 1) != 0) {
+	if (sysctl_set_int("kern.annibale.var_busy", 1) != 0) {
 		printf("var_store: the store is claimed by another saver (%s)\n", strerror(errno));
 		return 0;
 	}
@@ -132,7 +132,7 @@ claim(void)
 static void
 release(void)
 {
-	(void)sysctl_set_int("kern.redwood.var_busy", 0);
+	(void)sysctl_set_int("kern.annibale.var_busy", 0);
 }
 
 /* ---- checksum (the same one the loader reads a write back with) ---- */
@@ -900,7 +900,7 @@ main(int argc, char **argv, char **envp)
 	store = default_device();
 	crc_init();
 	if (strcmp(what, "stamp") == 0) {
-		return stamp(argc > 2 ? argv[2] : "/private/var/redwood-stamp") ? 0 : 1;
+		return stamp(argc > 2 ? argv[2] : "/private/var/annibale-stamp") ? 0 : 1;
 	}
 	buffer = mmap(NULL, BUFFER, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	links = mmap(NULL, LINKS * sizeof(*links), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -916,7 +916,7 @@ main(int argc, char **argv, char **envp)
 	if (strcmp(what, "load") == 0) {
 		int disk_loaded = 0;
 		size_t dlen = sizeof(disk_loaded);
-		if (sysctlbyname("kern.redwood.var_disk_loaded", &disk_loaded, &dlen, NULL, 0) == 0 && disk_loaded != 0) {
+		if (sysctlbyname("kern.annibale.var_disk_loaded", &disk_loaded, &dlen, NULL, 0) == 0 && disk_loaded != 0) {
 			printf("var_store: /private/var already loaded from persistent disk; seed unpack skipped\n");
 			return 0;
 		}

@@ -363,7 +363,7 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
 
 /*
  * A w x h sample of the texture's first level as 8-bit RGBA, nearest texel at the centre of each
- * cell, for a driver's diagnostic print (REDWOOD_THUMBS in the userland driver). Values are
+ * cell, for a driver's diagnostic print (ANNIBALE_THUMBS in the userland driver). Values are
  * clamped to [0, 1], except in a two-channel float texture, which holds signed values (RenderBox
  * accumulates path winding in one): there R and G are magnitudes and B carries the signs, 128
  * for a negative R and 64 for a negative G. A depth texture is sampled as RenderBox's depth

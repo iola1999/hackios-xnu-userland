@@ -265,7 +265,7 @@ def find_record(image, bno, key):
 
 #: a second reading of the store's format, from bsd/miscfs/apfs/apfs_store.h and nothing else, so
 #: that what the C writes is never checked only by the C that wrote it
-STORE_MAGIC = b'RDWSTOR\x00'
+STORE_MAGIC = b'ANNSTOR\x00'
 STORE_PAYLOAD = 4096
 FNV_INIT = 0xcbf29ce484222325
 FNV_PRIME = 0x100000001b3
@@ -403,7 +403,7 @@ def test_store_refusals():
     # a volume that is not the store: the name is the gate
     base, img = fresh('store-notstore')
     rc, out = store_save(img, b'x' * 100)
-    say(rc != 0 and 'not named' in out, 'refused: a volume that is not named RedwoodStore' +
+    say(rc != 0 and 'not named' in out, 'refused: a volume that is not named AnnibaleStore' +
         ('' if rc != 0 else ':\n' + out.strip()))
     say(changed_blocks(base, img) == [], '  and nothing in it was written')
 
@@ -442,7 +442,7 @@ def test_store_refusals():
         argv = [sys.executable, os.path.join(HERE, 'mkapfs.py'), '-o', img]
         if compress:
             argv.append('-z')
-        argv.append('RedwoodStore=' + tree)
+        argv.append('AnnibaleStore=' + tree)
         rc, out = run(*argv)
         if rc != 0:
             say(False, '%s: the image could not be made:\n%s' % (what, out))

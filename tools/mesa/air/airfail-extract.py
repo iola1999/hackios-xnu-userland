@@ -3,7 +3,7 @@
 
 usage: airfail-extract.py OUT_DIR [LOG|RUN_DIR]...
 
-libredwoodmetal prints a render pipeline it could not build, and redwoodmetal.m's air_fail_dump
+libannibalemetal prints a render pipeline it could not build, and annibalemetal.m's air_fail_dump
 prints the module that was refused with it, as base64 between `AIRFAIL begin` and `AIRFAIL end`
 lines. Those lines are the only road a module has out of a running daemon: the loader keeps the
 console and the harness snapshots it every 20 s, so what the phone held is here.
@@ -64,7 +64,7 @@ def blocks(paths):
     """The AIRFAIL blocks in these snapshots, in the order the snapshots were taken."""
     open_block = None
     for path in paths:
-        # One console line can carry a prefix of its own (redwoodmetal[backboardd 11]:) and a
+        # One console line can carry a prefix of its own (annibalemetal[backboardd 11]:) and a
         # snapshot can be cut mid-line, so errors='replace' and a search rather than a match.
         for line in path.read_bytes().decode("utf-8", errors="replace").split("\n"):
             if "AIRFAIL" not in line:

@@ -3,8 +3,8 @@
  * for the wide camera as the back camera and the front one as the front camera (both FrontFacingCamera
  * and FrontFacingSuperWideCamera for iPhone18,3 V57), made for mediaserverd / cameracaptured's
  * BWFigCaptureDeviceVendor in place of the device Apple's H10ISP/H16ISP.mediacapture makes of the
- * iPhone's ISP (part of libredwood-media.dylib; inject_media.c gives the vendor our device's create
- * function when the kernel has a camera: /dev/redwood-camera).
+ * iPhone's ISP (part of libannibale-media.dylib; inject_media.c gives the vendor our device's create
+ * function when the kernel has a camera: /dev/annibale-camera).
  *
  * Both are CoreMedia "derived objects" (CMDerivedObjectCreate): a table of functions for the base
  * class (properties) and one for the device or stream class, signed with the exact arm64e PAC
@@ -14,7 +14,7 @@
  * A stream's frames go to the capture graph through the blocks it is given in its property
  * "VideoOutputHandlers" ({ output: { PixelBufferHandler: ^(CVPixelBufferRef, CMTime) } }), for the
  * outputs "VideoOutputConfigurations" describes (the graph's own buffer pools) and "VideoOutputsEnabled"
- * switches on. A frame: read from the kernel's /dev/redwood-camera (RAW10), made into a picture by
+ * switches on. A frame: read from the kernel's /dev/annibale-camera (RAW10), made into a picture by
  * camera_isp.c (exposure, white balance kept to the sensor's reference lights, the colour matrix and
  * lens shading of the camera's own tuning, gamma, zoom), one pixel buffer for each output, with the
  * metadata the graph keeps its frame statistics and its zoom by. The kernel gives one sensor's frames
@@ -51,14 +51,14 @@
 #endif
 #include "camera_isp.h"
 
-void redwood_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
+void annibale_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 void
-redwood_camera_say(const char *format, ...)
+annibale_camera_say(const char *format, ...)
 {
 	char line[400];
 	va_list ap;
-	int n = snprintf(line, sizeof(line), "redwood: camera: ");
+	int n = snprintf(line, sizeof(line), "annibale: camera: ");
 
 	va_start(ap, format);
 	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
@@ -69,7 +69,7 @@ redwood_camera_say(const char *format, ...)
 	line[n++] = '\n';
 	write(2, line, (size_t)n);
 }
-#define say redwood_camera_say
+#define say annibale_camera_say
 
 /* ---- CoreMedia's derived objects, with arm64e PAC discriminators for iOS 26 ------------------------- */
 
@@ -436,7 +436,7 @@ static const char *const output_names[OUTPUTS] = { "PrimaryScaler", "SecondarySc
  *   formats[k] = { sensor_width, sensor_height, crop_width, crop_height, max_fps, fes_width, fes_height, sifr_binning }
  */
 static const struct camera {
-	uint32_t        sensor;         /* the kernel's (the frames' sensor, REDWOOD_CAMERA_SENSOR) */
+	uint32_t        sensor;         /* the kernel's (the frames' sensor, ANNIBALE_CAMERA_SENSOR) */
 	const char      *name, *unique_id;
 	bool            turned;         /* its sensor the other way up from the iPhone's: the pictures turned half round */
 	double          focal_length, f_number, pixel_size, fov;
@@ -781,7 +781,7 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	return 0;
 }
 
-/* the flashlight: TorchLevel (0 to 1) as thousandths to the kernel's /dev/redwood-torch (torch=3) */
+/* the flashlight: TorchLevel (0 to 1) as thousandths to the kernel's /dev/annibale-torch (torch=3) */
 static void
 torch_set(struct stream *s, CFTypeRef value)
 {
@@ -794,10 +794,10 @@ torch_set(struct stream *s, CFTypeRef value)
 	level = level < 0 ? 0 : level > 1 ? 1 : level;
 	thousandths = (uint32_t)(level * 1000 + 0.5f);
 	if (s->torch < 0) {
-		s->torch = open("/dev/redwood-torch", O_WRONLY);
+		s->torch = open("/dev/annibale-torch", O_WRONLY);
 	}
 	if (s->torch < 0 || write(s->torch, &thousandths, sizeof(thousandths)) != (ssize_t)sizeof(thousandths)) {
-		say("the flashlight at %u of 1000 NOT TAKEN (no /dev/redwood-torch)", thousandths);
+		say("the flashlight at %u of 1000 NOT TAKEN (no /dev/annibale-torch)", thousandths);
 	} else {
 		say("the flashlight at %u of 1000", thousandths);
 	}
@@ -906,7 +906,7 @@ static CFStringRef
 device_description(CMBaseObjectRef o)
 {
 	(void)o;
-	return CFRetain(CFSTR("<RedwoodCaptureDevice: the wide and front cameras>"));
+	return CFRetain(CFSTR("<AnnibaleCaptureDevice: the wide and front cameras>"));
 }
 
 static const struct base_class device_base = {
@@ -917,10 +917,10 @@ static const struct device_class device_derived = { 3, NULL, device_request_stre
 static const struct device_vtable device_vtable = { NULL, &device_base, &device_derived };
 
 /* The vendor's device create function (as H10ISPCaptureDeviceCreate / H16ISP is called). */
-OSStatus redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out);
+OSStatus annibale_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out);
 
 OSStatus
-redwood_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
+annibale_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
 {
 	static bool found, usable;
 	CMBaseObjectRef device = NULL, stream[MAX_STREAMS] = { NULL, NULL, NULL };

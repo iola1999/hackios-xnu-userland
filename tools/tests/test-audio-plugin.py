@@ -77,7 +77,7 @@ static AudioServerPlugInDriverRef plugin;
 static const int16_t pcm[12] = { -32768, 32767, -2000, 2000, -1, 1, 0, 0, 101, -101, 1234, -1234 };
 
 static void setup(void) {
-    plugin = RedwoodAudio_Create(NULL, kAudioServerPlugInTypeUUID);
+    plugin = AnnibaleAudio_Create(NULL, kAudioServerPlugInTypeUUID);
     assert(plugin != NULL);
     assert((*plugin)->Initialize(plugin, NULL) == 0);
 }

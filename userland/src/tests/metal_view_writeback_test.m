@@ -1,5 +1,5 @@
 /* Check writes through nested texture views against their original shared storage.
- * --native uses the host Metal device; the default loads the supplied Redwood driver. */
+ * --native uses the host Metal device; the default loads the supplied Annibale driver. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -31,7 +31,7 @@ static void watchdog(int signo) {
 
 int main(int argc, char **argv) { @autoreleasepool {
     BOOL native = NO, software = NO;
-    const char *library = "/redwood/lib/libredwoodmetal.dylib";
+    const char *library = "/annibale/lib/libannibalemetal.dylib";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--native")) native = YES;
         else if (!strcmp(argv[i], "--software")) software = YES;
@@ -55,11 +55,11 @@ int main(int argc, char **argv) { @autoreleasepool {
         if (!dlopen(library, RTLD_NOW | RTLD_LOCAL)) {
             printf("view_writeback: driver load error=%s\n", dlerror()); return 2;
         }
-        Class cls = objc_getClass("RedwoodMetalDevice");
+        Class cls = objc_getClass("AnnibaleMetalDevice");
         SEL init = sel_registerName("initWithAcceleratorPort:");
         if (!cls || ![cls instancesRespondToSelector:init]) return 2;
         d = ((id (*)(id, SEL, uint32_t))objc_msgSend)([cls alloc], init, 0);
-        void *air = dlopen("/redwood/lib/libredwoodair.dylib", RTLD_NOW | RTLD_NOLOAD);
+        void *air = dlopen("/annibale/lib/libannibaleair.dylib", RTLD_NOW | RTLD_NOLOAD);
         const char *(*device_name)(void *) = air ? dlsym(air, "rwa_device_name") : NULL;
         SEL mesa = sel_registerName("mesaDevice");
         if (!device_name || ![d respondsToSelector:mesa]) return 2;

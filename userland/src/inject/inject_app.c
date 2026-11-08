@@ -1,5 +1,5 @@
 /*
- * libredwood-app.dylib: code of ours inside an application, to find out why it dies (see inject.c
+ * libannibale-app.dylib: code of ours inside an application, to find out why it dies (see inject.c
  * for how it gets there; build.sh's INJECT names the programs).
  *
  * An application that is launched and gone again in a third of a second leaves nothing behind here:
@@ -57,7 +57,7 @@ killed(int number, siginfo_t *info, void *context)
 	int n = backtrace(frames, 32), k;
 
 	(void)context;
-	k = snprintf(line, sizeof(line), "redwood: %s: SIGNAL %d at %p (the cache's slide %#lx), the stack:", who, number,
+	k = snprintf(line, sizeof(line), "annibale: %s: SIGNAL %d at %p (the cache's slide %#lx), the stack:", who, number,
 	    info != NULL ? info->si_addr : NULL, (unsigned long)slide);
 	for (int i = 0; i < n && k < (int)sizeof(line) - 24; i++) {
 		k += snprintf(line + k, sizeof(line) - (size_t)k, " %#lx", (unsigned long)((uintptr_t)frames[i] - slide));
@@ -84,10 +84,10 @@ watched_begin_task(id self, SEL cmd, id handler)
 	char line[160];
 	int n;
 
-	n = snprintf(line, sizeof(line), "redwood: %s: asking UIKit for a background task\n", who);
+	n = snprintf(line, sizeof(line), "annibale: %s: asking UIKit for a background task\n", who);
 	say(line, (size_t)(n > 0 ? n : 0));
 	task = begin_task(self, cmd, handler);
-	n = snprintf(line, sizeof(line), "redwood: %s: the background task is %lu\n", who, task);
+	n = snprintf(line, sizeof(line), "annibale: %s: the background task is %lu\n", who, task);
 	say(line, (size_t)(n > 0 ? n : 0));
 	return task;
 }
@@ -119,7 +119,7 @@ keep_to_the_repositories(void)
 	defaults = get(defaults, sel_registerName("standardUserDefaults"));
 	if (defaults != NULL) {
 		set_bool(defaults, sel_registerName("setBool:forKey:"), 0, key);
-		say("redwood: Sileo: its Canister search is turned off (it is not reachable here)\n", 73);
+		say("annibale: Sileo: its Canister search is turned off (it is not reachable here)\n", 73);
 	}
 }
 
@@ -157,20 +157,20 @@ spawn_apt_said(pid_t *pid, const posix_spawn_file_actions_t *actions, const posi
 {
 	static char script[] =
 	    "exec 7>/dev/console; J=/var/jb\n"
-	    "echo \"redwood: apt-get runs as $($J/usr/bin/id), in $(pwd)\" >&7\n"
+	    "echo \"annibale: apt-get runs as $($J/usr/bin/id), in $(pwd)\" >&7\n"
 	    "$J/bin/ls -ln $J/var/cache/apt/archives $J/var/lib/apt/sileolists >&7 2>&1\n"
 	    "for a in \"$@\"; do case $a in -*|install) ;; *) p=${a%%=*}\n"
-	    "  echo \"redwood: $p in sileolists:\" >&7\n"
+	    "  echo \"annibale: $p in sileolists:\" >&7\n"
 	    "  $J/usr/bin/grep -h -A30 \"^Package: $p\\$\" $J/var/lib/apt/sileolists/*Packages 2>&1 | $J/usr/bin/head -40 >&7 ;; esac; done\n"
 	    "$J/usr/bin/apt-get \"$@\"\n"
-	    "s=$?; echo \"redwood: apt-get exits $s; its archives after:\" >&7\n"
+	    "s=$?; echo \"annibale: apt-get exits $s; its archives after:\" >&7\n"
 	    "$J/bin/ls -ln $J/var/cache/apt/archives >&7 2>&1; exit $s\n";
 	char *wrapped[96];
 	int k = 0;
 
 	for (int i = 0; envp != NULL && envp[i] != NULL; i++) {
 		char line[600];
-		int n = snprintf(line, sizeof(line), "redwood: %s: apt-get's environment: %s\n", who, envp[i]);
+		int n = snprintf(line, sizeof(line), "annibale: %s: apt-get's environment: %s\n", who, envp[i]);
 
 		say(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
 	}
@@ -195,7 +195,7 @@ watched_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *ac
     const posix_spawnattr_t *attr, char *const argv[], char *const envp[])
 {
 	char line[1200];
-	int n = snprintf(line, sizeof(line), "redwood: %s: (uid %d) spawns %s", who, (int)getuid(),
+	int n = snprintf(line, sizeof(line), "annibale: %s: (uid %d) spawns %s", who, (int)getuid(),
 	    path != NULL ? path : "?");
 
 	for (int i = 0; argv != NULL && argv[i] != NULL && n < (int)sizeof(line) - 40; i++) {
@@ -224,7 +224,7 @@ watched_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *ac
 	n = posix_spawn(pid, path, actions, attr, argv, envp);
 	if (n != 0) {
 		char said[300];
-		int k = snprintf(said, sizeof(said), "redwood: %s: ... and that spawn failed: %s\n", who, strerror(n));
+		int k = snprintf(said, sizeof(said), "annibale: %s: ... and that spawn failed: %s\n", who, strerror(n));
 
 		say(said, (size_t)(k < (int)sizeof(said) ? k : (int)sizeof(said) - 1));
 	}
@@ -259,7 +259,7 @@ file_said(const char *what, signed char ok, id from, id to, id error)
 {
 	if (!ok) {
 		char line[1400];
-		int n = snprintf(line, sizeof(line), "redwood: %s: %s %s -> %s failed: %s\n", who, what, text_of(from),
+		int n = snprintf(line, sizeof(line), "annibale: %s: %s %s -> %s failed: %s\n", who, what, text_of(from),
 		    text_of(to), error != NULL ? text_of(error) : "(no error given)");
 
 		say(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
@@ -328,7 +328,7 @@ setup_app_container_env(const char *name)
 	char line[256];
 	FILE *f;
 
-	snprintf(env_path, sizeof(env_path), "/redwood/etc/env/%s", name);
+	snprintf(env_path, sizeof(env_path), "/annibale/etc/env/%s", name);
 	f = fopen(env_path, "r");
 	if (f == NULL) {
 		return;
@@ -380,7 +380,7 @@ app_swizzled_wkpref_init(id self, SEL _cmd)
 							if (cstr && strcmp(cstr, "SWVPDecodersAlwaysEnabled") == 0) {
 								if (class_getInstanceMethod(cls, setEnabledSel)) {
 									((void (*)(id, SEL, BOOL, id))objc_msgSend)(self, setEnabledSel, YES, feat);
-									fprintf(stderr, "redwood-app: enabled SWVPDecodersAlwaysEnabled on WKPreferences %p\n", (void *)self);
+									fprintf(stderr, "annibale-app: enabled SWVPDecodersAlwaysEnabled on WKPreferences %p\n", (void *)self);
 								}
 								break;
 							}
@@ -410,14 +410,14 @@ app_enable_webkit_vp9(void)
 			orig_wkpref_init = method_getImplementation(m);
 			method_setImplementation(m, (IMP)app_swizzled_wkpref_init);
 			app_vp9_hook_installed = 1;
-			fprintf(stderr, "redwood-app: installed WKPreferences init hook for SWVPDecodersAlwaysEnabled\n");
+			fprintf(stderr, "annibale-app: installed WKPreferences init hook for SWVPDecodersAlwaysEnabled\n");
 		}
 	}
 	/* Also invoke libwebrtc registerWebKitVP9Decoder directly if loaded in this process */
 	void (*reg_vp9)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "_ZN6webrtc26registerWebKitVP9DecoderEv");
 	if (reg_vp9 != NULL) {
 		reg_vp9();
-		fprintf(stderr, "redwood-app: registered libwebrtc VP9 decoder\n");
+		fprintf(stderr, "annibale-app: registered libwebrtc VP9 decoder\n");
 	}
 	dispatch_async(dispatch_get_main_queue(), ^{
 		Class defsCls = objc_getClass("NSUserDefaults");
@@ -442,7 +442,7 @@ app_enable_webkit_vp9(void)
 
 __attribute__((constructor))
 static void
-redwood_app_init(void)
+annibale_app_init(void)
 {
 	static const int signals[] = { SIGTRAP, SIGABRT, SIGILL, SIGSEGV, SIGBUS, SIGSYS };
 	struct sigaction action = { 0 };
@@ -463,7 +463,7 @@ redwood_app_init(void)
 	if (boot_sec < 1767225600L) {
 		char time_warn[256];
 		int tw_len = snprintf(time_warn, sizeof(time_warn),
-		    "redwood: %s: WARNING: system clock (%ld) is before 2026! TLS handshake depends on com.apple.timed NTP sync.\n",
+		    "annibale: %s: WARNING: system clock (%ld) is before 2026! TLS handshake depends on com.apple.timed NTP sync.\n",
 		    name, (long)boot_sec);
 		say(time_warn, (size_t)(tw_len > 0 ? tw_len : 0));
 	}
@@ -503,7 +503,7 @@ redwood_app_init(void)
 	app_enable_webkit_vp9();
 	_dyld_register_func_for_add_image(app_dyld_image_added);
 
-	n = snprintf(line, sizeof(line), "redwood: %s: started as uid %d (effective %d), watching for what kills it\n",
+	n = snprintf(line, sizeof(line), "annibale: %s: started as uid %d (effective %d), watching for what kills it\n",
 	    name, (int)getuid(), (int)geteuid());
 	say(line, (size_t)(n > 0 ? n : 0));
 }
