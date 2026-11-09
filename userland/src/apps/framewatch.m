@@ -272,7 +272,7 @@ main(int argc, char **argv)
 			dumps++;
 			continue;
 		}
-		if (stalled > still_seconds && dumps >= max_dumps) {
+		if (stalled >= still_seconds) {
 			say("framewatch: still no frames, %d s at %llu\n", stalled,
 			    (unsigned long long)now_us());
 		}

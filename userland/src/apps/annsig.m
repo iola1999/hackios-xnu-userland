@@ -251,6 +251,9 @@ sleep_watching(unsigned seconds, int frozen, unsigned round)
 		}
 		uint32_t frames = frames_shown();
 
+		if (frames == 0 && last_frames == 0) {
+			continue;
+		}
 		if (frames != last_frames) {
 			last_frames = frames;
 			last_frame_us = now_us();
@@ -306,20 +309,16 @@ main(int argc, char **argv)
 		signal_named(SIGSTOP, "stop");
 		say("annsig: phase stop round %d at %llu\n", round, (unsigned long long)now_us());
 		if (sleep_watching((unsigned)frozen_seconds, 1, (unsigned)round) != 0) {
-			continue_all();
 			return 3;
 		}
 		if (finish) {
-			continue_all();
 			return 0;
 		}
 		signal_named(SIGCONT, "resume");
 		say("annsig: phase resume round %d at %llu\n", round, (unsigned long long)now_us());
 		if (sleep_watching((unsigned)running_seconds, 0, (unsigned)round) != 0) {
-			continue_all();
 			return 3;
 		}
 	}
-	continue_all();
 	return 0;
 }

@@ -935,20 +935,29 @@ codec_open(void)
 static void
 codec_close(void)
 {
+	int old_mic = mic;
+
+	mic = -1;
 	say("annibale: audio: the microphone stops: %llu.%02llu s asked for, %llu.%02llu s of it from the kernel (peak %d of 32768), "
 	    "%llu reads short\n", mic_frames / ANNIBALE_AUDIO_RATE, mic_frames % ANNIBALE_AUDIO_RATE * 100 / ANNIBALE_AUDIO_RATE,
 	    mic_heard / ANNIBALE_AUDIO_RATE, mic_heard % ANNIBALE_AUDIO_RATE * 100 / ANNIBALE_AUDIO_RATE, mic_peak, mic_short);
-	if (mic >= 0) {
-		close(mic);
+	if (old_mic >= 0) {
+		close(old_mic);
 	}
-	mic = -1;
 }
 
 static void
 codec_read(int16_t *samples, UInt32 frames)
 {
-	ssize_t got = mic >= 0 ? read(mic, samples, (size_t)frames * 2) : -1;
-	UInt32 have = got > 0 ? (UInt32)got / 2 : 0;
+	int fd;
+	ssize_t got;
+	UInt32 have;
+
+	pthread_mutex_lock(&lock);
+	fd = mic;
+	got = fd >= 0 ? read(fd, samples, (size_t)frames * 2) : -1;
+	pthread_mutex_unlock(&lock);
+	have = got > 0 ? (UInt32)got / 2 : 0;
 
 	if (have > 0 && mic_heard == 0) {
 		say("annibale: audio: the microphone's first samples, %llu.%02llu s after the input started\n",
@@ -1026,8 +1035,14 @@ get_zero_time_stamp(__unused AudioServerPlugInDriverRef driver, AudioObjectID ob
 		return kAudioHardwareBadObjectError;
 	}
 	pthread_mutex_lock(&lock);
-	while (now >= d->anchor + (UInt64)((Float64)(d->periods + 1) * ticks_per_period)) {
-		d->periods++;
+	if (d->anchor == 0) {
+		d->anchor = now;
+		d->periods = 0;
+	} else if (now > d->anchor && ticks_per_period > 0.0) {
+		UInt64 elapsed_periods = (UInt64)((Float64)(now - d->anchor) / ticks_per_period);
+		if (elapsed_periods > d->periods) {
+			d->periods = elapsed_periods;
+		}
 	}
 	*sample_time = (Float64)d->periods * TIMESTAMP_PERIOD;
 	*host_time = d->anchor + (UInt64)((Float64)d->periods * ticks_per_period);
@@ -1074,8 +1089,8 @@ actuator_write(const int16_t *samples, UInt32 frames)
 		peak = v > peak ? v : peak;
 	}
 	if (haptic == -1) {
-		haptic = open("/dev/annibale-haptic", O_WRONLY | O_NONBLOCK);
-		haptic = haptic >= 0 ? haptic : -2;
+		int fd = open("/dev/annibale-haptic", O_WRONLY | O_NONBLOCK);
+		haptic = fd >= 0 ? fd : (errno == ENOENT ? -2 : -1);
 	}
 	if (haptic >= 0) {
 		(void)write(haptic, samples, (size_t)frames * 2);

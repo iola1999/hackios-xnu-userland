@@ -18,6 +18,7 @@ An entry is called as entry(table[0], arguments...). What is generated for it:
 The header is in two parts: with EAGL_GEN_DECLARATIONS defined, the types and the prototypes of
 the library's functions; with EAGL_GEN_TABLE, the functions and eagl_fill_table().
 """
+import os
 import re
 import sys
 import xml.etree.ElementTree as ET
@@ -46,7 +47,11 @@ for command in ET.parse(xml_path).getroot().iter('command'):
     protos[name] = (ret, params)
 
 exported = set(open(exported_path).read().split())
-by_hand = set(re.findall(r'^my_(gl\w+)\(', open(source_path).read(), re.M))
+source_dir = os.path.dirname(source_path)
+source_text = open(source_path).read()
+for inc in re.findall(r'^#include\s+"(eagl_\w+\.inc)"', source_text, re.M):
+    source_text += '\n' + open(os.path.join(source_dir, inc)).read()
+by_hand = set(re.findall(r'^my_(gl\w+)\(', source_text, re.M))
 
 # The guard. A function written by hand that the scan does not find does not fail the build: it
 # silently becomes a generated pass-on or a missing-entry stub, which is what a split of eagl.c
@@ -119,7 +124,7 @@ for offset, used, names in slots:
         entries.append((offset, choice[0], 'pass', choice[1]))
         needed[choice[1]] = protos[choice[0]]
 # ... and what the functions written by hand call
-for name in set(re.findall(r'(?<![\w])(gl[A-Z]\w*)\s*\(', open(source_path).read())):
+for name in set(re.findall(r'(?<![\w])(gl[A-Z]\w*)\s*\(', source_text)):
     if name in exported and name in protos:
         needed.setdefault(name, protos[name])
 for name in sorted(needed):

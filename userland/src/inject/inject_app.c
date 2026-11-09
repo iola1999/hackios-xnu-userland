@@ -396,6 +396,8 @@ app_swizzled_wkpref_init(id self, SEL _cmd)
 static void
 app_enable_webkit_vp9(void)
 {
+	static int vp9_defaults_scheduled;
+
 	if (app_vp9_hook_installed) {
 		return;
 	}
@@ -413,6 +415,10 @@ app_enable_webkit_vp9(void)
 			fprintf(stderr, "annibale-app: installed WKPreferences init hook for SWVPDecodersAlwaysEnabled\n");
 		}
 	}
+	if (vp9_defaults_scheduled) {
+		return;
+	}
+	vp9_defaults_scheduled = 1;
 	/* Also invoke libwebrtc registerWebKitVP9Decoder directly if loaded in this process */
 	void (*reg_vp9)(void) = (void (*)(void))dlsym(RTLD_DEFAULT, "_ZN6webrtc26registerWebKitVP9DecoderEv");
 	if (reg_vp9 != NULL) {

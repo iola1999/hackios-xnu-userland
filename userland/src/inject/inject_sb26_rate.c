@@ -346,10 +346,9 @@ stall_watch(void *argument)
     uint64_t said_turn = 0, next_ms = 25;
 
     for (;;) {
-        uint64_t began = turn_began;
-
         usleep(10000);
-        if (began == 0 || began != turn_began) {
+        uint64_t began = turn_began;
+        if (began == 0) {
             continue;
         }
         uint64_t ms = (mach_absolute_time() - began) * timebase.numer / timebase.denom / 1000000;

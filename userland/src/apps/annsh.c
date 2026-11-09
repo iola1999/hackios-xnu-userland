@@ -257,6 +257,7 @@ do_spawn(char **argv)
 		close(pipefd[0]);
 		return 127;
 	}
+	int reaped = 0;
 	for (;;) {
 		struct pollfd p = { pipefd[0], POLLIN, 0 };
 		ssize_t n;
@@ -266,8 +267,13 @@ do_spawn(char **argv)
 			kill(pid, SIGKILL);
 			break;
 		}
-		if (poll(&p, 1, 200) <= 0)
+		if (poll(&p, 1, 200) <= 0) {
+			if (!reaped && waitpid(pid, &status, WNOHANG) == pid) {
+				reaped = 1;
+				break;
+			}
 			continue;
+		}
 		n = read(pipefd[0], buffer + held, sizeof(buffer) - 1 - held);
 		if (n <= 0)
 			break;
@@ -293,7 +299,9 @@ do_spawn(char **argv)
 		out("%s", buffer);
 	}
 	close(pipefd[0]);
-	waitpid(pid, &status, 0);
+	if (!reaped) {
+		waitpid(pid, &status, 0);
+	}
 	return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 }
 

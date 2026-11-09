@@ -554,17 +554,18 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 		if (r->done || (cls = objc_getClass(r->class_name)) == NULL) {
 			continue;
 		}
-		r->done = true;
 		method = r->instance ? class_getInstanceMethod(cls, sel_registerName(r->selector)) :
 		    class_getClassMethod(cls, sel_registerName(r->selector));
 		original = method ? method_getImplementation(method) : NULL;
 		if (original == NULL || (!is_ios26 && r->expected != 0 && STRIP_FN(original) != r->expected + slide)) {
 			if (r->expected != 0) {
+				r->done = true;
 				say("annibale: %c[%s %s]: found %#lx, expected %#lx; left alone\n", r->instance ? '-' : '+',
 				    r->class_name, r->selector, original ? STRIP_FN(original) - slide : 0, r->expected);
 			}
 			continue;
 		}
+		r->done = true;
 		if (r->original != NULL) {
 			*r->original = original;
 		}
