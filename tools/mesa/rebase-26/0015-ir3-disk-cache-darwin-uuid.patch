@@ -1,6 +1,6 @@
 --- a/src/freedreno/ir3/ir3_disk_cache.c
 +++ b/src/freedreno/ir3/ir3_disk_cache.c
-@@ -27,29 +27,81 @@
+@@ -27,29 +27,102 @@
   * their draw-pass counterpart, both variants are serialized together.
   */
  
@@ -8,8 +8,27 @@
 +#include <dlfcn.h>
 +#include <mach-o/loader.h>
 +#include <sys/stat.h>
++#include <unistd.h>
++#include "util/u_process.h"
 +
 +#define ANNIBALE_IR3_CACHE_DIR "/private/var/db/annibale-ir3cache"
++
++static unsigned ir3_cache_hits;
++static unsigned ir3_cache_stores;
++
++static void
++ir3_cache_note(bool hit)
++{
++   unsigned h = hit ? p_atomic_inc_return(&ir3_cache_hits) : p_atomic_read(&ir3_cache_hits);
++   unsigned s = hit ? p_atomic_read(&ir3_cache_stores) : p_atomic_inc_return(&ir3_cache_stores);
++   unsigned total = h + s;
++
++   if (total == 1 || total == 8 || total == 32 || (total % 64) == 0) {
++      printf("ir3 cache[%s %d]: %u hits, %u stores\n",
++             util_get_process_name(), getpid(), h, s);
++      fflush(stdout);
++   }
++}
 +
 +static const uint8_t *
 +get_darwin_macho_uuid(const void *addr, unsigned *uuid_len)
@@ -64,7 +83,9 @@
 +      char cache_dir[256];
 +      snprintf(cache_dir, sizeof(cache_dir), "%s/%s", ANNIBALE_IR3_CACHE_DIR, uuid_str);
 +      mkdir(ANNIBALE_IR3_CACHE_DIR, 0777);
++      chmod(ANNIBALE_IR3_CACHE_DIR, 0777);
 +      mkdir(cache_dir, 0777);
++      chmod(cache_dir, 0777);
 +      setenv("MESA_SHADER_CACHE_DIR", cache_dir, 1);
 +   }
  #else
@@ -89,7 +110,7 @@
     _mesa_blake3_update(&ctx, &compiler->options.uche_trap_base,
                       sizeof(compiler->options.uche_trap_base));
     _mesa_blake3_final(&ctx, blake3);
-@@ -59,7 +111,6 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+@@ -59,7 +132,6 @@
  
     uint64_t driver_flags = ir3_shader_debug_hash_key();
     compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
@@ -97,3 +118,103 @@
  }
  
  void
+@@ -254,6 +326,10 @@
+ 
+    free(buffer);
+ 
++#ifdef __APPLE__
++   ir3_cache_note(true);
++#endif
++
+    return true;
+ }
+ 
+@@ -284,4 +360,7 @@
+ 
+    disk_cache_put(shader->compiler->disk_cache, cache_key, blob.data, blob.size, NULL);
+    blob_finish(&blob);
++#ifdef __APPLE__
++   ir3_cache_note(false);
++#endif
+ }
+--- a/src/util/disk_cache_os.c
++++ b/src/util/disk_cache_os.c
+@@ -133,9 +133,17 @@
+    if (!mkdir_if_needed)
+       return -1;
+ 
++#ifdef __APPLE__
++   int ret = mkdir(path, 0777);
++   if (ret == 0 || (ret == -1 && errno == EEXIST)) {
++      chmod(path, 0777);
++      return 0;
++   }
++#else
+    int ret = mkdir(path, 0700);
+    if (ret == 0 || (ret == -1 && errno == EEXIST))
+      return 0;
++#endif
+ 
+    fprintf(stderr, "Failed to create %s for shader cache (%s)---disabling.\n",
+            path, strerror(errno));
+@@ -861,7 +869,13 @@
+    if (asprintf(&filename_tmp, "%s.tmp", filename) == -1)
+       goto done;
+ 
++#ifdef __APPLE__
++   fd = open(filename_tmp, O_WRONLY | O_CLOEXEC | O_CREAT, 0666);
++   if (fd != -1)
++      fchmod(fd, 0666);
++#else
+    fd = open(filename_tmp, O_WRONLY | O_CLOEXEC | O_CREAT, 0644);
++#endif
+ 
+    /* Make the two-character subdirectory within the cache as needed. */
+    if (fd == -1) {
+@@ -870,7 +884,13 @@
+ 
+       make_cache_file_directory(dc_job->cache, dc_job->key);
+ 
++#ifdef __APPLE__
++      fd = open(filename_tmp, O_WRONLY | O_CLOEXEC | O_CREAT, 0666);
++      if (fd != -1)
++         fchmod(fd, 0666);
++#else
+       fd = open(filename_tmp, O_WRONLY | O_CLOEXEC | O_CREAT, 0644);
++#endif
+       if (fd == -1)
+          goto done;
+    }
+@@ -1168,10 +1188,18 @@
+ 
+    struct stat attr;
+    if (stat(marker_path, &attr) == -1) {
++#ifdef __APPLE__
++      int fd = open(marker_path, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
++      if (fd != -1) {
++         fchmod(fd, 0666);
++         close(fd);
++      }
++#else
+       int fd = open(marker_path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+       if (fd != -1) {
+          close(fd);
+       }
++#endif
+    } else if (now - attr.st_mtime > 60 * 60 * 24 /* One day */) {
+       (void)utime(marker_path, NULL);
+    }
+@@ -1188,7 +1216,13 @@
+    if (path == NULL)
+       goto path_fail;
+ 
++#ifdef __APPLE__
++   fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0666);
++   if (fd != -1)
++      fchmod(fd, 0666);
++#else
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++#endif
+    if (fd == -1)
+       goto path_fail;
+ 

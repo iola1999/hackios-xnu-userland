@@ -195,6 +195,22 @@ sb26_on_unlocked(void)
     sb26_schedule_stepped_refresh();
 }
 
+static void
+wake_screen_for_unlock(void)
+{
+    Class bl_cls = objc_getClass("SBBacklightController");
+    if (!bl_cls) return;
+    SEL shared = sel_registerName("sharedInstanceIfExists");
+    if (!class_getClassMethod(bl_cls, shared))
+        shared = sel_registerName("sharedInstance");
+    if (!class_getClassMethod(bl_cls, shared)) return;
+    id bl = ((id (*)(Class, SEL))objc_msgSend)(bl_cls, shared);
+    if (!bl) return;
+    SEL turn_on = sel_registerName("turnOnScreenFullyWithBacklightSource:");
+    if (class_getInstanceMethod(bl_cls, turn_on))
+        ((void (*)(id, SEL, long))objc_msgSend)(bl, turn_on, 1);
+}
+
 static int
 unlock_once(const char *why)
 {
@@ -210,6 +226,7 @@ unlock_once(const char *why)
     if (!((BOOL (*)(id, SEL))objc_msgSend)(manager, locked)) {
         return 0;
     }
+    wake_screen_for_unlock();
     BOOL answer = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, nil);
     int locked_after = ((BOOL (*)(id, SEL))objc_msgSend)(manager, locked);
     fprintf(stderr, "sb26: unlock %s: answer=%d locked_after=%d\n", why, answer, locked_after);
@@ -415,6 +432,14 @@ install_unlock(void)
         if (unlock_once("notification") == 0) {
             fprintf(stderr, "sb26: unlock notification: not locked\n");
             sb26_on_unlocked();
+            return;
+        }
+        id manager = lock_screen_manager();
+        if (manager && ((BOOL (*)(id, SEL))objc_msgSend)(manager, sel_registerName("isUILocked"))) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * (int64_t)NSEC_PER_MSEC),
+                dispatch_get_main_queue(), ^{
+                unlock_once("notification-retry");
+            });
         }
     });
 
