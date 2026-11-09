@@ -950,7 +950,7 @@ python3 ../tools/apfs/mkapfs.py -z --plain fw -o root$V.apfs annibale=root | tai
 # With the iOS volume on the phone's flash as the root, all that has to come from RAM is what is not
 # on it -- the two cryptexes, OS with the dyld shared cache and App -- and what starts the boot: three
 # APFS containers back to back in the one resident image. The first, the boot volume, is the root the
-# kernel starts from (rd=md0): stage0 as /sbin/launchd mounts the small image on /annibale and runs its
+# kernel starts from (rootdev=md0): stage0 as /sbin/launchd mounts the small image on /annibale and runs its
 # init, which with boot-arg root_apfs=DEV mounts the volume on /flash, makes it the root and moves the
 # boot volume to the volume's /private/preboot, then mounts the second container -- the OS cryptex -- on
 # the boot volume's empty Cryptexes/OS and the third -- Apple's App cryptex as it is -- on Cryptexes/App:
