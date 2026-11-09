@@ -758,6 +758,49 @@ register_system_app(NSString *appPath)
 }
 
 /*
+ * At boot AnnibaleInstaller.app goes into a bundle container, as a downloaded application does. lsd
+ * rebuilds its database at boot from the bundle containers, so the copy there keeps its icon without a
+ * registration of its own; a registration sent while that rebuild runs waits about 90 s and is refused.
+ * SOURCE_MARK in the container holds the SHA-256 of the image's executable the copy was made from (the
+ * installed executable is re-signed, so it cannot be compared), and a new image replaces the copy.
+ */
+static NSString *const INSTALLER_SOURCE = @"/annibale/Applications/AnnibaleInstaller.app";
+static NSString *const SOURCE_MARK = @".annibale-source-sha256";
+
+static int
+ensure_installer_bundle(void)
+{
+	NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:[INSTALLER_SOURCE stringByAppendingPathComponent:@"Info.plist"]];
+	NSData *executable = [NSData dataWithContentsOfFile:[INSTALLER_SOURCE stringByAppendingPathComponent:info[@"CFBundleExecutable"] ?: @""]];
+	if (info[@"CFBundleIdentifier"] == nil || executable == nil) {
+		fprintf(stderr, "appinst: %s has no Info.plist or executable\n", INSTALLER_SOURCE.UTF8String);
+		return 1;
+	}
+	unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+	CC_SHA256(executable.bytes, (CC_LONG)executable.length, digest);
+	NSMutableString *hex = [NSMutableString string];
+	for (size_t i = 0; i < sizeof(digest); i++) [hex appendFormat:@"%02x", digest[i]];
+
+	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
+	MCMContainer *bundle = [NSClassFromString(@"MCMAppContainer") containerWithIdentifier:info[@"CFBundleIdentifier"]
+	                                                                    createIfNecessary:NO existed:NULL error:NULL];
+	NSString *mark = [bundle.url.path stringByAppendingPathComponent:SOURCE_MARK];
+	if (mark != nil && app_in(bundle.url.path) != nil &&
+	    [[NSString stringWithContentsOfFile:mark encoding:NSUTF8StringEncoding error:NULL] isEqualToString:hex]) {
+		printf("appinst: %s is in %s already\n", [info[@"CFBundleIdentifier"] UTF8String], bundle.url.path.UTF8String);
+		return 0;
+	}
+	int status = install(INSTALLER_SOURCE);
+	bundle = [NSClassFromString(@"MCMAppContainer") containerWithIdentifier:info[@"CFBundleIdentifier"]
+	                                                     createIfNecessary:NO existed:NULL error:NULL];
+	if (app_in(bundle.url.path) != nil) {
+		[hex writeToFile:[bundle.url.path stringByAppendingPathComponent:SOURCE_MARK] atomically:YES
+		        encoding:NSUTF8StringEncoding error:NULL];
+	}
+	return status;
+}
+
+/*
  * Watch INBOX (/private/var/db/appinst-inbox) and legacy USB transfer directory (/private/var/tmp/ipa).
  * Auto-polling of Safari Downloads and AppGroup Downloads has been removed per §8.1 item 8
  * to prevent repeated app decompression, re-signing, and installation on boot.
@@ -807,8 +850,6 @@ watch(void)
 	[fm createDirectoryAtPath:INBOX withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0777 } error:nil];
 	[fm createDirectoryAtPath:LEGACY_INBOX withIntermediateDirectories:YES attributes:@{ NSFilePosixPermissions: @0777 } error:nil];
 
-	/* Ensure AnnibaleInstaller.app is registered in LaunchServices so it appears on home screen even with existing darwin_var */
-	register_system_app(@"/annibale/Applications/AnnibaleInstaller.app");
 
 	for (;;) {
 		@autoreleasepool {
@@ -1068,8 +1109,7 @@ main(int argc, char **argv)
 			return watch();
 		}
 		if ((argc == 2 || argc == 3) && (strcmp(argv[1], "register-system") == 0 || strcmp(argv[1], "register") == 0)) {
-			NSString *target = (argc == 3) ? @(argv[2]) : @"/annibale/Applications/AnnibaleInstaller.app";
-			return register_system_app(target);
+			return argc == 3 ? register_system_app(@(argv[2])) : ensure_installer_bundle();
 		}
 		fprintf(stderr, "usage: appinst install FILE.ipa|DIR.app | remove BUNDLE-ID | list | open BUNDLE-ID | url URL | clean | watch | register-system [APP_PATH]\n");
 		return 2;
