@@ -3,7 +3,7 @@
  * use it. Each step is one layer of what a stock application needs:
  *
  * usage: net_test [--deadline SECONDS] STEP...
- *   --deadline SECONDS    bound the entire invocation; expiry exits 124 (use 12 for rwsh's 15 s limit)
+ *   --deadline SECONDS    bound the entire invocation; expiry exits 124 (use 12 for annsh's 15 s limit)
  * DNS, TCP, HTTP and waitaddr failures exit 1 after the remaining steps; fetch requires HTTP 2xx.
  *   show                  the interfaces and their addresses, as the kernel has them
  *   store [PATTERN]       what configd has in its dynamic store (default: everything under

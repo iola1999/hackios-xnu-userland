@@ -8,5 +8,5 @@
 /annibale/bin/sound_test springboard route
 /annibale/bin/sound_test level 1 raw 60 wait 6
 /annibale/bin/sound_test level 1 tone 30 &
-/annibale/bin/rwtouch wait 2 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup
+/annibale/bin/anntouch wait 2 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup
 /annibale/bin/sound_test route wait 32 system 1100 wait 3 file /System/Library/Audio/UISounds/New/Fanfare.caf wait 5

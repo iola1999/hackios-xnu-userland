@@ -4,13 +4,13 @@
 # opened and its Airplane Mode switch turned on and off; Settings closed; Control Center opened, a long press on its
 # brightness slider, Control Center closed. One step a command, so that the log says which step a line belongs to.
 /annibale/bin/sound_test springboard
-/annibale/bin/rwtouch wait 15
-/annibale/bin/rwtouch hold 0.615 0.71 1200 wait 3
-/annibale/bin/rwtouch tap 0.5 0.15 wait 3
-/annibale/bin/rwtouch tap 0.615 0.71 wait 4
-/annibale/bin/rwtouch tap 0.84 0.32 wait 3
-/annibale/bin/rwtouch tap 0.84 0.32 wait 3
-/annibale/bin/rwtouch swipe 0.5 0.995 0.5 0.55 150 wait 3
-/annibale/bin/rwtouch swipe 0.92 0.003 0.92 0.5 300 wait 3
-/annibale/bin/rwtouch hold 0.6 0.62 1200 wait 3
-/annibale/bin/rwtouch button home wait 2 button home wait 3
+/annibale/bin/anntouch wait 15
+/annibale/bin/anntouch hold 0.615 0.71 1200 wait 3
+/annibale/bin/anntouch tap 0.5 0.15 wait 3
+/annibale/bin/anntouch tap 0.615 0.71 wait 4
+/annibale/bin/anntouch tap 0.84 0.32 wait 3
+/annibale/bin/anntouch tap 0.84 0.32 wait 3
+/annibale/bin/anntouch swipe 0.5 0.995 0.5 0.55 150 wait 3
+/annibale/bin/anntouch swipe 0.92 0.003 0.92 0.5 300 wait 3
+/annibale/bin/anntouch hold 0.6 0.62 1200 wait 3
+/annibale/bin/anntouch button home wait 2 button home wait 3

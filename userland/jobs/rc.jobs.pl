@@ -10,4 +10,4 @@
 /var/jb/usr/bin/dpkg-query -W -f${binary:Package}_${Version}_${Status}\n preferenceloader ellekit
 /var/jb/bin/ls -la /var/jb/usr/lib/TweakInject/
 /var/jb/usr/bin/uiopen prefs:
-/annibale/bin/rwtouch wait 20
+/annibale/bin/anntouch wait 20

@@ -2,5 +2,5 @@
 # work from a second process at all? That question is owed to the whole port, not to the AIR
 # frontend, and a refusal here is as much of a result as a pixel.
 /annibale/bin/sound_test springboard
-/annibale/bin/rwtouch wait 25
+/annibale/bin/anntouch wait 25
 /annibale/bin/air_run /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib clearFragment01

@@ -65,21 +65,25 @@ SHA256=${SHA256:-592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a
 # on purpose: the layer only belongs on 26.x, never on 25.0.7.
 REBASE=${REBASE:-}
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
-source "$ROOT/xnu-env.sh"
+KROOT=$ROOT
+[ -d "$KROOT/xnu-deps" ] || KROOT=$(cd "$ROOT/../hackios-xnu-kernel" && pwd)
+PATH="$KROOT/xnu-deps/host/bin:$PATH"
+THEOS=${THEOS:-$HOME/theos}
+export PATH THEOS
 # the stamp expressions in the one text build.sh sources too: what is written here is read there,
 # so the pair cannot drift into "a rebuild every build" or "a stale library shipped quietly"
 source "$ROOT/tools/mesa-stamp.sh"
-B=$ROOT/xnu-deps/build/mesa
+B=$KROOT/xnu-deps/build/mesa
 SDK=$THEOS/sdks/iPhoneOS16.5.sdk
-CC=$ROOT/xnu-deps/host/bin/xnu-clang
-# xnu-clang links through $ROOT/xnu-deps/host/bin/ld64 -- that exact path is where the kernel build
+CC=$KROOT/xnu-deps/host/bin/xnu-clang
+# xnu-clang links through $KROOT/xnu-deps/host/bin/ld64 -- that exact path is where the kernel build
 # looks for the linker, and nothing but this script puts it there: an untracked symlink onto the
 # theos toolchain, which is why the container image, not the repository, is its source of truth.
-LD64=$ROOT/xnu-deps/host/bin/ld64
+LD64=$KROOT/xnu-deps/host/bin/ld64
 [ -e "$LD64" ] || ln -sfn "$THEOS/toolchain/linux/iphone/bin/ld" "$LD64"
 # the C++ name of the same wrapper, which xnu-deps/setup.sh also makes (line: link xnu-clang
 # host/bin/xnu-clang++); Mesa needs the C++ compiler, and mesa does not run setup.sh
-[ -e "$ROOT/xnu-deps/host/bin/xnu-clang++" ] || ln -s xnu-clang "$ROOT/xnu-deps/host/bin/xnu-clang++"
+[ -e "$KROOT/xnu-deps/host/bin/xnu-clang++" ] || ln -s xnu-clang "$KROOT/xnu-deps/host/bin/xnu-clang++"
 # the same toolchain holds install_name_tool; the bare name is only right on macOS, and it was
 # never on the PATH of the old containers, so resolve it rather than assume it
 INTOOL=$THEOS/toolchain/linux/iphone/bin/install_name_tool

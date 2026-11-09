@@ -10,7 +10,7 @@
 # every "on"/"off" line below answers 0xe00002c7 and the properties stay (none).
 #
 # And one thing about that kernel, for whoever boots it next and not for this run: a kernel
-# built in a working copy where tools/mk-ath11k.sh has not run has no Wi-Fi driver in it (weak
+# built in a working copy where the Wi-Fi driver has not run has no Wi-Fi driver in it (weak
 # stubs, bsd/dev/annibale_lx.c: "lx: THE DRIVER IS NOT BUILT IN"), which costs this experiment
 # nothing and costs a boot with wifi=1 everything.
 /annibale/bin/metal_props show

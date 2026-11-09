@@ -12,7 +12,7 @@
 # nowhere else, and a decrypted App Store dump's own signature no longer matches its bytes.
 #
 # Why a URL and not a tap: the icon of a 143rd application is on a later page of the home screen
-# and its place is not known in advance, so rwtouch cannot be told where to press. The bundle was
+# and its place is not known in advance, so anntouch cannot be told where to press. The bundle was
 # given a scheme of its own (CFBundleURLTypes -> re4) and battery_test, which holds the entitlement
 # SpringBoard wants of whoever asks it to open a URL, asks for it by name. That is the same way
 # rc.jobs.triangle starts this port's own application.
@@ -22,18 +22,18 @@
 /annibale/bin/vol_ls ls /Applications/RE4.app
 /annibale/bin/metal_props on
 # the lock screen out of the way, as every job list that wants the home screen does
-/annibale/bin/rwtouch wait 20 swipe 0.5 0.985 0.5 0.3 250 wait 4
+/annibale/bin/anntouch wait 20 swipe 0.5 0.985 0.5 0.3 250 wait 4
 # did LaunchServices take the bundle? If it did not, the open below fails and says so, and the
 # cause is in the bundle rather than in the game
 /annibale/bin/battery_test open re4://
 # 12 864 static initialisers run before main, and 192 MiB of __TEXT is faulted in a page at a time
 # out of a zlib-compressed RAM disk: this is the one step of the boot where minutes are plausible
 # and a short wait would prove nothing
-/annibale/bin/rwtouch wait 25
+/annibale/bin/anntouch wait 25
 /bin/ps -A
-/annibale/bin/rwtouch wait 45
+/annibale/bin/anntouch wait 45
 /bin/ps -A
 # whatever it wrote: a game that cannot find its data says so in a file more often than on a console
 /annibale/bin/vol_ls ls /private/var/mobile/Library/Caches
-/annibale/bin/rwtouch wait 30
+/annibale/bin/anntouch wait 30
 /bin/ps -A

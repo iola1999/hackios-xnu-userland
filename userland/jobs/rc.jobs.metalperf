@@ -47,7 +47,7 @@
 #                      it each draw case prints the core's own time itself. Arm it with
 #                        cp BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.gputime \
 #                           BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-#                      (under xnu-src/xnu-8796.121.2/). Without it nothing breaks: the mode
+#                      (under xnu-src/xnu-12377.121.6/). Without it nothing breaks: the mode
 #                      says "this kernel does not report GPU time" and the two older methods
 #                      still stand.
 #   gpu_log=1          optional now, and still worth having: it is the only per-submission

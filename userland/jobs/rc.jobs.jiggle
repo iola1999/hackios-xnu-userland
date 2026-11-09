@@ -3,6 +3,6 @@
 # the icons jiggle and puts the translucent minus on each of them. Then SpringBoard writes down the
 # layers it has on the screen (com.annibale.layers, see inject_sb.c), which names the badge's views.
 /annibale/bin/sound_test springboard
-/annibale/bin/rwtouch wait 25 swipe 0.5 0.985 0.5 0.3 200 wait 8
-/annibale/bin/rwtouch hold 0.5 0.62 2000
-/annibale/bin/rwtouch wait 6 notify com.annibale.layers wait 10
+/annibale/bin/anntouch wait 25 swipe 0.5 0.985 0.5 0.3 200 wait 8
+/annibale/bin/anntouch hold 0.5 0.62 2000
+/annibale/bin/anntouch wait 6 notify com.annibale.layers wait 10

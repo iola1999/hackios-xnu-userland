@@ -1,6 +1,6 @@
 #!/bin/bash
 # Lay out the files of iOS 26.6.2 (23G90, iPhone 17: iPhone18,3) that the system image is made of, the
-# way ../userland/build.sh expects them with IOS=../ios26 (the layout of ../ios165/fetch.sh):
+# way ../userland/build.sh expects them with IOS=../ios26:
 #
 #   rootfs/                  all files from os.dmg
 #   system.manifest          original owners, modes and symbolic links

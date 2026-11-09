@@ -246,9 +246,9 @@ sb26_perform_full_uninstall(const char *bundle_id)
         closedir(data_dir);
     }
 
-    /* 5. Trigger var_store persistence sync so uninstall persists across reboot */
-    notify_post("com.annibale.var_save");
-    fprintf(stderr, "sb26: posted com.annibale.var_save for %s uninstall\n", bundle_id);
+    /* 5. Sync /private/var after uninstall */
+    sync();
+    fprintf(stderr, "sb26: synced /private/var for %s uninstall\n", bundle_id);
 
     return 0;
 }

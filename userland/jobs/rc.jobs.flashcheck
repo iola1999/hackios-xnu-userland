@@ -16,7 +16,7 @@
 /annibale/bin/net_test resolve example.com fetch https://example.com/ fetch https://www.apple.com/library/test/success.html >> /private/var/results
 /annibale/bin/sound_test springboard wait 5 tone 3 wait 3 system 1100 wait 3 system 1104 wait 3 file /System/Library/Audio/UISounds/New/Fanfare.caf
 /annibale/bin/battery_test open https://example.com
-/annibale/bin/rwtouch wait 20
+/annibale/bin/anntouch wait 20
 /annibale/bin/battery_test 1 >> /private/var/results
 /annibale/bin/vol_ls sysctl kern.annibale_memory >> /private/var/results
 /bin/ps -A

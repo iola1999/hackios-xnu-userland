@@ -6,7 +6,7 @@
  *
  * The lock screen is dismissed once after boot, as 16.5's inject_sb.c does, and
  * again whenever the Darwin notification com.annibale.unlock is posted
- * (rwtouch notify com.annibale.unlock). autounlock=0 among the boot arguments
+ * (anntouch notify com.annibale.unlock). autounlock=0 among the boot arguments
  * keeps the lock screen until it is swiped away.
  */
 #include <CoreFoundation/CoreFoundation.h>

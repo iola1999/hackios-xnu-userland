@@ -1,12 +1,9 @@
-# A whitelist. In a workspace made by hackios-xnu-kernel's common/setup.sh this repository shares its
-# working tree with the kernel repository; this file then lives in .userland.git/info/exclude
-# (common/userland.exclude) instead, and only the files named here belong to it.
+# A whitelist of tracked files and directories in hackios-xnu-userland.
 /*
 !/.gitignore
 !/README.md
 !/LICENSE
 !/userland/
-!/ios165/
 !/ios26/
 !/tools/
 !/docs/
@@ -30,7 +27,6 @@ __pycache__/
 !/tools/mesa-stamp.sh
 !/tools/mk-jb.sh
 !/tools/jb-preinstall.py
-!/tools/font_trim.py
 !/tools/metallib.py
 
 /userland/*
@@ -44,9 +40,6 @@ __pycache__/
 !/userland/var/
 !/userland/var.skel.extra
 
-/ios165/*
-!/ios165/fetch.sh
-!/ios165/*.py
 /ios26/*
 !/ios26/fetch.sh
 !/ios26/*.py

@@ -3,6 +3,6 @@
 # (Continue), and its record button pressed; it records until the run ends. For screenshots: the time running, the
 # waveform of what the microphone hears, the orange dot of a microphone in use.
 /annibale/bin/sound_test springboard
-/annibale/bin/rwtouch wait 10
+/annibale/bin/anntouch wait 10
 /annibale/bin/battery_test open voicememos://
-/annibale/bin/rwtouch wait 10 tap 0.5 0.895 wait 10 tap 0.5 0.885 wait 30
+/annibale/bin/anntouch wait 10 tap 0.5 0.895 wait 10 tap 0.5 0.885 wait 30

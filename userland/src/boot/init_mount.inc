@@ -205,7 +205,7 @@ mount_writable(void)
 		return 0;
 	}
 
-	/* the directories of the data volume, as listed in the template that ships with iOS (ios165/mkvarskel.py) */
+	/* the directories of the data volume, as listed in the template that ships with iOS (ios26/full-system.py) */
 	read_whole(in_image("/etc/var.skel"), skeleton, sizeof(skeleton));
 	for (char *line = skeleton; ok && *line;) {
 		char *end = strchr(line, '\n'), *f[6];
@@ -344,41 +344,18 @@ mount_writable(void)
 }
 
 /*
- * What the last boot left in /private/var, back out of the phone's flash (var_store=1): the
- * memory filesystem is empty at every boot, so everything iOS writes -- the home screen's layout,
- * the applications' own data, the snapshots and the baked wallpaper -- would otherwise be new
- * again every time. userland/src/var_store.c keeps a copy at the end of the DSU slot, past the
- * system image, and puts it back here, over the skeleton: a name the skeleton has and
- * the store has too comes out as the store has it. A store that is not there or does not check
- * out leaves what the skeleton made, and the boot goes on either way -- so a bad store cannot
- * keep the phone from starting.
+ * Finalize the persistent /private/var data volume mounted from darwin_var (ANNFS001): ensure
+ * essential directories exist, propagate global preferences, and sync the volume metadata.
  */
 static void
 restore_var(void)
 {
-	const char *wanted = boot_arg("var_store");
-	int disk_loaded = 0, status = 0, vfd;
+	int disk_loaded = 0, vfd;
 	size_t len = sizeof(disk_loaded);
-	char *argv[3];
-	pid_t pid;
 
 	if (sysctlbyname("kern.annibale.var_disk_loaded", &disk_loaded, &len, NULL, 0) == 0 && disk_loaded != 0) {
 		printf("\n-- the data volume of the last boot --\n");
 		printf("  /private/var loaded directly from persistent disk (ANNFS001)\n");
-	} else if (wanted != NULL && strcmp(wanted, "1") == 0) {
-		printf("\n-- the data volume of the last boot --\n");
-		argv[0] = (char *)in_image("/bin/var_store");
-		argv[1] = (char *)"load";
-		argv[2] = NULL;
-		pid = fork();
-		if (pid == 0) {
-			execve(argv[0], argv, environ);
-			printf("  %s: %s\n", argv[0], strerror(errno));
-			_exit(127);
-		}
-		if (pid < 0 || wait4(pid, &status, 0, NULL) != pid || !WIFEXITED(status)) {
-			printf("  var_store did not run\n");
-		}
 	}
 
 	/* Ensure essential directories exist even when loaded directly from persistent disk */

@@ -6,10 +6,10 @@
 # libannibale-sb.dylib is in it: INJECT with MobileSafari on its line).
 /annibale/bin/mg_test HasExtendedColorDisplay
 /annibale/bin/sound_test springboard
-/annibale/bin/rwtouch wait 10
+/annibale/bin/anntouch wait 10
 /annibale/bin/battery_test open https://yandex.ru
-/annibale/bin/rwtouch wait 8 notify com.annibale.layers wait 15 notify com.annibale.layers wait 7
+/annibale/bin/anntouch wait 8 notify com.annibale.layers wait 15 notify com.annibale.layers wait 7
 /bin/ps -A
 /annibale/bin/battery_test open https://example.com
-/annibale/bin/rwtouch wait 25
+/annibale/bin/anntouch wait 25
 /bin/ps -A

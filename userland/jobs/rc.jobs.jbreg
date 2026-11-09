@@ -6,10 +6,10 @@
 # dpkg, and its application registered by uicache, as Sileo does it after an install.
 /annibale/bin/sound_test springboard
 /var/jb/bin/sh /var/jb/prep.sh
-/annibale/bin/rwtouch wait 40
+/annibale/bin/anntouch wait 40
 /var/jb/usr/bin/dpkg -i /annibale/bin/trollstorehelper.deb
 /var/jb/usr/bin/ls -la /var/jb/Applications/TrollStorePersistenceHelper.app
 /var/jb/usr/bin/uicache -p /var/jb/Applications/TrollStorePersistenceHelper.app
-/annibale/bin/rwtouch wait 5
+/annibale/bin/anntouch wait 5
 /var/jb/usr/bin/uicache -p /var/jb/Applications/TrollStorePersistenceHelper.app
-/annibale/bin/rwtouch wait 5
+/annibale/bin/anntouch wait 5

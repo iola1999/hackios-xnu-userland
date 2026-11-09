@@ -8,4 +8,4 @@
 # stopped; mediaserverd's "annibale: camera:" lines what the capture stack asked of the device.
 /annibale/bin/sound_test springboard
 /annibale/bin/camera_avtest
-/annibale/bin/rwtouch wait 10 swipe 0.5 0.985 0.5 0.3 200 wait 6 tap 0.845 0.36 wait 40
+/annibale/bin/anntouch wait 10 swipe 0.5 0.985 0.5 0.3 200 wait 6 tap 0.845 0.36 wait 40

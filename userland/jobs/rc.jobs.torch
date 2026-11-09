@@ -7,7 +7,7 @@
 # them.
 /annibale/bin/sound_test springboard
 /annibale/bin/torch_test state level 1.0 wait 3 state level 0.25 wait 3 state off wait 1 state
-/annibale/bin/rwtouch wait 2 swipe 0.85 0.005 0.85 0.6 300 wait 3
-/annibale/bin/rwtouch tap 0.385 0.61 wait 5 tap 0.385 0.61 wait 3 tap 0.5 0.92 wait 2
+/annibale/bin/anntouch wait 2 swipe 0.85 0.005 0.85 0.6 300 wait 3
+/annibale/bin/anntouch tap 0.385 0.61 wait 5 tap 0.385 0.61 wait 3 tap 0.5 0.92 wait 2
 /annibale/bin/torch_test state
 /annibale/bin/torch_test level 1.0 wait 8 state off wait 1 state

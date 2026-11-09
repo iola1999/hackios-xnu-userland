@@ -5,13 +5,13 @@
 # plug-in's volume control is in the log ("annibale: audio: the volume is ..."), and the kernel's "sound:" and
 # "speaker:" lines say what the amplifiers did with it (register 0x05).
 /annibale/bin/sound_test springboard route wait 2 tone 2 wait 4
-/annibale/bin/rwtouch button voldown wait 0.5 button voldown wait 0.5 button voldown wait 0.5 button voldown wait 1
+/annibale/bin/anntouch button voldown wait 0.5 button voldown wait 0.5 button voldown wait 0.5 button voldown wait 1
 /annibale/bin/sound_test route tone 2 wait 4
-/annibale/bin/rwtouch button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 1
+/annibale/bin/anntouch button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 1
 /annibale/bin/sound_test route tone 2 wait 4
-/annibale/bin/rwtouch button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3
-/annibale/bin/rwtouch button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 1
+/annibale/bin/anntouch button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3
+/annibale/bin/anntouch button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 0.3 button voldown wait 1
 /annibale/bin/sound_test route tone 2 wait 4
-/annibale/bin/rwtouch button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 1
+/annibale/bin/anntouch button volup wait 0.5 button volup wait 0.5 button volup wait 0.5 button volup wait 1
 /annibale/bin/sound_test route tone 2 wait 4
 /bin/ps -A

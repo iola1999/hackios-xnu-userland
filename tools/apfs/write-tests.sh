@@ -8,7 +8,7 @@
 #               check-image.sh pins, cloned into xnu-deps/build/apfsprogs and built there: the
 #               reader that has nothing to do with us and checks the space manager's bitmaps
 #               against every block anything refers to
-#   7-Zip       a third APFS reader, already needed by ios165/fetch.sh
+#   7-Zip       a third APFS reader, already needed by ios26/fetch.sh
 #
 # usage: tools/apfs/write-tests.sh [-k] [TEST ...]       (-k: keep the images in apfs-work)
 # The tests: baseline writes refusals volume-gates extent-gates power-failure real-images
@@ -32,7 +32,7 @@ TOOL=$ROOT/apfs-work/apfs-tool
 stale=""
 [ -x "$TOOL" ] || stale=1
 for f in "$HERE"/*.c "$HERE"/apfs_tool.h "$HERE"/build-tool.sh \
-	"$ROOT"/xnu-src/xnu-8796.121.2/bsd/miscfs/apfs/*.[ch] \
+	"$ROOT"/../hackios-xnu-kernel/xnu-src/xnu-12377.121.6/bsd/miscfs/apfs/*.[ch] "$ROOT"/../hackios-xnu-kernel/xnu/files/bsd/miscfs/apfs/*.[ch] \
 	"$ROOT"/xnu/files/bsd/miscfs/apfs/*.[ch]; do
 	[ -n "$stale" ] && break
 	[ -e "$f" ] && [ "$f" -nt "$TOOL" ] && stale=1

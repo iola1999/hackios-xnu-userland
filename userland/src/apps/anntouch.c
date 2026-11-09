@@ -1,7 +1,7 @@
 /*
- * rwtouch: replay touches through /dev/annibale-touch (see annibale_input.h).
+ * anntouch: replay touches through /dev/annibale-touch (see annibale_input.h).
  *
- * usage: rwtouch STEP...
+ * usage: anntouch STEP...
  *   wait SECONDS                 pause
  *   tap X Y                      a short touch
  *   swipe X0 Y0 X1 Y1 [MS]       drag from one point to the other in MS milliseconds (default 300)
@@ -17,11 +17,11 @@
  *                                for measuring how far behind the finger the screen is (tools/latency.py)
  *   button NAME [MS]             press a button: home, lock, volup, voldown
  *   read                         print the samples that arrive, forever (to watch the queue)
- *   notify NAME                  post a Darwin notification (com.annibale.unlock: see inject_sb.c)
+ *   notify NAME                  post a Darwin notification (com.annibale.unlock: see inject_sb26.c)
  *   clock                        how long short sleeps really take (a check of the kernel's timers)
  * Positions are fractions of the screen: 0 0 is the top left corner, 1 1 the bottom right.
  * Example, "swipe up from the bottom edge two minutes after boot":
- *   rwtouch wait 120 swipe 0.5 0.99 0.5 0.4 250
+ *   anntouch wait 120 swipe 0.5 0.99 0.5 0.4 250
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -73,7 +73,7 @@ send_record(const struct annibale_touch *record)
 
 		if (!said) {
 			said = 1;
-			say("rwtouch: post failed at event %llu errno %d (%s)\n", posted, error,
+			say("anntouch: post failed at event %llu errno %d (%s)\n", posted, error,
 			    strerror(error));
 		}
 	}
@@ -195,10 +195,10 @@ main(int argc, char **argv)
 	mach_timebase_info(&timebase);
 	device = open(ANNIBALE_TOUCH_DEVICE, O_RDWR);
 	if (device < 0) {
-		perror("rwtouch: " ANNIBALE_TOUCH_DEVICE);
+		perror("anntouch: " ANNIBALE_TOUCH_DEVICE);
 		return 1;
 	}
-	say("rwtouch: opened %s fd %d after %.3f s of boot\n", ANNIBALE_TOUCH_DEVICE, device,
+	say("anntouch: opened %s fd %d after %.3f s of boot\n", ANNIBALE_TOUCH_DEVICE, device,
 	    (double)(mach_absolute_time() * timebase.numer / timebase.denom / 1000000) / 1e6);
 	unsigned actions = 0;
 
@@ -211,7 +211,7 @@ main(int argc, char **argv)
 		/* An action names itself before it starts and counts what it sent after it ends: a
 		 * replay that stops in the middle leaves a start without an end, and one that sent
 		 * nothing says zero. Both read without cross-checking any other line. */
-		say("rwtouch: action %u %s start\n", action, step);
+		say("anntouch: action %u %s start\n", action, step);
 
 		if (strcmp(step, "wait") == 0 && left >= 1) {
 			usleep((useconds_t)(atof(argv[i + 1]) * 1e6));
@@ -243,7 +243,7 @@ main(int argc, char **argv)
 			int ms = left >= 2 && argv[i + 2][0] >= '0' && argv[i + 2][0] <= '9' ? atoi(argv[i + 2]) : 0;
 
 			if (which == 0) {
-				fprintf(stderr, "rwtouch: buttons are home, lock, volup and voldown\n");
+				fprintf(stderr, "anntouch: buttons are home, lock, volup and voldown\n");
 				return 2;
 			}
 			button(which, ms ? ms : 80);
@@ -264,7 +264,7 @@ main(int argc, char **argv)
 		} else if (strcmp(step, "notify") == 0 && left >= 1) {
 			uint32_t status = notify_post(argv[i + 1]);
 
-			printf("rwtouch: notification %s: %s\n", argv[i + 1], status == NOTIFY_STATUS_OK ? "posted" : "FAILED");
+			printf("anntouch: notification %s: %s\n", argv[i + 1], status == NOTIFY_STATUS_OK ? "posted" : "FAILED");
 			i += 1;
 		} else if (strcmp(step, "clock") == 0) {
 			static const useconds_t lengths[] = { 1000, 16000, 100000 };
@@ -282,7 +282,7 @@ main(int argc, char **argv)
 					worst = took > worst ? took : worst;
 				}
 				total = (mach_absolute_time() - start) * timebase.numer / timebase.denom / 1000;
-				printf("rwtouch: 20 sleeps of %u us took %llu us (the longest %llu us)\n", lengths[k],
+				printf("anntouch: 20 sleeps of %u us took %llu us (the longest %llu us)\n", lengths[k],
 				    (unsigned long long)total, (unsigned long long)(worst * timebase.numer / timebase.denom / 1000));
 			}
 		} else if (strcmp(step, "read") == 0) {
@@ -290,20 +290,20 @@ main(int argc, char **argv)
 
 			while (read(device, &t, sizeof(t)) == (ssize_t)sizeof(t)) {
 				if (t.type >= ANNIBALE_BUTTON_DOWN) {
-					printf("rwtouch: button %u %s\n", t.finger, t.type == ANNIBALE_BUTTON_DOWN ? "down" : "up");
+					printf("anntouch: button %u %s\n", t.finger, t.type == ANNIBALE_BUTTON_DOWN ? "down" : "up");
 					continue;
 				}
-				printf("rwtouch: %s finger %u at %.3f %.3f\n", t.type == ANNIBALE_TOUCH_DOWN ? "down" :
+				printf("anntouch: %s finger %u at %.3f %.3f\n", t.type == ANNIBALE_TOUCH_DOWN ? "down" :
 				    t.type == ANNIBALE_TOUCH_MOVE ? "move" : "up  ", t.finger, t.x / 65535.0, t.y / 65535.0);
 			}
 			return 0;
 		} else {
-			fprintf(stderr, "rwtouch: bad step \"%s\"\n", step);
+			fprintf(stderr, "anntouch: bad step \"%s\"\n", step);
 			return 2;
 		}
-		say("rwtouch: action %u %s end %llu events\n", action, step, posted - before);
+		say("anntouch: action %u %s end %llu events\n", action, step, posted - before);
 		usleep(50000);
 	}
-	say("rwtouch: all %u actions done, %llu events sent\n", actions, posted);
+	say("anntouch: all %u actions done, %llu events sent\n", actions, posted);
 	return 0;
 }

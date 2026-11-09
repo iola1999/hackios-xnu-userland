@@ -2,19 +2,15 @@
 
 本仓库是 [HackiOS K90 移植](https://github.com/iola1999/hackios-redmi-k90-annibale)的用户态部分：init 与注入库、launchd 任务、APFS 镜像构建、从 IPSW 提取 iOS 文件的脚本、Mesa 补丁与 AIR（Metal IR）前端，以及 Adreno 830 固件。默认分支 `k90-port`。使用方法、当前进展和排查记录都在顶层工作区。
 
-本仓库 fork 自 OOSEX GANG 的 [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史。上游面向 iOS 16.5 的内容（`ios165/fetch.sh`、16.5 的测试场景）仍在仓库里，本分支不维护这部分。
+本仓库 fork 自 OOSEX GANG 的 [hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland)，保留其 Git 历史。
 
 ## 1. 获取
 
-本仓库不单独使用，要检出到 [K90 内核仓库](https://github.com/iola1999/hackios-xnu-kernel)的工作目录里，两个仓库的脚本按同一棵目录树互相引用：
+本仓库作为顶层工作区的子模块检出在 `hackios-xnu-userland/`，与 [K90 内核仓库](https://github.com/iola1999/hackios-xnu-kernel)并列：
 
 ```sh
-cd hackios-xnu-kernel
-USERLAND_URL=https://github.com/iola1999/hackios-xnu-userland.git USERLAND_REF=k90-port common/setup.sh
-common/ugit status        # 在这棵树里操作本仓库
+git submodule update --init --recursive
 ```
-
-开发在内核工作树的 `.userland.git` 里进行，提交再移植到本仓库，所以提交说明里会写「移植 `.userland.git` 某提交」。
 
 ## 2. 目录
 

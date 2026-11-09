@@ -291,7 +291,7 @@
 #
 # 2. The lock screen out of the way, the way rc.jobs.unlock does it, and time for SpringBoard
 #    to have finished coming up. Forty seconds is what rc.jobs.launch waits for the same thing.
-/annibale/bin/rwtouch wait 40 swipe 0.5 0.985 0.5 0.3 250 wait 6
+/annibale/bin/anntouch wait 40 swipe 0.5 0.985 0.5 0.3 250 wait 6
 #
 # 3. THE APPLICATION, launched the way a link launches one: SpringBoard is asked to open the
 #    bundle's own URL scheme (src/triangle_app.plist, CFBundleURLTypes -> annibaletriangle).
@@ -308,7 +308,7 @@
 #    process died before exec, and the kernel's own lines above are where to look.
 #
 #    TAKE THE SCREENSHOT ANY TIME AFTER THIS LINE: ./xl screenshot logs/triangle.png
-/annibale/bin/rwtouch wait 20
+/annibale/bin/anntouch wait 20
 /bin/ps -A
 #
 # 5. THE DRAWABLE AGAIN, IN A PROCESS WITH NO WINDOW, and the ORDER HERE IS THE ONE DECISION IN
@@ -349,7 +349,7 @@
 # 6. And then nothing but time, so that the application keeps repainting and the screenshot can
 #    be taken again -- once while the application is alone on the GPU and once after step 5 has
 #    also used it, which is worth having as two photographs rather than one.
-/annibale/bin/rwtouch wait 180
+/annibale/bin/anntouch wait 180
 /bin/ps -A
 #
 # ------------------------------------------------------------------------------------------

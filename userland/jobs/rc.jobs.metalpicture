@@ -99,12 +99,12 @@
 #    that cannot draw 4x4 would be two findings tangled into one.
 /annibale/bin/metal_drv_test --draw /System/Library/Extensions/AppleMetalGLRenderer.bundle/default.metallib
 #
-# 2. A pause, which is a sleep and nothing else (src/rwtouch.c: "wait SECONDS"). Under
+# 2. A pause, which is a sleep and nothing else (src/anntouch.c: "wait SECONDS"). Under
 #    JOBS="" there is no lock screen to wait for and these twenty seconds buy nothing but
 #    a quiet console; they are kept because the same file has to work on an image built
 #    with the window server, where src/gl_test.c's job waits exactly this way
 #    (rc.jobs.gltest) for the lock screen to stop drawing over the panel.
-/annibale/bin/rwtouch wait 20
+/annibale/bin/anntouch wait 20
 #
 # 3. The picture itself. TAKE THE SCREENSHOT AS SOON AS ANYTHING APPEARS ON THE PHONE:
 #    from another terminal, `./xl screenshot logs/metal-picture.png`. The mosaic alone is

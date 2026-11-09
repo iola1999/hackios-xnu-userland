@@ -7,7 +7,7 @@
  * usage: keychain_test [keep|read|add|delete]
  *   (none)   the whole round trip, as before: delete, add, read back, delete
  *   keep     read it; if it is not there, write one that says when -- so a later boot's "read"
- *            says which boot wrote it. For the data volume kept in the flash (var_store=1): the
+ *            says which boot wrote it. For the data volume kept in the flash: the
  *            keychain's database is a file under /private/var like any other, and whether an item
  *            written in one boot can still be decrypted in the next is the question (the class keys
  *            are a reversible transformation in the kernel, iokit/Kernel/MiniAppleKeyStore.cpp, not

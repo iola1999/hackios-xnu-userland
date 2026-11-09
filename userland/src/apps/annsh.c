@@ -1,15 +1,15 @@
 /*
- * rwsh: run the commands the host sends while iOS runs, and put their output into the console log.
+ * annsh: run the commands the host sends while iOS runs, and put their output into the console log.
  *
  * The host sends "fastboot oem sh TEXT"; the loader writes TEXT into the running kernel's mailbox
  * (struct loader_live in osfmk/arm64/loader_return.c) and the kernel shows it as kern.annibale.cmd,
  * "SEQ TEXT". This program looks at that every 250 ms and runs each new SEQ once. It is started from
- * rc.jobs ("/annibale/bin/rwsh &") and so runs as root, outside any sandbox.
+ * rc.jobs ("/annibale/bin/annsh &") and so runs as root, outside any sandbox.
  *
  * Every line of output goes to stderr, which init leaves on the console:
- *   rwsh SEQ start TEXT
- *   rwsh SEQ| LINE                     at most RWSH_MAX_LINES of them
- *   rwsh SEQ exit STATUS MS ms
+ *   annsh SEQ start TEXT
+ *   annsh SEQ| LINE                     at most ANNSH_MAX_LINES of them
+ *   annsh SEQ exit STATUS MS ms
  * tools/k90auto/rsh.py on the host sends the command and collects these lines.
  *
  * iOS has no shell, so the words of TEXT are split on blanks with no quoting, and these are built in:
@@ -38,7 +38,7 @@
  *   ls PATH                    the directory's entries: type, size, name
  *   rm PATH                    unlink(2)
  * Anything else is a program: posix_spawnp with stdout and stderr read back, killed after
- * RWSH_LIMIT_SECONDS.
+ * ANNSH_LIMIT_SECONDS.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -85,10 +85,10 @@ struct proc_threadinfo {
 	char pth_name[64];
 };
 
-#define RWSH_POLL_US            250000
-#define RWSH_LIMIT_SECONDS      120     /* var_store save FILE packs all of /private/var */
-#define RWSH_MAX_PIDS           2048
-#define RWSH_MAX_THREADS        1024
+#define ANNSH_POLL_US            250000
+#define ANNSH_LIMIT_SECONDS      120     /* bounds a single command */
+#define ANNSH_MAX_PIDS           2048
+#define ANNSH_MAX_THREADS        1024
 
 extern char **environ;
 static unsigned long long current;
@@ -114,12 +114,12 @@ emit(const char *format, ...)
 
 /* The console log is a 1.3 MB ring the host reads whole, so one command's output is capped: a
  * program that prints without end would otherwise push everything else out of it. */
-#define RWSH_MAX_LINES          600
+#define ANNSH_MAX_LINES          600
 static unsigned long lines, dropped;
 
 #define out(format, ...) do { \
-	if (++lines <= RWSH_MAX_LINES) \
-		emit("rwsh %llu| " format, current, ##__VA_ARGS__); \
+	if (++lines <= ANNSH_MAX_LINES) \
+		emit("annsh %llu| " format, current, ##__VA_ARGS__); \
 	else \
 		dropped++; \
 } while (0)
@@ -137,7 +137,7 @@ mach_seconds(uint64_t ticks)
 static int
 do_ps(void)
 {
-	static int pids[RWSH_MAX_PIDS];
+	static int pids[ANNSH_MAX_PIDS];
 	int count = proc_listpids(PROC_ALL_PIDS, 0, pids, (int)sizeof(pids)) / (int)sizeof(pids[0]);
 
 	out("%6s %6s %5s %9s %9s %4s %s", "pid", "ppid", "uid", "user_s", "sys_s", "thr", "name");
@@ -162,7 +162,7 @@ do_ps(void)
 static int
 do_threads(int pid)
 {
-	static uint64_t ids[RWSH_MAX_THREADS];
+	static uint64_t ids[ANNSH_MAX_THREADS];
 	static const char *const states[] = { "?", "run", "stop", "wait", "uninterruptible", "halted" };
 	int bytes = proc_pidinfo(pid, PROC_PIDLISTTHREADIDS, 0, ids, (int)sizeof(ids));
 
@@ -239,7 +239,7 @@ do_spawn(char **argv)
 	mach_timebase_info_data_t tb;
 
 	mach_timebase_info(&tb);
-	deadline += (uint64_t)RWSH_LIMIT_SECONDS * 1000000000ULL * tb.denom / tb.numer;
+	deadline += (uint64_t)ANNSH_LIMIT_SECONDS * 1000000000ULL * tb.denom / tb.numer;
 	if (pipe(pipefd) != 0) {
 		out("pipe: %s", strerror(errno));
 		return 1;
@@ -262,7 +262,7 @@ do_spawn(char **argv)
 		ssize_t n;
 
 		if (mach_absolute_time() > deadline) {
-			emit("rwsh %llu| %s: still running after %d s, killed", current, argv[0], RWSH_LIMIT_SECONDS);
+			emit("annsh %llu| %s: still running after %d s, killed", current, argv[0], ANNSH_LIMIT_SECONDS);
 			kill(pid, SIGKILL);
 			break;
 		}
@@ -329,7 +329,7 @@ do_env(int argc, char **argv, int append)
 static int
 do_restart(int argc, char **argv)
 {
-	static int pids[RWSH_MAX_PIDS];
+	static int pids[ANNSH_MAX_PIDS];
 	int count = proc_listpids(PROC_ALL_PIDS, 0, pids, (int)sizeof(pids)) / (int)sizeof(pids[0]);
 	int killed = 0;
 
@@ -442,7 +442,7 @@ do_cat(const char *path, long long from)
 			close(fd);
 		return 1;
 	}
-	while (lines + 2 < RWSH_MAX_LINES) {
+	while (lines + 2 < ANNSH_MAX_LINES) {
 		ssize_t n = read(fd, chunk, sizeof(chunk));
 		size_t o = 0;
 
@@ -541,7 +541,7 @@ do_dump_pid(int pid)
 static int
 for_named(const char *verb, const char *which, int (*each)(int pid))
 {
-	static int pids[RWSH_MAX_PIDS];
+	static int pids[ANNSH_MAX_PIDS];
 	int count, found = 0;
 
 	if (which[strspn(which, "0123456789")] == 0)
@@ -634,18 +634,18 @@ main(void)
 
 	/* The number already there when this starts was meant for an earlier run of the program. */
 	if (sysctlbyname("kern.annibale.cmd", value, &size, NULL, 0) != 0) {
-		emit("rwsh: no kern.annibale.cmd (%s): this kernel has no command mailbox", strerror(errno));
+		emit("annsh: no kern.annibale.cmd (%s): this kernel has no command mailbox", strerror(errno));
 		return 1;
 	}
 	done = strtoull(value, NULL, 10);
-	emit("rwsh: ready, last command %llu", done);
+	emit("annsh: ready, last command %llu", done);
 	for (;;) {
 		char *text;
 		unsigned long long seq;
 		uint64_t began;
 		int status;
 
-		usleep(RWSH_POLL_US);
+		usleep(ANNSH_POLL_US);
 		size = sizeof(value) - 1;
 		if (sysctlbyname("kern.annibale.cmd", value, &size, NULL, 0) != 0)
 			continue;
@@ -658,10 +658,10 @@ main(void)
 			text++;
 		lines = dropped = 0;
 		began = mach_absolute_time();
-		emit("rwsh %llu start %s", seq, text);
+		emit("annsh %llu start %s", seq, text);
 		status = run(text);
 		if (dropped > 0)
-			emit("rwsh %llu dropped %lu lines after the first %d", seq, dropped, RWSH_MAX_LINES);
-		emit("rwsh %llu exit %d %.0f ms", seq, status, mach_seconds(mach_absolute_time() - began) * 1e3);
+			emit("annsh %llu dropped %lu lines after the first %d", seq, dropped, ANNSH_MAX_LINES);
+		emit("annsh %llu exit %d %.0f ms", seq, status, mach_seconds(mach_absolute_time() - began) * 1e3);
 	}
 }

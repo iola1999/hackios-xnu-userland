@@ -6,7 +6,7 @@
  *   drawable_test --refusals          only the cases the bridge must decline, by name
  *
  * WHY IT IS A PROGRAM AND NOT A UNIT TEST. The drawable path of the Metal driver
- * (src/annibaledrawable.m, docs/metal.md 10.46) ends in a texture laid over memory the
+ * (tools/userland-driver/annibaledrawable.m, docs/metal.md 10.46) ends in a texture laid over memory the
  * kernel allocated for an IOSurface, and everything about it can be made to look right
  * without being right: the import can succeed over the wrong pages, over the right pages
  * at the wrong stride, or over a staging copy that is written back later -- and in all
@@ -49,7 +49,7 @@ static int failed, checks;
 
 /*
  * The three calls of the compiler library this program needs, looked up the way the driver
- * looks them up (src/annibalemetal.m): the library is opened by its path on the device, and a
+ * looks them up (tools/userland-driver/annibalemetal.m): the library is opened by its path on the device, and a
  * symbol that is not there is a sentence rather than a failed link. rwa_texture_from_surface
  * is NOT among them -- annibaledrawable.m finds that one itself, and this program goes through
  * annibaledrawable.m on purpose, because the bridge is what is under test.
@@ -158,7 +158,7 @@ static int
 refusals(void)
 {
 	char why[512];
-	struct rwd_texture_shape shape = {
+	struct ann_texture_shape shape = {
 		.pixel_format = 80, .type = 2, .width = 4, .height = 4, .depth = 1,
 		.array_length = 1, .mip_levels = 1, .sample_count = 1, .usage = 4,
 	};
@@ -166,19 +166,19 @@ refusals(void)
 	unsigned cpp = 0;
 
 	why[0] = 0;
-	CHECK(rwd_texture_for_surface(NULL, NULL, 0, &shape, NULL, why, sizeof(why)) == NULL,
+	CHECK(ann_texture_for_surface(NULL, NULL, 0, &shape, why, sizeof(why)) == NULL,
 	    "a texture with no device");
 	printf("drawable_test: no device      -> %s\n", why);
 
 	why[0] = 0;
-	CHECK(rwd_format_of_metal(80, &fourcc, &cpp, why, sizeof(why)) == 0 &&
+	CHECK(ann_format_of_metal(80, &fourcc, &cpp, why, sizeof(why)) == 0 &&
 	    fourcc == 0x42475241 && cpp == 4, "MTLPixelFormatBGRA8Unorm is 'BGRA', 4 bytes");
 	why[0] = 0;
-	CHECK(rwd_format_of_metal(552, NULL, NULL, why, sizeof(why)) != 0,
+	CHECK(ann_format_of_metal(552, NULL, NULL, why, sizeof(why)) != 0,
 	    "a ten-bit XR format must be refused: the kernel substitutes BGRA for it");
 	printf("drawable_test: format 552     -> %s\n", why);
 	why[0] = 0;
-	CHECK(rwd_format_of_metal(7, NULL, NULL, why, sizeof(why)) != 0,
+	CHECK(ann_format_of_metal(7, NULL, NULL, why, sizeof(why)) != 0,
 	    "a format this import cannot lay over one linear plane must be refused");
 	printf("drawable_test: format 7       -> %s\n", why);
 	/*
@@ -188,7 +188,7 @@ refusals(void)
 	 * truncated mid-sentence is a reason nobody can act on, so its length is checked too.
 	 */
 	why[0] = 0;
-	CHECK(rwd_format_of_metal(500, NULL, NULL, why, sizeof(why)) != 0,
+	CHECK(ann_format_of_metal(500, NULL, NULL, why, sizeof(why)) != 0,
 	    "MTLPixelFormatYCBCR8_420_2P must be refused: it is two planes");
 	CHECK(strstr(why, "YCBCR8_420_2P") != NULL,
 	    "and the refusal must NAME it, not merely call the number unknown");
@@ -197,28 +197,28 @@ refusals(void)
 	    sizeof(why));
 	printf("drawable_test: format 500     -> %s\n", why);
 	why[0] = 0;
-	CHECK(rwd_format_of_metal(629, NULL, NULL, why, sizeof(why)) != 0,
+	CHECK(ann_format_of_metal(629, NULL, NULL, why, sizeof(why)) != 0,
 	    "629 is the last of Metal's YCbCr block and must be refused with it");
 	why[0] = 0;
-	CHECK(rwd_format_of_metal(630, &fourcc, &cpp, why, sizeof(why)) != 0,
+	CHECK(ann_format_of_metal(630, &fourcc, &cpp, why, sizeof(why)) != 0,
 	    "630 is past the YCbCr block and must fall to the general refusal");
 	CHECK(strstr(why, "two planes") != NULL,
 	    "... which still says what the block above it was");
 
-	struct rwd_surface s = { .surface = 1, .width = 1080, .height = 2400, .rowBytes = 4320,
+	struct ann_surface s = { .surface = 1, .width = 1080, .height = 2400, .rowBytes = 4320,
 				 .size = 4320 * 2400, .planes = 1 };
 	why[0] = 0;
-	CHECK(rwd_surface_fits_adreno(&s, 4, why, sizeof(why)) != 0,
+	CHECK(ann_surface_fits_adreno(&s, 4, why, sizeof(why)) != 0,
 	    "4320 bytes a row is not a multiple of 64 and must be refused by that number");
 	printf("drawable_test: row 4320       -> %s\n", why);
 	s.rowBytes = 4352;
 	s.size = (uint64_t)4352 * 2400;
 	why[0] = 0;
-	CHECK(rwd_surface_fits_adreno(&s, 4, why, sizeof(why)) == 0,
+	CHECK(ann_surface_fits_adreno(&s, 4, why, sizeof(why)) == 0,
 	    "4352 bytes a row is what the kernel gives and what Adreno takes");
 	s.planes = 2;
 	why[0] = 0;
-	CHECK(rwd_surface_fits_adreno(&s, 4, why, sizeof(why)) != 0,
+	CHECK(ann_surface_fits_adreno(&s, 4, why, sizeof(why)) != 0,
 	    "two planes must be refused: a drawable's texture is one plane");
 	printf("drawable_test: two planes     -> %s\n", why);
 	return 0;
@@ -230,8 +230,7 @@ main(int argc, char **argv)
 	unsigned width = 1080, height = 2400;
 	char why[512] = { 0 };
 	io_connect_t gpu = 0;
-	struct rwd_surface described;
-	struct rwd_surface took;
+	struct ann_surface described;
 	struct rwa_device *device;
 	struct rwa_texture *texture;
 	IOSurfaceRef surface;
@@ -267,14 +266,14 @@ main(int argc, char **argv)
 	 * given. Printed next to IOSurface.framework's own answer on purpose: the two coming
 	 * from different sides of the same call is what makes either of them worth quoting.
 	 */
-	if (rwd_gpu_open(&gpu, why, sizeof(why)) != 0) {
+	if (ann_gpu_open(&gpu, why, sizeof(why)) != 0) {
 		printf("drawable_test: NOT MEASURED: %s\n", why);
 		CFRelease(surface);
 		return 1;
 	}
-	if (rwd_surface_describe(gpu, id, &described, why, sizeof(why)) != 0) {
+	if (ann_surface_describe(gpu, id, &described, why, sizeof(why)) != 0) {
 		printf("drawable_test: NOT MEASURED: %s\n", why);
-		rwd_gpu_close(gpu);
+		ann_gpu_close(gpu);
 		CFRelease(surface);
 		return 1;
 	}
@@ -292,7 +291,7 @@ main(int argc, char **argv)
 	CHECK(described.rowBytes % 64 == 0,
 	    "the row is a multiple of 64, which is what the import requires (%u)",
 	    described.rowBytes);
-	rwd_gpu_close(gpu);
+	ann_gpu_close(gpu);
 
 	if (open_library() != 0) {
 		CFRelease(surface);
@@ -315,7 +314,7 @@ main(int argc, char **argv)
 		    pattern(corners[i][0], corners[i][1], 0));
 	}
 
-	struct rwd_texture_shape shape = {
+	struct ann_texture_shape shape = {
 		.pixel_format = 80 /* MTLPixelFormatBGRA8Unorm */,
 		.type = 2 /* MTLTextureType2D */, .width = width, .height = height,
 		.depth = 1, .array_length = 1, .mip_levels = 1, .sample_count = 1,
@@ -323,7 +322,7 @@ main(int argc, char **argv)
 	};
 
 	why[0] = 0;
-	texture = rwd_texture_for_surface(device, (void *)surface, 0, &shape, &took, why,
+	texture = ann_texture_for_surface(device, &described, 0, &shape, why,
 	    sizeof(why));
 	if (texture == NULL) {
 		printf("drawable_test: NOT MEASURED: no texture over the surface: %s\n", why);

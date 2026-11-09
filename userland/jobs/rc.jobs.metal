@@ -11,5 +11,5 @@
 # ("sound_test: the ringer is on after 208 s"), so a QEMU session wants 480 s or more -- a shorter
 # one ends before metal_test is reached at all.
 /annibale/bin/sound_test springboard
-/annibale/bin/rwtouch wait 25
+/annibale/bin/anntouch wait 25
 /annibale/bin/metal_test

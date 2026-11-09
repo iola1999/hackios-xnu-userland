@@ -1,5 +1,5 @@
 /*
- * rwsig: stop and continue named processes, so that one round can carry both halves of an
+ * annsig: stop and continue named processes, so that one round can carry both halves of an
  * experiment without rebuilding anything.
  *
  * The question it is for: the compositor stops submitting frames for 59 seconds at a time, once
@@ -7,7 +7,7 @@
  * those fetches hold the compositor is answered by running the frames with chronod frozen and
  * again with it running, in the same boot, on the same desktop.
  *
- * usage: rwsig SECONDS-FROZEN SECONDS-RUNNING ROUNDS NAME...
+ * usage: annsig SECONDS-FROZEN SECONDS-RUNNING ROUNDS NAME...
  *   freeze every NAME for SECONDS-FROZEN, continue them for SECONDS-RUNNING, ROUNDS times.
  *   A name matches p_comm exactly first, then as a prefix, so "chronod" and "extensionk" work
  *   (p_comm is 16 bytes and "extensionkitservice" arrives as "extensionkitse").
@@ -21,12 +21,12 @@
  * Two guards, because a stopped daemon left behind outlives the run:
  *   - every pid this program stopped is continued on the way out, including from a signal
  *     handler, and the whole process table is scanned once more for the names it was given;
- *   - if a frozen phase sees no new frame for RWSIG_ABORT_SECONDS (90 by default), it continues
+ *   - if a frozen phase sees no new frame for ANNSIG_ABORT_SECONDS (90 by default), it continues
  *     everything and exits: a freeze that stops the panel says nothing more by lasting longer.
  *
  * Each phase prints one line in microseconds of mach_absolute_time, the clock the frame log
  * (tl: v) carries, so the frames can be cut at the same instants:
- *   rwsig: phase stop|resume round N at <us>
+ *   annsig: phase stop|resume round N at <us>
  *
  * Five seconds into every frozen phase it also asks the kernel for a thread dump of backboardd
  * (kern.annibale.thread_dump, osfmk/kern/annibale_threads.c). The library's own watcher only dumps
@@ -133,17 +133,17 @@ dump_threads(void)
 	int error;
 
 	if (pid <= 0) {
-		say("rwsig: thread dump: no backboardd at %llu\n", (unsigned long long)now_us());
+		say("annsig: thread dump: no backboardd at %llu\n", (unsigned long long)now_us());
 		return;
 	}
 	value = pid;
 	if (sysctlbyname("kern.annibale.thread_dump", NULL, NULL, &value, sizeof(value)) != 0) {
 		error = errno;
-		say("rwsig: thread dump refused errno %d (%s) for pid %d at %llu\n", error,
+		say("annsig: thread dump refused errno %d (%s) for pid %d at %llu\n", error,
 		    strerror(error), pid, (unsigned long long)now_us());
 		return;
 	}
-	say("rwsig: thread dump asked for pid %d at %llu\n", pid, (unsigned long long)now_us());
+	say("annsig: thread dump asked for pid %d at %llu\n", pid, (unsigned long long)now_us());
 }
 
 /* One signal to every process whose p_comm matches one of the names. Returns how many got it. */
@@ -156,7 +156,7 @@ signal_named(int which, const char *phase)
 	int sent = 0;
 
 	if (count <= 0) {
-		say("rwsig: no processes listed (%d)\n", bytes);
+		say("annsig: no processes listed (%d)\n", bytes);
 		return 0;
 	}
 	for (int i = 0; i < count; i++) {
@@ -183,11 +183,11 @@ signal_named(int which, const char *phase)
 		if (which == SIGSTOP && stopped_count < MAX_PIDS) {
 			stopped[stopped_count++] = pids[i];
 		}
-		say("rwsig: %s %s pid %d\n", phase, comm, pids[i]);
+		say("annsig: %s %s pid %d\n", phase, comm, pids[i]);
 		sent++;
 	}
 	if (sent == 0) {
-		say("rwsig: %s matches nothing\n", phase);
+		say("annsig: %s matches nothing\n", phase);
 	}
 	return sent;
 }
@@ -199,7 +199,7 @@ continue_all(void)
 {
 	for (int i = 0; i < stopped_count; i++) {
 		if (kill(stopped[i], SIGCONT) == 0) {
-			say("rwsig: resume pid %d on the way out\n", stopped[i]);
+			say("annsig: resume pid %d on the way out\n", stopped[i]);
 		}
 	}
 	stopped_count = 0;
@@ -217,7 +217,7 @@ static void
 on_exit(void)
 {
 	continue_all();
-	say("rwsig: done at %llu\n", (unsigned long long)now_us());
+	say("annsig: done at %llu\n", (unsigned long long)now_us());
 }
 
 /* Sleeps in short steps so that a signal ends it, and while frozen watches the frame counter:
@@ -257,7 +257,7 @@ sleep_watching(unsigned seconds, int frozen, unsigned round)
 			continue;
 		}
 		if (now_us() - last_frame_us >= (uint64_t)abort_after * 1000000) {
-			say("rwsig: abort, no frames for %d s in the frozen phase of round %u at %llu\n",
+			say("annsig: abort, no frames for %d s in the frozen phase of round %u at %llu\n",
 			    abort_after, round, (unsigned long long)now_us());
 			return -1;
 		}
@@ -272,17 +272,17 @@ main(int argc, char **argv)
 	const char *abort_env;
 
 	if (argc < 5) {
-		fprintf(stderr, "usage: rwsig SECONDS-FROZEN SECONDS-RUNNING ROUNDS NAME...\n");
+		fprintf(stderr, "usage: annsig SECONDS-FROZEN SECONDS-RUNNING ROUNDS NAME...\n");
 		return 2;
 	}
 	frozen_seconds = atoi(argv[1]);
 	running_seconds = atoi(argv[2]);
 	rounds = atoi(argv[3]);
 	if (frozen_seconds <= 0 || running_seconds <= 0 || rounds <= 0) {
-		fprintf(stderr, "rwsig: seconds and rounds must be positive\n");
+		fprintf(stderr, "annsig: seconds and rounds must be positive\n");
 		return 2;
 	}
-	abort_env = getenv("RWSIG_ABORT_SECONDS");
+	abort_env = getenv("ANNSIG_ABORT_SECONDS");
 	if (abort_env != NULL && atoi(abort_env) > 0) {
 		abort_after = atoi(abort_env);
 	}
@@ -296,15 +296,15 @@ main(int argc, char **argv)
 	signal(SIGQUIT, on_signal);
 
 	if (frames_shown() == 0) {
-		say("rwsig: kern.annibale.frames is not there: the 90 s guard cannot fire this run\n");
+		say("annsig: kern.annibale.frames is not there: the 90 s guard cannot fire this run\n");
 	}
 	if (frozen_seconds >= abort_after) {
-		say("rwsig: the frozen phase is %d s, at or beyond the guard's %d s: it will fire\n",
+		say("annsig: the frozen phase is %d s, at or beyond the guard's %d s: it will fire\n",
 		    frozen_seconds, abort_after);
 	}
 	for (int round = 1; round <= rounds && !finish; round++) {
 		signal_named(SIGSTOP, "stop");
-		say("rwsig: phase stop round %d at %llu\n", round, (unsigned long long)now_us());
+		say("annsig: phase stop round %d at %llu\n", round, (unsigned long long)now_us());
 		if (sleep_watching((unsigned)frozen_seconds, 1, (unsigned)round) != 0) {
 			continue_all();
 			return 3;
@@ -314,7 +314,7 @@ main(int argc, char **argv)
 			return 0;
 		}
 		signal_named(SIGCONT, "resume");
-		say("rwsig: phase resume round %d at %llu\n", round, (unsigned long long)now_us());
+		say("annsig: phase resume round %d at %llu\n", round, (unsigned long long)now_us());
 		if (sleep_watching((unsigned)running_seconds, 0, (unsigned)round) != 0) {
 			continue_all();
 			return 3;

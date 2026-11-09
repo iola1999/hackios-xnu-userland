@@ -7,11 +7,11 @@
 /var/jb/bin/sh /var/jb/prep.sh
 /annibale/bin/net_test waitaddr en0 60 resolve apt.procurs.us
 /var/jb/usr/bin/apt-get update
-/annibale/bin/rwtouch wait 25
+/annibale/bin/anntouch wait 25
 /var/jb/usr/bin/uiopen sileo://
-/annibale/bin/rwtouch wait 20
+/annibale/bin/anntouch wait 20
 /var/jb/usr/bin/apt-get install -y preferenceloader
-/annibale/bin/rwtouch wait 15
+/annibale/bin/anntouch wait 15
 /var/jb/usr/bin/uicache -a
-/annibale/bin/rwtouch wait 15
+/annibale/bin/anntouch wait 15
 /bin/ps -A

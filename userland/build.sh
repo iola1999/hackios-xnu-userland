@@ -14,7 +14,7 @@
 #                      OSLOG="..."  labels of the jobs whose os_log output goes to the console ("all": every
 #                                   one of JOBS; default: only the window server, which says little)
 #                      INJECT="..." the programs started with a library of ours, "LIBRARY NAME..." per line
-#                                   (default: src/inject.c in backboardd, src/inject_sb.c in SpringBoard,
+#                                   (default: src/inject.c in backboardd, src/inject_sb26.c in SpringBoard,
 #                                   src/inject_media.c in mediaserverd);
 #                                   init hands the list to the kernel (etc/inject.conf -> sysctl kern.exec_inject)
 #                      STOREFRONT=1 ... and src/inject_store.c inside appstored: the storefront answered,
@@ -30,7 +30,7 @@
 #                      RC_JOBS=<file> what the job com.annibale.demo runs: rc.jobs (default), or
 #                                   rc.jobs.unlock, which also swipes the lock screen away (for the phone,
 #                                   where nothing else can touch the screen yet).
-#                                   A job list cannot assume a shell. iOS 16.5's own root has none at all
+#                                   A job list cannot assume a shell. iOS's own root has none at all
 #                                   -- /bin is df and ps, and nothing else -- so a line beginning /bin/sh
 #                                   fails with "No such file or directory" and status 127 on a flash-root
 #                                   boot. The /var/jb/bin/sh that rc.jobs.jb and rc.jobs.sileo run is the
@@ -54,11 +54,10 @@
 #                                   kernel's adsp_step=N, bsd/dev/annibale_adsp.c, which runs before the root is
 #                                   mounted). Not beside GL=1: the two do not fit the 64 MB the loader takes with
 #                                   the kernel. adsp=1 needs none of it: the system image has the firmware in /fw.
-#   system.apfs      the system image, the root filesystem (the resident RAM disk, /dev/md0), an
-#                    APFS container: the part of iOS 16.5 chosen by ../ios165/select-system.py at
+#   system26.apfs    the system image, the root filesystem (the resident RAM disk, /dev/md0), an
+#                    APFS container: the part of iOS 26 validated by ../ios26/full-system.py at
 #                    its real paths, the dyld shared cache, and src/stage0.c as /sbin/launchd (the
-#                    real one is /sbin/launchd.ios). 2.5 GB; upload once per loader session with
-#                    `xl ramdisk userland/system.apfs`. Rebuilt when missing, when its inputs
+#                    real one is /sbin/launchd.ios). Rebuilt when missing, when its inputs
 #                    (stage0, the manifest, the cryptex files) are newer, or with SYSTEM=1 (after
 #                    changing the recipe below). HIGHRATE=1 (with SYSTEM=1 to remake an existing image):
 #                    CADisableMinimumFrameDurationOnPhone in every application's Info.plist (mkhighrate.py).
@@ -80,11 +79,18 @@
 #                    containing only stage0 and mount points. Firmware comes from md1 or modem_a.
 set -e
 cd "$(dirname "$(readlink -f "$0")")"
-source ../xnu-env.sh
+for _d in "$PWD/../../hackios-xnu-kernel/xnu-deps/host/bin" "$PWD/../xnu-deps/host/bin"; do
+	[ -d "$_d" ] && PATH="$_d:$PATH"
+done
+unset _d
+THEOS=${THEOS:-$HOME/theos}
+export PATH THEOS
+DRV=../../hackios-xnu-kernel/tools/userland-driver
+[ -d "$DRV" ] || DRV=../tools/userland-driver
 
 CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
 LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
-SRC_INC="-Isrc/boot -Isrc/inject -Isrc/gfx -Isrc/services -Isrc/apps -Isrc/tests"
+SRC_INC="-Isrc/boot -Isrc/inject -Isrc/gfx -Isrc/services -Isrc/apps -Isrc/tests -I$DRV"
 DYN="xnu-clang -arch arm64 -isysroot ${THEOS:-$HOME/theos}/sdks/iPhoneOS16.5.sdk -O1 $SRC_INC"
 # ldid signs a program with its entitlements. The build container has it in theos's toolchain but not
 # on PATH, and the iOS 26 branch below calls it three times without a guard, so name it here when PATH
@@ -99,14 +105,12 @@ if [ -z "$LDID" ] && ! command -v ldid >/dev/null 2>&1; then
 	fi
 	unset _ldid
 fi
-# the iOS release the images are made of: ../ios165 (16.5, 20F66, iPhone X), or IOS=../ios26 for 26.6.2
-# (23G90, iPhone 17), which ../ios26/fetch.sh lays out the same way; DSC is the cache's file name, and
-# the images of 26 are root26.apfs and system26.apfs, beside those of 16.5
-IOS=${IOS:-../ios165}
-case $IOS in
-*ios26) CACHE=$IOS/23G90__iPhone18,3 DSC=dyld_shared_cache_arm64e V=26 ;;
-*) CACHE=$IOS/20F66__iPhone10,3_6 DSC=dyld_shared_cache_arm64 V= ;;
-esac
+# the iOS release the images are made of: ../ios26 for 26.6.2 (23G90, iPhone 17), which ../ios26/fetch.sh
+# lays out; DSC is the cache's file name, and the images are root26.apfs and system26.apfs
+IOS=${IOS:-../ios26}
+CACHE=$IOS/23G90__iPhone18,3
+DSC=dyld_shared_cache_arm64e
+V=26
 if [ -n "$FLASHBOOT_ONLY" ]; then
 	[ -n "$FLASHBOOT" ] || { echo "build.sh: FLASHBOOT_ONLY=1 requires FLASHBOOT=1" >&2; exit 1; }
 	[ "$CRYPTEXES" = flash ] || { echo "build.sh: FLASHBOOT_ONLY=1 requires CRYPTEXES=flash" >&2; exit 1; }
@@ -130,16 +134,16 @@ fi
 if [ "$V" = 26 ] && [ "$(uname -s)" = Darwin ]; then
 	DYN="/usr/bin/xcrun -sdk iphoneos clang -arch arm64e -miphoneos-version-min=26.0 -O1 $SRC_INC"
 fi
-# ios165/rootfs and ios165/cryptex must be this copy's own directories of hard links, the way
-# tools/new-workspace.sh makes them. A symlink to another copy's tree makes sysroot a symlink too, because
+# ios26/rootfs and ios26/cryptex must be this copy's own directories of hard links.
+# A symlink to another copy's tree makes sysroot a symlink too, because
 # cp -a does not follow one, and then every rm -rf and mv below edits the shared extraction in place. That
 # happened on 19 October 2026: 491 LaunchDaemons, NanoLaunchDaemons, LaunchAngels, xpc/launchd.plist and
 # private/var went out of the main copy's tree, and only the hard links in the other copies still held them.
 for d in rootfs cryptex cryptex-app; do
 	[ -L $IOS/$d ] || continue
-	echo "build.sh: ios165/$d is a symlink to $(readlink $IOS/$d)" >&2
-	echo "build.sh: it has to be a directory of this copy's own: rm it and cp -al the original over," >&2
-	echo "build.sh: as tools/new-workspace.sh does. Building against a link damages the shared tree." >&2
+	echo "build.sh: ios26/$d is a symlink to $(readlink $IOS/$d)" >&2
+	echo "build.sh: it has to be a directory of this copy's own: rm it and cp -al the original over." >&2
+	echo "build.sh: Building against a link damages the shared tree." >&2
 	exit 1
 done
 # The stock iOS jobs given to launchd, roughly in the order they were brought up.
@@ -170,7 +174,7 @@ fi
 # WIFID=0 leaves it out.
 [ "${WIFID-1}" != 0 ] && IOS_JOBS="$IOS_JOBS com.apple.wifid"
 # The programs (file names) started with a library of ours inside them: "LIBRARY NAME..." per line
-# (src/inject.c is libannibale.dylib, src/inject_sb.c is libannibale-sb.dylib, src/inject_media.c is
+# (src/inject.c is libannibale.dylib, src/inject_sb26.c is libannibale-sb26.dylib, src/inject_media.c is
 # libannibale-media.dylib).
 # What Sileo runs from /bin (see the package manager's prefix below): the system image's /bin, or the
 # boot volume's bin, bound over the iOS volume's /bin when that is the root (src/init.c, flash_root).
@@ -179,11 +183,9 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # SpringBoard the library above opens it, here it is named for the programs that have no library of
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 if [ "$V" = 26 ]; then
-	# The default injection libraries use 20F66 private layouts.
 	INJECT=${INJECT-"/annibale/lib/libannibale-sb26.dylib SpringBoard Preferences lsd wifid"}
 fi
 INJECT=${INJECT-"/annibale/lib/libannibale.dylib backboardd containermanagerd containermanagerd_system
-/annibale/lib/libannibale-sb.dylib SpringBoard
 /annibale/lib/libannibale-media.dylib mediaserverd
 /annibale/lib/libannibale-app.dylib Sileo
 /annibale/lib/libannibale-tweaks.dylib Preferences"}
@@ -200,7 +202,7 @@ mkdir -p obj
 $CC $LD -o hello src/tests/hello.c
 $CC -Ilibmini -c libmini/mini.c -o obj/mini.o
 $CC -c libmini/start.S -o obj/start.o
-for prog in init child stage0 var_store; do
+for prog in init child stage0; do
 	$CC -Ilibmini $LD -o obj/$prog.new src/boot/$prog.c obj/mini.o obj/start.o
 	# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
 	cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
@@ -271,8 +273,6 @@ rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
 cp obj/child root/bin/child
-# The data volume seed / snapshot helper (src/var_store.c).
-[ -f obj/var_store ] && cp obj/var_store root/bin/
 if [ "$V" = 26 ]; then
 	cp obj/input26-service root/bin/
 	cp com.annibale.input26.plist root/LaunchDaemons/
@@ -297,18 +297,18 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# an IOSurface of ours imported as a texture of the GPU, written through one view
 	# and read through the other (src/tests/drawable_test.c): the check that tells a texture
 	# over the surface's own pages from a texture over a copy of them. It goes through
-	# src/gfx/annibaledrawable.m, which is the bridge under test, and dlopens the compiler
+	# tools/userland-driver/annibaledrawable.m, which is the bridge under test, and dlopens the compiler
 	# library the way the driver does.
-	$DYN -Wno-four-char-constants -framework CoreFoundation -framework IOSurface \
-		-framework IOKit -o obj/drawable_test src/tests/drawable_test.c src/gfx/annibaledrawable.m
-	$DYN -o obj/rwtouch src/apps/rwtouch.c
-	# the command runner the host reaches through the loader's mailbox (src/apps/rwsh.c)
-	$DYN -o obj/rwsh src/apps/rwsh.c
+	$DYN -fno-objc-arc -Wno-four-char-constants -framework CoreFoundation -framework IOSurface \
+		-framework IOKit -o obj/drawable_test src/tests/drawable_test.c "$DRV/annibaledrawable.m"
+	$DYN -o obj/anntouch src/apps/anntouch.c
+	# the command runner the host reaches through the loader's mailbox (src/apps/annsh.c)
+	$DYN -o obj/annsh src/apps/annsh.c
 	# stop and continue named daemons, so that one round carries both halves of an
-	# experiment without rebuilding the image (src/apps/rwsig.m)
-	$DYN -o obj/rwsig src/apps/rwsig.m
+	# experiment without rebuilding the image (src/apps/annsig.m)
+	$DYN -o obj/annsig src/apps/annsig.m
 	# wait for the compositor to stop putting frames on the panel and ask for a thread
-	# dump at that instant (src/apps/framewatch.m). rwsig freezes a process and asks where it
+	# dump at that instant (src/apps/framewatch.m). annsig freezes a process and asks where it
 	# sits; framewatch waits for the system to stop by itself, which is what the round
 	# with 17 frames did.
 	$DYN -o obj/framewatch src/apps/framewatch.m
@@ -342,15 +342,15 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	$DYN -framework Foundation -framework IOKit -framework Metal -lobjc \
 		-o obj/metal_stubdev src/tests/metal_stubdev.m
 	# the device object of the driver itself, as the library a bundle would hold
-	# (src/gfx/annibalemetal.m). It links against Metal's private _OBJC_CLASS_$__MTLDevice,
+	# (tools/userland-driver/annibalemetal.m). It links against Metal's private _OBJC_CLASS_$__MTLDevice,
 	# which is bindable because IOGPU.framework imports the same symbol; -lobjc for
 	# class_addProtocol and no ARC because it calls objc_msgSend by hand.
-	# (with src/gfx/annibaledrawable.m beside it: the IOSurface a CAMetalLayer hands a
+	# (with tools/userland-driver/annibaledrawable.m beside it: the IOSurface a CAMetalLayer hands a
 	# device, as a texture. A file of its own because it answers CoreAnimation and
 	# not Metal, and the two meet in one method -- docs/metal.md 10.46.)
-	$DYN -dynamiclib -install_name /annibale/lib/libannibalemetal.dylib \
+	$DYN -fno-objc-arc -dynamiclib -install_name /annibale/lib/libannibalemetal.dylib \
 		-framework Foundation -framework IOKit -framework Metal -lobjc \
-		-o obj/libannibalemetal.dylib src/gfx/annibalemetal.m src/gfx/annibaledrawable.m
+		-o obj/libannibalemetal.dylib "$DRV/annibalemetal.m" "$DRV/annibaledrawable.m"
 	# and the program that walks Metal's own steps 4 and 5 against it
 	$DYN -framework Foundation -framework IOKit -framework Metal -lobjc \
 		-o obj/metal_drv_test src/tests/metal_drv_test.m
@@ -414,8 +414,6 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# our library for inside stock iOS programs (the jobs in INJECT are started with it)
 	$DYN -dynamiclib -install_name /annibale/lib/libannibale.dylib -framework CoreFoundation -framework IOKit -lobjc \
 		-o obj/libannibale.dylib src/inject/inject.c
-	$DYN -dynamiclib -install_name /annibale/lib/libannibale-sb.dylib -framework CoreFoundation -framework IOKit -lobjc \
-		-o obj/libannibale-sb.dylib src/inject/inject_sb.c
 	# ... the tweak loader of the package manager's prefix (src/inject/inject_tweaks.c): it goes into a
 	# program either as the one library the kernel inserts or opened by a library of ours
 	$DYN -dynamiclib -install_name /annibale/lib/libannibale-tweaks.dylib -framework CoreFoundation -lobjc \
@@ -445,8 +443,8 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# came out of that bundle (0x1811e0dac). The dylib above cannot serve as the
 	# executable: dyld uniques images by install_name, so a process that already has
 	# /annibale/lib/libannibalemetal.dylib would bind the bundle to it and fail that test.
-	$DYN -bundle -framework Foundation -framework IOKit -framework Metal -lobjc \
-		-o obj/AnnibaleMetal src/gfx/annibalemetal.m src/gfx/annibaledrawable.m
+	$DYN -fno-objc-arc -bundle -framework Foundation -framework IOKit -framework Metal -lobjc \
+		-o obj/AnnibaleMetal "$DRV/annibalemetal.m" "$DRV/annibaledrawable.m"
 	if [ -n "$GL" ]; then
 		# the OpenGL ES library, and the table of functions that hands CoreAnimation's calls to it
 		# (Mesa says beside the library what it was built from: one from other patches is built again)
@@ -488,7 +486,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		[ -f $M/air_run ] && cp $M/air_run obj/air_run
 		# The compiler the Metal driver asks for: AIR in, a dispatch on the
 		# Adreno out (tools/mesa/air/air_metal.h). It is copied whether or not
-		# GL is wanted, because src/gfx/annibalemetal.m dlopens it by that path --
+		# GL is wanted, because tools/userland-driver/annibalemetal.m dlopens it by that path --
 		# and its absence is a sentence the driver prints, not a crash.
 		[ -f $M/libannibaleair.dylib ] && cp $M/libannibaleair.dylib obj/
 	fi
@@ -502,7 +500,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		echo "build.sh: obj/lsprobe is older than src/apps/lsprobe.m; build it (IOS=$IOS) before staging" >&2
 		exit 1
 	}
-	for t in hello_dyn svc_test surf_test drawable_test rwtouch rwsh rwsig framewatch lsprobe mg_test; do
+	for t in hello_dyn svc_test surf_test drawable_test anntouch annsh annsig framewatch lsprobe mg_test; do
 		if [ -f obj/$t ]; then cp obj/$t root/bin/; fi
 	done
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/
@@ -591,7 +589,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	# devfs is mounted on /dev, and init puts a ramfs on /private/var
 	mkdir -p root/dev root/private/var
 	mkdir -p root/lib
-	cp obj/libannibale.dylib obj/libannibale-sb.dylib root/lib/
+	cp obj/libannibale.dylib root/lib/
 	if [ "$V" = 26 ]; then
 		cp obj/libannibale-sb26.dylib root/lib/
 		# the inject.conf loop below drops an entry whose library is absent, so an image that names
@@ -603,13 +601,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/libannibale-fairplay.dylib ] && cp obj/libannibale-fairplay.dylib root/lib/
 	[ -f obj/libannibale-app.dylib ] && cp obj/libannibale-app.dylib root/lib/
 	[ -f obj/libannibale-tweaks.dylib ] && cp obj/libannibale-tweaks.dylib root/lib/
-	# The build above sits behind `-d $IOS/rootfs/usr/lib`, this copy does
-	# not: with IOS at its default of ../ios165, which has no rootfs here, the compile is
-	# skipped and the image gets whatever object was left from an earlier run. That is how a
-	# driver built on 23 October reached a 28 October image (docs/plan/k90auto-run-protocol.md).
 	[ -f obj/libannibalemetal.dylib ] || { echo "build.sh: obj/libannibalemetal.dylib missing"; exit 1; }
-	[ obj/libannibalemetal.dylib -nt src/gfx/annibalemetal.m ] || {
-		echo "build.sh: obj/libannibalemetal.dylib is older than src/gfx/annibalemetal.m; build it (IOS=../ios26) before staging"
+	[ obj/libannibalemetal.dylib -nt "$DRV/annibalemetal.m" ] || {
+		echo "build.sh: obj/libannibalemetal.dylib is older than $DRV/annibalemetal.m; build it (IOS=../ios26) before staging"
 		exit 1
 	}
 	cp obj/libannibalemetal.dylib root/lib/
@@ -769,20 +763,10 @@ PY
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
 fi
 # firmware of the phone's own hardware, where somebody has pulled it from the phone's Android into ../fw-gpu
-# (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/annibale_adreno.c, finds it in fw/
+# (it is the vendor's and never in the repository): the kernel's GPU bring-up, bsd/dev/adreno8_cx.c, finds it in fw/
 if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
-fi
-# ... and the image of the Wi-Fi DSP, from /vendor/firmware_mnt/image of the same Android into ../fw-wifi
-# (bsd/dev/annibale_wifi.c; 7.6 MB), with what the radio's firmware is sent once it runs: this phone's
-# board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
-if [ -f ../fw-wifi/wpss.mdt ]; then
-	mkdir -p root/fw
-	install -m 0644 ../fw-wifi/wpss.mdt ../fw-wifi/wpss.b0[2-9] root/fw/
-	for f in bd_m20gl.elf regdb_xiaomi.bin; do
-		[ -f ../fw-wifi/qca6750/$f ] && install -m 0644 ../fw-wifi/qca6750/$f root/fw/
-	done
 fi
 # ... and the cameras' register tables (bsd/dev/annibale/annibale_camera.c, cam=2 and up), made by tools/camsensor.py out of
 # the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
@@ -810,12 +794,10 @@ if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
-# device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
-# slot on 19 October 2026. It is the vendor's and never in the repository, so a copy made with bare
-# git worktree add has none of it, and neither has one whose tools/new-workspace.sh predates the fw-*
-# loop there. Say what went in and what was not there to go in; what each one is for is above.
+# device log. It is the vendor's and never in the repository, so a fresh clone has none of it.
+# Say what went in and what was not there to go in; what each one is for is above.
 fwhave= fwnone=
-for d in gpu wifi camera audio; do
+for d in gpu camera audio; do
 	if [ -d ../fw-$d ]; then fwhave="$fwhave $d"; else fwnone="$fwnone $d"; fi
 done
 echo "build.sh: fw/: $(ls -1 root/fw 2>/dev/null | wc -l) files from ../fw-*:${fwhave:- none present}${fwnone:+, absent:$fwnone}"
@@ -1028,13 +1010,6 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 	{ [ ! -f system$V.apfs ] || [ obj/stage0 -nt system$V.apfs ] || [ $IOS/system.manifest -nt system$V.apfs ] ||
 	  [ $IOS/.done-rootfs -nt system$V.apfs ] || [ $IOS/cryptex -nt system$V.apfs ] ||
 	  [ $IOS/cryptex-app -nt system$V.apfs ] || [ -n "$SYSTEM" ]; }; then
-	# what ios165/select-system.py has chosen since ios165/rootfs was extracted is not in it, and would not be
-	# in the image either (so it was once with the audio plug-ins and the system's sounds: iOS found no
-	# speaker and played nothing, though our device was there and the kernel's side worked)
-	if [ "$V" != 26 ] && [ -f $IOS/.done-rootfs ] && [ $IOS/select-system.py -nt $IOS/.done-rootfs ]; then
-		echo "build.sh: ios165/select-system.py has changed since ios165/rootfs was extracted: run KEEP=1 ios165/fetch.sh" >&2
-		exit 1
-	fi
 	rm -rf sysroot
 	cp -al $IOS/rootfs sysroot                      # hard links: no copies of the 0.5 GB
 	# launchd must load our choice of jobs, not all 500 that iOS has

@@ -8,4 +8,4 @@
 /annibale/bin/sound_test springboard route
 /annibale/bin/sound_test system 1519 wait 2 system 1520 wait 2 system 1521 wait 2 system 4095 wait 3 system 4095 wait 3
 /annibale/bin/sound_test haptic wait 3 haptic 1.5
-/annibale/bin/rwtouch hold 0.15 0.925 1200 wait 6 tap 0.5 0.2 wait 3 hold 0.385 0.475 1200 wait 6 tap 0.5 0.2 wait 3
+/annibale/bin/anntouch hold 0.15 0.925 1200 wait 6 tap 0.5 0.2 wait 3 hold 0.385 0.475 1200 wait 6 tap 0.5 0.2 wait 3

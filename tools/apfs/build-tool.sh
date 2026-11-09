@@ -12,7 +12,7 @@ ROOT=$(cd "$HERE/../.." && pwd)
 OUT=${1:-$ROOT/apfs-work/apfs-tool}
 
 SRC=""
-for d in "$ROOT/xnu-src/xnu-8796.121.2/bsd/miscfs/apfs" "$ROOT/xnu/files/bsd/miscfs/apfs"; do
+for d in "$ROOT/../hackios-xnu-kernel/xnu-src/xnu-12377.121.6/bsd/miscfs/apfs" "$ROOT/../hackios-xnu-kernel/xnu/files/bsd/miscfs/apfs" "$ROOT/xnu-src/xnu-12377.121.6/bsd/miscfs/apfs" "$ROOT/xnu/files/bsd/miscfs/apfs"; do
 	[ -f "$d/apfs_lib.c" ] && { SRC=$d; break; }
 done
 [ -n "$SRC" ] || { echo "build-tool.sh: apfs_lib.c is in neither the kernel tree nor xnu/files" >&2; exit 1; }
@@ -20,6 +20,13 @@ done
 mkdir -p "$(dirname "$OUT")"
 # TOOL_CFLAGS: more for the compiler, e.g. "-fsanitize=thread -g" with APFS_TOOL_THREADS
 TOOL_CFLAGS=${TOOL_CFLAGS:-}
+CRYPTO_FLAGS=""
+for prefix in /opt/homebrew/opt/openssl /usr/local/opt/openssl; do
+	if [ -d "$prefix/lib" ] && [ -d "$prefix/include" ]; then
+		CRYPTO_FLAGS="-I$prefix/include -L$prefix/lib"
+		break
+	fi
+done
 OBJ=$(mktemp -d)
 trap 'rm -rf "$OBJ"' EXIT
 # (libdeflate as released compares signed with unsigned in a few places; -Wextra says so)
@@ -40,6 +47,6 @@ else
 	echo "build-tool.sh: no bsd/vfs/vfs_unicode.c: names other than plain ASCII are found by reading the directory" >&2
 fi
 cc -std=c11 -D_DEFAULT_SOURCE -O2 -Wall -Wextra -Wno-unused-parameter -I"$SRC" -I"$HERE" \
-	$TOOL_CFLAGS -o "$OUT" "$HERE"/apfs-tool.c "$HERE"/img.c "$HERE"/cmd_basic.c "$HERE"/cmd_census.c "$HERE"/cmd_cfrace.c "$HERE"/cmd_names.c "$HERE"/cmd_rwstore.c "$SRC/apfs_lib.c" "$SRC/apfs_write.c" "$SRC/apfs_store.c" "$SRC/apfs_zbitmap.c" \
+	$TOOL_CFLAGS $CRYPTO_FLAGS -o "$OUT" "$HERE"/apfs-tool.c "$HERE"/img.c "$HERE"/cmd_basic.c "$HERE"/cmd_census.c "$HERE"/cmd_cfrace.c "$HERE"/cmd_names.c "$HERE"/cmd_store.c "$SRC/apfs_lib.c" "$SRC/apfs_write.c" "$SRC/apfs_store.c" "$SRC/apfs_zbitmap.c" \
 	"$OBJ/apfs_deflate.o" $UNI -lz -lcrypto -pthread
 echo "build-tool.sh: $OUT (from $SRC)"
