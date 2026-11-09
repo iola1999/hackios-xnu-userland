@@ -3,13 +3,10 @@
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>com.annibale.appinst</string>
-	<!-- puts /annibale/Applications/AnnibaleInstaller.app into a bundle container when the image's copy
-	     differs from the installed one (src/apps/appinst.m, register-system); lsd registers it from there
-	     when it rebuilds its database at boot. -->
+	<string>com.annibale.trollstore</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/annibale/bin/appinst</string>
+		<string>/annibale/bin/trollstorehelper</string>
 		<string>register-system</string>
 	</array>
 	<key>RunAtLoad</key>

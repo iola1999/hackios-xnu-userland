@@ -1,6 +1,6 @@
 /*
  * HelloK90: the smallest third-party application, built for arm64 as App Store applications are, to
- * try appinst (src/appinst.m): an installed bundle outside /Applications, launched from the home
+ * test TrollStore (trollstorehelper): an installed bundle outside /Applications, launched from the home
  * screen, drawing through UIKit. It shows its own name, the time it was opened, and a coloured bar
  * that moves with a finger, so a screenshot tells it ran and touches reached it.
  */

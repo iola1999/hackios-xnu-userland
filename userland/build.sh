@@ -757,7 +757,7 @@ PY
 	[ -n "$QUIET" ] && : > root/etc/quiet
 	# init exposes these jobs at /System/Library/LaunchDaemons. FLASHBOOT checks programs against
 	# the original volume listing; other builds check the extracted files (complete for iOS 26).
-	cp com.annibale.demo.plist com.annibale.wifi.plist com.annibale.appinst.plist root/LaunchDaemons/
+	cp com.annibale.demo.plist com.annibale.wifi.plist com.annibale.trollstore.plist root/LaunchDaemons/
 	VOLUME=""
 	[ -n "$FLASHBOOT" ] && [ -f $IOS/rootfs.slt ] && VOLUME="--root-volume $IOS/rootfs.slt"
 	[ -n "$IOS_JOBS" ] && OSLOG=${OSLOG-com.apple.backboardd} ./mkjobs.py ${REST:+--rest} $VOLUME $IOS/rootfs root/LaunchDaemons $IOS_JOBS
@@ -819,6 +819,9 @@ mkdir -p root/empty root/xpc root/hal
 for f in extensions.plist extensions.plist.sig; do
 	[ -f $IOS/rootfs/System/Library/xpc/$f ] && cp $IOS/rootfs/System/Library/xpc/$f root/xpc/
 done
+if [ -f ../../TrollStore/build_k90.sh ]; then
+	bash ../../TrollStore/build_k90.sh "$PWD/obj" "$PWD/root"
+fi
 # iOS 26 outside the restore environment: launchd's jobs come from the cache in xpc, made of ours
 # (mkcache.py); stage0 binds root/xpc onto /System/Library/xpc
 if [ "$V" = 26 ]; then
@@ -834,15 +837,6 @@ if [ "$V" = 26 ]; then
 	done
 fi
 [ -d root/lib/AnnibaleAudio.driver ] && ln -sf /annibale/lib/AnnibaleAudio.driver root/hal/AnnibaleAudio.driver
-if [ -f src/apps/build_installer.sh ]; then
-	bash src/apps/build_installer.sh
-fi
-if [ -d obj/AnnibaleInstaller.app ]; then
-	mkdir -p root/Applications
-	rm -rf root/Applications/AnnibaleInstaller.app
-	cp -a obj/AnnibaleInstaller.app root/Applications/
-fi
-[ -f obj/appinst ] && cp obj/appinst root/bin/appinst
 # The 26 image runs where the dyld shared cache has an arm64e slice and no other (ios26/23G90__iPhone18,3
 # holds dyld_shared_cache_arm64e alone), so every program in it that reaches dyld has to be an arm64e
 # slice, and one Apple's clang made: a slice whose cpusubtype lacks the LIB64 bit comes from a compiler

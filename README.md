@@ -17,7 +17,7 @@ git submodule update --init --recursive
 | 路径 | 内容 |
 |---|---|
 | `userland/build.sh` | 构建用户态程序与 APFS 镜像，变量说明在文件开头。iOS 26：在 `userland/` 执行 `COMPILE_ONLY=1 IOS=../ios26 bash build.sh`（需要 Xcode），生成供顶层 `package.py` 打包辅助盘的 `root/`；系统卷使用 IPSW 中的原版 APFS 容器 |
-| `userland/src/` | 按职责分为 6 个子目录：`boot/`（`init.c`、`stage0.c`）、`inject/`（注入 SpringBoard、系统应用与守护进程的库 `inject_sb26*.c`、`inject_app.c`、`ax.m` 等）、`gfx/`（OpenGL ES 到 Mesa 桥接 `eagl.c`、drawable 与 DRM/IOMFB 适配）、`services/`（触摸与按键 `input26_service.c`、蓝牙 `bluetool.c`、音频插件、相机服务）、`apps/`（原生 IPA 管理器 `AnnibaleInstaller.app`、安装工具 `appinst.m`、控制端 `annsh.c`、`anntouch.c`）、`tests/`（测试与探针程序） |
+| `userland/src/` | 按职责分为 6 个子目录：`boot/`（`init.c`、`stage0.c`）、`inject/`（注入 SpringBoard、系统应用与守护进程的库 `inject_sb26*.c`、`inject_app.c`、`ax.m` 等）、`gfx/`（OpenGL ES 到 Mesa 桥接 `eagl.c`、drawable 与 DRM/IOMFB 适配）、`services/`（触摸与按键 `input26_service.c`、蓝牙 `bluetool.c`、音频插件、相机服务）、`apps/`（控制端 `annsh.c`、`anntouch.c`、网络工具 `netctl.c`）、`tests/`（测试与探针程序）；IPA 安装器由顶层子模块 `TrollStore/` 构建为 `TrollStore.app` 与 `trollstorehelper` |
 | `userland/var/`、`var.skel.extra` | `/private/var` 的默认内容 |
 | `ios26/` | `fetch.sh` 完整提取 iPhone 17 的 iOS 26.6.2 `os.dmg`、`systemos.dmg` 与 `appos.dmg`（IPSW 需另行下载），供 helper、launchd 任务生成和框架分析使用；`full-system.py` 生成元数据并校验提取状态 |
 | `tools/mk-mesa.sh`、`tools/mesa/` | Mesa 加本项目补丁。K90 用 26.2.5 与 `REBASE=26`，补丁说明见 [tools/mesa/rebase-26/README.md](tools/mesa/rebase-26/README.md) |
