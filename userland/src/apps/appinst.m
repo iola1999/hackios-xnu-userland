@@ -676,10 +676,15 @@ register_system_app(NSString *appPath)
 		sign_all_machos(app, nil);
 	}
 
-	/* Unregister existing stale LaunchServices proxy if present to force fresh registration */
+	/*
+	 * The LaunchServices database outlives a reboot and this runs at every boot. A record that already
+	 * points at this bundle is registered over in place; unregistering it first would leave no record
+	 * at all whenever the registration below fails, and the icon would leave the home screen.
+	 */
 	LSApplicationWorkspace *ws = [NSClassFromString(@"LSApplicationWorkspace") defaultWorkspace];
 	LSApplicationProxy *old = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:identifier];
-	if (old != nil && old.bundleURL != nil) {
+	if (old.bundleURL != nil && ![old.bundleURL.path.stringByResolvingSymlinksInPath
+	                               isEqualToString:app.stringByResolvingSymlinksInPath]) {
 		[ws unregisterApplication:old.bundleURL];
 	}
 
