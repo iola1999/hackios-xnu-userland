@@ -5,6 +5,7 @@
  * Included by src/inject_app.c.
  */
 
+#include <pthread.h>
 #include <sys/sysctl.h>
 
 struct annibale_modem_user_status {
@@ -29,6 +30,7 @@ struct annibale_modem_user_status {
 };
 
 /* Live kernel cellular state cache (refreshed at most once every 2 seconds). */
+static pthread_mutex_t cell_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct {
 	time_t   last_poll;
 	int      modem_state;
@@ -48,10 +50,14 @@ annibale_refresh_cellular_state(void)
 	size_t sz;
 	int val = 0;
 
+	pthread_mutex_lock(&cell_cache_lock);
 	if (now - cell_cache.last_poll < 2 && cell_cache.last_poll != 0) {
+		pthread_mutex_unlock(&cell_cache_lock);
 		return;
 	}
 	cell_cache.last_poll = now;
+	cell_cache.mcc = 0;
+	cell_cache.mnc = 0;
 
 	sz = sizeof(val);
 	if (sysctlbyname("kern.annibale.modem_state", &val, &sz, NULL, 0) == 0) {
@@ -98,6 +104,14 @@ annibale_refresh_cellular_state(void)
 		}
 		close(fd);
 	}
+	if (cell_cache.modem_state < 4) {
+		cell_cache.bars = 0;
+		cell_cache.mcc = 0;
+		cell_cache.mnc = 0;
+		strlcpy(cell_cache.rat, "None", sizeof(cell_cache.rat));
+		cell_cache.operator_name[0] = '\0';
+	}
+	pthread_mutex_unlock(&cell_cache_lock);
 }
 
 /* CoreTelephony and SystemStatus read the modem status exported by the kernel. */
@@ -109,8 +123,6 @@ static IMP orig_ctnetinfo_rat;
 static IMP orig_ctnetinfo_svc_rat;
 static IMP orig_st_signal_bars;
 static IMP orig_st_service_state;
-
-static id (*orig_container_url_for_group)(id, SEL, id) = NULL;
 
 static id
 nsstring_from_cstr(const char *s)
@@ -125,9 +137,13 @@ nsstring_from_cstr(const char *s)
 static id
 hooked_ctcarrier_name(id self, SEL cmd)
 {
+	char name[sizeof(cell_cache.operator_name)];
 	annibale_refresh_cellular_state();
-	if (cell_cache.operator_name[0] != '\0' && strcmp(cell_cache.operator_name, "None") != 0) {
-		return nsstring_from_cstr(cell_cache.operator_name);
+	pthread_mutex_lock(&cell_cache_lock);
+	strlcpy(name, cell_cache.operator_name, sizeof(name));
+	pthread_mutex_unlock(&cell_cache_lock);
+	if (name[0] != '\0' && strcmp(name, "None") != 0) {
+		return nsstring_from_cstr(name);
 	}
 	return orig_ctcarrier_name ? ((id (*)(id, SEL))orig_ctcarrier_name)(self, cmd) : nil;
 }
@@ -135,10 +151,14 @@ hooked_ctcarrier_name(id self, SEL cmd)
 static id
 hooked_ctcarrier_mcc(id self, SEL cmd)
 {
+	uint16_t mcc;
 	annibale_refresh_cellular_state();
-	if (cell_cache.mcc != 0) {
+	pthread_mutex_lock(&cell_cache_lock);
+	mcc = cell_cache.mcc;
+	pthread_mutex_unlock(&cell_cache_lock);
+	if (mcc != 0) {
 		char buf[16];
-		snprintf(buf, sizeof(buf), "%03u", cell_cache.mcc);
+		snprintf(buf, sizeof(buf), "%03u", mcc);
 		return nsstring_from_cstr(buf);
 	}
 	return orig_ctcarrier_mcc ? ((id (*)(id, SEL))orig_ctcarrier_mcc)(self, cmd) : nil;
@@ -147,10 +167,14 @@ hooked_ctcarrier_mcc(id self, SEL cmd)
 static id
 hooked_ctcarrier_mnc(id self, SEL cmd)
 {
+	uint16_t mnc;
 	annibale_refresh_cellular_state();
-	if (cell_cache.mnc != 0) {
+	pthread_mutex_lock(&cell_cache_lock);
+	mnc = cell_cache.mnc;
+	pthread_mutex_unlock(&cell_cache_lock);
+	if (mnc != 0) {
 		char buf[16];
-		snprintf(buf, sizeof(buf), "%02u", cell_cache.mnc);
+		snprintf(buf, sizeof(buf), "%02u", mnc);
 		return nsstring_from_cstr(buf);
 	}
 	return orig_ctcarrier_mnc ? ((id (*)(id, SEL))orig_ctcarrier_mnc)(self, cmd) : nil;
@@ -159,8 +183,12 @@ hooked_ctcarrier_mnc(id self, SEL cmd)
 static signed char
 hooked_ctcarrier_voip(id self, SEL cmd)
 {
+	int state;
 	annibale_refresh_cellular_state();
-	if (cell_cache.modem_state >= 4) {
+	pthread_mutex_lock(&cell_cache_lock);
+	state = cell_cache.modem_state;
+	pthread_mutex_unlock(&cell_cache_lock);
+	if (state >= 4) {
 		return 1;
 	}
 	return orig_ctcarrier_voip ? ((signed char (*)(id, SEL))orig_ctcarrier_voip)(self, cmd) : 1;
@@ -187,9 +215,15 @@ ct_rat_constant_for_kernel_rat(const char *rat)
 static id
 hooked_ctnetinfo_rat(id self, SEL cmd)
 {
+	int state;
+	char rat[sizeof(cell_cache.rat)];
 	annibale_refresh_cellular_state();
-	const char *ct_rat = ct_rat_constant_for_kernel_rat(cell_cache.rat);
-	if (cell_cache.modem_state >= 4 && ct_rat != NULL) {
+	pthread_mutex_lock(&cell_cache_lock);
+	state = cell_cache.modem_state;
+	strlcpy(rat, cell_cache.rat, sizeof(rat));
+	pthread_mutex_unlock(&cell_cache_lock);
+	const char *ct_rat = ct_rat_constant_for_kernel_rat(rat);
+	if (state >= 4 && ct_rat != NULL) {
 		return nsstring_from_cstr(ct_rat);
 	}
 	return orig_ctnetinfo_rat ? ((id (*)(id, SEL))orig_ctnetinfo_rat)(self, cmd) : nil;
@@ -202,9 +236,15 @@ hooked_ctnetinfo_svc_rat(id self, SEL cmd)
 	if (orig != nil) {
 		return orig;
 	}
+	int state;
+	char rat[sizeof(cell_cache.rat)];
 	annibale_refresh_cellular_state();
-	const char *ct_rat = ct_rat_constant_for_kernel_rat(cell_cache.rat);
-	if (cell_cache.modem_state >= 4 && ct_rat != NULL) {
+	pthread_mutex_lock(&cell_cache_lock);
+	state = cell_cache.modem_state;
+	strlcpy(rat, cell_cache.rat, sizeof(rat));
+	pthread_mutex_unlock(&cell_cache_lock);
+	const char *ct_rat = ct_rat_constant_for_kernel_rat(rat);
+	if (state >= 4 && ct_rat != NULL) {
 		Class dictCls = objc_getClass("NSDictionary");
 		id k = nsstring_from_cstr("0000000100000001");
 		id v = nsstring_from_cstr(ct_rat);
@@ -219,9 +259,14 @@ hooked_ctnetinfo_svc_rat(id self, SEL cmd)
 static unsigned long
 hooked_st_signal_bars(id self, SEL cmd)
 {
+	int state, bars;
 	annibale_refresh_cellular_state();
-	if (cell_cache.modem_state >= 4 || cell_cache.bars > 0) {
-		return (unsigned long)cell_cache.bars;
+	pthread_mutex_lock(&cell_cache_lock);
+	state = cell_cache.modem_state;
+	bars = cell_cache.bars;
+	pthread_mutex_unlock(&cell_cache_lock);
+	if (state >= 4 || bars > 0) {
+		return (unsigned long)bars;
 	}
 	return orig_st_signal_bars ? ((unsigned long (*)(id, SEL))orig_st_signal_bars)(self, cmd) : 0;
 }
@@ -229,32 +274,48 @@ hooked_st_signal_bars(id self, SEL cmd)
 static unsigned long
 hooked_st_service_state(id self, SEL cmd)
 {
+	int state;
 	annibale_refresh_cellular_state();
-	if (cell_cache.modem_state >= 5) {
+	pthread_mutex_lock(&cell_cache_lock);
+	state = cell_cache.modem_state;
+	pthread_mutex_unlock(&cell_cache_lock);
+	if (state >= 4) {
 		return 2; /* STTelephonyServiceStateInService */
 	}
 	return orig_st_service_state ? ((unsigned long (*)(id, SEL))orig_st_service_state)(self, cmd) : 0;
 }
 
-static id
-watched_container_url_for_group(id self, SEL cmd, id groupId)
-{
-	return orig_container_url_for_group ? orig_container_url_for_group(self, cmd, groupId) : nil;
-}
+enum {
+	CELL_HOOK_CARRIER = 1u << 0,
+	CELL_HOOK_NETINFO = 1u << 1,
+	CELL_HOOK_SIMINFO = 1u << 2,
+	CELL_HOOK_ALL     = CELL_HOOK_CARRIER | CELL_HOOK_NETINFO | CELL_HOOK_SIMINFO,
+};
+static unsigned cell_hooks_mask;
 
 static void
 watch_cellular_classes(void)
 {
-	watch("CTCarrier", "carrierName", (IMP)hooked_ctcarrier_name, &orig_ctcarrier_name);
-	watch("CTCarrier", "mobileCountryCode", (IMP)hooked_ctcarrier_mcc, &orig_ctcarrier_mcc);
-	watch("CTCarrier", "mobileNetworkCode", (IMP)hooked_ctcarrier_mnc, &orig_ctcarrier_mnc);
-	watch("CTCarrier", "allowsVOIP", (IMP)hooked_ctcarrier_voip, &orig_ctcarrier_voip);
-
-	watch("CTTelephonyNetworkInfo", "currentRadioAccessTechnology", (IMP)hooked_ctnetinfo_rat, &orig_ctnetinfo_rat);
-	watch("CTTelephonyNetworkInfo", "serviceCurrentRadioAccessTechnology", (IMP)hooked_ctnetinfo_svc_rat, &orig_ctnetinfo_svc_rat);
-
-	watch("STTelephonyStatusDomainSIMInfo", "signalStrengthBars", (IMP)hooked_st_signal_bars, &orig_st_signal_bars);
-	watch("STTelephonyStatusDomainSIMInfo", "serviceState", (IMP)hooked_st_service_state, &orig_st_service_state);
+	if ((cell_hooks_mask & CELL_HOOK_ALL) == CELL_HOOK_ALL) {
+		return;
+	}
+	if (!(cell_hooks_mask & CELL_HOOK_CARRIER) && objc_getClass("CTCarrier") != NULL) {
+		watch("CTCarrier", "carrierName", (IMP)hooked_ctcarrier_name, &orig_ctcarrier_name);
+		watch("CTCarrier", "mobileCountryCode", (IMP)hooked_ctcarrier_mcc, &orig_ctcarrier_mcc);
+		watch("CTCarrier", "mobileNetworkCode", (IMP)hooked_ctcarrier_mnc, &orig_ctcarrier_mnc);
+		watch("CTCarrier", "allowsVOIP", (IMP)hooked_ctcarrier_voip, &orig_ctcarrier_voip);
+		cell_hooks_mask |= CELL_HOOK_CARRIER;
+	}
+	if (!(cell_hooks_mask & CELL_HOOK_NETINFO) && objc_getClass("CTTelephonyNetworkInfo") != NULL) {
+		watch("CTTelephonyNetworkInfo", "currentRadioAccessTechnology", (IMP)hooked_ctnetinfo_rat, &orig_ctnetinfo_rat);
+		watch("CTTelephonyNetworkInfo", "serviceCurrentRadioAccessTechnology", (IMP)hooked_ctnetinfo_svc_rat, &orig_ctnetinfo_svc_rat);
+		cell_hooks_mask |= CELL_HOOK_NETINFO;
+	}
+	if (!(cell_hooks_mask & CELL_HOOK_SIMINFO) && objc_getClass("STTelephonyStatusDomainSIMInfo") != NULL) {
+		watch("STTelephonyStatusDomainSIMInfo", "signalStrengthBars", (IMP)hooked_st_signal_bars, &orig_st_signal_bars);
+		watch("STTelephonyStatusDomainSIMInfo", "serviceState", (IMP)hooked_st_service_state, &orig_st_service_state);
+		cell_hooks_mask |= CELL_HOOK_SIMINFO;
+	}
 }
 
 static void
@@ -262,8 +323,9 @@ app_dyld_image_added(const struct mach_header *mh, intptr_t vmaddr_slide)
 {
 	(void)mh;
 	(void)vmaddr_slide;
-	watch_cellular_classes();
-	watch("NSFileManager", "containerURLForSecurityApplicationGroupIdentifier:", (IMP)watched_container_url_for_group, &orig_container_url_for_group);
+	if ((cell_hooks_mask & CELL_HOOK_ALL) != CELL_HOOK_ALL) {
+		watch_cellular_classes();
+	}
 	if (!app_vp9_hook_installed) {
 		app_enable_webkit_vp9();
 	}

@@ -473,6 +473,13 @@ static const struct camera {
 	  } },
 };
 
+enum camera_stream_state {
+	CAM_STREAM_STOPPED = 0,
+	CAM_STREAM_WARMING = 1,
+	CAM_STREAM_ACTIVE  = 2,
+	CAM_STREAM_FAULTED = 3,
+};
+
 struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
@@ -491,8 +498,7 @@ struct stream {
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
 	pthread_t       worker;
-	volatile bool   running;
-	volatile bool   graph_running;  /* the capture graph has started this stream: frames may be given out */
+	volatile int    state;
 	bool            worker_started;
 	int             torch;
 	uint64_t        frames, stills_given;
@@ -766,6 +772,7 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		    CFArrayGetCount(value) > 0)) {
 			say_value("stream: focus:", key, value);
 		}
+		pthread_mutex_lock(&s->lock);
 		if (key_is(key, "AFWindowParams")) {
 			af_window(s, value);
 		} else if (key_is(key, "LockAFNow")) {
@@ -775,6 +782,7 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 			s->af_locked = false;
 			s->af_now = true;
 		}
+		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
 	say_once("stream: set (not used)", key, value);
@@ -878,6 +886,17 @@ device_relinquish_streams(CMBaseObjectRef o, CFArrayRef streams, CFDictionaryRef
 		say("device: streams given back (%ld)", streams ? (long)CFArrayGetCount(streams) : 0L);
 	} else if (relinquishes % 1000 == 0) {
 		say("device: streams given back %u times", relinquishes);
+	}
+	if (streams != NULL) {
+		CFIndex n = CFArrayGetCount(streams);
+
+		for (CFIndex i = 0; i < n; i++) {
+			CMBaseObjectRef st = (CMBaseObjectRef)CFArrayGetValueAtIndex(streams, i);
+
+			if (st != NULL) {
+				(void)stream_stop(st);
+			}
+		}
 	}
 	return 0;
 }

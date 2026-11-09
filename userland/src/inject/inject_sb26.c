@@ -175,6 +175,25 @@ lock_screen_manager(void)
 
 /* 1: locked, an unlock was asked for; 0: not locked; -1: no lock screen manager to ask. */
 static void sb26_schedule_stepped_refresh(void);
+static int sb26_wallpaper_suspended;
+static int sb26_suspend_token = NOTIFY_TOKEN_INVALID;
+
+static void
+sb26_on_unlocked(void)
+{
+    if (!sb26_wallpaper_suspended) {
+        sb26_wallpaper_suspended = 1;
+        if (sb26_suspend_token == NOTIFY_TOKEN_INVALID &&
+            notify_register_check("com.annibale.wallpaper.suspend", &sb26_suspend_token) != NOTIFY_STATUS_OK) {
+            sb26_suspend_token = NOTIFY_TOKEN_INVALID;
+        }
+        if (sb26_suspend_token != NOTIFY_TOKEN_INVALID) {
+            notify_set_state(sb26_suspend_token, 1);
+        }
+        notify_post("com.annibale.wallpaper.suspend");
+    }
+    sb26_schedule_stepped_refresh();
+}
 
 static int
 unlock_once(const char *why)
@@ -189,15 +208,13 @@ unlock_once(const char *why)
     id manager = lock_screen_manager();
     if (!manager) return -1;
     if (!((BOOL (*)(id, SEL))objc_msgSend)(manager, locked)) {
-        notify_post("com.annibale.wallpaper.suspend");
         return 0;
     }
     BOOL answer = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, nil);
     int locked_after = ((BOOL (*)(id, SEL))objc_msgSend)(manager, locked);
     fprintf(stderr, "sb26: unlock %s: answer=%d locked_after=%d\n", why, answer, locked_after);
     if (!locked_after) {
-        notify_post("com.annibale.wallpaper.suspend");
-        sb26_schedule_stepped_refresh();
+        sb26_on_unlocked();
     }
     return 1;
 }
@@ -353,8 +370,7 @@ boot_unlock(void *context)
     if (state == 1) boot_unlock_seen_locked = 1;
     if (state == 0 && boot_unlock_seen_locked) {
         fprintf(stderr, "sb26: boot unlock done after %lu attempts\n", (unsigned long)attempt);
-        notify_post("com.annibale.wallpaper.suspend");
-        sb26_schedule_stepped_refresh();
+        sb26_on_unlocked();
         return;
     }
     if (attempt >= UNLOCK_ATTEMPTS) {
@@ -373,8 +389,7 @@ sb26_hook_unlock_ui(id self, SEL cmd, long source, id options)
     BOOL ans = orig_unlock_ui ? orig_unlock_ui(self, cmd, source, options) : NO;
     SEL locked = sel_registerName("isUILocked");
     if (!((BOOL (*)(id, SEL))objc_msgSend)(self, locked)) {
-        notify_post("com.annibale.wallpaper.suspend");
-        sb26_schedule_stepped_refresh();
+        sb26_on_unlocked();
     }
     return ans;
 }
@@ -399,8 +414,7 @@ install_unlock(void)
         (void)t;
         if (unlock_once("notification") == 0) {
             fprintf(stderr, "sb26: unlock notification: not locked\n");
-            notify_post("com.annibale.wallpaper.suspend");
-            sb26_schedule_stepped_refresh();
+            sb26_on_unlocked();
         }
     });
 

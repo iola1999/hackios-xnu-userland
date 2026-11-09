@@ -401,6 +401,10 @@ static void
 mercury_set_suspended(int suspend)
 {
     pthread_mutex_lock(&s_link_mutex);
+    if (s_wallpaper_suspended == suspend) {
+        pthread_mutex_unlock(&s_link_mutex);
+        return;
+    }
     s_wallpaper_suspended = suspend;
     for (int i = 0; i < s_num_display_links; i++) {
         id link = s_display_links[i];
@@ -423,49 +427,74 @@ mercury_cmdbuf_commit(id self, SEL cmd)
     }
 }
 
+enum {
+    PB_HOOK_DISPLAYLINK = 1u << 0,
+    PB_HOOK_CMDBUF      = 1u << 1,
+    PB_HOOK_NOTIFY      = 1u << 2,
+    PB_HOOK_ALL         = PB_HOOK_DISPLAYLINK | PB_HOOK_CMDBUF | PB_HOOK_NOTIFY,
+};
+static unsigned s_mercury_hooks_mask = 0;
+
 static void
 install_mercury_hooks(void)
 {
-    static int hooks_installed = 0;
-    if (hooks_installed) return;
-    hooks_installed = 1;
+    unsigned before = s_mercury_hooks_mask;
+    if ((before & PB_HOOK_ALL) == PB_HOOK_ALL) return;
 
-    Class dl_cls = objc_getClass("CADisplayLink");
-    if (dl_cls) {
-        Method m_add = class_getInstanceMethod(dl_cls, sel_registerName("addToRunLoop:forMode:"));
-        if (m_add) {
-            orig_add_to_run_loop = (void (*)(id, SEL, id, id))method_getImplementation(m_add);
-            method_setImplementation(m_add, (IMP)mercury_display_link_add_to_run_loop);
-        }
-        Method m_inv = class_getInstanceMethod(dl_cls, sel_registerName("invalidate"));
-        if (m_inv) {
-            orig_display_link_invalidate = (void (*)(id, SEL))method_getImplementation(m_inv);
-            method_setImplementation(m_inv, (IMP)mercury_display_link_invalidate);
-        }
-    }
-
-    Class cb_cls = objc_getClass("_MTLCommandBuffer");
-    if (cb_cls) {
-        Method m_commit = class_getInstanceMethod(cb_cls, sel_registerName("commit"));
-        if (m_commit) {
-            orig_cmdbuf_commit = (void (*)(id, SEL))method_getImplementation(m_commit);
-            method_setImplementation(m_commit, (IMP)mercury_cmdbuf_commit);
+    if (!(s_mercury_hooks_mask & PB_HOOK_DISPLAYLINK)) {
+        Class dl_cls = objc_getClass("CADisplayLink");
+        if (dl_cls) {
+            Method m_add = class_getInstanceMethod(dl_cls, sel_registerName("addToRunLoop:forMode:"));
+            if (m_add) {
+                orig_add_to_run_loop = (void (*)(id, SEL, id, id))method_getImplementation(m_add);
+                method_setImplementation(m_add, (IMP)mercury_display_link_add_to_run_loop);
+            }
+            Method m_inv = class_getInstanceMethod(dl_cls, sel_registerName("invalidate"));
+            if (m_inv) {
+                orig_display_link_invalidate = (void (*)(id, SEL))method_getImplementation(m_inv);
+                method_setImplementation(m_inv, (IMP)mercury_display_link_invalidate);
+            }
+            s_mercury_hooks_mask |= PB_HOOK_DISPLAYLINK;
         }
     }
 
-    int token_suspend = 0;
-    notify_register_dispatch("com.annibale.wallpaper.suspend", &token_suspend, dispatch_get_main_queue(), ^(int t) {
-        (void)t;
-        mercury_set_suspended(1);
-    });
+    if (!(s_mercury_hooks_mask & PB_HOOK_CMDBUF)) {
+        Class cb_cls = objc_getClass("_MTLCommandBuffer");
+        if (cb_cls) {
+            Method m_commit = class_getInstanceMethod(cb_cls, sel_registerName("commit"));
+            if (m_commit) {
+                orig_cmdbuf_commit = (void (*)(id, SEL))method_getImplementation(m_commit);
+                method_setImplementation(m_commit, (IMP)mercury_cmdbuf_commit);
+            }
+            s_mercury_hooks_mask |= PB_HOOK_CMDBUF;
+        }
+    }
 
-    int token_resume = 0;
-    notify_register_dispatch("com.annibale.wallpaper.resume", &token_resume, dispatch_get_main_queue(), ^(int t) {
-        (void)t;
-        mercury_set_suspended(0);
-    });
+    if (!(s_mercury_hooks_mask & PB_HOOK_NOTIFY)) {
+        int token_suspend = 0;
+        if (notify_register_dispatch("com.annibale.wallpaper.suspend", &token_suspend,
+            dispatch_get_main_queue(), ^(int t) {
+            (void)t;
+            mercury_set_suspended(1);
+        }) == NOTIFY_STATUS_OK) {
+            uint64_t initial = 0;
+            if (notify_get_state(token_suspend, &initial) == NOTIFY_STATUS_OK && initial != 0) {
+                mercury_set_suspended(1);
+            }
+        }
 
-    fprintf(stderr, "pb26: mercury poster throttling and suspension hooks installed\n");
+        int token_resume = 0;
+        notify_register_dispatch("com.annibale.wallpaper.resume", &token_resume,
+            dispatch_get_main_queue(), ^(int t) {
+            (void)t;
+            mercury_set_suspended(0);
+        });
+        s_mercury_hooks_mask |= PB_HOOK_NOTIFY;
+    }
+
+    if (s_mercury_hooks_mask != before && (s_mercury_hooks_mask & PB_HOOK_ALL) == PB_HOOK_ALL) {
+        fprintf(stderr, "pb26: mercury poster throttling and suspension hooks installed\n");
+    }
 }
 
 static void
@@ -473,8 +502,7 @@ mercury_image_callback(const struct mach_header *header, intptr_t slide)
 {
     (void)header;
     (void)slide;
-    Class dl_cls = objc_getClass("CADisplayLink");
-    if (dl_cls) {
+    if ((s_mercury_hooks_mask & PB_HOOK_ALL) != PB_HOOK_ALL) {
         install_mercury_hooks();
     }
 }

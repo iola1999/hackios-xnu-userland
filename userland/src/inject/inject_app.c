@@ -498,7 +498,6 @@ annibale_app_init(void)
 	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
 
 	watch_cellular_classes();
-	watch("NSFileManager", "containerURLForSecurityApplicationGroupIdentifier:", (IMP)watched_container_url_for_group, &orig_container_url_for_group);
 
 	app_enable_webkit_vp9();
 	_dyld_register_func_for_add_image(app_dyld_image_added);

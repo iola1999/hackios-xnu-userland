@@ -504,10 +504,11 @@ worker(void *context)
 	pthread_setname_np("annibale-camera");
 	if (device < 0) {
 		say("no %s (%s): no frames", ANNIBALE_CAMERA_DEVICE, strerror(errno));
+		s->state = CAM_STREAM_FAULTED;
 		return NULL;
 	}
 	isp_init(&isp);
-	while (s->running && failures < 5) {
+	while ((s->state == CAM_STREAM_WARMING || s->state == CAM_STREAM_ACTIVE) && failures < 5) {
 		ssize_t n;
 
 		if (buffer == NULL) {
@@ -569,14 +570,23 @@ worker(void *context)
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
 		}
-		if (s->af_now) {
-			s->af_now = false;
+		bool af_now, af_locked;
+		float af_win[4];
+		pthread_mutex_lock(&s->lock);
+		af_now = s->af_now;
+		s->af_now = false;
+		af_locked = s->af_locked;
+		memcpy(af_win, s->af_window, sizeof(af_win));
+		pthread_mutex_unlock(&s->lock);
+		if (af_now) {
 			/* (whatever it was doing: at once, from the next frame) */
 			af.state = AF_STEADY;
+			af.target = af.at;
+			af.wait = 0;
 			af.now = true;
 			af.sweep = true;
 		}
-		af_frame(device, &af, f, raw, s->af_window, s->af_locked);
+		af_frame(device, &af, f, raw, af_win, af_locked);
 		s->frames++;
 
 		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
@@ -597,7 +607,7 @@ worker(void *context)
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
 		pthread_mutex_lock(&s->lock);
-		for (int i = 0; s->graph_running && i < OUTPUTS; i++) {
+		for (int i = 0; s->state == CAM_STREAM_ACTIVE && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
 			/*
@@ -631,6 +641,9 @@ worker(void *context)
 	}
 	free(buffer);
 	close(device);
+	if (s->state == CAM_STREAM_WARMING || s->state == CAM_STREAM_ACTIVE) {
+		s->state = CAM_STREAM_FAULTED;
+	}
 	say("the frames stopped (%llu)", s->frames);
 	return NULL;
 }
@@ -650,27 +663,36 @@ stream_begin(CMBaseObjectRef o, bool graph)
 {
 	struct stream *s = stream_of(o);
 
-	if (graph) {
-		pthread_mutex_lock(&s->lock);
-		s->graph_running = true;
-		pthread_mutex_unlock(&s->lock);
-		say("stream: the graph starts the stream (format %d)", s->format_index);
+	if (s->state == CAM_STREAM_FAULTED && s->worker_started) {
+		pthread_join(s->worker, NULL);
+		s->worker_started = false;
+		s->state = CAM_STREAM_STOPPED;
 	}
-	if (s->running) {
+	if (s->state == CAM_STREAM_WARMING || s->state == CAM_STREAM_ACTIVE) {
+		if (graph && s->state != CAM_STREAM_ACTIVE) {
+			pthread_mutex_lock(&s->lock);
+			s->state = CAM_STREAM_ACTIVE;
+			pthread_mutex_unlock(&s->lock);
+			say("stream: the graph starts the stream (format %d)", s->format_index);
+		}
 		return 0;
 	}
 	/* one camera at a time: the kernel gives one sensor's frames (the other stream's worker stopped first) */
 	for (int i = 0; i < MAX_STREAMS; i++) {
-		if (all_streams[i] != NULL && all_streams[i] != o && stream_of(all_streams[i])->running) {
+		if (all_streams[i] != NULL && all_streams[i] != o &&
+		    stream_of(all_streams[i])->state != CAM_STREAM_STOPPED) {
 			say("stream: the %s's frames stop for the %s's", stream_of(all_streams[i])->camera->name, s->camera->name);
 			(void)stream_stop(all_streams[i]);
 		}
 	}
-	s->running = true;
+	s->state = graph ? CAM_STREAM_ACTIVE : CAM_STREAM_WARMING;
+	if (graph) {
+		say("stream: the graph starts the stream (format %d)", s->format_index);
+	}
 	s->frames = 0;
 	say("stream: frames begin (format %d)", s->format_index);
 	if (pthread_create(&s->worker, NULL, worker, o) != 0) {
-		s->running = false;
+		s->state = CAM_STREAM_STOPPED;
 		return ERR_UNSUPPORTED;
 	}
 	s->worker_started = true;
@@ -691,12 +713,11 @@ stream_stop(CMBaseObjectRef o)
 	say("stream: stop (%llu frames, %llu pictures given)", (unsigned long long)s->frames,
 	    (unsigned long long)s->out[0].delivered);
 	pthread_mutex_lock(&s->lock);
-	s->graph_running = false;
+	s->state = CAM_STREAM_STOPPED;
 	for (int i = 0; i < OUTPUTS; i++) {
 		let_go(&s->out[i]);
 	}
 	pthread_mutex_unlock(&s->lock);
-	s->running = false;
 	if (s->worker_started) {
 		pthread_join(s->worker, NULL);
 		s->worker_started = false;

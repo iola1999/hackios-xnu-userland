@@ -784,8 +784,11 @@ ensure_installer_bundle(void)
 	dlopen("/System/Library/PrivateFrameworks/MobileContainerManager.framework/MobileContainerManager", RTLD_NOW);
 	MCMContainer *bundle = [NSClassFromString(@"MCMAppContainer") containerWithIdentifier:info[@"CFBundleIdentifier"]
 	                                                                    createIfNecessary:NO existed:NULL error:NULL];
+	NSString *installedApp = app_in(bundle.url.path);
+	LSApplicationProxy *proxy = [NSClassFromString(@"LSApplicationProxy") applicationProxyForIdentifier:info[@"CFBundleIdentifier"]];
 	NSString *mark = [bundle.url.path stringByAppendingPathComponent:SOURCE_MARK];
-	if (mark != nil && app_in(bundle.url.path) != nil &&
+	if (mark != nil && installedApp != nil &&
+	    [proxy.bundleURL.path isEqualToString:installedApp] &&
 	    [[NSString stringWithContentsOfFile:mark encoding:NSUTF8StringEncoding error:NULL] isEqualToString:hex]) {
 		printf("appinst: %s is in %s already\n", [info[@"CFBundleIdentifier"] UTF8String], bundle.url.path.UTF8String);
 		return 0;
@@ -793,9 +796,11 @@ ensure_installer_bundle(void)
 	int status = install(INSTALLER_SOURCE);
 	bundle = [NSClassFromString(@"MCMAppContainer") containerWithIdentifier:info[@"CFBundleIdentifier"]
 	                                                     createIfNecessary:NO existed:NULL error:NULL];
-	if (app_in(bundle.url.path) != nil) {
-		[hex writeToFile:[bundle.url.path stringByAppendingPathComponent:SOURCE_MARK] atomically:YES
-		        encoding:NSUTF8StringEncoding error:NULL];
+	mark = [bundle.url.path stringByAppendingPathComponent:SOURCE_MARK];
+	if (status == 0 && app_in(bundle.url.path) != nil) {
+		[hex writeToFile:mark atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+	} else if (mark != nil) {
+		[NSFileManager.defaultManager removeItemAtPath:mark error:nil];
 	}
 	return status;
 }
@@ -843,6 +848,7 @@ watch(void)
 {
 	NSFileManager *fm = NSFileManager.defaultManager;
 	NSMutableSet<NSString *> *done = [NSMutableSet set];
+	NSMutableDictionary<NSString *, NSNumber *> *attempts = [NSMutableDictionary dictionary];
 	NSUInteger folders = NSUIntegerMax;
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
@@ -871,19 +877,25 @@ watch(void)
 					    !zip_whole(path, size)) {
 						continue;
 					}
-					[done addObject:key];
 					[fm removeItemAtPath:copy error:nil];
 					if (![fm copyItemAtPath:path toPath:copy error:nil]) {
 						printf("appinst: %s went away before it was copied\n", name.UTF8String);
 						continue;
 					}
-					printf("appinst: installing %s (%llu bytes) from %s\n", name.UTF8String, size, dir.UTF8String);
+					unsigned tries = [attempts[key] unsignedIntValue] + 1;
+					attempts[key] = @(tries);
+					printf("appinst: installing %s (%llu bytes) from %s (attempt %u)\n",
+					    name.UTF8String, size, dir.UTF8String, tries);
 					int install_status = install(copy);
 					printf("appinst: %s\n", install_status == 0 ? "installed" : "NOT INSTALLED");
 					[fm removeItemAtPath:copy error:nil];
 					if (install_status == 0) {
+						[done addObject:key];
+						[attempts removeObjectForKey:key];
 						/* Remove source file after successful installation to save ramfs space and avoid re-install */
 						[fm removeItemAtPath:path error:nil];
+					} else if (tries >= 3) {
+						[done addObject:key];
 					}
 				}
 			}
@@ -1051,7 +1063,7 @@ clean_test_apps(void)
 	}
 
 	/* 4. Ensure AnnibaleInstaller is registered cleanly with LaunchServices */
-	register_system_app(@"/annibale/Applications/AnnibaleInstaller.app");
+	ensure_installer_bundle();
 
 	notify_post("com.apple.LaunchServices.ApplicationsChanged");
 	notify_post("com.annibale.var_save");

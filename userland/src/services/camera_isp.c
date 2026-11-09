@@ -224,9 +224,11 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 	uint32_t lines, gain, frame_lines = 0;
 	double digital = 1;
 
-	if (isp->asked && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
+	if (isp->ae_wait > 0 && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
+		isp->ae_wait--;
 		return false;                   /* (the last change not in the frames yet) */
 	}
+	isp->ae_wait = 0;
 	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
 	ratio = target / mean;
 	if (bright * ratio > 0.9 * WHITE && bright > 0) {
@@ -260,7 +262,7 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 	isp->asked_lines = lines;
 	isp->asked_gain = gain;
 	isp->asked_frame_lines = frame_lines;
-	isp->asked = true;
+	isp->ae_wait = 4;
 	memset(c, 0, sizeof(*c));
 	c->command = ANNIBALE_CAMERA_EXPOSURE;
 	c->a = lines;

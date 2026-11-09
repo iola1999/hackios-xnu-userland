@@ -62,6 +62,13 @@
 
 static NSString *const BUNDLES_DIR = @"/private/var/containers/Bundle/Application";
 static NSString *const INBOX_DIR = @"/private/var/tmp/ipa";
+static NSString *const STAGED_DIR = @"/private/var/tmp/installer-staged";
+
+typedef NS_ENUM(NSInteger, InstallerUIState) {
+	INSTALLER_UI_IDLE = 0,
+	INSTALLER_UI_CONFIRMING = 1,
+	INSTALLER_UI_BUSY = 2,
+};
 
 static unsigned long long calculate_directory_size(NSString *path)
 {
@@ -247,6 +254,8 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 @property (nonatomic, strong) UIRefreshControl *refreshControl;
 @property (nonatomic, strong) NSMutableArray<AppRecord *> *installedApps;
 @property (nonatomic, strong) NSMutableArray<IPARecord *> *availableIPAs;
+@property (nonatomic, assign) InstallerUIState uiState;
+@property (nonatomic, strong) NSURL *pendingIncomingURL;
 - (void)handleIncomingFile:(NSURL *)fileURL;
 @end
 
@@ -365,6 +374,7 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 	NSMutableArray<NSString *> *dirs = [NSMutableArray array];
 
 	[dirs addObject:INBOX_DIR];
+	[dirs addObject:STAGED_DIR];
 	[dirs addObject:@"/private/var/mobile/Downloads"];
 	[dirs addObject:@"/private/var/tmp"];
 
@@ -414,38 +424,84 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 	}
 }
 
+- (void)finishModalTransition
+{
+	self.uiState = INSTALLER_UI_IDLE;
+	if (self.pendingIncomingURL != nil) {
+		NSURL *next = self.pendingIncomingURL;
+		self.pendingIncomingURL = nil;
+		[self presentIncomingFilePrompt:next];
+	}
+}
+
 - (void)cleanTestAppsClicked
 {
+	if (self.uiState != INSTALLER_UI_IDLE) {
+		return;
+	}
+	self.uiState = INSTALLER_UI_CONFIRMING;
 	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"清理残留测试应用"
 	                                                               message:@"将扫描并清理开发测试过程中遗留的应用（如 com.example.*、com.test.*、com.annibale.hello 等）。是否继续？"
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
 
-	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+		[self finishModalTransition];
+	}]];
 	[alert addAction:[UIAlertAction actionWithTitle:@"开始清理" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-		int count = 0;
-		NSString *cliOut = nil;
-		int rc = run_external_appinst("clean", NULL, &cliOut);
-		if (rc != 0) {
-			for (AppRecord *rec in [self.installedApps copy]) {
-				if (is_test_identifier(rec.bundleID)) {
-					run_external_appinst("remove", rec.bundleID.UTF8String, NULL);
-					count++;
+		self.uiState = INSTALLER_UI_BUSY;
+		NSArray<AppRecord *> *snapshot = [self.installedApps copy];
+		UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"正在清理"
+		                                                                  message:@"正在移除测试应用并刷新缓存"
+		                                                           preferredStyle:UIAlertControllerStyleAlert];
+		[self presentViewController:progress animated:YES completion:nil];
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+			NSString *cliOut = nil;
+			int rc = run_external_appinst("clean", NULL, &cliOut);
+			if (rc != 0) {
+				for (AppRecord *rec in snapshot) {
+					if (is_test_identifier(rec.bundleID)) {
+						run_external_appinst("remove", rec.bundleID.UTF8String, NULL);
+					}
 				}
 			}
-		} else {
-			[self scanInstalledApplications];
-			count = (int)self.installedApps.count;
-		}
-
-		[self reloadCurrentData];
-		NSString *msg = [NSString stringWithFormat:@"清理完成，当前剩余 %lu 个应用。", (unsigned long)self.installedApps.count];
-		UIAlertController *doneAlert = [UIAlertController alertControllerWithTitle:@"清理结果"
-		                                                                   message:msg
-		                                                            preferredStyle:UIAlertControllerStyleAlert];
-		[doneAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-		[self presentViewController:doneAlert animated:YES completion:nil];
+			dispatch_async(dispatch_get_main_queue(), ^{
+				[progress dismissViewControllerAnimated:YES completion:^{
+					[self reloadCurrentData];
+					NSString *msg = [NSString stringWithFormat:@"清理完成，当前剩余 %lu 个应用。", (unsigned long)self.installedApps.count];
+					UIAlertController *doneAlert = [UIAlertController alertControllerWithTitle:@"清理结果"
+					                                                                   message:msg
+					                                                            preferredStyle:UIAlertControllerStyleAlert];
+					[doneAlert addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *doneAction) {
+						[self finishModalTransition];
+					}]];
+					[self presentViewController:doneAlert animated:YES completion:nil];
+				}];
+			});
+		});
 	}]];
 
+	[self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)presentIncomingFilePrompt:(NSURL *)stagedURL
+{
+	if (stagedURL == nil) {
+		return;
+	}
+	self.uiState = INSTALLER_UI_CONFIRMING;
+	self.segmentedControl.selectedSegmentIndex = 1;
+	[self reloadCurrentData];
+
+	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"检测到安装包"
+	                                                               message:[NSString stringWithFormat:@"已接收 %@，是否立即安装？", stagedURL.lastPathComponent]
+	                                                        preferredStyle:UIAlertControllerStyleAlert];
+	[alert addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+		[self finishModalTransition];
+	}]];
+	[alert addAction:[UIAlertAction actionWithTitle:@"立即安装" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+		self.uiState = INSTALLER_UI_IDLE;
+		[self executeInstallIPA:stagedURL.path];
+	}]];
 	[self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -455,26 +511,26 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 		return;
 	}
 	NSFileManager *fm = NSFileManager.defaultManager;
-	[fm createDirectoryAtPath:INBOX_DIR withIntermediateDirectories:YES attributes:nil error:nil];
-	NSString *dest = [INBOX_DIR stringByAppendingPathComponent:fileURL.lastPathComponent];
-	[fm removeItemAtPath:dest error:nil];
-	[fm copyItemAtURL:fileURL toURL:[NSURL fileURLWithPath:dest] error:nil];
-
-	self.segmentedControl.selectedSegmentIndex = 1;
-	[self reloadCurrentData];
-
-	UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"检测到安装包"
-	                                                               message:[NSString stringWithFormat:@"已接收 %@，是否立即安装？", fileURL.lastPathComponent]
-	                                                        preferredStyle:UIAlertControllerStyleAlert];
-	[alert addAction:[UIAlertAction actionWithTitle:@"稍后" style:UIAlertActionStyleCancel handler:nil]];
-	[alert addAction:[UIAlertAction actionWithTitle:@"立即安装" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-		[self executeInstallIPA:dest];
-	}]];
-	[self presentViewController:alert animated:YES completion:nil];
+	[fm createDirectoryAtPath:STAGED_DIR withIntermediateDirectories:YES attributes:nil error:nil];
+	NSString *dest = [STAGED_DIR stringByAppendingPathComponent:fileURL.lastPathComponent];
+	if (![fileURL.path isEqualToString:dest]) {
+		[fm removeItemAtPath:dest error:nil];
+		[fm copyItemAtURL:fileURL toURL:[NSURL fileURLWithPath:dest] error:nil];
+	}
+	NSURL *stagedURL = [NSURL fileURLWithPath:dest];
+	if (self.uiState != INSTALLER_UI_IDLE) {
+		self.pendingIncomingURL = stagedURL;
+		return;
+	}
+	[self presentIncomingFilePrompt:stagedURL];
 }
 
 - (void)executeInstallIPA:(NSString *)ipaPath
 {
+	if (self.uiState != INSTALLER_UI_IDLE) {
+		return;
+	}
+	self.uiState = INSTALLER_UI_BUSY;
 	UIAlertController *progress = [UIAlertController alertControllerWithTitle:@"正在安装"
 	                                                                  message:ipaPath.lastPathComponent
 	                                                           preferredStyle:UIAlertControllerStyleAlert];
@@ -483,18 +539,24 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
 		NSString *output = nil;
 		int res = run_external_appinst("install", ipaPath.fileSystemRepresentation, &output);
+		if (res == 0 && [ipaPath hasPrefix:STAGED_DIR]) {
+			[NSFileManager.defaultManager removeItemAtPath:ipaPath error:nil];
+		}
 
 		dispatch_async(dispatch_get_main_queue(), ^{
 			[progress dismissViewControllerAnimated:YES completion:^{
 				if (res == 0) {
 					self.segmentedControl.selectedSegmentIndex = 0;
 					[self reloadCurrentData];
+					[self finishModalTransition];
 					return;
 				}
 				UIAlertController *failed = [UIAlertController alertControllerWithTitle:@"安装失败"
 				                                                                message:output.length ? output : [NSString stringWithFormat:@"appinst 退出码 %d", res]
 				                                                         preferredStyle:UIAlertControllerStyleAlert];
-				[failed addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+				[failed addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+					[self finishModalTransition];
+				}]];
 				[self presentViewController:failed animated:YES completion:nil];
 			}];
 		});
@@ -582,17 +644,27 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 
 - (void)confirmUninstallAtIndex:(NSInteger)idx
 {
-	if (idx < 0 || idx >= (NSInteger)self.installedApps.count) {
+	if (self.uiState != INSTALLER_UI_IDLE || idx < 0 || idx >= (NSInteger)self.installedApps.count) {
 		return;
 	}
+	self.uiState = INSTALLER_UI_CONFIRMING;
 	AppRecord *rec = self.installedApps[idx];
 	UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"卸载「%@」？", rec.name]
 	                                                               message:@"应用及其数据都会被删除。"
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
-	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+		[self finishModalTransition];
+	}]];
 	[alert addAction:[UIAlertAction actionWithTitle:@"卸载" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-		run_external_appinst("remove", rec.bundleID.UTF8String, NULL);
-		[self reloadCurrentData];
+		self.uiState = INSTALLER_UI_BUSY;
+		NSString *bid = rec.bundleID;
+		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+			run_external_appinst("remove", bid.UTF8String, NULL);
+			dispatch_async(dispatch_get_main_queue(), ^{
+				[self reloadCurrentData];
+				[self finishModalTransition];
+			});
+		});
 	}]];
 	[self presentViewController:alert animated:YES completion:nil];
 }
@@ -607,17 +679,21 @@ static UIButton *capsule_button(NSString *title, SEL action, id target, NSIntege
 
 - (void)confirmDeleteIPAAtIndex:(NSInteger)idx
 {
-	if (idx < 0 || idx >= (NSInteger)self.availableIPAs.count) {
+	if (self.uiState != INSTALLER_UI_IDLE || idx < 0 || idx >= (NSInteger)self.availableIPAs.count) {
 		return;
 	}
+	self.uiState = INSTALLER_UI_CONFIRMING;
 	IPARecord *rec = self.availableIPAs[idx];
 	UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"删除「%@」？", rec.filename]
 	                                                               message:nil
 	                                                        preferredStyle:UIAlertControllerStyleAlert];
-	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+	[alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+		[self finishModalTransition];
+	}]];
 	[alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
 		[NSFileManager.defaultManager removeItemAtPath:rec.filePath error:nil];
 		[self reloadCurrentData];
+		[self finishModalTransition];
 	}]];
 	[self presentViewController:alert animated:YES completion:nil];
 }

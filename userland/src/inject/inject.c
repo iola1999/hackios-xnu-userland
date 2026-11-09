@@ -767,8 +767,9 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 #define EDGE_TOP        (16.0 / 812)
 #define EDGE_BOTTOM     (34.0 / 812)    /* the strip below the applications' content, where the home bar is */
 
+enum ann_finger_state { ANN_FINGER_IDLE = 0, ANN_FINGER_WAKE_SWALLOWED = 1, ANN_FINGER_ACTIVE_INNER = 2, ANN_FINGER_ACTIVE_EDGE = 3 };
 static struct {
-	bool touching, edge;
+	enum ann_finger_state state;
 	double x, y;
 } fingers[MAX_FINGERS];
 
@@ -937,31 +938,29 @@ send_touch(IOHIDServiceClientRef screen, const struct annibale_touch *t)
 	bool any = false;
 	unsigned f = t->finger;
 
-	if (f >= MAX_FINGERS || (t->type != ANNIBALE_TOUCH_DOWN && !fingers[f].touching)) {
-		return;
-	}
-	fingers[f].touching = t->type != ANNIBALE_TOUCH_UP;
+	if (f >= MAX_FINGERS || (t->type != ANNIBALE_TOUCH_DOWN && fingers[f].state < ANN_FINGER_ACTIVE_INNER)) return;
+	bool was_edge = fingers[f].state == ANN_FINGER_ACTIVE_EDGE;
 	fingers[f].x = t->x / 65535.0;
 	fingers[f].y = t->y / 65535.0;
-	if (t->type == ANNIBALE_TOUCH_DOWN) {
-		fingers[f].edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE || fingers[f].y < EDGE_TOP ||
+	if (t->type == ANNIBALE_TOUCH_UP) {
+		fingers[f].state = ANN_FINGER_IDLE;
+	} else if (t->type == ANNIBALE_TOUCH_DOWN) {
+		was_edge = fingers[f].x < EDGE_SIDE || fingers[f].x > 1 - EDGE_SIDE || fingers[f].y < EDGE_TOP ||
 		    fingers[f].y > 1 - EDGE_BOTTOM;
+		fingers[f].state = was_edge ? ANN_FINGER_ACTIVE_EDGE : ANN_FINGER_ACTIVE_INNER;
 	}
-	for (unsigned i = 0; i < MAX_FINGERS; i++) {
-		any |= fingers[i].touching;
-	}
-
+	for (unsigned i = 0; i < MAX_FINGERS; i++) any |= fingers[i].state >= ANN_FINGER_ACTIVE_INNER;
 	hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, change & ~DIGITIZER_RANGE, 0, fingers[f].x,
 	    fingers[f].y, 0, 0, 0, 0, any, any, 0);
 	IOHIDEventSetIntegerValue(hand, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
 	IOHIDEventSetIntegerValue(hand, FIELD_IS_BUILT_IN, 1);
 	for (unsigned i = 0; i < MAX_FINGERS; i++) {
-		if (!fingers[i].touching && i != f) {
-			continue;
-		}
+		bool touching = fingers[i].state >= ANN_FINGER_ACTIVE_INNER;
+		bool edge = i == f ? was_edge : fingers[i].state == ANN_FINGER_ACTIVE_EDGE;
+		if (!touching && i != f) continue;
 		finger = IOHIDEventCreateDigitizerFingerEvent(NULL, t->time, i + 1, i + 2,
-		    (i == f ? change : 0) | (fingers[i].edge ? DIGITIZER_FROM_EDGE_TIP : 0), fingers[i].x, fingers[i].y, 0,
-		    fingers[i].touching ? 1.0 : 0.0, 0, fingers[i].touching, fingers[i].touching, 0);
+		    (i == f ? change : 0) | (edge ? DIGITIZER_FROM_EDGE_TIP : 0), fingers[i].x, fingers[i].y, 0,
+		    touching ? 1.0 : 0.0, 0, touching, touching, 0);
 		IOHIDEventSetIntegerValue(finger, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
 		IOHIDEventAppendEvent(hand, finger, 0);
 		CFRelease(finger);
@@ -1028,7 +1027,7 @@ input_thread(__unused void *arg)
 	IOHIDEventSystemClientRef client = NULL;
 	IOHIDServiceClientRef screen = NULL, buttons = NULL;
 	struct annibale_touch t;
-	unsigned count = 0, waking = 0;         /* waking: the fingers whose touch went into waking the display */
+	unsigned count = 0;
 	int device;
 
 	pthread_setname_np("annibale input");
@@ -1075,25 +1074,26 @@ input_thread(__unused void *arg)
 		if (count++ < 4) {
 			say("annibale: input: sample type %u finger %u at %u %u\n", t.type, t.finger, t.x, t.y);
 		}
+		int mode_low = touch_mode & 0xff;
 		if (t.type > ANNIBALE_TOUCH_UP) {
-			if (buttons != NULL) {
-				send_button(buttons, &t);
+			if (buttons != NULL) send_button(buttons, &t);
+		} else if (t.finger >= MAX_FINGERS) {
+			continue;
+		} else if (mode_low == TOUCH_MODE_WAKE || mode_low == TOUCH_MODE_OFF) {
+			for (unsigned i = 0; i < MAX_FINGERS; i++)
+				if (fingers[i].state >= ANN_FINGER_ACTIVE_INNER) fingers[i].state = ANN_FINGER_IDLE;
+			if (mode_low == TOUCH_MODE_WAKE && t.type == ANNIBALE_TOUCH_DOWN && buttons != NULL) {
+				/* The display is off and a tap wakes it via the lock button. */
+				struct annibale_touch press = { .time = t.time, .type = ANNIBALE_BUTTON_DOWN, .finger = ANNIBALE_BUTTON_LOCK };
+				send_button(buttons, &press);
+				press.type = ANNIBALE_BUTTON_UP;
+				send_button(buttons, &press);
+				fingers[t.finger].state = ANN_FINGER_WAKE_SWALLOWED;
+			} else if (t.type == ANNIBALE_TOUCH_UP) {
+				fingers[t.finger].state = ANN_FINGER_IDLE;
 			}
-		} else if (t.type == ANNIBALE_TOUCH_DOWN && (touch_mode & 0xff) == TOUCH_MODE_WAKE && buttons != NULL) {
-			/*
-			 * The display is off and a tap is to wake it. The lock button is what wakes it here:
-			 * press it for the finger, and keep the rest of this touch to ourselves.
-			 */
-			struct annibale_touch press = { .time = t.time, .type = ANNIBALE_BUTTON_DOWN, .finger = ANNIBALE_BUTTON_LOCK };
-
-			send_button(buttons, &press);
-			press.type = ANNIBALE_BUTTON_UP;
-			send_button(buttons, &press);
-			waking |= 1u << (t.finger & 31);
-		} else if (waking & (1u << (t.finger & 31))) {
-			if (t.type == ANNIBALE_TOUCH_UP) {
-				waking &= ~(1u << (t.finger & 31));
-			}
+		} else if (fingers[t.finger].state == ANN_FINGER_WAKE_SWALLOWED && t.type != ANNIBALE_TOUCH_DOWN) {
+			if (t.type == ANNIBALE_TOUCH_UP) fingers[t.finger].state = ANN_FINGER_IDLE;
 		} else {
 			send_touch(screen, &t);
 			if (touch_latency) {
