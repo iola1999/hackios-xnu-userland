@@ -543,108 +543,19 @@ is_build_23g90(void)
 }
 
 /*
- * Settings "About" capacity fix:
- * Preferences reads total capacity from MGCopyAnswer(CFSTR("DiskUsage")) or
- * MGCopyAnswer(CFSTR("TotalDiskCapacity")). Because HackiOS lacks Apple NVMe
- * controller driver, MobileGestalt returns 0 KB.
- * We interpose MGCopyAnswer to report the darwin and darwin_var partition sizes
- * (kern.annibale.darwin_bytes, kern.annibale.darwin_var_bytes) with the free
- * space read from statfs("/private/var").
+ * Preferences and SpringBoard get true for MGCopyAnswer("airdrop") and ("airdrop-p2p"). The disk
+ * capacity keys are MobileGestalt's own: it reads disk0's kIOMediaSizeKey and statfs("/private/var").
  */
 extern CFTypeRef MGCopyAnswer(CFStringRef property);
-
-static void
-sb26_query_capacities(int64_t *total_disk, int64_t *total_sys, int64_t *total_data, int64_t *avail_val)
-{
-    uint64_t sys_b = 0, data_b = 0, used_b = 0;
-    size_t sz = sizeof(uint64_t);
-    struct statfs st;
-
-    (void)sysctlbyname("kern.annibale.darwin_bytes", &sys_b, &sz, NULL, 0);
-    sz = sizeof(uint64_t);
-    (void)sysctlbyname("kern.annibale.darwin_var_bytes", &data_b, &sz, NULL, 0);
-    if (sys_b == 0) sys_b = 8ULL << 30;
-    if (data_b == 0) data_b = 112ULL << 30;
-    if (statfs("/private/var", &st) == 0 && st.f_blocks > st.f_bavail) {
-        used_b = (uint64_t)(st.f_blocks - st.f_bavail) * (uint64_t)st.f_bsize;
-    }
-    *total_sys  = (int64_t)sys_b;
-    *total_data = (int64_t)data_b;
-    *total_disk = (int64_t)(sys_b + data_b);
-    *avail_val  = (int64_t)(data_b > used_b ? data_b - used_b : data_b);
-}
 
 static CFTypeRef
 sb26_hook_MGCopyAnswer(CFStringRef property)
 {
     const char *prog = getprogname();
-    if (property && prog && (strcmp(prog, "Preferences") == 0 || strcmp(prog, "SpringBoard") == 0)) {
-        int64_t total_disk = 0, total_sys = 0, total_data = 0, avail_val = 0;
-        if (CFEqual(property, CFSTR("DiskUsage"))) {
-            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
-
-            CFNumberRef num_total_disk = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_disk);
-            CFNumberRef num_total_sys  = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_sys);
-            CFNumberRef num_total_data = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_data);
-            CFNumberRef num_avail      = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &avail_val);
-
-            const void *keys[] = {
-                CFSTR("TotalDiskCapacity"),
-                CFSTR("TotalSystemCapacity"),
-                CFSTR("TotalDataCapacity"),
-                CFSTR("TotalDataAvailable"),
-                CFSTR("AmountDataAvailable")
-            };
-            const void *values[] = {
-                num_total_disk,
-                num_total_sys,
-                num_total_data,
-                num_avail,
-                num_avail
-            };
-
-            CFDictionaryRef dict = CFDictionaryCreate(
-                kCFAllocatorDefault,
-                keys,
-                values,
-                sizeof(keys) / sizeof(keys[0]),
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks
-            );
-
-            if (num_total_disk) CFRelease(num_total_disk);
-            if (num_total_sys)  CFRelease(num_total_sys);
-            if (num_total_data) CFRelease(num_total_data);
-            if (num_avail)      CFRelease(num_avail);
-
-            return dict;
-        }
-
-        if (CFEqual(property, CFSTR("TotalDiskCapacity"))) {
-            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_disk);
-        }
-
-        if (CFEqual(property, CFSTR("TotalSystemCapacity"))) {
-            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_sys);
-        }
-
-        if (CFEqual(property, CFSTR("TotalDataCapacity"))) {
-            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &total_data);
-        }
-
-        if (CFEqual(property, CFSTR("TotalDataAvailable")) || CFEqual(property, CFSTR("AmountDataAvailable"))) {
-            sb26_query_capacities(&total_disk, &total_sys, &total_data, &avail_val);
-            return CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &avail_val);
-        }
-
-        if (CFEqual(property, CFSTR("airdrop-p2p")) || CFEqual(property, CFSTR("airdrop"))) {
-            return kCFBooleanTrue;
-        }
+    if (property && prog && (strcmp(prog, "Preferences") == 0 || strcmp(prog, "SpringBoard") == 0) &&
+        (CFEqual(property, CFSTR("airdrop-p2p")) || CFEqual(property, CFSTR("airdrop")))) {
+        return kCFBooleanTrue;
     }
-
     return MGCopyAnswer(property);
 }
 
