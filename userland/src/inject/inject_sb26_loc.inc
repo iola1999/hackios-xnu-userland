@@ -371,3 +371,62 @@ sb26_clear_wifi_join_failures(void)
     }
     CFRelease(plist);
 }
+
+static int
+sb26_backlight_was_restored(void)
+{
+    unsigned int (*get_match)(unsigned int, CFDictionaryRef) =
+        (unsigned int (*)(unsigned int, CFDictionaryRef))dlsym(RTLD_DEFAULT, "IOServiceGetMatchingService");
+    CFMutableDictionaryRef (*svc_matching)(const char *) =
+        (CFMutableDictionaryRef (*)(const char *))dlsym(RTLD_DEFAULT, "IOServiceMatching");
+    CFTypeRef (*create_prop)(unsigned int, CFStringRef, CFAllocatorRef, unsigned int) =
+        (CFTypeRef (*)(unsigned int, CFStringRef, CFAllocatorRef, unsigned int))dlsym(RTLD_DEFAULT, "IORegistryEntryCreateCFProperty");
+    int (*obj_rel)(unsigned int) = (int (*)(unsigned int))dlsym(RTLD_DEFAULT, "IOObjectRelease");
+    if (!get_match || !svc_matching || !create_prop || !obj_rel) return 0;
+
+    unsigned int svc = get_match(0, svc_matching("AppleARMBacklight"));
+    if (!svc) return 0;
+    CFTypeRef val = create_prop(svc, CFSTR("annibale-bl-restored"), kCFAllocatorDefault, 0);
+    obj_rel(svc);
+    int restored = (val && CFGetTypeID(val) == CFBooleanGetTypeID() && CFBooleanGetValue((CFBooleanRef)val)) ? 1 : 0;
+    if (val) CFRelease(val);
+    return restored;
+}
+
+static void
+sb26_sync_initial_brightness(int call_bks_set)
+{
+    if (sb26_backlight_was_restored()) return;
+
+    float full = 1.0f;
+    CFNumberRef one = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloatType, &full);
+    if (one) {
+        CFPreferencesSetAppValue(CFSTR("SBBacklightLevel2"), one, CFSTR("com.apple.springboard"));
+        CFPreferencesSetAppValue(CFSTR("BacklightLevel"), one, CFSTR("com.apple.backboardd"));
+        CFPreferencesSetAppValue(CFSTR("BKEnableALS"), kCFBooleanFalse, CFSTR("com.apple.backboardd"));
+        CFPreferencesAppSynchronize(CFSTR("com.apple.springboard"));
+        CFPreferencesAppSynchronize(CFSTR("com.apple.backboardd"));
+        CFRelease(one);
+    }
+    Class bks_cls = objc_getClass("BKSDefaults");
+    if (bks_cls) {
+        SEL ext_sel = sel_registerName("externalDefaults");
+        SEL sb_sel = sel_registerName("springBoardDefaults");
+        SEL set_sel = sel_registerName("setBrightness:");
+        if (class_getClassMethod(bks_cls, ext_sel)) {
+            id ext = ((id (*)(Class, SEL))objc_msgSend)(bks_cls, ext_sel);
+            if (ext && class_getInstanceMethod(object_getClass(ext), sb_sel)) {
+                id sb_def = ((id (*)(id, SEL))objc_msgSend)(ext, sb_sel);
+                if (sb_def && class_getInstanceMethod(object_getClass(sb_def), set_sel)) {
+                    ((void (*)(id, SEL, float))objc_msgSend)(sb_def, set_sel, 1.0f);
+                }
+            }
+        }
+    }
+    if (call_bks_set) {
+        void (*bks_set)(float, int) = (void (*)(float, int))dlsym(RTLD_DEFAULT, "BKSDisplayBrightnessSet");
+        if (bks_set) {
+            bks_set(1.0f, 1);
+        }
+    }
+}

@@ -20,6 +20,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <mach/mach_time.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -95,6 +96,7 @@ shared_vendor_with_func(id self, SEL selector, void *func)
 		func = (void *)annibale_camera_device_create;
 		say("annibale: media: supplying annibale_camera_device_create to sharedCaptureDeviceVendor\n");
 	}
+	*(int *)(0x1ecd7b640UL + slide) = 2; /* CoreMedia fig_notes = stderr */
 	return ((id (*)(id, SEL, void *))original_shared_vendor_with_func)(self, selector, func);
 }
 
@@ -357,6 +359,24 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  * A node's output given no sample buffer at all: drop NULL sample buffers before they reach downstream nodes.
  */
 static IMP original_emit_sample_buffer;
+static IMP original_ms_configure;
+static IMP original_ms_prepare;
+
+static int
+ms_configure(id self, SEL selector, id *error)
+{
+	int err = ((int (*)(id, SEL, id *))original_ms_configure)(self, selector, error);
+	say("annibale: media: -[BWMultiStreamCameraSourceNode configure:] -> %d\n", err);
+	return err;
+}
+
+static void
+ms_prepare(id self, SEL selector)
+{
+	say("annibale: media: -[BWMultiStreamCameraSourceNode prepareForCurrentConfigurationToBecomeLive] begin\n");
+	((void (*)(id, SEL))original_ms_prepare)(self, selector);
+	say("annibale: media: -[BWMultiStreamCameraSourceNode prepareForCurrentConfigurationToBecomeLive] done\n");
+}
 
 static void
 emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
@@ -469,6 +489,8 @@ static struct replacement {
 	  (IMP)quality_prioritization, &original_quality_prioritization, true, false },
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
+	{ "BWMultiStreamCameraSourceNode", "configure:", 0UL, (IMP)ms_configure, &original_ms_configure, true, false },
+	{ "BWMultiStreamCameraSourceNode", "prepareForCurrentConfigurationToBecomeLive", 0UL, (IMP)ms_prepare, &original_ms_prepare, true, false },
 };
 
 /* ---- the Metal device leaves this process on iOS 16.5 when cvadepth-iOS.metallib is absent -------- */
@@ -607,11 +629,40 @@ annibale_media_init(void)
 	/* On iOS 26, cameracaptured loads CMCapture on demand or via dyld shared cache; ensure CMCapture is loaded so hooks attach immediately */
 	if (strcmp(name, "cameracaptured") == 0) {
 		unlink("/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist");
+		unlink("/private/var/root/Library/Preferences/com.apple.cameracapture.volatile.plist");
+		unlink("/private/var/preferences/com.apple.cameracapture.volatile.plist");
 		CFPreferencesSetValue(CFSTR("CaptureSourceInfo"), NULL, CFSTR("com.apple.cameracapture.volatile"),
 		    kCFPreferencesCurrentUser, kCFPreferencesCurrentHost);
 		CFPreferencesSynchronize(CFSTR("com.apple.cameracapture.volatile"),
 		    kCFPreferencesCurrentUser, kCFPreferencesCurrentHost);
+		CFPreferencesSetAppValue(CFSTR("fig_notes"), CFSTR("stderr"), CFSTR("com.apple.coremedia"));
+		*(int *)(0x1ecd7b640UL + slide) = 2;
 		(void)dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY | RTLD_GLOBAL);
+	}
+	{
+		Dl_info info;
+		char uuid_str[40] = "none", line[160];
+
+		if (dladdr((const void *)&annibale_media_init, &info) && info.dli_fbase) {
+			const struct mach_header_64 *mh = (const struct mach_header_64 *)info.dli_fbase;
+			if (mh->magic == MH_MAGIC_64) {
+				const struct load_command *lc = (const struct load_command *)(mh + 1);
+				for (uint32_t i = 0; i < mh->ncmds; i++) {
+					if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+						const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
+						snprintf(uuid_str, sizeof(uuid_str),
+						    "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+						    u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+						    u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+						break;
+					}
+					lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+				}
+			}
+		}
+		snprintf(line, sizeof(line), "media: loaded in %s uuid=%s camera=%d torch=%d\n",
+		    name, uuid_str, camera, torch >= 0);
+		sysctlbyname("kern.annibale.say", NULL, NULL, line, strlen(line) + 1);
 	}
 	_dyld_register_func_for_add_image(image_added);         /* also called for every image already there */
 }

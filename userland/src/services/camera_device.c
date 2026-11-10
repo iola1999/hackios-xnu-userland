@@ -197,16 +197,21 @@ static pthread_mutex_t said_lock = PTHREAD_MUTEX_INITIALIZER;
 static void
 say_value(const char *what, CFStringRef key, CFTypeRef value)
 {
-	char name[160] = "?", text[300] = "";
+	char name[160] = "?", text[320] = "";
 
 	CFStringGetCString(key, name, sizeof(name), kCFStringEncodingUTF8);
 	if (value != NULL) {
 		CFStringRef d = CFCopyDescription(value);
+		CFIndex used = 0;
 
-		CFStringGetCString(d, text, sizeof(text), kCFStringEncodingUTF8);
-		CFRelease(d);
+		if (d != NULL) {
+			CFStringGetBytes(d, CFRangeMake(0, CFStringGetLength(d)), kCFStringEncodingUTF8,
+			    '?', false, (UInt8 *)text, sizeof(text) - 1, &used);
+			text[used] = '\0';
+			CFRelease(d);
+		}
 		for (char *c = text; *c; c++) {
-			*c = *c == '\n' ? ' ' : *c;
+			*c = (*c == '\n' || *c == '\t') ? ' ' : *c;
 		}
 	}
 	say("%s %s%s%s", what, name, value ? " = " : "", text);
@@ -326,30 +331,42 @@ supported(const struct prop *p, size_t n)
 #define PF_420F         0x34323066      /* '420f' */
 #define PF_420V         0x34323076      /* '420v' */
 #define PF_X420         0x78343230      /* 'x420' */
+#define PF_XF20         0x78663230      /* 'xf20' */
+#define PF_P422         0x70343232      /* 'p422' */
+#define PF_PF22         0x70663232      /* 'pf22' */
 #define PF_X422         0x78343232      /* 'x422' */
+#define PF_XF22         0x78663232      /* 'xf22' */
 #define PF_BGRA         0x42475241      /* 'BGRA' */
+#define PF_L008         0x4c303038      /* 'L008' */
 
 static CFDictionaryRef
-output_info(int width, int height)
+output_info(int width, int height, int max_fps)
 {
 	CFMutableDictionaryRef o = (CFMutableDictionaryRef)new_dict();
-	CFNumberRef pf[5] = {
+	CFNumberRef pf[9] = {
 		number_i(PF_420F), number_i(PF_420V),
-		number_i(PF_X420), number_i(PF_X422),
+		number_i(PF_X420), number_i(PF_XF20),
+		number_i(PF_P422), number_i(PF_PF22),
+		number_i(PF_X422), number_i(PF_XF22),
 		number_i(PF_BGRA)
 	};
-	CFArrayRef pfs = CFArrayCreate(NULL, (const void **)pf, 5, &kCFTypeArrayCallBacks);
+	CFArrayRef pfs = CFArrayCreate(NULL, (const void **)pf, 9, &kCFTypeArrayCallBacks);
 
-	for (int i = 0; i < 5; i++) {
+	for (int i = 0; i < 9; i++) {
 		CFRelease(pf[i]);
 	}
 	put(o, "SupportedPixelFormats", pfs);
 	put(o, "NativeWidth", number_i(width));
 	put(o, "NativeHeight", number_i(height));
+	put(o, "NativeWidthPostGeometricDistortionCorrection", number_i(width));
+	put(o, "NativeHeightPostGeometricDistortionCorrection", number_i(height));
 	put(o, "MaxDownscaleFactor", number_f(32));
 	put(o, "MaxScaleFactor", number_f(1));
 	put(o, "MinScaleFactor", number_f(1.0 / 32));
 	put(o, "OutputWidthAlignmentRequirement", number_i(16));
+	put(o, "MaxFrameRate", number_f(max_fps));
+	put(o, "SashimiRawPixelFormat", number_i(PF_BGRA));
+	put(o, "SushiRawPixelFormat", number_i(PF_BGRA));
 	return o;
 }
 
@@ -381,6 +398,11 @@ format_crop(int sensor_width, int sensor_height, int crop_width, int crop_height
 	put(f, "SensorHeight", number_i(sensor_height));
 	put(f, "ISOBase", number_f(32));
 	put(f, "DefaultAEMaxGain", number_f(64));
+	put(f, "SashimiRawPixelFormat", number_i(PF_BGRA));
+	put(f, "SushiRawPixelFormat", number_i(PF_BGRA));
+	put(f, "QuadraBinningFactor", number_i(sifr_binning > 0 ? sifr_binning : 1));
+	put(f, "FocusPixelDataSupported", CFRetain(kCFBooleanFalse));
+	put(f, "SensorCenterOffsetSupported", CFRetain(kCFBooleanFalse));
 	if (fes_width > 0 && fes_height > 0) {
 		put(f, "FrontEndScalerOutputWidth", number_i(fes_width));
 		put(f, "FrontEndScalerOutputHeight", number_i(fes_height));
@@ -399,9 +421,11 @@ format_crop(int sensor_width, int sensor_height, int crop_width, int crop_height
 	put(f, "GeometricDistortionCorrectedNativeWidth", number_i(cw));
 	put(f, "GeometricDistortionCorrectedNativeHeight", number_i(ch));
 
-	put(outputs, "PrimaryScaler", output_info(cw, ch));
-	put(outputs, "SecondaryScaler", output_info(cw, ch));
-	put(outputs, "StillImage", output_info(cw, ch));
+	put(outputs, "PrimaryScaler", output_info(cw, ch, max_fps));
+	put(outputs, "SecondaryScaler", output_info(cw, ch, max_fps));
+	put(outputs, "StillImage", output_info(cw, ch, max_fps));
+	put(outputs, "StillImageQuadra", output_info(cw, ch, max_fps));
+	put(outputs, "StillImageRaw", output_info(cw, ch, max_fps));
 	put(f, "SupportedOutputs", outputs);
 	return f;
 }
@@ -424,8 +448,11 @@ struct output {
 
 static void let_go(struct output *out);
 
-#define OUTPUTS 3
-static const char *const output_names[OUTPUTS] = { "PrimaryScaler", "SecondaryScaler", "StillImage" };
+#define OUTPUTS 6
+static const char *const output_names[OUTPUTS] = {
+	"PrimaryScaler", "SecondaryScaler", "StillImage",
+	"StillImageQuadra", "StillImageRaw", "Depth"
+};
 
 #define MAX_ZOOM                16      /* (the most the iPhone's wide camera zooms digitally) */
 #define MAX_CAMERA_FORMATS      16
@@ -447,12 +474,16 @@ static const struct camera {
 		{ 4032, 3024,    0,    0, 30,    0,    0, 0 },  /* D22 Photo */
 		{ 4224, 2376,    0,    0, 60,    0,    0, 0 },  /* D22 Video-60 */
 		{ 4224, 3024,    0,    0, 60,    0,    0, 1 },  /* V57 Photo */
-		{ 4224, 3024,    0,    0, 60, 2464, 1764, 1 },  /* V57 Photo FESCompanion */
+		{ 4224, 3024,    0,    0, 30, 2464, 1764, 1 },  /* V57 Photo FESCompanion & Video-FullSensor-FES-30 FullBinSIFR */
 		{ 4224, 3024, 4032, 3024, 60, 1920, 1440, 0 },  /* V57 Photo DepthCompanion */
-		{ 4224, 3024, 4224, 2640, 60, 2464, 1764, 2 },  /* V57 Video-FullSensor-FES-30/60 & Medium-Res */
+		{ 4224, 3024, 4224, 2640, 30, 2464, 1764, 2 },  /* V57 Video-FullSensor-FES-30 (1080p30 / 720p30) */
+		{ 4224, 3024, 4224, 2640, 60, 2464, 1764, 2 },  /* V57 Video-FullSensor-FES-60 & Medium-Res */
 		{ 4224, 3024, 4032, 3024, 60, 1440, 1080, 2 },  /* V57 Video-4by3-Low-Resolution */
-		{ 4224, 2640,    0,    0, 60,    0,    0, 2 },  /* V57 Video-30 & Video-60 */
+		{ 4224, 2640,    0,    0, 30,    0,    0, 2 },  /* V57 Video-30 (UHD30) */
+		{ 4224, 2640,    0,    0, 60,    0,    0, 2 },  /* V57 Video-60 (UHD60) */
 		{ 4224, 2640, 4224, 2376, 60, 2464, 1540, 2 },  /* V57 Video-30 DepthCompanion */
+		{ 4224, 3024, 4224, 3024, 30,    0,    0, 2 },  /* V57 ActionCameraCompanion-30 */
+		{ 4224, 3024, 4224, 3024, 60,    0,    0, 2 },  /* V57 ActionCameraCompanion-60 */
 	  } },
 	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
 	  {
@@ -460,13 +491,13 @@ static const struct camera {
 		{ 3840, 2160,    0,    0, 30,    0,    0, 0 },  /* D22 Video-30 */
 		{ 4896, 4896,    0,    0, 60, 4608, 4608, 1 },  /* V57 FrontUltraWide Photo */
 		{ 4896, 4896,    0,    0, 60, 2496, 2496, 1 },  /* V57 FrontUltraWide Photo FESCompanion */
-		{ 4896, 4896,    0,    0, 60, 4608, 4608, 2 },  /* V57 FrontUltraWide Video-30 / 16x10-30 / 10x16-30 */
-		{ 4896, 4896,    0,    0, 60, 2496, 2496, 2 },  /* V57 FrontUltraWide Video-FES-30 / 10x16-FES-30 / 16x10-FES-30 */
+		{ 4896, 4896,    0,    0, 30, 4608, 4608, 2 },  /* V57 FrontUltraWide Video-30 / 16x10-30 / 10x16-30 */
+		{ 4896, 4896,    0,    0, 30, 2496, 2496, 2 },  /* V57 FrontUltraWide Video-FES-30 / 10x16-FES-30 / 16x10-FES-30 */
 		{ 4896, 4896, 3672, 4896, 60, 1224, 1224, 0 },  /* V57 FrontUltraWide Video-3by4-Low-Resolution */
 		{ 4896, 4896, 3024, 4032, 60, 4032, 4032, 1 },  /* V57 FrontVirtual Photo & Photo-3088x2316 */
 		{ 4896, 4896, 3024, 4032, 60, 2112, 2112, 1 },  /* V57 FrontVirtual Photo FESCompanion */
-		{ 4896, 4896, 2520, 4032, 60, 4032, 4032, 2 },  /* V57 FrontVirtual Video-30 */
-		{ 4896, 4896, 3024, 4032, 60, 2112, 2112, 2 },  /* V57 FrontVirtual Video-FullSensor-FES-30 & Medium-Res */
+		{ 4896, 4896, 2520, 4032, 30, 4032, 4032, 2 },  /* V57 FrontVirtual Video-30 (UHD30) */
+		{ 4896, 4896, 3024, 4032, 30, 2112, 2112, 2 },  /* V57 FrontVirtual Video-FullSensor-FES-30 (1080p30) & Medium-Res */
 		{ 3680, 4896, 3024, 4032, 60,  852, 1136, 0 },  /* V57 FrontVirtual Video-4by3-Low-Resolution */
 		{ 3072, 4896, 2520, 4032, 60, 2520, 4032, 0 },  /* V57 FrontVirtual Video-60 */
 		{ 3072, 4896, 2520, 4032, 60, 1320, 2112, 0 },  /* V57 FrontVirtual Video-FES-60 */
@@ -564,6 +595,29 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 				CFDictionarySetValue(d, name, s->out[i].enabled ? kCFBooleanTrue : kCFBooleanFalse);
 			}
 			CFRelease(name);
+		}
+		if (configs) {
+			static const char *const mask_keys[7] = {
+				"LightSourceMaskConfiguration", "KeypointDescriptorDataConfiguration",
+				"HumanFullBodiesMaskConfiguration", "HumanHairMaskConfiguration",
+				"HumanSkinsMaskConfiguration", "SkyMaskConfiguration",
+				"WeightSegmentMapConfiguration"
+			};
+			CFMutableDictionaryRef meta = (CFMutableDictionaryRef)new_dict();
+
+			for (int k = 0; k < 7; k++) {
+				CFMutableDictionaryRef mc = (CFMutableDictionaryRef)new_dict();
+
+				put(mc, "Width", number_i(320));
+				put(mc, "Height", number_i(240));
+				put(mc, "PixelFormat", number_i(PF_L008));
+				put(mc, "DataBufferSize", number_i(4096));
+				put(mc, "BufferPoolBytesPerRowAlignmentRequirement", number_i(64));
+				put(mc, "BufferPoolPlaneAlignmentRequirement", number_i(64));
+				put(mc, "BufferPoolCountForCaptureStream", number_i(4));
+				put(meta, mask_keys[k], mc);
+			}
+			put(d, "Metadata", meta);
 		}
 		pthread_mutex_unlock(&s->lock);
 		value = d;

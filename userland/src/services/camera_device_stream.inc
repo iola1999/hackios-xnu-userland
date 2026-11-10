@@ -28,11 +28,12 @@ render_piece(void *context, size_t i)
 	} else if (j->still) {
 		isp_render_still_nv12(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0),
 		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0), CVPixelBufferGetBaseAddressOfPlane(j->pb, 1),
-		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end, j->format == PF_420V);
+		    CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end,
+		    j->format == PF_420V || j->format == PF_X420);
 	} else {
 		isp_render_nv12(j->isp, j->f, j->raw, CVPixelBufferGetBaseAddressOfPlane(j->pb, 0), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 0),
 		    CVPixelBufferGetBaseAddressOfPlane(j->pb, 1), CVPixelBufferGetBytesPerRowOfPlane(j->pb, 1), j->width, j->height, first, end,
-		    j->format == PF_420V);
+		    j->format == PF_420V || j->format == PF_X420);
 	}
 }
 
@@ -166,7 +167,8 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	pf = CVPixelBufferGetPixelFormatType(pb);
 	width = (uint32_t)CVPixelBufferGetWidth(pb);
 	height = (uint32_t)CVPixelBufferGetHeight(pb);
-	if (width == 0 || height == 0 || (pf != PF_420F && pf != PF_420V && pf != PF_BGRA)) {
+	if (width == 0 || height == 0 ||
+	    (pf != PF_420F && pf != PF_420V && pf != PF_X420 && pf != PF_XF20 && pf != PF_BGRA)) {
 		if (out->delivered == 0 && out->said_shape == false) {
 			out->said_shape = true;
 			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, width, height, pf >> 24, pf >> 16 & 255,
@@ -177,10 +179,34 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, strcmp(out->name, "StillImage") == 0 && pf != PF_BGRA };
+	bool is_still = strncmp(out->name, "StillImage", 10) == 0;
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, is_still && pf != PF_BGRA };
 	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	if (pf == PF_X420 || pf == PF_XF20) {
+		uint8_t *y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
+		size_t y_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
+		uint8_t *uv_base = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+		size_t uv_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+
+		for (uint32_t y = 0; y < height; y++) {
+			uint8_t *r8 = y_base + (size_t)y * y_stride;
+			uint16_t *r16 = (uint16_t *)r8;
+
+			for (int32_t x = (int32_t)width - 1; x >= 0; x--) {
+				r16[x] = (uint16_t)r8[x] << 8;
+			}
+		}
+		for (uint32_t y = 0; y < height / 2; y++) {
+			uint8_t *r8 = uv_base + (size_t)y * uv_stride;
+			uint16_t *r16 = (uint16_t *)r8;
+
+			for (int32_t x = (int32_t)width - 1; x >= 0; x--) {
+				r16[x] = (uint16_t)r8[x] << 8;
+			}
+		}
+	}
 	if (job.still) {
 		static mach_timebase_info_data_t tb;
 
@@ -213,7 +239,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	 * the window server copying it), and the next frame drawn into it showed as bands of two frames,
 	 * torn across. Kept, they make the pool take others. (One kept was not enough.)
 	 */
-	if (strcmp(out->name, "StillImage") != 0) {
+	if (!is_still) {
 		if (out->held[out->held_next] != NULL) {
 			CVPixelBufferRelease(out->held[out->held_next]);
 		}
@@ -607,15 +633,19 @@ worker(void *context)
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
 		pthread_mutex_lock(&s->lock);
+		bool gave_still = false;
 		for (int i = 0; s->state == CAM_STREAM_ACTIVE && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
+			if (strcmp(out->name, "Depth") == 0) {
+				continue;
+			}
 			/*
 			 * The scalers' outputs are the moving picture and are given every frame. The still image
-			 * output is the whole sensor (4032x3024) and is the photograph: a frame goes to it only
-			 * when the graph has asked for one, which is not something to make thirty times a second.
+			 * outputs are the photograph: a frame goes to them only when the graph has asked for one,
+			 * which is not something to make thirty times a second.
 			 */
-			bool still = strcmp(out->name, "StillImage") == 0;
+			bool still = strncmp(out->name, "StillImage", 10) == 0;
 
 			if (out->handler == NULL || out->config == NULL || !(out->enabled || i == 0)) {
 				continue;
@@ -625,9 +655,12 @@ worker(void *context)
 			}
 			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
-				s->stills_wanted--;
-				say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
+				gave_still = true;
 			}
+		}
+		if (gave_still && s->stills_wanted > 0) {
+			s->stills_wanted--;
+			say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 		}
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {

@@ -175,7 +175,7 @@ create_als_event(uint64_t ts, uint32_t lux, uint32_t clear_raw, uint32_t ir_raw)
 	IOHIDEventSetIntegerValue(event, FIELD_ALS_RAW_CH0, (CFIndex)clear_raw);
 	IOHIDEventSetIntegerValue(event, FIELD_ALS_RAW_CH1, (CFIndex)ir_raw);
 	IOHIDEventSetIntegerValue(event, FIELD_ALS_BRIGHTNESS_CHANGED, 0);
-	IOHIDEventSetIntegerValue(event, FIELD_ALS_ILLUMINANCE, (CFIndex)lux);
+	IOHIDEventSetIntegerValue(event, FIELD_ALS_ILLUMINANCE, ((CFIndex)lux) << 16);
 	return event;
 }
 
@@ -620,7 +620,18 @@ input_run(void)
     if (!screen) return 1;
     buttons = make_service(client, "Annibale buttons", HID_PAGE_CONSUMER, HID_USAGE_CONSUMER_CONTROL, false);
     if (!buttons) return 1;
-    als_service = make_service_ext(client, "Annibale ambient light sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_ALS, true, false);
+    {
+        struct annibale_sensor_sample init_sample = { 0 };
+        int sfd = open(ANNIBALE_SENSORS_DEVICE, O_RDONLY | O_NONBLOCK);
+        if (sfd >= 0) {
+            (void)pread(sfd, &init_sample, sizeof(init_sample), 0);
+            close(sfd);
+        }
+        /* Register ALS only when hardware I2C, ADSP SSC, or explicit injection is active. */
+        if ((init_sample.source_flags & 0x0eu) != 0) {
+            als_service = make_service_ext(client, "Annibale ambient light sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_ALS, true, false);
+        }
+    }
     prox_service = make_service_ext(client, "Annibale proximity sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_PROXIMITY, false, false);
     start_sensors_poller(queue, als_service, prox_service);
     say("input26: services registered (als=%p prox=%p); reading %s\n", (void *)als_service, (void *)prox_service, ANNIBALE_TOUCH_DEVICE);

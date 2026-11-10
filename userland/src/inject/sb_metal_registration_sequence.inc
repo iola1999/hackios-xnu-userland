@@ -27,7 +27,7 @@ static void run_sequence(const char *process, const char *build, const char *fla
         @try { attempt_registration(target->bundle); }
         @catch (NSException *exception) { registration_exception(exception); }
     } else { registration_skipped(build, flag); }
-    if (target->switch_value) {
+    {
         char line[160];
         snprintf(line, sizeof(line), "sbmetal26: %s[%d] registration device=%d\n", process, getpid(), held_device != nil);
         sysctlbyname("kern.annibale.say", NULL, NULL, line, strlen(line) + 1);

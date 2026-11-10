@@ -24,7 +24,10 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <dlfcn.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <os/lock.h>
@@ -34,6 +37,7 @@ extern const void *_dyld_get_shared_cache_range(size_t *);
 extern id MTLCreateSystemDefaultDevice(void);
 void sb26_install_layer_dump(void);   /* inject_sb26_layers.c */
 void sb26_install_rate(uintptr_t slide);   /* inject_sb26_rate.c */
+static void sb26_sync_initial_brightness(int call_bks_set);
 
 static atomic_uint activation_calls;
 
@@ -209,6 +213,7 @@ wake_screen_for_unlock(void)
     SEL turn_on = sel_registerName("turnOnScreenFullyWithBacklightSource:");
     if (class_getInstanceMethod(bl_cls, turn_on))
         ((void (*)(id, SEL, long))objc_msgSend)(bl, turn_on, 1);
+    sb26_sync_initial_brightness(1);
 }
 
 static int
@@ -272,6 +277,17 @@ refresh_view_recursive(id view, int depth)
                     ? ((const char *(*)(id, SEL))objc_msgSend)(dname, utf8_sel) : NULL;
                 if (cstr && cstr[0]) {
                     fprintf(stderr, "sb26: icon[%u] displayName='%s'\n", sb26_logged_icon_labels++, cstr);
+                    if (sb26_logged_icon_labels == 4) {
+                        mach_timebase_info_data_t tb = { 0 };
+                        mach_timebase_info(&tb);
+                        uint64_t ns = tb.denom ? (mach_absolute_time() * tb.numer / tb.denom) : 0;
+                        char mline[128];
+                        snprintf(mline, sizeof(mline), "milestone: icons_ready at %llu.%03llu s (icons=%u)\n",
+                            (unsigned long long)(ns / 1000000000ULL),
+                            (unsigned long long)((ns / 1000000ULL) % 1000ULL),
+                            sb26_logged_icon_labels);
+                        sysctlbyname("kern.annibale.say", NULL, NULL, mline, strlen(mline) + 1);
+                    }
                 }
             }
         }
@@ -319,10 +335,47 @@ refresh_windows_array(id windows_array)
 }
 
 static void
+sb26_check_wifi_status(unsigned long step_idx)
+{
+    Class wifi_cls = objc_getClass("SBWiFiManager");
+    SEL shared_sel = sel_registerName("sharedInstance");
+    if (!wifi_cls || !class_getClassMethod(wifi_cls, shared_sel)) return;
+    id mgr = ((id (*)(Class, SEL))objc_msgSend)(wifi_cls, shared_sel);
+    if (!mgr) return;
+
+    SEL powered_sel = sel_registerName("isPowered");
+    SEL assoc_sel = sel_registerName("isAssociated");
+    SEL prim_sel = sel_registerName("isPrimaryInterface");
+    SEL bars_sel = sel_registerName("signalStrengthBars");
+    SEL rssi_sel = sel_registerName("signalStrengthRSSI");
+    SEL prim_chg_sel = sel_registerName("_primaryInterfaceChanged:");
+    SEL upd_sig_sel = sel_registerName("_updateSignalStrength");
+
+    int powered = class_respondsToSelector(wifi_cls, powered_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, powered_sel) : -1;
+    int assoc = class_respondsToSelector(wifi_cls, assoc_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, assoc_sel) : -1;
+    int prim = class_respondsToSelector(wifi_cls, prim_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, prim_sel) : -1;
+    int bars = class_respondsToSelector(wifi_cls, bars_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, bars_sel) : -1;
+    int rssi = class_respondsToSelector(wifi_cls, rssi_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, rssi_sel) : 0;
+
+    if (assoc == 1 && prim == 0 && class_respondsToSelector(wifi_cls, prim_chg_sel)) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(mgr, prim_chg_sel, YES);
+        prim = class_respondsToSelector(wifi_cls, prim_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, prim_sel) : -1;
+    }
+    if (assoc == 1 && bars <= 0 && class_respondsToSelector(wifi_cls, upd_sig_sel)) {
+        ((void (*)(id, SEL))objc_msgSend)(mgr, upd_sig_sel);
+        bars = class_respondsToSelector(wifi_cls, bars_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, bars_sel) : -1;
+        rssi = class_respondsToSelector(wifi_cls, rssi_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, rssi_sel) : 0;
+    }
+    fprintf(stderr, "sb26: wifi step=%lu powered=%d associated=%d primary=%d bars=%d rssi=%d\n",
+        step_idx, powered, assoc, prim, bars, rssi);
+}
+
+static void
 sb26_stepped_refresh_step(void *context)
 {
     uintptr_t step_idx = (uintptr_t)context;
     fprintf(stderr, "sb26: stepped icon refresh step %lu executing on main thread\n", (unsigned long)step_idx);
+    sb26_check_wifi_status((unsigned long)step_idx);
 
     Class app_class = objc_getClass("UIApplication");
     Class window_class = objc_getClass("UIWindow");
@@ -364,10 +417,10 @@ sb26_schedule_stepped_refresh(void)
     if (scheduled) return;
     scheduled = 1;
 
-    static const int delays[] = { 3, 6, 10, 15, 22, 30, 45 };
+    static const int delays[] = { 3, 6, 10, 15, 22, 30, 45, 65, 90, 110 };
     const size_t num_delays = sizeof(delays) / sizeof(delays[0]);
 
-    fprintf(stderr, "sb26: scheduling stepped icon refresh after unlock (%zu steps: +3s..+45s)\n", num_delays);
+    fprintf(stderr, "sb26: scheduling stepped icon refresh after unlock (%zu steps: +3s..+110s)\n", num_delays);
 
     for (size_t i = 0; i < num_delays; i++) {
         dispatch_after_f(
@@ -458,103 +511,6 @@ install_unlock(void)
     }
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, UNLOCK_FIRST_SECONDS * NSEC_PER_SEC),
         dispatch_get_main_queue(), NULL, boot_unlock);
-}
-
-static BOOL
-haptic_return_no(id self, SEL cmd)
-{
-    (void)self;
-    (void)cmd;
-    return NO;
-}
-
-static BOOL
-haptic_start_and_return_error(id self, SEL cmd, id *err)
-{
-    (void)self;
-    (void)cmd;
-    if (err) *err = nil;
-    return YES;
-}
-
-static void
-haptic_start_with_completion(id self, SEL cmd, void (^handler)(id))
-{
-    (void)self;
-    (void)cmd;
-    if (handler) handler(nil);
-}
-
-static BOOL
-haptic_stop_and_return_error(id self, SEL cmd, id *err)
-{
-    (void)self;
-    (void)cmd;
-    if (err) *err = nil;
-    return YES;
-}
-
-static void
-haptic_stop_with_completion(id self, SEL cmd, void (^handler)(id))
-{
-    (void)self;
-    (void)cmd;
-    if (handler) handler(nil);
-}
-
-static id (*orig_haptic_caps)(id, SEL);
-static id
-haptic_capabilities_for_hardware(id self, SEL cmd)
-{
-    id caps = orig_haptic_caps ? orig_haptic_caps(self, cmd) : nil;
-    if (caps) {
-        Class caps_cls = object_getClass(caps);
-        Method m_h = class_getInstanceMethod(caps_cls, sel_registerName("supportsHaptics"));
-        if (m_h) method_setImplementation(m_h, (IMP)haptic_return_no);
-        Method m_a = class_getInstanceMethod(caps_cls, sel_registerName("supportsAudio"));
-        if (m_a) method_setImplementation(m_a, (IMP)haptic_return_no);
-    }
-    return caps;
-}
-
-static void
-install_haptic_hooks(Class engine_cls)
-{
-    if (!engine_cls) return;
-
-    Method m_caps = class_getClassMethod(engine_cls, sel_registerName("capabilitiesForHardware"));
-    if (m_caps) {
-        orig_haptic_caps = (id (*)(id, SEL))method_getImplementation(m_caps);
-        method_setImplementation(m_caps, (IMP)haptic_capabilities_for_hardware);
-    }
-
-    Method m_start = class_getInstanceMethod(engine_cls, sel_registerName("startAndReturnError:"));
-    if (m_start) method_setImplementation(m_start, (IMP)haptic_start_and_return_error);
-
-    Method m_start_cb = class_getInstanceMethod(engine_cls, sel_registerName("startWithCompletionHandler:"));
-    if (m_start_cb) method_setImplementation(m_start_cb, (IMP)haptic_start_with_completion);
-
-    Method m_stop = class_getInstanceMethod(engine_cls, sel_registerName("stopAndReturnError:"));
-    if (m_stop) method_setImplementation(m_stop, (IMP)haptic_stop_and_return_error);
-
-    Method m_stop_cb = class_getInstanceMethod(engine_cls, sel_registerName("stopWithCompletionHandler:"));
-    if (m_stop_cb) method_setImplementation(m_stop_cb, (IMP)haptic_stop_with_completion);
-
-    fprintf(stderr, "sb26: CHHapticEngine non-blocking interception installed\n");
-}
-
-static void
-haptic_image_callback(const struct mach_header *header, intptr_t slide)
-{
-    (void)header;
-    (void)slide;
-    static int haptics_done;
-    if (haptics_done) return;
-    Class cls = objc_getClass("CHHapticEngine");
-    if (cls) {
-        haptics_done = 1;
-        install_haptic_hooks(cls);
-    }
 }
 
 static int
@@ -881,6 +837,33 @@ discovery_image_callback(const struct mach_header *header, intptr_t slide)
     install_uninstall_hooks();
 }
 
+static void
+sb26_log_self_uuid(const char *prog)
+{
+    Dl_info info;
+    char uuid_str[40] = "none", line[160];
+
+    if (dladdr((const void *)&sb26_log_self_uuid, &info) && info.dli_fbase) {
+        const struct mach_header_64 *mh = (const struct mach_header_64 *)info.dli_fbase;
+        if (mh->magic == MH_MAGIC_64) {
+            const struct load_command *lc = (const struct load_command *)(mh + 1);
+            for (uint32_t i = 0; i < mh->ncmds; i++) {
+                if (lc->cmd == LC_UUID && lc->cmdsize >= sizeof(struct uuid_command)) {
+                    const uint8_t *u = ((const struct uuid_command *)lc)->uuid;
+                    snprintf(uuid_str, sizeof(uuid_str),
+                        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                        u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                        u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+                    break;
+                }
+                lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
+            }
+        }
+    }
+    snprintf(line, sizeof(line), "sb26: loaded in %s uuid=%s\n", prog, uuid_str);
+    sysctlbyname("kern.annibale.say", NULL, NULL, line, strlen(line) + 1);
+}
+
 __attribute__((constructor)) static void
 install_sb26(void)
 {
@@ -888,8 +871,12 @@ install_sb26(void)
     if (!prog || (strcmp(prog, "SpringBoard") && strcmp(prog, "Preferences") &&
         strcmp(prog, "lsd") && strcmp(prog, "wifid"))) return;
 
+    sb26_log_self_uuid(prog);
     sb26_ensure_chinese_preferences();
     sb26_clear_wifi_join_failures();
+    if (!strcmp(prog, "SpringBoard")) {
+        sb26_sync_initial_brightness(0);
+    }
     sb26_install_localization_hooks();
     if (!strcmp(prog, "lsd") || !strcmp(prog, "wifid")) return;
 
@@ -931,12 +918,6 @@ install_sb26(void)
     sb26_install_rate(slide);
     install_powerdown_hooks();
     sb26_install_localization_hooks();
-
-    _dyld_register_func_for_add_image(haptic_image_callback);
-    Class engine_cls = objc_getClass("CHHapticEngine");
-    if (engine_cls) {
-        install_haptic_hooks(engine_cls);
-    }
 
     Class cal_cls = objc_getClass("SBCalendarIconImageProvider");
     if (cal_cls) install_calendar_icon_hooks(cal_cls);
