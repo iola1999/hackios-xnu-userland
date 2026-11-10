@@ -360,7 +360,9 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  */
 static IMP original_emit_sample_buffer;
 static IMP original_ms_configure;
+static IMP original_ms_allocate_pools;
 static IMP original_ms_prepare;
+static IMP original_ms_start;
 
 static int
 ms_configure(id self, SEL selector, id *error)
@@ -370,12 +372,28 @@ ms_configure(id self, SEL selector, id *error)
 	return err;
 }
 
+static int
+ms_allocate_pools(id self, SEL selector, id node)
+{
+	int err = ((int (*)(id, SEL, id))original_ms_allocate_pools)(self, selector, node);
+	say("annibale: media: -[BWMultiStreamCameraSourceNode allocateOrReuseBufferPoolsFromSourceNode:] -> %d\n", err);
+	return err;
+}
+
 static void
 ms_prepare(id self, SEL selector)
 {
 	say("annibale: media: -[BWMultiStreamCameraSourceNode prepareForCurrentConfigurationToBecomeLive] begin\n");
 	((void (*)(id, SEL))original_ms_prepare)(self, selector);
 	say("annibale: media: -[BWMultiStreamCameraSourceNode prepareForCurrentConfigurationToBecomeLive] done\n");
+}
+
+static BOOL
+ms_start(id self, SEL selector, id *error)
+{
+	BOOL ok = ((BOOL (*)(id, SEL, id *))original_ms_start)(self, selector, error);
+	say("annibale: media: -[BWMultiStreamCameraSourceNode start:] -> %d\n", (int)ok);
+	return ok;
 }
 
 static void
@@ -490,7 +508,10 @@ static struct replacement {
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
 	{ "BWMultiStreamCameraSourceNode", "configure:", 0UL, (IMP)ms_configure, &original_ms_configure, true, false },
+	{ "BWMultiStreamCameraSourceNode", "allocateOrReuseBufferPoolsFromSourceNode:", 0UL, (IMP)ms_allocate_pools,
+	  &original_ms_allocate_pools, true, false },
 	{ "BWMultiStreamCameraSourceNode", "prepareForCurrentConfigurationToBecomeLive", 0UL, (IMP)ms_prepare, &original_ms_prepare, true, false },
+	{ "BWMultiStreamCameraSourceNode", "start:", 0UL, (IMP)ms_start, &original_ms_start, true, false },
 };
 
 /* ---- the Metal device leaves this process on iOS 16.5 when cvadepth-iOS.metallib is absent -------- */

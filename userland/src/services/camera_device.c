@@ -367,6 +367,7 @@ output_info(int width, int height, int max_fps)
 	put(o, "MaxFrameRate", number_f(max_fps));
 	put(o, "SashimiRawPixelFormat", number_i(PF_BGRA));
 	put(o, "SushiRawPixelFormat", number_i(PF_BGRA));
+	put(o, "FocusPixelDataSupported", CFRetain(kCFBooleanFalse));
 	return o;
 }
 
@@ -515,6 +516,7 @@ struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
 	CFDictionaryRef colour_info;    /* from VideoOutputsColorInfo */
+	CFDictionaryRef meta_config;    /* from VideoOutputConfigurations["Metadata"] */
 	CFDictionaryRef metadata;       /* the last frame's (frame_metadata()), for a buffer that has none of its own */
 	pthread_mutex_t metadata_lock;  /* (not `lock': AddAttachmentsToSampleBuffer may come while a frame is given out) */
 	unsigned        stills_wanted;  /* photographs asked for by StillImageCaptureNow, not yet given */
@@ -588,24 +590,37 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 			CFStringRef name = CFStringCreateWithCString(NULL, output_names[i], kCFStringEncodingUTF8);
 
 			if (configs) {
-				if (s->out[i].config != NULL) {
-					CFDictionarySetValue(d, name, s->out[i].config);
+				CFMutableDictionaryRef oc = s->out[i].config != NULL ?
+				    CFDictionaryCreateMutableCopy(NULL, 0, s->out[i].config) :
+				    (CFMutableDictionaryRef)new_dict();
+
+				if (!CFDictionaryContainsKey(oc, CFSTR("BufferPoolBytesPerRowAlignmentRequirement"))) {
+					put(oc, "BufferPoolBytesPerRowAlignmentRequirement", number_i(64));
 				}
+				if (!CFDictionaryContainsKey(oc, CFSTR("BufferPoolPlaneAlignmentRequirement"))) {
+					put(oc, "BufferPoolPlaneAlignmentRequirement", number_i(64));
+				}
+				if (!CFDictionaryContainsKey(oc, CFSTR("BufferPoolCountForCaptureStream"))) {
+					put(oc, "BufferPoolCountForCaptureStream", number_i(6));
+				}
+				CFDictionarySetValue(d, name, oc);
+				CFRelease(oc);
 			} else {
 				CFDictionarySetValue(d, name, s->out[i].enabled ? kCFBooleanTrue : kCFBooleanFalse);
 			}
 			CFRelease(name);
 		}
 		if (configs) {
-			static const char *const mask_keys[7] = {
+			static const char *const mask_keys[10] = {
 				"LightSourceMaskConfiguration", "KeypointDescriptorDataConfiguration",
 				"HumanFullBodiesMaskConfiguration", "HumanHairMaskConfiguration",
 				"HumanSkinsMaskConfiguration", "SkyMaskConfiguration",
-				"WeightSegmentMapConfiguration"
+				"WeightSegmentMapConfiguration", "PreLTMThumbnailConfiguration",
+				"LTMThumbnailConfiguration", "PostColorProcessingThumbnailConfiguration"
 			};
 			CFMutableDictionaryRef meta = (CFMutableDictionaryRef)new_dict();
 
-			for (int k = 0; k < 7; k++) {
+			for (int k = 0; k < 10; k++) {
 				CFMutableDictionaryRef mc = (CFMutableDictionaryRef)new_dict();
 
 				put(mc, "Width", number_i(320));
@@ -615,6 +630,24 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 				put(mc, "BufferPoolBytesPerRowAlignmentRequirement", number_i(64));
 				put(mc, "BufferPoolPlaneAlignmentRequirement", number_i(64));
 				put(mc, "BufferPoolCountForCaptureStream", number_i(4));
+				if (s->meta_config != NULL) {
+					CFStringRef mk = CFStringCreateWithCString(NULL, mask_keys[k], kCFStringEncodingUTF8);
+					CFTypeRef sub = CFDictionaryGetValue(s->meta_config, mk);
+
+					if (sub != NULL && CFGetTypeID(sub) == CFDictionaryGetTypeID()) {
+						CFIndex sn = CFDictionaryGetCount(sub);
+						const void **skeys = calloc((size_t)sn + 1, sizeof(void *));
+						const void **svals = calloc((size_t)sn + 1, sizeof(void *));
+
+						CFDictionaryGetKeysAndValues(sub, skeys, svals);
+						for (CFIndex si = 0; si < sn; si++) {
+							CFDictionarySetValue(mc, skeys[si], svals[si]);
+						}
+						free(skeys);
+						free(svals);
+					}
+					CFRelease(mk);
+				}
 				put(meta, mask_keys[k], mc);
 			}
 			put(d, "Metadata", meta);
@@ -765,16 +798,57 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 			struct output *out;
 
 			if (k < 0) {
-				say_once("stream: an output not here:", keys[i], NULL);
+				if (configs && CFGetTypeID(keys[i]) == CFStringGetTypeID() &&
+				    key_is(keys[i], "Metadata") && CFGetTypeID(values[i]) == CFDictionaryGetTypeID()) {
+					CFMutableDictionaryRef mc = s->meta_config != NULL ?
+					    CFDictionaryCreateMutableCopy(NULL, 0, s->meta_config) :
+					    (CFMutableDictionaryRef)new_dict();
+					CFIndex mn = CFDictionaryGetCount(values[i]);
+					const void **mkeys = calloc((size_t)mn + 1, sizeof(void *));
+					const void **mvals = calloc((size_t)mn + 1, sizeof(void *));
+
+					CFDictionaryGetKeysAndValues(values[i], mkeys, mvals);
+					for (CFIndex mi = 0; mi < mn; mi++) {
+						CFDictionarySetValue(mc, mkeys[mi], mvals[mi]);
+					}
+					free(mkeys);
+					free(mvals);
+					if (s->meta_config != NULL) {
+						CFRelease(s->meta_config);
+					}
+					s->meta_config = mc;
+					continue;
+				}
+				if (CFGetTypeID(keys[i]) != CFStringGetTypeID() || !key_is(keys[i], "Metadata")) {
+					say_once("stream: an output not here:", keys[i], NULL);
+				}
 				continue;
 			}
 			out = &s->out[k];
 			if (configs) {
-				if (out->config != NULL) {
-					CFRelease(out->config);
-				}
 				let_go(out);
-				out->config = CFGetTypeID(values[i]) == CFDictionaryGetTypeID() ? CFRetain(values[i]) : NULL;
+				if (CFGetTypeID(values[i]) == CFDictionaryGetTypeID()) {
+					CFMutableDictionaryRef merged = out->config != NULL ?
+					    CFDictionaryCreateMutableCopy(NULL, 0, out->config) :
+					    (CFMutableDictionaryRef)new_dict();
+					CFIndex cn = CFDictionaryGetCount(values[i]);
+					const void **ckeys = calloc((size_t)cn + 1, sizeof(void *));
+					const void **cvals = calloc((size_t)cn + 1, sizeof(void *));
+
+					CFDictionaryGetKeysAndValues(values[i], ckeys, cvals);
+					for (CFIndex ci = 0; ci < cn; ci++) {
+						CFDictionarySetValue(merged, ckeys[ci], cvals[ci]);
+					}
+					free(ckeys);
+					free(cvals);
+					if (out->config != NULL) {
+						CFRelease(out->config);
+					}
+					out->config = merged;
+				} else if (out->config != NULL) {
+					CFRelease(out->config);
+					out->config = NULL;
+				}
 			} else if (enabled) {
 				int64_t on = 1;
 

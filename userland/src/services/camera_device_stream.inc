@@ -849,6 +849,9 @@ stream_finalize(CMBaseObjectRef o)
 	if (s->colour_info) {
 		CFRelease(s->colour_info);
 	}
+	if (s->meta_config) {
+		CFRelease(s->meta_config);
+	}
 	if (s->metadata) {
 		CFRelease(s->metadata);
 	}
