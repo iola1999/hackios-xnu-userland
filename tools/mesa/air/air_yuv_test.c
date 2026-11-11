@@ -9,10 +9,12 @@
          return 1;                                                                                 \
       }                                                                                            \
    } while (0)
-static const float expected[4][4] = {{.419433594f, .166503906f, 0, 1},
+static const float expected[6][4] = {{.419433594f, .166503906f, 0, 1},
                                      {.444335938f, .179199219f, 0, 1},
+                                     {.429835225f, .161063796f, 0, 1},
                                      {.426269531f, .204589844f, .029785156f, 1},
-                                     {.447753906f, .215820312f, .019042969f, 1}};
+                                     {.447753906f, .215820312f, .019042969f, 1},
+                                     {.436028235f, .199930980f, .014883137f, 1}};
 int main(int argc, char **argv) {
    char why[1024] = {0};
    CHECK(argc == 3);
@@ -30,9 +32,13 @@ int main(int argc, char **argv) {
    struct rwa_compute *cs =
        rwa_compute_create(d, air, length, "combined_sample", NULL, why, sizeof why);
    CHECK(cs);
-   for (unsigned c = 0; c < 4; c++) {
+   for (unsigned c = 0; c < 6; c++) {
       nir_shader *n = nir_shader_clone(NULL, cs->nir);
-      struct rwa_yuv_key key = {.mask = 1, .full_range = c / 2, .bt709 = c % 2, .uv_slot = {2}};
+      struct rwa_yuv_key key = {.mask = 1,
+                                .full_range = c / 3,
+                                .bt709 = (c % 3) == 1,
+                                .bt2020 = (c % 3) == 2,
+                                .uv_slot = {2}};
       CHECK(lower_yuv(n, &key, why, sizeof why));
       CHECK(BITSET_TEST(n->info.textures_used, 2));
       unsigned y = 0, uv = 0, guard = 0;
@@ -149,6 +155,25 @@ int main(int argc, char **argv) {
    struct rwa_texture *t = rwa_texture_combine_yuv(y, uv, false, 6, why, sizeof why);
    CHECK(t);
    CHECK(y->references == 2 && uv->references == 2);
+   struct rwa_texture *t2020 = rwa_texture_combine_yuv(y, uv, false, 9, why, sizeof why);
+   CHECK(t2020 && t2020->yuv_bt2020 && !t2020->yuv_bt709);
+   rwa_texture_destroy(t2020);
+   struct rwa_texture_shape s10 = s;
+   s10.pixel_format = 20;
+   s10.width = 32;
+   s10.height = 16;
+   struct rwa_texture *y10 = rwa_texture_create(d, &s10, why, sizeof why);
+   CHECK(y10);
+   s10.pixel_format = 60;
+   s10.width = 16;
+   s10.height = 8;
+   struct rwa_texture *uv10 = rwa_texture_create(d, &s10, why, sizeof why);
+   CHECK(uv10);
+   struct rwa_texture *t10 = rwa_texture_combine_yuv(y10, uv10, false, 9, why, sizeof why);
+   CHECK(t10 && t10->shape.pixel_format == 505 && t10->yuv_bt2020);
+   rwa_texture_destroy(t10);
+   rwa_texture_destroy(y10);
+   rwa_texture_destroy(uv10);
    CHECK(!rwa_texture_combine_yuv(y, uv, false, 99, why, sizeof why));
    CHECK(!rwa_texture_view(t, 10, 0, 1, why, sizeof why));
    unsigned level = 0;

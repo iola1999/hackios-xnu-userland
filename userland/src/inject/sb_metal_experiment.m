@@ -32,7 +32,31 @@ static id<MTLDevice> register_device(const char *path, BOOL software)
     stage("default device before registration");
     id<MTLDevice> before = MTLCreateSystemDefaultDevice();
     fprintf(stderr, "sbmetal26: default_before=%s\n", before ? object_getClassName(before) : "nil");
-    if (before) { [before release]; fail("default device already registered"); return nil; }
+    if (before) {
+        Class native_cls = objc_getClass("AnnibaleMetalDevice");
+        Protocol *spi = objc_getProtocol("MTLDeviceSPI");
+        if (native_cls && [before isKindOfClass:native_cls] && spi &&
+            [before conformsToProtocol:spi] && [before conformsToProtocol:@protocol(MTLDevice)]) {
+            SEL mesa_sel = sel_registerName("mesaDevice");
+            void *backend = dlopen("/annibale/lib/libannibaleair.dylib", RTLD_NOW | RTLD_NOLOAD);
+            const char *(*backend_name)(void *) = backend ? dlsym(backend, "rwa_device_name") : NULL;
+            void *mesa = [before respondsToSelector:mesa_sel] ?
+                ((void *(*)(id, SEL))objc_msgSend)(before, mesa_sel) : NULL;
+            const char *name = mesa && backend_name ? backend_name(mesa) : NULL;
+            if (!name || (software ? strcmp(name, "softpipe") : strcmp(name, "Adreno (TM) 830"))) {
+                fprintf(stderr, "sbmetal26: actual_backend=%s\n", name ?: "nil");
+                [before release];
+                fail("native default device backend mismatch");
+                return nil;
+            }
+            fprintf(stderr, "sbmetal26: adopted native default device=%s backend=%s apple3=%d\n",
+                object_getClassName(before), name, [before supportsFamily:MTLGPUFamilyApple3]);
+            return before;
+        }
+        [before release];
+        fail("default device already registered");
+        return nil;
+    }
     if (objc_getClass("AnnibaleMetalDevice")) { fail("candidate class already loaded"); return nil; }
 
     stage("resolve MTLAddDevice");

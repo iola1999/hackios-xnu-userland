@@ -250,6 +250,73 @@ src = f'{src_root}/System/Library/LaunchDaemons'
 # Safari's daemons are in the App cryptex) -- is looked for where fetch.sh unpacked that cryptex, beside
 # the root filesystem; the images have it at the same place (build.sh).
 CRYPTEXES = {'/System/Cryptexes/OS/': 'cryptex', '/System/Cryptexes/App/': 'cryptex-app'}
+_OMIT = object()
+
+
+def load_feature_flags(rootfs):
+    """Load Domain/Feature flags from System/Library/FeatureFlags/Domain/*.plist."""
+    flags = {}
+    domain_dir = os.path.join(rootfs, 'System/Library/FeatureFlags/Domain')
+    if not os.path.isdir(domain_dir):
+        return flags
+    for name in sorted(os.listdir(domain_dir)):
+        if not name.endswith('.plist'):
+            continue
+        domain = name[:-len('.plist')]
+        with open(os.path.join(domain_dir, name), 'rb') as f:
+            data = plistlib.load(f)
+        if not isinstance(data, dict):
+            continue
+        for feat, entry in data.items():
+            enabled = False
+            if isinstance(entry, dict):
+                if 'Enabled' in entry:
+                    enabled = bool(entry['Enabled'])
+                elif entry.get('DevelopmentPhase') == 'FeatureComplete':
+                    enabled = True
+            elif isinstance(entry, bool):
+                enabled = entry
+            flags[f'{domain}/{feat}'] = enabled
+    return flags
+
+
+def resolve_feature_flags(node, flags):
+    """Evaluate #IfFeatureFlagEnabled / #IfFeatureFlagDisabled (#Then / #Else) recursively."""
+    if isinstance(node, dict):
+        if '#IfFeatureFlagEnabled' in node or '#IfFeatureFlagDisabled' in node:
+            if '#IfFeatureFlagEnabled' in node:
+                cond = flags.get(node['#IfFeatureFlagEnabled'], False)
+            else:
+                cond = not flags.get(node['#IfFeatureFlagDisabled'], False)
+            branch = '#Then' if cond else '#Else'
+            if branch not in node:
+                return _OMIT
+            return resolve_feature_flags(node[branch], flags)
+        out = {}
+        for k, v in node.items():
+            rv = resolve_feature_flags(v, flags)
+            if rv is not _OMIT:
+                out[k] = rv
+        return out
+    if isinstance(node, list):
+        out = []
+        for item in node:
+            rv = resolve_feature_flags(item, flags)
+            if rv is not _OMIT:
+                out.append(rv)
+        return out
+    return node
+
+
+def normalize_job_plist(job, flags):
+    job = resolve_feature_flags(job, flags)
+    ms = job.get('MachServices')
+    if isinstance(ms, dict):
+        job['MachServices'] = {k: v for k, v in ms.items() if v is not False}
+    return job
+
+
+FEATURE_FLAGS = load_feature_flags(src_root)
 
 
 def volume_paths(listing, _cache={}):
@@ -280,7 +347,7 @@ for label in labels:
     if is_angel:
         path = f'{angels}/{label}.plist'
     with open(path, 'rb') as f:
-        job = plistlib.load(f)
+        job = normalize_job_plist(plistlib.load(f), FEATURE_FLAGS)
     if is_angel:
         for key in startup_triggers:
             job.pop(key, None)
@@ -332,9 +399,9 @@ if rest:
         if label == 'com.apple.CommCenter':
             continue
         with open(f'{directory}/{name}', 'rb') as f:
-            job = plistlib.load(f)
+            job = normalize_job_plist(plistlib.load(f), FEATURE_FLAGS)
         program = job.get('Program') or (job.get('ProgramArguments') or [''])[0]
-        if not job.get('MachServices') or not present(program):
+        if job.get('Disabled') is True or not job.get('MachServices') or not present(program):
             continue
         # The XPC activities a job declares under LaunchEvents stay: a job that checks in with
         # XPC_ACTIVITY_CHECK_IN reads its criteria from them. With them taken out, osanalyticshelper's

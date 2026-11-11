@@ -245,6 +245,12 @@ number_i(int64_t v)
 }
 
 static CFNumberRef
+number_i32(int32_t v)
+{
+	return CFNumberCreate(NULL, kCFNumberSInt32Type, &v);
+}
+
+static CFNumberRef
 number_f(double v)
 {
 	return CFNumberCreate(NULL, kCFNumberDoubleType, &v);
@@ -282,6 +288,7 @@ struct prop {
 
 static const struct prop stream_props[] = {
 	{ "PortType", "String", "ReadOnly" }, { "UniqueID", "String", "ReadOnly" }, { "NonLocalizedName", "String", "ReadOnly" },
+	{ "ModuleInfo", "Collection", "ReadOnly" }, { "SensorRawOutputBufferPoolRequirements", "Collection", "ReadOnly" },
 	{ "SupportedFormatsArray", "Collection", "ReadOnly" }, { "FocalLength", "Number", "ReadOnly" },
 	{ "LensFNumber", "Number", "ReadOnly" }, { "PixelSize", "Number", "ReadOnly" },
 	{ "MaxZoomFactor", "Number", "ReadOnly" }, { "SupportedColorSpaces", "Collection", "ReadOnly" },
@@ -295,6 +302,7 @@ static const struct prop stream_props[] = {
 	{ "StillImageCaptureNow", "Collection", "WriteOnly" }, { "LockAENow", "Boolean", "WriteOnly" }, { "UnlockAENow", "Boolean", "WriteOnly" },
 	{ "LockAWBNow", "Boolean", "WriteOnly" }, { "UnlockAWBNow", "Boolean", "WriteOnly" }, { "MaxIntegrationTime", "Number", "ReadWrite" },
 	{ "AEMaxGain", "Number", "ReadWrite" }, { "AEMinGain", "Number", "ReadWrite" }, { "FaceDetectionEnabled", "Boolean", "ReadWrite" },
+	{ "FaceDetectionConfiguration", "Collection", "ReadWrite" },
 	{ "VideoRecordingInProgress", "Boolean", "ReadWrite" }, { "MemoryPoolID", "Number", "ReadWrite" },
 	{ "ChromaNoiseReductionEnabled", "Boolean", "ReadWrite" }, { "TemporalNoiseReductionEnabled", "Boolean", "ReadWrite" },
 	{ "MultipleOutputSupportEnabled", "Boolean", "ReadWrite" }, { "VideoOutputsColorInfo", "Collection", "ReadWrite" },
@@ -516,6 +524,7 @@ struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
 	CFDictionaryRef colour_info;    /* from VideoOutputsColorInfo */
+	CFDictionaryRef face_config;    /* from FaceDetectionConfiguration */
 	CFDictionaryRef meta_config;    /* from VideoOutputConfigurations["Metadata"] */
 	CFDictionaryRef metadata;       /* the last frame's (frame_metadata()), for a buffer that has none of its own */
 	pthread_mutex_t metadata_lock;  /* (not `lock': AddAttachmentsToSampleBuffer may come while a frame is given out) */
@@ -554,6 +563,9 @@ output_index(CFStringRef name)
 	return -1;
 }
 
+static CFDictionaryRef stream_module_info(const struct stream *s);
+static CFDictionaryRef stream_raw_pool_requirements(const struct stream *s);
+
 static OSStatus
 stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocator, void *out)
 {
@@ -563,6 +575,16 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 	(void)allocator;
 	if (key_is(key, "PortType")) {
 		value = CFRetain(s->port);
+	} else if (key_is(key, "ModuleInfo")) {
+		value = stream_module_info(s);
+	} else if (key_is(key, "SensorRawOutputBufferPoolRequirements")) {
+		pthread_mutex_lock(&s->lock);
+		value = stream_raw_pool_requirements(s);
+		pthread_mutex_unlock(&s->lock);
+	} else if (key_is(key, "FaceDetectionConfiguration")) {
+		pthread_mutex_lock(&s->lock);
+		value = s->face_config != NULL ? CFRetain(s->face_config) : new_dict();
+		pthread_mutex_unlock(&s->lock);
 	} else if (key_is(key, "UniqueID") || key_is(key, "ModelID")) {
 		value = CFStringCreateWithCString(NULL, s->camera->unique_id, kCFStringEncodingUTF8);
 	} else if (key_is(key, "NonLocalizedName") || key_is(key, "LocalizedName")) {
@@ -886,6 +908,15 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 			CFRelease(s->colour_info);
 		}
 		s->colour_info = value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID() ? CFRetain(value) : NULL;
+		pthread_mutex_unlock(&s->lock);
+		return 0;
+	}
+	if (key_is(key, "FaceDetectionConfiguration")) {
+		pthread_mutex_lock(&s->lock);
+		if (s->face_config != NULL) {
+			CFRelease(s->face_config);
+		}
+		s->face_config = value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID() ? CFRetain(value) : NULL;
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}

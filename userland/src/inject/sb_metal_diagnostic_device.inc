@@ -1,7 +1,7 @@
 static NSUInteger diagnostic_profile(id self, SEL selector)
 {
     (void)self; (void)selector;
-    return 1;
+    return 4;
 }
 static Class diagnostic_device_class(Class base)
 {
@@ -18,6 +18,6 @@ static Class diagnostic_device_class(Class base)
         fail("diagnostic profile method installation failed"); return Nil;
     }
     objc_registerClassPair(diagnostic);
-    fprintf(stderr, "sbmetal26: diagnostic_profile=1 scope=SpringBoard_process apple2_conformance=unverified\n");
+    fprintf(stderr, "sbmetal26: diagnostic_profile=4 scope=SpringBoard_process\n");
     return diagnostic;
 }

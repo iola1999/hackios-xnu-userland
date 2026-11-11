@@ -209,18 +209,21 @@ flash_root(const char *dev)
 		{ "/empty", "/flash/System/Library/NanoLaunchDaemons" },
 		{ "/empty", "/flash/System/Library/LaunchAngels" },
 		{ "/xpc", "/flash/System/Library/xpc" },
-		{ "/hal", "/flash/System/Library/Audio/Plug-Ins/HAL" },
 	};
 	for (unsigned i = 0; i < sizeof(mounts) / sizeof(mounts[0]); i++) {
 		check(mount_dir(mounts[i].to) && bind_dir(in_image(mounts[i].from), mounts[i].to), mounts[i].to);
 	}
-	if (stat(in_image("/lib/AnnibaleMetal.bundle"), &fw_st) == 0) {
-		if (lstat("/flash/System/Library/Extensions/AnnibaleMetal.bundle", &fw_st) != 0) {
-			(void)synthetic_dir("/flash/System/Library/Extensions/AnnibaleMetal.bundle");
+	static const struct { const char *from, *to, *what; } bundles[] = {
+		{ "/lib/AnnibaleAudio.driver", "/flash/System/Library/Audio/Plug-Ins/HAL/AnnibaleAudio.driver",
+		  "our audio HAL bundle in /System/Library/Audio/Plug-Ins/HAL" },
+		{ "/lib/AnnibaleMetal.bundle", "/flash/System/Library/Extensions/AnnibaleMetal.bundle",
+		  "our Metal driver bundle in /System/Library/Extensions" },
+	};
+	for (unsigned i = 0; i < sizeof(bundles) / sizeof(bundles[0]); i++) {
+		if (stat(in_image(bundles[i].from), &fw_st) == 0) {
+			check(mount_dir(bundles[i].to) && bind_dir(in_image(bundles[i].from), bundles[i].to),
+			    bundles[i].what);
 		}
-		check(bind_dir(in_image("/lib/AnnibaleMetal.bundle"),
-		    "/flash/System/Library/Extensions/AnnibaleMetal.bundle"),
-		    "our Metal driver bundle in /System/Library/Extensions");
 	}
 	if (stat("/fw", &fw_st) == 0 && lstat("/flash/fw", &fw_st) != 0) {
 		/* the audio DSP's firmware and the speakers' configuration, from the RAM image as in a RAM boot */

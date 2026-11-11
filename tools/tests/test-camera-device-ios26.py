@@ -86,6 +86,46 @@ int main(void) {
     assert(stream_set_property(back, CFSTR("FormatIndex"), fmt3) == 0);
     CFRelease(fmt3);
 
+    /* ModuleInfo, SensorRawOutputBufferPoolRequirements, and FaceDetectionConfiguration */
+    CFDictionaryRef sup = NULL;
+    assert(stream_copy_property(back, CFSTR("SupportedPropertiesDictionary"), kCFAllocatorDefault, &sup) == 0);
+    assert(CFDictionaryContainsKey(sup, CFSTR("ModuleInfo")));
+    assert(CFDictionaryContainsKey(sup, CFSTR("SensorRawOutputBufferPoolRequirements")));
+    assert(CFDictionaryContainsKey(sup, CFSTR("FaceDetectionConfiguration")));
+    CFRelease(sup);
+
+    CFDictionaryRef mod_back = NULL, mod_front = NULL;
+    assert(stream_copy_property(back, CFSTR("ModuleInfo"), kCFAllocatorDefault, &mod_back) == 0);
+    assert(get_int(mod_back, CFSTR("SensorID")) == 0x0904);
+    assert(get_int(mod_back, CFSTR("ModuleFocusID")) == 1);
+    assert(get_int(mod_back, CFSTR("ModuleActuatorID")) == 1);
+    assert(get_int(mod_back, CFSTR("ModuleLensID")) == 1);
+    assert(get_int(mod_back, CFSTR("ModuleIntegratorID")) == 1);
+    CFRelease(mod_back);
+
+    assert(stream_copy_property(front_sw, CFSTR("ModuleInfo"), kCFAllocatorDefault, &mod_front) == 0);
+    assert(get_int(mod_front, CFSTR("SensorID")) == 0x0914);
+    CFRelease(mod_front);
+
+    CFDictionaryRef raw_req = NULL;
+    assert(stream_copy_property(back, CFSTR("SensorRawOutputBufferPoolRequirements"), kCFAllocatorDefault, &raw_req) == 0);
+    assert(get_int(raw_req, CFSTR("MinimumBufferCount")) == 4);
+    assert(get_int(raw_req, CFSTR("Width")) == 4224);
+    assert(get_int(raw_req, CFSTR("Height")) == 3024);
+    assert(get_int(raw_req, CFSTR("BytesPerRowAlignment")) == 64);
+    assert(get_int(raw_req, CFSTR("PlaneAlignment")) == 64);
+    assert(get_int(raw_req, CFSTR("PixelFormatType")) == PF_BGRA);
+    CFRelease(raw_req);
+
+    CFMutableDictionaryRef fd_cfg = (CFMutableDictionaryRef)new_dict();
+    put(fd_cfg, "MaxFaces", number_i(10));
+    assert(stream_set_property(back, CFSTR("FaceDetectionConfiguration"), fd_cfg) == 0);
+    CFRelease(fd_cfg);
+    CFDictionaryRef fd_out = NULL;
+    assert(stream_copy_property(back, CFSTR("FaceDetectionConfiguration"), kCFAllocatorDefault, &fd_out) == 0);
+    assert(get_int(fd_out, CFSTR("MaxFaces")) == 10);
+    CFRelease(fd_out);
+
     /* Unconditional Depth handler registration in 0x1ae9c79f4 */
     CFMutableDictionaryRef handlers = (CFMutableDictionaryRef)new_dict();
     CFMutableDictionaryRef h_entry = (CFMutableDictionaryRef)new_dict();

@@ -3,6 +3,41 @@
  * and /dev/annibale-camera worker thread (included by camera_device.c).
  */
 
+/*
+ * ModuleInfo and SensorRawOutputBufferPoolRequirements aligned with V57/CameraSetup.plist
+ * (0x0904 BackWide, 0x0914 FrontSuperWide, ModuleIDSchemeVersion 1) and BWFigVideoCaptureDevice.
+ */
+static CFDictionaryRef
+stream_module_info(const struct stream *s)
+{
+	CFMutableDictionaryRef m = (CFMutableDictionaryRef)new_dict();
+	int32_t sensor_id = s->camera->sensor == 1 ? 0x0904 : 0x0914;
+
+	put(m, "SensorID", number_i32(sensor_id));
+	put(m, "ModuleFocusID", number_i32(1));
+	put(m, "ModuleActuatorID", number_i32(1));
+	put(m, "ModuleLensID", number_i32(1));
+	put(m, "ModuleIntegratorID", number_i32(1));
+	return m;
+}
+
+static CFDictionaryRef
+stream_raw_pool_requirements(const struct stream *s)
+{
+	CFMutableDictionaryRef r = (CFMutableDictionaryRef)new_dict();
+	int idx = (s->format_index >= 0 && s->format_index < MAX_CAMERA_FORMATS) ? s->format_index : 0;
+	int32_t w = s->camera->formats[idx][0] > 0 ? s->camera->formats[idx][0] : 1920;
+	int32_t h = s->camera->formats[idx][1] > 0 ? s->camera->formats[idx][1] : 1080;
+
+	put(r, "MinimumBufferCount", number_i32(4));
+	put(r, "Width", number_i32(w));
+	put(r, "Height", number_i32(h));
+	put(r, "BytesPerRowAlignment", number_i32(64));
+	put(r, "PlaneAlignment", number_i32(64));
+	put(r, "PixelFormatType", number_i32((int32_t)PF_BGRA));
+	return r;
+}
+
 /* ---- the frames ------------------------------------------------------------------------------------- */
 
 struct render_job {
@@ -848,6 +883,9 @@ stream_finalize(CMBaseObjectRef o)
 	}
 	if (s->colour_info) {
 		CFRelease(s->colour_info);
+	}
+	if (s->face_config) {
+		CFRelease(s->face_config);
 	}
 	if (s->meta_config) {
 		CFRelease(s->meta_config);

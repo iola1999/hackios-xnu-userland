@@ -7,33 +7,36 @@ rwa_texture_combine_yuv(struct rwa_texture *y, struct rwa_texture *uv,
                         bool full_range, unsigned matrix, char *why, size_t why_size)
 {
    RWA_LOCKED;
-   if (!y || !uv || y->device != uv->device || y->shape.pixel_format != 10 ||
-       uv->shape.pixel_format != 30 || y->shape.type != 2 || uv->shape.type != 2 ||
+   bool nv12 = y && uv && y->shape.pixel_format == 10 && uv->shape.pixel_format == 30;
+   bool p010 = y && uv && y->shape.pixel_format == 20 && uv->shape.pixel_format == 60;
+   if ((!nv12 && !p010) || y->device != uv->device || y->shape.type != 2 || uv->shape.type != 2 ||
        y->shape.sample_count != 1 || uv->shape.sample_count != 1 ||
        texture_levels(y) != 1 || texture_levels(uv) != 1 ||
        uv->shape.width != (y->shape.width + 1) / 2 ||
        uv->shape.height != (y->shape.height + 1) / 2 ||
-       !y->shader_read || !uv->shader_read || (matrix != 1 && matrix != 6)) {
-      say(why, why_size, "combined NV12 requires R8/RG8 2D planes and matrix 1 or 6");
+       !y->shader_read || !uv->shader_read ||
+       (matrix != 1 && matrix != 6 && matrix != 9)) {
+      say(why, why_size, "combined YCbCr requires R8/RG8 or R16/RG16 2D planes and matrix 1, 6, or 9");
       return NULL;
    }
    struct rwa_texture *t = calloc(1, sizeof(*t));
    if (!t) {
-      say(why, why_size, "out of memory creating a combined NV12 texture");
+      say(why, why_size, "out of memory creating a combined YCbCr texture");
       return NULL;
    }
    t->references = 1;
    t->device = y->device;
    t->shape = y->shape;
-   t->shape.pixel_format = 500;
+   t->shape.pixel_format = p010 ? 505 : 500;
    t->shape.usage = 1;
-   t->format_name = "MTLPixelFormatYCBCR8_420_2P";
+   t->format_name = p010 ? "MTLPixelFormatYCBCR10_420_2P" : "MTLPixelFormatYCBCR8_420_2P";
    t->shader_read = true;
    t->layers = 1;
    t->storage_owner = y;
    t->chroma = uv;
    t->yuv_full_range = full_range;
    t->yuv_bt709 = matrix == 1;
+   t->yuv_bt2020 = matrix == 9;
    y->references++;
    uv->references++;
    pipe_resource_reference(&t->res, y->res);
@@ -86,6 +89,7 @@ yuv_key_for(const struct air_shader_info *info, const struct rwa_bindings *bindi
       key->mask |= bit;
       key->full_range |= t->yuv_full_range ? bit : 0;
       key->bt709 |= t->yuv_bt709 ? bit : 0;
+      key->bt2020 |= t->yuv_bt2020 ? bit : 0;
       key->uv_slot[r->index] = slot;
    }
    return true;
@@ -131,6 +135,7 @@ lower_yuv(nir_shader *nir, const struct rwa_yuv_key *key, char *why, size_t why_
       .lower_y_uv_external = key->mask,
       .yuv_full_range_external = key->full_range,
       .bt709_external = key->bt709,
+      .bt2020_external = key->bt2020,
    };
    nir_lower_tex(nir, &options);
    nir_foreach_function_impl(impl, nir) {

@@ -183,7 +183,8 @@ SILEO_BIN="chmod cp mkdir mv rm"
 # SpringBoard the library above opens it, here it is named for the programs that have no library of
 # ours -- Settings, where a tweak's own pane belongs. Add a program's name to have tweaks in it.)
 if [ "$V" = 26 ]; then
-	INJECT=${INJECT-"/annibale/lib/libannibale-sb26.dylib SpringBoard Preferences lsd wifid"}
+	INJECT=${INJECT-"/annibale/lib/libannibale-sb26.dylib SpringBoard Preferences lsd wifid
+/annibale/lib/libannibale-vt.dylib videocodecd mediaserverd com.apple.WebKit.GPU video_decode_test video_player_test"}
 fi
 INJECT=${INJECT-"/annibale/lib/libannibale.dylib backboardd containermanagerd containermanagerd_system
 /annibale/lib/libannibale-media.dylib mediaserverd
@@ -424,6 +425,15 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	$DYN -O2 -dynamiclib -install_name /annibale/lib/libannibale-media.dylib -framework CoreFoundation -framework CoreMedia \
 		-framework CoreVideo -framework IOSurface -lobjc \
 		-o obj/libannibale-media.dylib src/inject/inject_media.c src/services/camera_device.c src/services/camera_isp.c
+	$DYN -Os -Wno-four-char-constants -dynamiclib -install_name /annibale/lib/libannibale-vt.dylib \
+		-framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework IOSurface \
+		-o obj/libannibale-vt.dylib src/inject/videotoolbox_iris.c
+	$DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo \
+		-framework VideoToolbox -o obj/video_decode_test src/tests/video_decode_test.m
+	$DYN -fobjc-arc -framework Foundation -framework AVFoundation -framework CoreMedia -framework CoreVideo \
+		-o obj/video_player_test src/tests/video_player_test.m
+	$DYN -fno-objc-arc -framework Foundation -framework Metal -framework CoreVideo -framework IOSurface -lobjc \
+		-o obj/video_combined_test src/tests/video_combined_test.m
 	# ... and inside appstored (STOREFRONT=1), which answers with a storefront and watches for a bag
 	# request being built (src/inject/inject_store.c)
 	# (-lc++abi for __cxa_throw: every C++ exception thrown in the process is watched, which is how
@@ -527,6 +537,9 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	[ -f obj/camera_test ] && cp obj/camera_test root/bin/
 	[ -f obj/camera_avtest ] && cp obj/camera_avtest root/bin/
 	[ -f obj/record_test ] && cp obj/record_test root/bin/
+	[ -f obj/video_decode_test ] && cp obj/video_decode_test root/bin/
+	[ -f obj/video_player_test ] && cp obj/video_player_test root/bin/
+	[ -f obj/video_combined_test ] && cp obj/video_combined_test root/bin/
 	# The same binary as the application below, under /annibale/bin, for its --layer mode:
 	# a CAMetalLayer with no window and no UIKit, driven once. That mode cannot say whether
 	# a frame reaches the panel, and it answers the two questions that come before it -- does
@@ -597,6 +610,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		if [ -f obj/libannibale-sbmetal-experiment.dylib ]; then cp obj/libannibale-sbmetal-experiment.dylib root/lib/; fi
 	fi
 	[ -f obj/libannibale-media.dylib ] && cp obj/libannibale-media.dylib root/lib/
+	[ -f obj/libannibale-vt.dylib ] && cp obj/libannibale-vt.dylib root/lib/
 	[ -f obj/libannibale-store.dylib ] && cp obj/libannibale-store.dylib root/lib/
 	[ -f obj/libannibale-fairplay.dylib ] && cp obj/libannibale-fairplay.dylib root/lib/
 	[ -f obj/libannibale-app.dylib ] && cp obj/libannibale-app.dylib root/lib/
@@ -793,6 +807,14 @@ if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
+for _iris_fw in ../out/fw-iris/vpu35_4v.mbn ../fw-iris/vpu35_4v.mbn; do
+	if [ -f "$_iris_fw" ]; then
+		mkdir -p root/fw
+		cp "$_iris_fw" root/fw/vpu35_4v.mbn
+		break
+	fi
+done
+unset _iris_fw
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log. It is the vendor's and never in the repository, so a fresh clone has none of it.
 # Say what went in and what was not there to go in; what each one is for is above.

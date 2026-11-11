@@ -1,6 +1,9 @@
 #import <Foundation/Foundation.h>
 #include <assert.h>
 #include <string.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
+static id held_device;
 static char trace[32]; static unsigned n; static int throws; static const char *bundle; static const char *loaded;
 static void attempt_registration(const char *b) { trace[n++]='R'; bundle=b; if(throws)[NSException raise:@"Test" format:@"failure"]; }
 static void registration_exception(NSException *e) { (void)e;trace[n++]='E'; }
