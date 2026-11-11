@@ -563,9 +563,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    if (read_sampler) {
       /* AIR 2.8 ordinary read adds a builtin sampler and zero offset. Explicit
        * sampler reads also use this signature and need separate addressing semantics. */
-      if (t.dim != GLSL_SAMPLER_DIM_2D || t.depth || t.is_ms || tex.is_image ||
+      if (t.dim != GLSL_SAMPLER_DIM_2D || t.depth || t.is_ms ||
           in->num_operands != 7 + (unsigned)t.is_array)
-         return air_error(c, "intrinsic: builtin read sampler requires a read-only 2D or 2D-array (texture, sampler, coord, [layer,] offset, lod, access) signature");
+         return air_error(c, "intrinsic: builtin read sampler requires a 2D or 2D-array (texture, sampler, coord, [layer,] offset, lod, access) signature");
       if (!tex_handle(c, in, arg++, AIR_PTR_READ_SAMPLER, &samp))
          return false;
       const struct air_type *coord = in->operands[arg]->type;
@@ -586,8 +586,20 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
           lod->kind != AIR_TYPE_INT || (lod->bits != 16 && lod->bits != 32) ||
           in->operands[offset_arg + 2]->type->kind != AIR_TYPE_INT ||
           in->operands[offset_arg + 2]->type->bits != 32 ||
-          !air_const_uint(in->operands[offset_arg + 2], &access) || (access != 0 && access != 1))
+          !air_const_uint(in->operands[offset_arg + 2], &access))
          return air_error(c, "intrinsic: builtin read sampler has invalid coordinate, offset, lod or access types");
+      if (tex.is_image) {
+         bool readable = false;
+         for (unsigned i = 0; i < c->info->num_resources; i++) {
+            const struct air_resource *r = &c->info->resources[i];
+            if (r->kind == AIR_RESOURCE_IMAGE && r->index == tex.binding)
+               readable = r->read && r->write;
+         }
+         if (access != 3 || !readable)
+            return air_error(c, "intrinsic: builtin read sampler requires read_write image access");
+      } else if (access != 0 && access != 1) {
+         return air_error(c, "intrinsic: builtin read sampler requires sample or read texture access");
+      }
    }
    bool have_sampler = !strcmp(t.op, "sample") || !strcmp(t.op, "gather") ||
                        !strcmp(t.op, "lod");
@@ -702,6 +714,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *offset = air_get_ssa(c, in->operands[arg++]);
       if (!offset || !all_zero(offset))
          return air_error(c, "intrinsic: builtin read sampler requires a constant zero offset");
+      uint64_t level;
+      if (tex.is_image && (!air_const_uint(in->operands[arg], &level) || level != 0))
+         return air_error(c, "intrinsic: builtin read_write image load only supports level 0");
    }
 
    if (!strcmp(t.op, "read") && tex.is_image) {

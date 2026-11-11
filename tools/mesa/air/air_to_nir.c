@@ -1303,7 +1303,7 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       uint64_t index = 0;
       md_key_int(node, "air.location_index", &index);
       bool sample = md_key(node, "air.sample") >= 0;
-      bool read = md_key(node, "air.read") >= 0;
+      bool read = md_key(node, "air.read") >= 0 || md_key(node, "air.read_write") >= 0;
       bool write = md_key(node, "air.write") >= 0 || md_key(node, "air.read_write") >= 0;
       /* A texture the shader writes is an image to Gallium, with its own
        * binding space; one it only samples or reads is a sampler view.
