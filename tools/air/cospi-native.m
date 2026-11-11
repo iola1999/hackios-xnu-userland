@@ -85,9 +85,21 @@ int main(int argc, char **argv)
                                                            DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             library = [device newLibraryWithData:wrapped error:&error];
         } else library = [device newLibraryWithSource:source options:options error:&error];
-        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:
-            [library newFunctionWithName:@"check"] error:&error];
-        if (!pipeline) { NSLog(@"%@", error); return 2; }
+        if (!library) {
+            fprintf(stderr, "cospi: library creation failed: %s\n", error.description.UTF8String ?: "no error");
+            return 2;
+        }
+        id<MTLFunction> function = [library newFunctionWithName:@"check"];
+        if (!function) {
+            fprintf(stderr, "cospi: function check unavailable; exports=%s\n",
+                    [library.functionNames componentsJoinedByString:@","].UTF8String);
+            return 2;
+        }
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline) {
+            fprintf(stderr, "cospi: pipeline creation failed: %s\n", error.description.UTF8String ?: "no error");
+            return 2;
+        }
         id<MTLBuffer> input = [device newBufferWithBytes:data.bytes length:data.length options:MTLResourceStorageModeShared];
         id<MTLBuffer> output = [device newBufferWithLength:data.length / 2 options:MTLResourceStorageModeShared];
         id<MTLCommandQueue> queue = [device newCommandQueue];
