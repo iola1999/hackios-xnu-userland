@@ -43,6 +43,31 @@ static id node(NSString *name, NSArray *args, NSArray *after) {
                                                          arguments:args
                                                controlDependencies:after] autorelease];
 }
+static BOOL function_label(id<MTLFunction> function) {
+    if (!function || ![function respondsToSelector:@selector(label)] ||
+        ![function respondsToSelector:@selector(setLabel:)]) {
+        printf("ci-graph: function label selectors missing\n");
+        return NO;
+    }
+    NSMutableString *label = [[NSMutableString alloc] initWithString:
+        @"ci_affine_crop mutable diagnostic label"];
+    NSString *expected = [label copy];
+    function.label = label;
+    [label appendString:@" changed"];
+    BOOL valid = [function.label isEqualToString:expected];
+    function.label = function.label;
+    valid &= [function.label isEqualToString:expected];
+    function.label = @"ci_affine_crop";
+    function.label = @"ci_affine_crop";
+    valid &= [function.label isEqualToString:@"ci_affine_crop"];
+    function.label = nil;
+    valid &= function.label == nil;
+    function.label = @"ci_affine_crop";
+    [expected release];
+    [label release];
+    printf("ci-graph: function label %s copy/self/repeated/nil\n", valid ? "PASS" : "FAIL");
+    return valid;
+}
 int main(int argc, char **argv) {
     @autoreleasepool {
         @try {
@@ -151,6 +176,7 @@ int main(int argc, char **argv) {
             }
             id<MTLFunction> function = [linked newFunctionWithName:@"ci_affine_crop"];
             printf("ci-graph: function type=%lu\n", (unsigned long)function.functionType);
+            if (!function_label(function)) return 4;
             MTLComputePipelineReflection *reflection = nil;
             id<MTLComputePipelineState> pipeline =
                 [device newComputePipelineStateWithFunction:function
