@@ -11,6 +11,7 @@
  */
 
 #include "air_private.h"
+#include "air_reflection.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -121,8 +122,6 @@ same_resource(const struct air_ptr *a, const struct air_ptr *b)
    return a->class == b->class && a->binding == b->binding && a->is_image == b->is_image;
 }
 
-#include "air_ptr_slot.inc"
-
 /* A texture CHOSEN AT RUN TIME. space::rasterizeBackgroundFragment picks one of four
  * gobo textures by a uniform, with a `select` chain and a `phi` of texture arguments,
  * and passes the result to the function that samples it. A texture is not a value to
@@ -171,6 +170,8 @@ air_val_agg(struct air_ctx *c, unsigned n)
    v->elems = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(n, 1));
    return v;
 }
+
+#include "air_ptr_slot.inc"
 
 void
 air_set(struct air_ctx *c, const struct air_value *v, struct air_val *val)
@@ -1699,68 +1700,7 @@ load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type 
    return nir_bcsel(&c->b, v->def, a, b);
 }
 
-static bool
-gep_into(struct air_ctx *c, struct air_val *base, const struct air_inst *in,
-         struct air_val **out)
-{
-   /* A getelementptr on a pointer CHOSEN at run time: the index goes into both
-    * sides and the choice stays. Both sides have the same pointee type -- the
-    * select that made the choice required it -- so this is one walk per side
-    * and not a different offset on each.
-    */
-   if (base->kind == AIR_VAL_PTR_SELECT) {
-      struct air_val *a = NULL, *b = NULL;
-      if (!gep_into(c, base->elems[0], in, &a) ||
-          !gep_into(c, base->elems[1], in, &b))
-         return false;
-      *out = air_val_ptr_select(c, base->def, a, b);
-      return true;
-   }
-   if (base->kind != AIR_VAL_PTR)
-      return air_error(c, "instruction: getelementptr on something that is not a "
-                          "pointer");
-
-   struct air_ptr p = base->ptr;
-   const struct air_type *t = in->aux_type;
-
-   /* index 0 steps over objects of the source type */
-   uint64_t stride = air_type_alloc_size(c->m, t);
-   uint64_t first_const;
-   if (!air_const_uint(in->operands[1], &first_const) || first_const != 0) {
-      nir_def *first = air_get_ssa(c, in->operands[1]);
-      if (!first)
-         return false;
-      p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, first), stride));
-   }
-
-   for (unsigned i = 2; i < in->num_operands; i++) {
-      nir_def *idx = air_get_ssa(c, in->operands[i]);
-      if (!idx)
-         return false;
-      if (t->kind == AIR_TYPE_STRUCT) {
-         uint64_t field;
-         if (!air_const_uint(in->operands[i], &field))
-            return air_error(c, "instruction: a struct field chosen at run time");
-         unsigned n = field;
-         if (n >= t->num_members)
-            return air_error(c, "instruction: struct field %u of %u", n, t->num_members);
-         uint64_t off = air_struct_member_offset(c->m, t, n);
-         if (off)
-            p = air_ptr_add(c, p, nir_imm_int(&c->b, off));
-         t = t->members[n];
-      } else if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_VECTOR) {
-         uint64_t es = t->kind == AIR_TYPE_ARRAY ? air_type_alloc_size(c->m, t->elem)
-                                                 : MAX2(air_type_bit_size(t->elem) / 8, 1);
-         p = air_ptr_add(c, p, nir_imul_imm(&c->b, nir_u2u32(&c->b, idx), es));
-         t = t->elem;
-      } else {
-         return air_error(c, "instruction: getelementptr into a scalar");
-      }
-   }
-   p.pointee = t;
-   *out = air_val_ptr(c, p);
-   return true;
-}
+#include "air_gep.inc"
 
 static bool
 translate_gep(struct air_ctx *c, const struct air_inst *in)
@@ -2283,7 +2223,10 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *stored = in->base.type && in->base.type->kind == AIR_TYPE_POINTER
          ? stored_pointer(c, p) : NULL;
       if (stored) {
-         air_set(c, &in->base, stored);
+         struct air_val *value = val_in_current_impl(c, stored);
+         if (!value)
+            return false;
+         air_set(c, &in->base, value);
          return true;
       }
       /* An argument buffer resolves before it loads: the byte offset names a
@@ -3403,6 +3346,9 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
                         !reads_threadgroup(c.nir);
 
    if (info) {
+      if (stage == MESA_SHADER_COMPUTE && !wrap)
+         info->reflection = air_compute_reflection(mem_ctx, c.m, fn, in_node,
+                                                   &info->reflection_error);
       /* The info's arrays live under mem_ctx, not under the scratch context --
        * and so must every STRING in them, which is the part this used to get
        * wrong. `air_md_string` returns a NUL-terminated copy allocated as a

@@ -189,16 +189,13 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          return NULL;
       }
       if (ptr) {
-         /* The pointer itself is a resolution, which the callee shares as it
-          * is; its byte offset is a def of the caller's impl and travels as a
-          * parameter instead, so that the callee's own builder holds the only
-          * use of it. A constant offset travels the same way even though it
-          * folds: a `load_const` also belongs to the impl that built it, and one
-          * used inside another function's call is the same crossing -- it was
-          * what nir_lower_goto_ifs asserted on the first module this let
-          * through.
+         /* A constant byte offset is recreated in the callee, which keeps
+          * a local pointer slot addressable during translation. A run-time
+          * offset travels as a parameter because its def belongs to the
+          * caller's impl.
           */
-         kind[i] = argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset
+         kind[i] = argv[i]->kind == AIR_VAL_PTR && argv[i]->ptr.offset &&
+                   !nir_src_is_const(nir_src_for_ssa(argv[i]->ptr.offset))
                       ? CALL_PARAM_OFFSET : CALL_PARAM_NONE;
       } else if (ret_member_is_number(f->args[i].type)) {
          kind[i] = CALL_PARAM_VALUE;
@@ -380,7 +377,12 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          continue;
       }
       if (kind[i] != CALL_PARAM_VALUE) {
-         air_set(c, &f->args[i], argv[i]);   /* the caller's own resolution */
+         struct air_val *value = val_in_current_impl(c, argv[i]);
+         if (argv[i] && !value) {
+            ok = false;
+            break;
+         }
+         air_set(c, &f->args[i], value);
          continue;
       }
       air_set(c, &f->args[i], air_val_ssa(c, nir_load_param(&c->b, pidx++)));

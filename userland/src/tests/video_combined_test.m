@@ -1,4 +1,4 @@
-/* Compare combined NV12 sampling with native Metal measurements. No presentation UI. */
+/* Compare combined NV12/P010 samples against native NV12 results and YCbCr matrices. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <CoreVideo/CoreVideo.h>
@@ -13,9 +13,21 @@
 #include <signal.h>
 #include <unistd.h>
 static void deadline(int signal) { (void)signal; _exit(124); }
-static const float expected[4][4] = {
-    {.419433594f,.166503906f,0,1}, {.444335938f,.179199219f,0,1},
-    {.426269531f,.204589844f,.029785156f,1}, {.447753906f,.215820312f,.019042969f,1}
+static const float expected[2][6][4] = {
+    {
+        {.419433594f,.166503906f,0,1}, {.444335938f,.179199219f,0,1},
+        {.429835225f,.161063796f,0,1},
+        {.426269531f,.204589844f,.029785156f,1}, {.447753906f,.215820312f,.019042969f,1},
+        {.436028235f,.199930980f,.014883137f,1}
+    },
+    /* P010 codes Y=256, Cb=384, Cr=640; limited ranges 64..940/64..960,
+     * full range 0..1023 with chroma centered at 512 (ITU-R BT.601/709/2020). */
+    {
+        {.419463796f,.166320939f,0,1}, {.444149511f,.179063796f,0,1},
+        {.429835225f,.161063796f,0,1},
+        {.425665689f,.203949169f,.028527859f,1}, {.447286804f,.215110068f,.018067644f,1},
+        {.434749560f,.199344673f,.014839492f,1}
+    }
 };
 static unsigned compare(const float *p, const float *want) {
     unsigned errors=0;
@@ -31,8 +43,14 @@ static BOOL submit(id<MTLCommandBuffer> command) {
 }
 int main(int argc,char **argv) { @autoreleasepool { @try {
     setbuf(stdout,NULL); signal(SIGALRM,deadline); alarm(30);
-    BOOL native=argc==3 && !strcmp(argv[1],"--native");
-    if(argc!=(native?3:2)) {fprintf(stderr,"usage: video_combined_test [--native] LIBRARY.metallib\n");return 2;}
+    BOOL native=NO,p010=NO;int libraryArg=1;
+    while(libraryArg<argc-1) {
+        if(!strcmp(argv[libraryArg],"--native"))native=YES;
+        else if(!strcmp(argv[libraryArg],"--p010"))p010=YES;
+        else break;
+        libraryArg++;
+    }
+    if(libraryArg!=argc-1 || argv[libraryArg][0]=='-') {fprintf(stderr,"usage: video_combined_test [--native] [--p010] LIBRARY.metallib\n");return 2;}
     id<MTLDevice> device=nil;
     if(native) device=MTLCreateSystemDefaultDevice();
     else {
@@ -53,7 +71,7 @@ int main(int argc,char **argv) { @autoreleasepool { @try {
     }
     id<MTLCommandQueue> queue=[device newCommandQueue]; NSError *error=nil;
     if(!device || !queue)return 2;
-    NSData *data=[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[native?2:1]]];
+    NSData *data=[NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[libraryArg]]];
     if(!data.length)return 3;
     dispatch_data_t wrapped=dispatch_data_create(data.bytes,data.length,NULL,DISPATCH_DATA_DESTRUCTOR_DEFAULT);
     id<MTLLibrary> library=[device newLibraryWithData:wrapped error:&error];
@@ -72,23 +90,31 @@ int main(int argc,char **argv) { @autoreleasepool { @try {
     id<MTLTexture> guard=[device newTextureWithDescriptor:gd];uint8_t value=128;
     [guard replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0 withBytes:&value bytesPerRow:1];
     unsigned total=0;
-    for(unsigned i=0;i<4;i++) {
-        CVPixelBufferRef pixel=NULL;unsigned full=i/2;
-        if(CVPixelBufferCreate(NULL,32,16,full?kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    CFStringRef matrices[]={kCVImageBufferYCbCrMatrix_ITU_R_601_4,kCVImageBufferYCbCrMatrix_ITU_R_709_2,kCVImageBufferYCbCrMatrix_ITU_R_2020};
+    unsigned matrixNames[]={601,709,2020};MTLPixelFormat format=(MTLPixelFormat)(p010?505:500);
+    for(unsigned i=0;i<6;i++) {
+        CVPixelBufferRef pixel=NULL;unsigned full=i/3;
+        OSType pixelFormat=p010?(full?kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+            :(full?kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange);
+        if(CVPixelBufferCreate(NULL,32,16,pixelFormat,
             (CFDictionaryRef)@{(id)kCVPixelBufferIOSurfacePropertiesKey:@{}},&pixel)) return 5;
-        CVBufferSetAttachment(pixel,kCVImageBufferYCbCrMatrixKey,i%2?kCVImageBufferYCbCrMatrix_ITU_R_709_2:kCVImageBufferYCbCrMatrix_ITU_R_601_4,kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pixel,kCVImageBufferYCbCrMatrixKey,matrices[i%3],kCVAttachmentMode_ShouldPropagate);
         CVPixelBufferLockBaseAddress(pixel,0);
         for(unsigned p=0;p<2;p++) {
             uint8_t *base=CVPixelBufferGetBaseAddressOfPlane(pixel,p);
             size_t stride=CVPixelBufferGetBytesPerRowOfPlane(pixel,p),w=CVPixelBufferGetWidthOfPlane(pixel,p),h=CVPixelBufferGetHeightOfPlane(pixel,p);
-            for(size_t y=0;y<h;y++) for(size_t x=0;x<w*(p+1);x++)base[y*stride+x]=p?(x%2?160:96):64;
+            for(size_t y=0;y<h;y++) for(size_t x=0;x<w*(p+1);x++) {
+                uint16_t code=p?(x%2?160:96):64;
+                if(p010)((uint16_t *)(base+y*stride))[x]=code<<8;
+                else base[y*stride+x]=(uint8_t)code;
+            }
         }
         CVPixelBufferUnlockBaseAddress(pixel,0);
-        MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)500 width:32 height:16 mipmapped:NO];
+        MTLTextureDescriptor *d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format width:32 height:16 mipmapped:NO];
         d.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;d.storageMode=MTLStorageModeShared;
         IOSurfaceRef surface=CVPixelBufferGetIOSurface(pixel);
         id<MTLTexture> texture=[device newTextureWithDescriptor:d iosurface:surface plane:0];
-        if(!texture || texture.pixelFormat!=500 || texture.iosurface!=surface || texture.iosurfacePlane!=0) return 6;
+        if(!texture || texture.pixelFormat!=format || texture.iosurface!=surface || texture.iosurfacePlane!=0) return 6;
         id<MTLBuffer> out=[device newBufferWithLength:32 options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb=[queue commandBuffer];id<MTLComputeCommandEncoder> enc=[cb computeCommandEncoder];
         [enc setComputePipelineState:cp];[enc setTexture:texture atIndex:0];[enc setTexture:guard atIndex:1];[enc setBuffer:out offset:0 atIndex:0];
@@ -104,9 +130,9 @@ int main(int argc,char **argv) { @autoreleasepool { @try {
         if(!submit(cb))return 7;
         float *v=out.contents,rgba[4],guardExpected[4]={128.f/255.f,0,0,1};
         [target getBytes:rgba bytesPerRow:16 fromRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0];
-        unsigned errors=compare(v,expected[i])+compare(v+4,guardExpected)+compare(rgba,expected[i]);total+=errors;
-        printf("video_combined: full=%u matrix=%u status=%lu compute=%.9f,%.9f,%.9f,%.9f fragment=%.9f,%.9f,%.9f,%.9f errors=%u\n",
-            full,i%2?709:601,(unsigned long)cb.status,v[0],v[1],v[2],v[3],rgba[0],rgba[1],rgba[2],rgba[3],errors);
+        unsigned errors=compare(v,expected[p010][i])+compare(v+4,guardExpected)+compare(rgba,expected[p010][i]);total+=errors;
+        printf("video_combined: depth=%u full=%u matrix=%u status=%lu compute=%.9f,%.9f,%.9f,%.9f fragment=%.9f,%.9f,%.9f,%.9f errors=%u\n",
+            p010?10:8,full,matrixNames[i%3],(unsigned long)cb.status,v[0],v[1],v[2],v[3],rgba[0],rgba[1],rgba[2],rgba[3],errors);
         [out release];[target release];
     }
     [guard release];[rd.vertexFunction release];[rd.fragmentFunction release];[rd release];[rp release];[cp release];[compute release];[library release];[queue release];[device release];alarm(0);

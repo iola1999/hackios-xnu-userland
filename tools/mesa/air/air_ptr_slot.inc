@@ -44,3 +44,44 @@ stored_pointer(struct air_ctx *c, const struct air_val *at)
    return ptr_slot_place(at) && c->ptr_slots
       ? _mesa_hash_table_u64_search(c->ptr_slots, ptr_slot_key(&at->ptr)) : NULL;
 }
+
+/* Pointer slots retain values across function translation. Constants are
+ * recreated in the current impl; run-time defs must travel through NIR
+ * parameters before another impl can use them.
+ */
+static struct air_val *
+val_in_current_impl(struct air_ctx *c, struct air_val *v)
+{
+   if (!v)
+      return NULL;
+   if (v->kind == AIR_VAL_AGG) {
+      struct air_val *copy = air_val_agg(c, v->num_elems);
+      for (unsigned i = 0; i < v->num_elems; i++) {
+         copy->elems[i] = val_in_current_impl(c, v->elems[i]);
+         if (v->elems[i] && !copy->elems[i])
+            return NULL;
+      }
+      return copy;
+   }
+
+   nir_def *def = v->kind == AIR_VAL_PTR ? v->ptr.offset : v->def;
+   if (!def || nir_cf_node_get_function(&nir_def_block(def)->cf_node) == c->b.impl)
+      return v;
+   if (!nir_src_is_const(nir_src_for_ssa(def))) {
+      air_error(c, "instruction: a %s crossing a function without a parameter",
+                v->kind == AIR_VAL_PTR ? "pointer byte offset" :
+                v->kind == AIR_VAL_PTR_SELECT ? "pointer choice" : "value");
+      return NULL;
+   }
+   if (v->kind == AIR_VAL_PTR) {
+      struct air_ptr ptr = v->ptr;
+      ptr.offset = nir_imm_int(&c->b, nir_src_as_uint(nir_src_for_ssa(def)));
+      return air_val_ptr(c, ptr);
+   }
+   if (v->kind == AIR_VAL_PTR_SELECT) {
+      air_error(c, "instruction: a pointer choice crossing a function without a parameter");
+      return NULL;
+   }
+   return air_val_ssa(c, nir_build_imm(&c->b, def->num_components, def->bit_size,
+                                      nir_src_as_const_value(nir_src_for_ssa(def))));
+}

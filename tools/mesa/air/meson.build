@@ -14,6 +14,9 @@ files_libair = files(
   'air_module.h',
   'air_print.c',
   'air_private.h',
+  'air_reflection.c',
+  'air_reflection.h',
+  'air_metal_reflection.h',
   'air_to_nir.c',
   'air_intrinsics.c',
   'nir_air.h',
@@ -33,6 +36,13 @@ idep_air = declare_dependency(
   dependencies : [idep_nir, idep_mesautil],
   link_with : libair,
   include_directories : include_directories('.'),
+)
+
+air_reflection_test = executable(
+  'air_reflection_test',
+  files('air_reflection_test.c'),
+  dependencies : [idep_air],
+  build_by_default : false,
 )
 
 # air_run (air_run.c) draws with a translated shader and reads the pixels back,

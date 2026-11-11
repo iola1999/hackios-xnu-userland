@@ -2,6 +2,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "air_metal_reflection.h"
+
 static void *compute_state_for(struct rwa_compute *compute, const unsigned block[3],
                                const struct rwa_yuv_key *yuv,
                                char *why, size_t why_size);
@@ -166,6 +168,27 @@ fail:
    ralloc_free(compute->mem_ctx);
    free(compute);
    return NULL;
+}
+
+int
+rwa_compute_get_reflection(struct rwa_compute *compute,
+                           const struct rwa_compute_reflection **out,
+                           char *why, size_t why_size)
+{
+   if (out)
+      *out = NULL;
+   if (!compute || !out) {
+      say(why, why_size, "compute reflection requires a pipeline and an output pointer");
+      return -1;
+   }
+   if (!compute->info.reflection) {
+      say(why, why_size, "%s", compute->info.reflection_error ?
+                              compute->info.reflection_error :
+                              "the pipeline has no compute argument metadata");
+      return -1;
+   }
+   *out = compute->info.reflection;
+   return 0;
 }
 
 /* Unbound before it is deleted, always. A Gallium context keeps a pointer to the state

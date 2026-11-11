@@ -71,8 +71,11 @@ struct iris_decode_frame {
 #include <CoreVideo/CoreVideo.h>
 #include <VideoToolbox/VideoToolbox.h>
 
-typedef CFTypeRef VTDecoderSessionRef;
-typedef CFTypeRef VTDecodeFrameRef;
+/* VT passes a borrowed context handle and a pointer-sized integer frame token.
+ * Neither has a CF object header; return each frame token unchanged to VT.
+ */
+typedef struct OpaqueVTDecoderSession *VTDecoderSessionRef;
+typedef void *VTDecodeFrameRef;
 
 extern const CFStringRef kVTVideoDecoder_IsHardwareAccelerated;
 extern const CFStringRef kVTVideoDecoderInfo_Rating;
@@ -348,7 +351,7 @@ iris_pending_push(struct iris_vt_decoder *dec, uint64_t tag, VTDecodeFrameRef fr
 			dec->pending[i].in_use = true;
 			dec->pending[i].tag = tag;
 			dec->pending[i].seq = dec->next_tag;
-			dec->pending[i].frame_ref = (VTDecodeFrameRef)CFRetain(frame_ref);
+			dec->pending[i].frame_ref = frame_ref;
 			return true;
 		}
 	}
@@ -394,9 +397,6 @@ iris_pending_abort_all(struct iris_vt_decoder *dec, OSStatus err_status)
 				(void)VTDecoderSessionEmitDecodedFrame(dec->session, ref,
 				    err_status, kVTDecodeInfo_FrameDropped, NULL);
 			}
-			if (ref != NULL) {
-				CFRelease(ref);
-			}
 		}
 	}
 }
@@ -414,10 +414,7 @@ iris_close_hw_session(struct iris_vt_decoder *dec)
 		(void)iris_sys_close(dec->fd);
 		dec->fd = -1;
 	}
-	if (dec->session != NULL) {
-		CFRelease(dec->session);
-		dec->session = NULL;
-	}
+	dec->session = NULL;
 	dec->sent_params = false;
 }
 
@@ -595,7 +592,7 @@ iris_configure_session_Locked(struct iris_vt_decoder *dec, VTDecoderSessionRef s
 	dec->width = (uint32_t)dims.width;
 	dec->height = (uint32_t)dims.height;
 	dec->sent_params = false;
-	dec->session = (VTDecoderSessionRef)CFRetain(session);
+	dec->session = session;
 
 	int32_t fmt_val = (int32_t)kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 	int32_t w_val = dims.width;
@@ -626,12 +623,16 @@ iris_configure_session_Locked(struct iris_vt_decoder *dec, VTDecoderSessionRef s
 static OSStatus
 iris_vt_start_session(CFTypeRef decoder, VTDecoderSessionRef session, CMVideoFormatDescriptionRef format_desc)
 {
+	iris_plugin_log("iris_vt[%d]: start decoder=%p session=%p format=%p\n",
+	    getpid(), decoder, (void *)session, format_desc);
 	struct iris_vt_decoder *dec = (struct iris_vt_decoder *)CMBaseObjectGetDerivedStorage(decoder);
 	if (dec == NULL) {
 		return paramErr;
 	}
 	pthread_mutex_lock(&dec->lock);
 	OSStatus status = iris_configure_session_Locked(dec, session, format_desc);
+	iris_plugin_log("iris_vt[%d]: start result=%d session_id=%u\n",
+	    getpid(), (int)status, dec->session_id);
 	pthread_mutex_unlock(&dec->lock);
 	return status;
 }
@@ -693,7 +694,6 @@ iris_run_decode_step_Locked(struct iris_vt_decoder *dec, VTDecodeFrameRef alloc_
 		VTDecodeFrameRef target_ref = iris_pending_pop(dec, req.out_tag);
 		if (target_ref != NULL) {
 			status = VTDecoderSessionEmitDecodedFrame(dec->session, target_ref, noErr, 0, pixbuf);
-			CFRelease(target_ref);
 			*out_emitted = true;
 		}
 	}
@@ -739,6 +739,10 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 	if (dec->fd < 0 || dec->session_id == 0 || dec->session == NULL) {
 		pthread_mutex_unlock(&dec->lock);
 		return kVTVideoDecoderMalfunctionErr;
+	}
+	if (dec->next_tag == 0) {
+		iris_plugin_log("iris_vt[%d]: decode session_id=%u frame_token=%p bytes=%zu\n",
+		    getpid(), dec->session_id, frame_ref, sample_len);
 	}
 
 	size_t needed = sample_len + dec->param_annexb_len + 1024u;
@@ -802,10 +806,7 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 	OSStatus status = iris_run_decode_step_Locked(dec, frame_ref, dec->annexb_buf, (uint32_t)annexb_len,
 	    tag, 0, &emitted);
 	if (status != noErr) {
-		VTDecodeFrameRef orphan = iris_pending_pop(dec, tag);
-		if (orphan != NULL) {
-			CFRelease(orphan);
-		}
+		(void)iris_pending_pop(dec, tag);
 		pthread_mutex_unlock(&dec->lock);
 		return status;
 	}
@@ -898,6 +899,8 @@ static const struct iris_cm_vtable g_iris_vt_vtable = {
 static OSStatus
 iris_decoder_create_instance(CMVideoCodecType codec_type, CFAllocatorRef allocator, CFTypeRef *out_decoder)
 {
+	iris_plugin_log("iris_vt[%d]: create codec=0x%08x allocator=%p out=%p\n",
+	    getpid(), codec_type, allocator, (void *)out_decoder);
 	if (out_decoder == NULL) {
 		return paramErr;
 	}
@@ -911,7 +914,11 @@ iris_decoder_create_instance(CMVideoCodecType codec_type, CFAllocatorRef allocat
 	}
 
 	CFTypeRef obj = NULL;
-	OSStatus status = CMDerivedObjectCreate(allocator, &g_iris_vt_vtable, VTVideoDecoderGetClassID(), &obj);
+	CFTypeID class_id = VTVideoDecoderGetClassID();
+	iris_plugin_log("iris_vt[%d]: create class=%p vtable=%p\n",
+	    getpid(), (void *)(uintptr_t)class_id, (const void *)&g_iris_vt_vtable);
+	OSStatus status = CMDerivedObjectCreate(allocator, &g_iris_vt_vtable, class_id, &obj);
+	iris_plugin_log("iris_vt[%d]: create result=%d object=%p\n", getpid(), (int)status, obj);
 	if (status != noErr || obj == NULL) {
 		return status != noErr ? status : memFullErr;
 	}

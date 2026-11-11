@@ -24,6 +24,7 @@ extern "C" {
 
 typedef struct nir_shader nir_shader;
 typedef struct nir_shader_compiler_options nir_shader_compiler_options;
+struct rwa_compute_reflection;
 
 /* -- the .metallib container ---------------------------------------------- */
 
@@ -340,6 +341,13 @@ struct air_shader_info {
     * divide, which freedreno has no partial threadgroups for.
     */
    bool group_free;
+
+   /* Complete API argument metadata, retained independently of translation's
+    * active resource list. An unsupported declaration records its reason here
+    * so that a pipeline can still be used without requesting reflection.
+    */
+   struct rwa_compute_reflection *reflection;
+   const char *reflection_error;
 };
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call
