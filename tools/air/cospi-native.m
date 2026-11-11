@@ -3,11 +3,23 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <math.h>
+#include <signal.h>
+#include <unistd.h>
+
+static void deadline(int signal_number)
+{
+    (void)signal_number;
+    static const char message[] = "cospi: 30-second deadline exceeded\n";
+    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+    _exit(124);
+}
 
 int main(int argc, char **argv)
 {
     @autoreleasepool {
         if (argc < 2 || argc > 3) return 2;
+        signal(SIGALRM, deadline);
+        alarm(30);
         NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:argv[1]]];
         if (data.length != 81920 * 2 * sizeof(float)) return 2;
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
