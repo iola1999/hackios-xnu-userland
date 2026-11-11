@@ -173,17 +173,20 @@ decode(const struct options *options)
 				failed = true;
 				break;
 			}
+			printf("video_decode_test: stage=input_ready bytes=%lld\n", (long long)st.st_size);
 			NSURL *url = [NSURL fileURLWithPath:@(options->path)];
 			AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
 			dispatch_semaphore_t loaded = dispatch_semaphore_create(0);
 			__block NSArray<AVAssetTrack *> *tracks = nil;
 			__block NSError *load_error = nil;
+			printf("video_decode_test: stage=tracks_begin\n");
 			[asset loadTracksWithMediaType:AVMediaTypeVideo completionHandler:^(NSArray<AVAssetTrack *> *value, NSError *error) {
 				tracks = value;
 				load_error = error;
 				dispatch_semaphore_signal(loaded);
 			}];
 			dispatch_semaphore_wait(loaded, DISPATCH_TIME_FOREVER);
+			printf("video_decode_test: stage=tracks_ready count=%lu\n", (unsigned long)tracks.count);
 			if (load_error != nil || tracks.count == 0) {
 				report_error("tracks", load_error);
 				printf("video_decode_test: stage=tracks count=%lu\n", (unsigned long)tracks.count);
@@ -200,11 +203,13 @@ decode(const struct options *options)
 				break;
 			}
 			[reader addOutput:output];
+			printf("video_decode_test: stage=reader_begin\n");
 			if (![reader startReading]) {
 				report_error("reader_start", reader.error);
 				failed = true;
 				break;
 			}
+			printf("video_decode_test: stage=reader_ready\n");
 			while (submitted < options->frames) {
 				CMSampleBufferRef sample = [output copyNextSampleBuffer];
 				if (sample == NULL) {
@@ -252,6 +257,7 @@ decode(const struct options *options)
 						(__bridge NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
 					};
 					VTDecompressionOutputCallbackRecord callback = { decoded_frame, &state };
+					printf("video_decode_test: stage=create_begin\n");
 					OSStatus status = VTDecompressionSessionCreate(NULL, format, (__bridge CFDictionaryRef)specification,
 					    (__bridge CFDictionaryRef)pixels, &callback, &session);
 					CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(format);

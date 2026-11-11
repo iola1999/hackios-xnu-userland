@@ -369,6 +369,7 @@ iris_pending_pop(struct iris_vt_decoder *dec, uint64_t tag)
 				return ref;
 			}
 		}
+		return NULL;
 	}
 	uint32_t best = IRIS_VT_PENDING_MAX;
 	uint64_t best_seq = UINT64_MAX;
@@ -725,20 +726,25 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 		*info_flags_out = 0;
 	}
 	struct iris_vt_decoder *dec = (struct iris_vt_decoder *)CMBaseObjectGetDerivedStorage(decoder);
-	if (dec == NULL || frame_ref == NULL || sample_buf == NULL) {
+	if (dec == NULL || frame_ref == NULL) {
 		return paramErr;
 	}
 
+	OSStatus status = noErr;
+	pthread_mutex_lock(&dec->lock);
+	if (sample_buf == NULL) {
+		status = paramErr;
+		goto failed;
+	}
 	CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample_buf);
 	size_t sample_len = block != NULL ? CMBlockBufferGetDataLength(block) : 0;
 	if (block == NULL || sample_len == 0 || sample_len > IRIS_VT_BITSTREAM_CAP - IRIS_VT_PARAM_CAP) {
-		return kVTVideoDecoderBadDataErr;
+		status = kVTVideoDecoderBadDataErr;
+		goto failed;
 	}
-
-	pthread_mutex_lock(&dec->lock);
 	if (dec->fd < 0 || dec->session_id == 0 || dec->session == NULL) {
-		pthread_mutex_unlock(&dec->lock);
-		return kVTVideoDecoderMalfunctionErr;
+		status = kVTVideoDecoderMalfunctionErr;
+		goto failed;
 	}
 	if (dec->next_tag == 0) {
 		iris_plugin_log("iris_vt[%d]: decode session_id=%u frame_token=%p bytes=%zu\n",
@@ -748,13 +754,13 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 	size_t needed = sample_len + dec->param_annexb_len + 1024u;
 	if (needed > dec->annexb_cap) {
 		if (needed > IRIS_VT_BITSTREAM_CAP) {
-			pthread_mutex_unlock(&dec->lock);
-			return kVTVideoDecoderBadDataErr;
+			status = kVTVideoDecoderBadDataErr;
+			goto failed;
 		}
 		uint8_t *grown = (uint8_t *)realloc(dec->annexb_buf, needed);
 		if (grown == NULL) {
-			pthread_mutex_unlock(&dec->lock);
-			return memFullErr;
+			status = memFullErr;
+			goto failed;
 		}
 		dec->annexb_buf = grown;
 		dec->annexb_cap = needed;
@@ -770,13 +776,13 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 	} else {
 		heap_copy = (uint8_t *)malloc(sample_len);
 		if (heap_copy == NULL) {
-			pthread_mutex_unlock(&dec->lock);
-			return memFullErr;
+			status = memFullErr;
+			goto failed;
 		}
 		if (CMBlockBufferCopyDataBytes(block, 0, sample_len, heap_copy) != kCMBlockBufferNoErr) {
 			free(heap_copy);
-			pthread_mutex_unlock(&dec->lock);
-			return kVTVideoDecoderBadDataErr;
+			status = kVTVideoDecoderBadDataErr;
+			goto failed;
 		}
 		raw_src = heap_copy;
 	}
@@ -788,8 +794,8 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 	    dec->annexb_buf, dec->annexb_cap, &annexb_len);
 	free(heap_copy);
 	if (!conv_ok) {
-		pthread_mutex_unlock(&dec->lock);
-		return kVTVideoDecoderBadDataErr;
+		status = kVTVideoDecoderBadDataErr;
+		goto failed;
 	}
 	dec->sent_params = true;
 
@@ -798,15 +804,17 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 		tag = ++dec->next_tag;
 	}
 	if (!iris_pending_push(dec, tag, frame_ref)) {
-		pthread_mutex_unlock(&dec->lock);
-		return kVTVideoDecoderMalfunctionErr;
+		status = kVTVideoDecoderMalfunctionErr;
+		goto failed;
 	}
 
 	bool emitted = false;
-	OSStatus status = iris_run_decode_step_Locked(dec, frame_ref, dec->annexb_buf, (uint32_t)annexb_len,
+	status = iris_run_decode_step_Locked(dec, frame_ref, dec->annexb_buf, (uint32_t)annexb_len,
 	    tag, 0, &emitted);
 	if (status != noErr) {
-		(void)iris_pending_pop(dec, tag);
+		if (iris_pending_pop(dec, tag) != NULL) {
+			goto failed;
+		}
 		pthread_mutex_unlock(&dec->lock);
 		return status;
 	}
@@ -823,11 +831,27 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 		if (!any_pending) {
 			break;
 		}
-		(void)iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_POLL, &emitted);
+		status = iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_POLL, &emitted);
+		if (status != noErr) {
+			iris_pending_abort_all(dec, status);
+			break;
+		}
 	}
 
 	pthread_mutex_unlock(&dec->lock);
-	return noErr;
+	return status;
+
+failed:
+	/* iOS 26 waits for EmitDecodedFrame even after decode_frame returns an error. */
+	if (dec->session != NULL) {
+		(void)VTDecoderSessionEmitDecodedFrame(dec->session, frame_ref, status,
+		    kVTDecodeInfo_FrameDropped, NULL);
+	}
+	if (info_flags_out != NULL) {
+		*info_flags_out |= kVTDecodeInfo_FrameDropped;
+	}
+	pthread_mutex_unlock(&dec->lock);
+	return status;
 }
 
 static OSStatus
