@@ -96,6 +96,7 @@ int main(void) {
 
     CFDictionaryRef mod_back = NULL, mod_front = NULL;
     assert(stream_copy_property(back, CFSTR("ModuleInfo"), kCFAllocatorDefault, &mod_back) == 0);
+    assert(get_int(mod_back, CFSTR("sensorID")) == 0x0904);
     assert(get_int(mod_back, CFSTR("SensorID")) == 0x0904);
     assert(get_int(mod_back, CFSTR("ModuleFocusID")) == 1);
     assert(get_int(mod_back, CFSTR("ModuleActuatorID")) == 1);
@@ -104,6 +105,7 @@ int main(void) {
     CFRelease(mod_back);
 
     assert(stream_copy_property(front_sw, CFSTR("ModuleInfo"), kCFAllocatorDefault, &mod_front) == 0);
+    assert(get_int(mod_front, CFSTR("sensorID")) == 0x0914);
     assert(get_int(mod_front, CFSTR("SensorID")) == 0x0914);
     CFRelease(mod_front);
 

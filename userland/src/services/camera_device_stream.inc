@@ -13,6 +13,7 @@ stream_module_info(const struct stream *s)
 	CFMutableDictionaryRef m = (CFMutableDictionaryRef)new_dict();
 	int32_t sensor_id = s->camera->sensor == 1 ? 0x0904 : 0x0914;
 
+	put(m, "sensorID", number_i32(sensor_id));
 	put(m, "SensorID", number_i32(sensor_id));
 	put(m, "ModuleFocusID", number_i32(1));
 	put(m, "ModuleActuatorID", number_i32(1));
