@@ -3,6 +3,7 @@
  * integers/half-integers and deterministic raw bit patterns. */
 #include "nir.h"
 #include "nir_builder.h"
+#include "ir3_nir.h"
 #include "util/u_math.h"
 #include "util/half_float.h"
 #include "air_math_private.h"
@@ -46,6 +47,9 @@ int main(int argc, char **argv)
                                     .write_mask = 1, .align_mul = 4);
       }
       nir_validate_shader(b.shader, "cospi test");
+      /* Apply the target's range reduction before folding. Its non-fused
+       * arithmetic can lose precision even when the input was already reduced. */
+      ir3_nir_apply_trig_workarounds(b.shader);
       nir_opt_constant_folding(b.shader);
       for (unsigned i = 0; i < BATCH; i++) {
          if (!nir_src_is_const(stores[i]->src[0])) return 3;

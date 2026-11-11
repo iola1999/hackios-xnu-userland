@@ -121,6 +121,8 @@ int main(int argc, char **argv)
         }
         const float *pairs = input.contents, *native = output.contents;
         double maximum[2] = {0};
+        double reference_error[2] = {0};
+        unsigned failures[2] = {0};
         for (unsigned i = 0; i < 81920; i++) {
             float x = pairs[i * 2], nir = pairs[i * 2 + 1], got = native[i];
             double reference = __cospi((double)x);
@@ -135,12 +137,19 @@ int main(int argc, char **argv)
              * and float cospi can return different zero signs at the same x. */
             if (reference == 0) ok = got == 0;
             if (!ok) {
-                fprintf(stderr, "native cospi input=%a NIR=%a native=%a\n", x, nir, got);
-                return 1;
+                if (failures[0] + failures[1] < 8)
+                    fprintf(stderr, "native cospi index=%u input=%a NIR=%a native=%a\n", i, x, nir, got);
+                failures[half ? 0 : 1]++;
             }
+            double error = isfinite(reference) ? fabs(got - reference) / ulp : 0;
+            if (isfinite(reference) && !isfinite(got)) error = INFINITY;
+            reference_error[half ? 0 : 1] = MAX(reference_error[half ? 0 : 1], error);
             if (isfinite(difference)) maximum[half ? 0 : 1] = MAX(maximum[half ? 0 : 1], difference);
         }
-        printf("PASS 81920 native Metal comparisons; maximum difference half=%g ULP float=%g ULP\n", maximum[0], maximum[1]);
+        printf("cospi: failures half=%u/65536 float=%u/16384; maximum reference error half=%g ULP float=%g ULP\n",
+               failures[0], failures[1], reference_error[0], reference_error[1]);
+        if (!failures[0] && !failures[1])
+            printf("PASS 81920 native Metal comparisons; maximum difference half=%g ULP float=%g ULP\n", maximum[0], maximum[1]);
 #if TARGET_OS_IPHONE
         NSData *portrait = [NSData dataWithContentsOfFile:
             @"/System/Library/VideoProcessors/CCPortrait.bundle/default.metallib"];
@@ -162,6 +171,7 @@ int main(int argc, char **argv)
         }
         puts("cospi: PASS 3 original CCPortrait pipelines; resources were not dispatched");
 #endif
+        if (failures[0] || failures[1]) return 1;
     } @catch (NSException *error) {
         fprintf(stderr, "cospi: exception=%s reason=%s\n", error.name.UTF8String, error.reason.UTF8String);
         return 2;
