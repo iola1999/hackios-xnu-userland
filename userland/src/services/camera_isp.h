@@ -75,7 +75,7 @@ struct isp {
 	bool            turned;         /* the picture turned half round (a sensor mounted the other way up) */
 	float           ccm[3][3];      /* the colour matrix, camera RGB (white balanced) to linear sRGB; rows sum to 1 */
 	struct isp_lsc  lsc;
-	uint8_t         gamma[4096];    /* linear (959 above black is 3836) to 8 bits, sRGB's curve */
+	uint8_t         gamma[4096];    /* linear 0..4092 to 8 bits, sRGB's curve */
 	uint32_t        asked_lines, asked_gain, asked_frame_lines;     /* what AE asked for last */
 	uint32_t        ae_wait;        /* frames left to wait for the sensor to apply asked_lines/asked_gain */
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
@@ -83,6 +83,8 @@ struct isp {
 };
 
 void isp_init(struct isp *isp);
+/* Releases the processor's tuning allocation. */
+void isp_destroy(struct isp *isp);
 /*
  * How sharp the picture is in a part of the frame (fractions of it, x0 < x1, y0 < y1): the squares of
  * green's steps between neighbouring blocks of 4x4 cells, over green's level squared -- higher is sharper,
@@ -91,7 +93,7 @@ void isp_init(struct isp *isp);
 float isp_sharpness(const struct annibale_camera_frame *f, const uint8_t *raw, float x0, float y0, float x1, float y1, float *level);
 /* the levels, from every 4th cell of every 4th pair of lines (with the processor's lens shading and white balance, if isp) */
 void isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, struct isp_stats *s);
-/* the exposure for the frames to come: true, and the command filled in, when it should change */
+/* Exposure adjustment requires known timing/gain and valid frame limits; true fills the next command. */
 bool isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_stats *s, struct annibale_camera_command *c);
 /*
  * The white balance: grey world -- of the nearly grey, when enough is -- kept to the line of the

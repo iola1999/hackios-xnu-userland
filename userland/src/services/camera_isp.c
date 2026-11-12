@@ -14,8 +14,8 @@
 #include <sys/stat.h>
 #include "camera_isp.h"
 
-#define WHITE           959             /* 1023 less the black level of 64 */
-#define LUT_WHITE       3836            /* WHITE in the gamma table's steps */
+#define WHITE           1023
+#define LUT_WHITE       (WHITE * 4)
 
 void
 isp_init(struct isp *isp)
@@ -47,15 +47,15 @@ cell_places(uint32_t bayer, int *r, int *b)
 
 /* the four values of the cell at cx of the pair of lines from `top' (above black, 0 and up) */
 static inline void
-cell(const uint8_t *top, size_t stride, uint32_t cx, int v[4])
+cell(const uint8_t *top, size_t stride, uint32_t cx, uint32_t black, int v[4])
 {
 	const uint8_t *g0 = top + (size_t)(cx >> 1) * 5, *g1 = g0 + stride;
 	unsigned o = (cx & 1) * 2;
 
-	v[0] = (g0[o] << 2 | (g0[4] >> (o * 2) & 3)) - 64;
-	v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - 64;
-	v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - 64;
-	v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - 64;
+	v[0] = (g0[o] << 2 | (g0[4] >> (o * 2) & 3)) - (int)black;
+	v[1] = (g0[o + 1] << 2 | (g0[4] >> (o * 2 + 2) & 3)) - (int)black;
+	v[2] = (g1[o] << 2 | (g1[4] >> (o * 2) & 3)) - (int)black;
+	v[3] = (g1[o + 1] << 2 | (g1[4] >> (o * 2 + 2) & 3)) - (int)black;
 	for (int i = 0; i < 4; i++) {
 		v[i] = v[i] < 0 ? 0 : v[i];
 	}
@@ -94,7 +94,7 @@ isp_sharpness(const struct annibale_camera_frame *f, const uint8_t *raw, float x
 				for (uint32_t cx = cx0 + bx * BLOCK; cx < cx0 + bx * BLOCK + BLOCK; cx++) {
 					int v[4];
 
-					cell(top, f->stride, cx, v);
+					cell(top, f->stride, cx, f->black, v);
 					for (int i = 0; i < 4; i++) {
 						g += i != r && i != b ? (uint32_t)v[i] : 0;
 					}
@@ -139,7 +139,7 @@ isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const 
 		for (uint32_t cx = 0; cx < cells_w; cx += 4) {
 			int v[4], g = 0, top_v = 0;
 
-			cell(top, f->stride, cx, v);
+			cell(top, f->stride, cx, f->black, v);
 			for (int i = 0; i < 4; i++) {
 				g += i != r && i != b ? v[i] : 0;
 				top_v = v[i] > top_v ? v[i] : top_v;
@@ -153,7 +153,7 @@ isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const 
 			 * green, the most sensitive, stops there first and the cell would count as magenta --
 			 * and one near black, where noise cut off at the black level is all there is.
 			 */
-			if (top_v < WHITE * 9 / 10 && g >= 24) {
+			if (top_v < (int)(WHITE - f->black) * 9 / 10 && g >= 24) {
 				float cr = (float)v[r], cg = (float)g, cb = (float)v[b];
 
 				/*
@@ -217,8 +217,12 @@ isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const 
 bool
 isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_stats *s, struct annibale_camera_command *c)
 {
+	if (f->exposure_lines == 0 || f->line_ns == 0 || f->gain == 0 || f->gain_unity == 0 ||
+	    f->gain_max < f->gain_unity || f->frame_lines_min <= f->margin || f->frame_lines_max < f->frame_lines_min) {
+		return false;
+	}
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double target = 0.15 * WHITE, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+	double white = WHITE - f->black, target = 0.15 * white, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;
@@ -231,8 +235,8 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 	isp->ae_wait = 0;
 	/* (the measured levels are the sensor's: digital gain is applied to the picture only) */
 	ratio = target / mean;
-	if (bright * ratio > 0.9 * WHITE && bright > 0) {
-		ratio = 0.9 * WHITE / bright > target / mean * 0.5 ? 0.9 * WHITE / bright : target / mean * 0.5;
+	if (bright * ratio > 0.9 * white && bright > 0) {
+		ratio = 0.9 * white / bright > target / mean * 0.5 ? 0.9 * white / bright : target / mean * 0.5;
 	}
 	ratio = ratio < 0.25 ? 0.25 : ratio > 4 ? 4 : ratio;
 	if (ratio > 0.94 && ratio < 1.06) {
@@ -394,12 +398,12 @@ struct pipe {
 };
 
 static void
-pipe_init(const struct isp *isp, struct pipe *p)
+pipe_init(const struct isp *isp, struct pipe *p, uint32_t black)
 {
 	p->identity = true;
 	for (int c = 0; c < 3; c++) {
 		for (int j = 0; j < 3; j++) {
-			p->m[c][j] = isp->ccm[c][j] * isp->wb[j] * isp->digital * (LUT_WHITE / (float)WHITE);
+			p->m[c][j] = isp->ccm[c][j] * isp->wb[j] * isp->digital * (LUT_WHITE / (float)(black < WHITE ? WHITE - black : 1));
 			p->identity = p->identity && (c == j ? isp->ccm[c][j] == 1 : isp->ccm[c][j] == 0);
 		}
 	}
@@ -456,7 +460,7 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 
 	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
 	cell_places(f->bayer, &r, &b);
-	pipe_init(isp, &p);
+	pipe_init(isp, &p, f->black);
 	if (isp->turned) {
 		row = height - 1 - row;         /* (and each line from its end, below) */
 	}
@@ -487,7 +491,7 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 				int v[4];
 				float w = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
 
-				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, v);
+				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, f->black, v);
 				c[0] += w * v[r];
 				c[2] += w * v[b];
 				for (int j = 0; j < 4; j++) {
@@ -510,7 +514,7 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 		uint32_t cx = (uint32_t)(at >> 16);
 		int v[4], g = 0;
 
-		cell(top, f->stride, cx, v);
+		cell(top, f->stride, cx, f->black, v);
 		for (int j = 0; j < 4; j++) {
 			g += j != r && j != b ? v[j] : 0;
 		}
@@ -697,7 +701,7 @@ isp_render_full_nv12(const struct isp *isp, const struct annibale_camera_frame *
 		have = width;
 	}
 	cfa(f->bayer, colour);
-	pipe_init(isp, &p);
+	pipe_init(isp, &p, f->black);
 	for (uint32_t row = first_row & ~1u; row < end_row && row < f->height; row += 2) {
 		for (int i = 0; i < 4; i++) {
 			unpack_line(f, raw, (int)row - 1 + i, lines[i]);
@@ -759,7 +763,7 @@ isp_render_still_nv12(const struct isp *isp, const struct annibale_camera_frame 
 	}
 	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
 	cfa(f->bayer, colour);
-	pipe_init(isp, &p);
+	pipe_init(isp, &p, f->black);
 	float sx_step = 2.0f * cw / width, sy_step = 2.0f * ch / height;
 
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
@@ -836,12 +840,12 @@ isp_lsc_from_flat(struct isp *isp, const struct annibale_camera_frame *f, const 
 					if (cx < 0 || cy < 0 || cx >= (int)cells_w || cy >= (int)cells_h) {
 						continue;
 					}
-					cell(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, v);
+					cell(raw + (size_t)cy * 2 * f->stride, f->stride, (uint32_t)cx, f->black, v);
 					sum[0] += v[r];
 					sum[2] += v[b];
 					for (int j = 0; j < 4; j++) {
 						sum[1] += j != r && j != b ? v[j] / 2.0 : 0;
-						clipped += v[j] > WHITE - 30;
+						clipped += v[j] > (int)(WHITE - f->black) - 30;
 					}
 					seen += 4;
 					n++;
@@ -917,6 +921,16 @@ tune_set(const uint8_t **p, const uint8_t *end, struct isp_tune_set *set, size_t
 	return true;
 }
 
+void
+isp_destroy(struct isp *isp)
+{
+	if (isp->tuning != NULL) {
+		free(isp->tuning->file);
+		free(isp->tuning);
+		isp->tuning = NULL;
+	}
+}
+
 bool
 isp_load_tuning(struct isp *isp, const char *path)
 {
@@ -926,11 +940,7 @@ isp_load_tuning(struct isp *isp, const char *path)
 	const uint8_t *p, *end;
 	bool good = false;
 
-	if (isp->tuning != NULL) {
-		free(isp->tuning->file);
-		free(isp->tuning);
-		isp->tuning = NULL;
-	}
+	isp_destroy(isp);
 	if (t != NULL && fd >= 0 && fstat(fd, &st) == 0 && st.st_size > 8 && st.st_size < (16 << 20) &&
 	    (t->file = malloc((size_t)st.st_size)) != NULL && read(fd, t->file, (size_t)st.st_size) == st.st_size) {
 		p = t->file;

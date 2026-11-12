@@ -1,7 +1,5 @@
 /*
- * The phone's cameras as iOS's capture stack wants them: a FigCaptureDevice with FigCaptureStreams
- * for the wide camera as the back camera and the front one as the front camera (both FrontFacingCamera
- * and FrontFacingSuperWideCamera for iPhone18,3 V57), made for mediaserverd / cameracaptured's
+ * FigCaptureDevice and FigCaptureStream objects for mediaserverd / cameracaptured's
  * BWFigCaptureDeviceVendor in place of the device Apple's H10ISP/H16ISP.mediacapture makes of the
  * iPhone's ISP (part of libannibale-media.dylib; inject_media.c gives the vendor our device's create
  * function when the kernel has a camera: /dev/annibale-camera).
@@ -14,16 +12,12 @@
  * A stream's frames go to the capture graph through the blocks it is given in its property
  * "VideoOutputHandlers" ({ output: { PixelBufferHandler: ^(CVPixelBufferRef, CMTime) } }), for the
  * outputs "VideoOutputConfigurations" describes (the graph's own buffer pools) and "VideoOutputsEnabled"
- * switches on. A frame: read from the kernel's /dev/annibale-camera (RAW10), made into a picture by
+ * switches on. Native frames require a checked RWCTAB03 profile and CAMIOC_CAPTURE completion before
+ * read() copies RAW10 from /dev/annibale-camera. Frames are converted by
  * camera_isp.c (exposure, white balance kept to the sensor's reference lights, the colour matrix and
  * lens shading of the camera's own tuning, gamma, zoom), one pixel buffer for each output, with the
- * metadata the graph keeps its frame statistics and its zoom by. The kernel gives one sensor's frames
- * at a time: a stream that starts stops the other's frames and has the kernel change sensors.
- *
- * The formats the streams offer match both D22/AVCaptureSession.plist (iOS 16.5) and
- * V57/AVCaptureSession.plist (iOS 26 iPhone18,3) by sensor sizes, crop dimensions, and frame rates,
- * so that their AVCaptureDevice formats and session presets resolve: the pictures are scaled from
- * the sensor's frames to whatever size is asked for.
+ * metadata from known frame fields and processing values. The native sensor mode supplies the
+ * format's geometry and nominal sensor frame rate; the ISP also provides 1920x1080 and 1280x720 scaled outputs.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreMedia/CoreMedia.h>
@@ -50,6 +44,7 @@
 #define CM_PTRAUTH_FUNC(disc)
 #endif
 #include "camera_isp.h"
+#include "camera_device_native.inc"
 
 void annibale_camera_say(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
@@ -123,7 +118,6 @@ static CMBaseClassID (*device_class_id)(void);
 static CMBaseClassID (*stream_class_id)(void);
 static CFStringRef port_back;           /* kFigCapturePortType_BackFacingCamera */
 static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera */
-static CFStringRef port_front_sw;       /* kFigCapturePortType_FrontFacingSuperWideCamera */
 
 /*
  * The frames' metadata: what H10ISP/H16ISP's stream attaches to every frame (a dictionary under
@@ -131,18 +125,11 @@ static CFStringRef port_front_sw;       /* kFigCapturePortType_FrontFacingSuperW
  * AddAttachmentsToSampleBuffer when the graph defers it), and what the capture device keeps its frame
  * statistics of.
  */
-enum {
-	MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_SENSOR_DGAIN, MD_ISO_BASE, MD_FRAME_RATE, MD_LUX, MD_SNR,
-	MD_AF_STATUS, MD_FOCUSING, MD_AE_STABLE, MD_AE_LOCKED, MD_AWB_STABLE, MD_AWB_LOCKED, MD_AF_LOCKED, MD_ZOOM, MD_KEYS
-};
+enum { MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_FRAME_RATE, MD_ZOOM, MD_KEYS };
 static const char *const md_names[MD_KEYS] = {
 	"kFigCaptureStreamMetadata_PortType", "kFigCaptureSampleBufferAttachmentKey_OriginalPresentationTimeStamp",
 	"kFigCaptureStreamMetadata_ExposureTime", "kFigCaptureStreamMetadata_AGC", "kFigCaptureStreamMetadata_ispDGain",
-	"kFigCaptureStreamMetadata_sensorDGain", "kFigCaptureStreamMetadata_ISOBase", "kFigCaptureStreamMetadata_CurrentFrameRate",
-	"kFigCaptureStreamMetadata_LuxLevel", "kFigCaptureStreamMetadata_NormalizedSNR", "kFigCaptureStreamMetadata_AFStatus",
-	"kFigCaptureStreamMetadata_FocusingMethod", "kFigCaptureStreamMetadata_AEStable", "kFigCaptureStreamMetadata_AELocked",
-	"kFigCaptureStreamMetadata_AWBStable", "kFigCaptureStreamMetadata_AWBLocked", "kFigCaptureStreamMetadata_AFLocked",
-	"kFigCaptureStreamMetadata_ZoomFactor",
+	"kFigCaptureStreamMetadata_CurrentFrameRate", "kFigCaptureStreamMetadata_ZoomFactor",
 };
 static CFStringRef md_key[MD_KEYS];
 static CFStringRef md_attachment;       /* kFigCaptureSampleBufferAttachmentKey_MetadataDictionary */
@@ -165,8 +152,6 @@ find_functions(void)
 	port_back = port != NULL ? *port : NULL;
 	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingCamera");
 	port_front = port != NULL ? *port : NULL;
-	port = dlsym(RTLD_DEFAULT, "kFigCapturePortType_FrontFacingSuperWideCamera");
-	port_front_sw = port != NULL ? *port : NULL;
 	port = dlsym(RTLD_DEFAULT, "kFigCaptureSampleBufferAttachmentKey_MetadataDictionary");
 	md_attachment = port != NULL ? *port : NULL;
 	for (int i = 0; i < MD_KEYS; i++) {
@@ -289,15 +274,14 @@ struct prop {
 static const struct prop stream_props[] = {
 	{ "PortType", "String", "ReadOnly" }, { "UniqueID", "String", "ReadOnly" }, { "NonLocalizedName", "String", "ReadOnly" },
 	{ "ModuleInfo", "Collection", "ReadOnly" }, { "SensorRawOutputBufferPoolRequirements", "Collection", "ReadOnly" },
-	{ "SupportedFormatsArray", "Collection", "ReadOnly" }, { "FocalLength", "Number", "ReadOnly" },
-	{ "LensFNumber", "Number", "ReadOnly" }, { "PixelSize", "Number", "ReadOnly" },
+	{ "SupportedFormatsArray", "Collection", "ReadOnly" },
 	{ "MaxZoomFactor", "Number", "ReadOnly" }, { "SupportedColorSpaces", "Collection", "ReadOnly" },
 	{ "HasAutoFocusPositionSensor", "Boolean", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" },
 	{ "FormatIndex", "Number", "ReadWrite" }, { "MinimumFrameRate", "Number", "ReadWrite" }, { "MaximumFrameRate", "Number", "ReadWrite" },
 	{ "MaximumAllowedFrameRate", "Number", "ReadWrite" }, { "VideoOutputConfigurations", "Collection", "ReadWrite" },
 	{ "VideoOutputsEnabled", "Collection", "ReadWrite" }, { "VideoOutputHandlers", "Collection", "WriteOnly" },
-	{ "DeferAdditionOfAttachments", "Boolean", "ReadWrite" }, { "TorchLevel", "Number", "ReadWrite" },
-	{ "HighCurrentTorchEnabled", "Boolean", "ReadWrite" }, { "ColorSpace", "Number", "ReadWrite" }, { "ZoomFactor", "Number", "ReadWrite" },
+	{ "DeferAdditionOfAttachments", "Boolean", "ReadWrite" },
+	{ "ColorSpace", "Number", "ReadWrite" }, { "ZoomFactor", "Number", "ReadWrite" },
 	{ "ExposureBias", "Number", "ReadWrite" }, { "DeviceOrientation", "Number", "ReadWrite" }, { "FlashMode", "Number", "ReadWrite" },
 	{ "StillImageCaptureNow", "Collection", "WriteOnly" }, { "LockAENow", "Boolean", "WriteOnly" }, { "UnlockAENow", "Boolean", "WriteOnly" },
 	{ "LockAWBNow", "Boolean", "WriteOnly" }, { "UnlockAWBNow", "Boolean", "WriteOnly" }, { "MaxIntegrationTime", "Number", "ReadWrite" },
@@ -317,6 +301,10 @@ static const struct prop stream_props[] = {
 }, device_props[] = {
 	{ "StreamArray", "Collection", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" }, { "ClientIsActive", "Boolean", "ReadWrite" },
 	{ "SupportedSynchronizedStreamsGroups", "Collection", "ReadOnly" }, { "MemoryPoolID", "Number", "ReadWrite" },
+}, torch_props[] = {
+	{ "PortType", "String", "ReadOnly" }, { "UniqueID", "String", "ReadOnly" }, { "NonLocalizedName", "String", "ReadOnly" },
+	{ "ModuleInfo", "Collection", "ReadOnly" }, { "SupportedFormatsArray", "Collection", "ReadOnly" },
+	{ "Clock", "Clock", "ReadOnly" }, { "TorchLevel", "Number", "ReadWrite" },
 };
 
 static CFDictionaryRef
@@ -340,27 +328,21 @@ supported(const struct prop *p, size_t n)
 #define PF_420V         0x34323076      /* '420v' */
 #define PF_X420         0x78343230      /* 'x420' */
 #define PF_XF20         0x78663230      /* 'xf20' */
-#define PF_P422         0x70343232      /* 'p422' */
-#define PF_PF22         0x70663232      /* 'pf22' */
-#define PF_X422         0x78343232      /* 'x422' */
-#define PF_XF22         0x78663232      /* 'xf22' */
 #define PF_BGRA         0x42475241      /* 'BGRA' */
 #define PF_L008         0x4c303038      /* 'L008' */
 
 static CFDictionaryRef
-output_info(int width, int height, int max_fps)
+output_info(int width, int height, double max_fps)
 {
 	CFMutableDictionaryRef o = (CFMutableDictionaryRef)new_dict();
-	CFNumberRef pf[9] = {
+	CFNumberRef pf[5] = {
 		number_i(PF_420F), number_i(PF_420V),
 		number_i(PF_X420), number_i(PF_XF20),
-		number_i(PF_P422), number_i(PF_PF22),
-		number_i(PF_X422), number_i(PF_XF22),
 		number_i(PF_BGRA)
 	};
-	CFArrayRef pfs = CFArrayCreate(NULL, (const void **)pf, 9, &kCFTypeArrayCallBacks);
+	CFArrayRef pfs = CFArrayCreate(NULL, (const void **)pf, 5, &kCFTypeArrayCallBacks);
 
-	for (int i = 0; i < 9; i++) {
+	for (int i = 0; i < 5; i++) {
 		CFRelease(pf[i]);
 	}
 	put(o, "SupportedPixelFormats", pfs);
@@ -380,61 +362,42 @@ output_info(int width, int height, int max_fps)
 }
 
 static CFDictionaryRef
-format_crop(int sensor_width, int sensor_height, int crop_width, int crop_height, int max_fps, int fes_width, int fes_height, int sifr_binning, bool binned, double fov)
+native_format(const struct annibale_camera_profile *profile, uint32_t width, uint32_t height)
 {
 	CFMutableDictionaryRef f = (CFMutableDictionaryRef)new_dict(), outputs = (CFMutableDictionaryRef)new_dict();
 	CMVideoFormatDescriptionRef fd = NULL;
-	int cw = crop_width > 0 ? crop_width : sensor_width;
-	int ch = crop_height > 0 ? crop_height : sensor_height;
+	double fps = profile->fps_milli / 1000.0;
 
-	CMVideoFormatDescriptionCreate(NULL, PF_420F, cw, ch, NULL, &fd);
+	CMVideoFormatDescriptionCreate(NULL, PF_420F, (int32_t)width, (int32_t)height, NULL, &fd);
 	if (fd != NULL) {
 		put(f, "FormatDescription", fd);
 	}
-	put(f, "VideoMinFrameRate", number_f(2));
-	put(f, "VideoMaxFrameRate", number_f(max_fps));
-	put(f, "VideoIsBinned", CFRetain(binned ? kCFBooleanTrue : kCFBooleanFalse));
-	put(f, "VideoBinningFactorHorizontal", number_i(binned ? 2 : 1));
-	put(f, "VideoBinningFactorVertical", number_i(binned ? 2 : 1));
-	put(f, "VideoFieldOfView", number_f(fov));
-	put(f, "VideoMinIntegrationTime", number_i(100));
-	put(f, "VideoMaxIntegrationTime", number_i(1000000 / 15));
+	put(f, "VideoMinFrameRate", number_f(fps));
+	put(f, "VideoMaxFrameRate", number_f(fps));
 	put(f, "VideoRawBitDepth", number_i(10));
-	put(f, "VideoMaxWidth", number_i(cw));
-	put(f, "VideoMaxHeight", number_i(ch));
+	put(f, "VideoMaxWidth", number_i(width));
+	put(f, "VideoMaxHeight", number_i(height));
 	put(f, "Experimental", CFRetain(kCFBooleanFalse));
-	put(f, "SensorWidth", number_i(sensor_width));
-	put(f, "SensorHeight", number_i(sensor_height));
-	put(f, "ISOBase", number_f(32));
-	put(f, "DefaultAEMaxGain", number_f(64));
+	put(f, "SensorWidth", number_i(profile->width));
+	put(f, "SensorHeight", number_i(profile->height));
 	put(f, "SashimiRawPixelFormat", number_i(PF_BGRA));
 	put(f, "SushiRawPixelFormat", number_i(PF_BGRA));
-	put(f, "QuadraBinningFactor", number_i(sifr_binning > 0 ? sifr_binning : 1));
 	put(f, "FocusPixelDataSupported", CFRetain(kCFBooleanFalse));
-	put(f, "SensorCenterOffsetSupported", CFRetain(kCFBooleanFalse));
-	if (fes_width > 0 && fes_height > 0) {
-		put(f, "FrontEndScalerOutputWidth", number_i(fes_width));
-		put(f, "FrontEndScalerOutputHeight", number_i(fes_height));
-	}
-	if (sifr_binning > 0) {
-		put(f, "SIFREnabled", CFRetain(kCFBooleanTrue));
-		put(f, "SIFRBinningFactor", number_i(sifr_binning));
-	}
+	put(f, "SensorCropWidth", number_i(profile->width));
+	put(f, "SensorCropHeight", number_i(profile->height));
+	put(f, "PreGDCSensorCropWidth", number_i(profile->width));
+	put(f, "PreGDCSensorCropHeight", number_i(profile->height));
+	put(f, "PostGDCCropWidth", number_i(width));
+	put(f, "PostGDCCropHeight", number_i(height));
+	put(f, "GeometricDistortionCorrectedNativeWidth", number_i(width));
+	put(f, "GeometricDistortionCorrectedNativeHeight", number_i(height));
+	put(f, "FrontEndScalerOutputWidth", number_i(width));
+	put(f, "FrontEndScalerOutputHeight", number_i(height));
 
-	put(f, "SensorCropWidth", number_i(cw));
-	put(f, "SensorCropHeight", number_i(ch));
-	put(f, "PreGDCSensorCropWidth", number_i(cw));
-	put(f, "PreGDCSensorCropHeight", number_i(ch));
-	put(f, "PostGDCCropWidth", number_i(cw));
-	put(f, "PostGDCCropHeight", number_i(ch));
-	put(f, "GeometricDistortionCorrectedNativeWidth", number_i(cw));
-	put(f, "GeometricDistortionCorrectedNativeHeight", number_i(ch));
-
-	put(outputs, "PrimaryScaler", output_info(cw, ch, max_fps));
-	put(outputs, "SecondaryScaler", output_info(cw, ch, max_fps));
-	put(outputs, "StillImage", output_info(cw, ch, max_fps));
-	put(outputs, "StillImageQuadra", output_info(cw, ch, max_fps));
-	put(outputs, "StillImageRaw", output_info(cw, ch, max_fps));
+	put(outputs, "PrimaryScaler", output_info((int)width, (int)height, fps));
+	put(outputs, "SecondaryScaler", output_info((int)width, (int)height, fps));
+	put(outputs, "StillImage", output_info((int)width, (int)height, fps));
+	put(outputs, "StillImageRaw", output_info((int)width, (int)height, fps));
 	put(f, "SupportedOutputs", outputs);
 	return f;
 }
@@ -464,53 +427,14 @@ static const char *const output_names[OUTPUTS] = {
 };
 
 #define MAX_ZOOM                16      /* (the most the iPhone's wide camera zooms digitally) */
-#define MAX_CAMERA_FORMATS      16
-
-/*
- * The device's cameras, offering stream formats matching both D22/AVCaptureSession.plist (iOS 16.5)
- * and V57/AVCaptureSession.plist (iOS 26 iPhone18,3):
- *   formats[k] = { sensor_width, sensor_height, crop_width, crop_height, max_fps, fes_width, fes_height, sifr_binning }
- */
+/* Physical identities are independent of a mode's native-capture support. */
 static const struct camera {
-	uint32_t        sensor;         /* the kernel's (the frames' sensor, ANNIBALE_CAMERA_SENSOR) */
+	uint32_t        sensor;
 	const char      *name, *unique_id;
-	bool            turned;         /* its sensor the other way up from the iPhone's: the pictures turned half round */
-	double          focal_length, f_number, pixel_size, fov;
-	int             formats[MAX_CAMERA_FORMATS][8];
+	bool            turned;
 } cameras[2] = {
-	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 4.0, 1.8, 1.22, 65.0,
-	  {
-		{ 4032, 3024,    0,    0, 30,    0,    0, 0 },  /* D22 Photo */
-		{ 4224, 2376,    0,    0, 60,    0,    0, 0 },  /* D22 Video-60 */
-		{ 4224, 3024,    0,    0, 60,    0,    0, 1 },  /* V57 Photo */
-		{ 4224, 3024,    0,    0, 30, 2464, 1764, 1 },  /* V57 Photo FESCompanion & Video-FullSensor-FES-30 FullBinSIFR */
-		{ 4224, 3024, 4032, 3024, 60, 1920, 1440, 0 },  /* V57 Photo DepthCompanion */
-		{ 4224, 3024, 4224, 2640, 30, 2464, 1764, 2 },  /* V57 Video-FullSensor-FES-30 (1080p30 / 720p30) */
-		{ 4224, 3024, 4224, 2640, 60, 2464, 1764, 2 },  /* V57 Video-FullSensor-FES-60 & Medium-Res */
-		{ 4224, 3024, 4032, 3024, 60, 1440, 1080, 2 },  /* V57 Video-4by3-Low-Resolution */
-		{ 4224, 2640,    0,    0, 30,    0,    0, 2 },  /* V57 Video-30 (UHD30) */
-		{ 4224, 2640,    0,    0, 60,    0,    0, 2 },  /* V57 Video-60 (UHD60) */
-		{ 4224, 2640, 4224, 2376, 60, 2464, 1540, 2 },  /* V57 Video-30 DepthCompanion */
-		{ 4224, 3024, 4224, 3024, 30,    0,    0, 2 },  /* V57 ActionCameraCompanion-30 */
-		{ 4224, 3024, 4224, 3024, 60,    0,    0, 2 },  /* V57 ActionCameraCompanion-60 */
-	  } },
-	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 2.87, 2.2, 1.0, 70.0,
-	  {
-		{ 3088, 2320,    0,    0, 30,    0,    0, 0 },  /* D22 Photo */
-		{ 3840, 2160,    0,    0, 30,    0,    0, 0 },  /* D22 Video-30 */
-		{ 4896, 4896,    0,    0, 60, 4608, 4608, 1 },  /* V57 FrontUltraWide Photo */
-		{ 4896, 4896,    0,    0, 60, 2496, 2496, 1 },  /* V57 FrontUltraWide Photo FESCompanion */
-		{ 4896, 4896,    0,    0, 30, 4608, 4608, 2 },  /* V57 FrontUltraWide Video-30 / 16x10-30 / 10x16-30 */
-		{ 4896, 4896,    0,    0, 30, 2496, 2496, 2 },  /* V57 FrontUltraWide Video-FES-30 / 10x16-FES-30 / 16x10-FES-30 */
-		{ 4896, 4896, 3672, 4896, 60, 1224, 1224, 0 },  /* V57 FrontUltraWide Video-3by4-Low-Resolution */
-		{ 4896, 4896, 3024, 4032, 60, 4032, 4032, 1 },  /* V57 FrontVirtual Photo & Photo-3088x2316 */
-		{ 4896, 4896, 3024, 4032, 60, 2112, 2112, 1 },  /* V57 FrontVirtual Photo FESCompanion */
-		{ 4896, 4896, 2520, 4032, 30, 4032, 4032, 2 },  /* V57 FrontVirtual Video-30 (UHD30) */
-		{ 4896, 4896, 3024, 4032, 30, 2112, 2112, 2 },  /* V57 FrontVirtual Video-FullSensor-FES-30 (1080p30) & Medium-Res */
-		{ 3680, 4896, 3024, 4032, 60,  852, 1136, 0 },  /* V57 FrontVirtual Video-4by3-Low-Resolution */
-		{ 3072, 4896, 2520, 4032, 60, 2520, 4032, 0 },  /* V57 FrontVirtual Video-60 */
-		{ 3072, 4896, 2520, 4032, 60, 1320, 2112, 0 },  /* V57 FrontVirtual Video-FES-60 */
-	  } },
+	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false },
+	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true },
 };
 
 enum camera_stream_state {
@@ -533,6 +457,7 @@ struct stream {
 	double          min_fps, max_fps;
 	float           zoom;           /* ZoomFactor: the picture is the middle 1/zoom of the sensor each way */
 	const struct camera *camera;
+	struct annibale_camera_profile profile;
 	CFStringRef     port;
 	bool            af_now;         /* a focus asked for (AutoFocusNow and the like): a search at the next frame */
 	bool            af_locked;      /* LockAFNow: no search but one asked for */
@@ -573,6 +498,10 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 	CFTypeRef value = NULL;
 
 	(void)allocator;
+	if (s->profile.bytes == 0 && !key_is(key, "SupportedPropertiesDictionary") &&
+	    !CFDictionaryContainsKey(s->supported, key)) {
+		return ERR_NOT_AVAILABLE;
+	}
 	if (key_is(key, "PortType")) {
 		value = CFRetain(s->port);
 	} else if (key_is(key, "ModuleInfo")) {
@@ -601,7 +530,14 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		value = number_f(s->max_fps);
 	} else if (key_is(key, "Clock")) {
 		value = CFRetain(CMClockGetHostTimeClock());
-	} else if (key_is(key, "TorchLevel") || key_is(key, "ExposureBias")) {
+	} else if (key_is(key, "TorchLevel")) {
+		uint32_t level;
+
+		if (s->torch < 0 || read(s->torch, &level, sizeof(level)) != (ssize_t)sizeof(level)) {
+			return ERR_NOT_AVAILABLE;
+		}
+		value = number_f(level / 1000.0);
+	} else if (key_is(key, "ExposureBias")) {
 		value = number_f(0);
 	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
 		bool configs = key_is(key, "VideoOutputConfigurations");
@@ -682,12 +618,6 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		pthread_mutex_unlock(&s->lock);
 	} else if (key_is(key, "SupportedPropertiesDictionary")) {
 		value = CFRetain(s->supported);
-	} else if (key_is(key, "FocalLength")) {
-		value = number_f(s->camera->focal_length);
-	} else if (key_is(key, "LensFNumber")) {
-		value = number_f(s->camera->f_number);
-	} else if (key_is(key, "PixelSize")) {
-		value = number_f(s->camera->pixel_size);
 	} else if (key_is(key, "MaxZoomFactor")) {
 		value = number_f(MAX_ZOOM);
 	} else if (key_is(key, "ZoomFactor")) {
@@ -699,8 +629,7 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		CFRelease(srgb);
 	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation") || key_is(key, "FlashMode")) {
 		value = number_i(0);
-	} else if (key_is(key, "HasAutoFocusPositionSensor") || key_is(key, "HighCurrentTorchEnabled") ||
-	    key_is(key, "DeferAdditionOfAttachments")) {
+	} else if (key_is(key, "HasAutoFocusPositionSensor") || key_is(key, "DeferAdditionOfAttachments")) {
 		value = CFRetain(kCFBooleanFalse);
 	} else {
 		say_once("stream: no answer for", key, NULL);
@@ -710,7 +639,7 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 	return 0;
 }
 
-static void torch_set(struct stream *s, CFTypeRef value);
+static OSStatus torch_set(struct stream *s, CFTypeRef value);
 
 static double
 dict_number(CFDictionaryRef d, const char *name, double otherwise)
@@ -767,6 +696,12 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 {
 	struct stream *s = stream_of(o);
 
+	if (key_is(key, "TorchLevel")) {
+		return torch_set(s, value);
+	}
+	if (s->profile.bytes == 0) {
+		return ERR_NOT_AVAILABLE;
+	}
 	if (key_is(key, "FormatIndex")) {
 		int64_t i = 0;
 
@@ -920,10 +855,6 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
-	if (key_is(key, "TorchLevel")) {
-		torch_set(s, value);
-		return 0;
-	}
 	if (key_is(key, "AutoFocusNow") || key_is(key, "ContinuousAutoFocusNow") || key_is(key, "FocusNow") ||
 	    key_is(key, "PeakTrackingFocusNow") || key_is(key, "LockAFNow") || key_is(key, "ManualFocusNow") ||
 	    key_is(key, "AFWindowParams") || key_is(key, "AutoFocusMode")) {
@@ -948,26 +879,28 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 	return 0;
 }
 
-/* the flashlight: TorchLevel (0 to 1) as thousandths to the kernel's /dev/annibale-torch (torch=3) */
-static void
+/* TorchLevel uses 0..1; /dev/annibale-torch accepts uint32_t thousandths. */
+static OSStatus
 torch_set(struct stream *s, CFTypeRef value)
 {
-	float level = 0;
+	double level = 0;
 	uint32_t thousandths;
 
-	if (value != NULL && CFGetTypeID(value) == CFNumberGetTypeID()) {
-		CFNumberGetValue(value, kCFNumberFloatType, &level);
+	if (s->torch < 0) {
+		return ERR_NOT_AVAILABLE;
+	}
+	if (value == NULL || CFGetTypeID(value) != CFNumberGetTypeID() ||
+	    !CFNumberGetValue(value, kCFNumberDoubleType, &level) || !isfinite(level)) {
+		return ERR_PARAM;
 	}
 	level = level < 0 ? 0 : level > 1 ? 1 : level;
-	thousandths = (uint32_t)(level * 1000 + 0.5f);
-	if (s->torch < 0) {
-		s->torch = open("/dev/annibale-torch", O_WRONLY);
+	thousandths = (uint32_t)(level * 1000 + 0.5);
+	if (write(s->torch, &thousandths, sizeof(thousandths)) != (ssize_t)sizeof(thousandths)) {
+		say("the flashlight write failed at %u of 1000", thousandths);
+		return ERR_NOT_AVAILABLE;
 	}
-	if (s->torch < 0 || write(s->torch, &thousandths, sizeof(thousandths)) != (ssize_t)sizeof(thousandths)) {
-		say("the flashlight at %u of 1000 NOT TAKEN (no /dev/annibale-torch)", thousandths);
-	} else {
-		say("the flashlight at %u of 1000", thousandths);
-	}
+	say("the flashlight requested at %u of 1000", thousandths);
+	return 0;
 }
 
 #include "camera_device_stream.inc"
@@ -1084,7 +1017,7 @@ static CFStringRef
 device_description(CMBaseObjectRef o)
 {
 	(void)o;
-	return CFRetain(CFSTR("<AnnibaleCaptureDevice: the wide and front cameras>"));
+	return CFRetain(CFSTR("<AnnibaleCaptureDevice>"));
 }
 
 static const struct base_class device_base = {
@@ -1101,11 +1034,14 @@ OSStatus
 annibale_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options, CMBaseObjectRef *out)
 {
 	static bool found, usable;
-	CMBaseObjectRef device = NULL, stream[MAX_STREAMS] = { NULL, NULL, NULL };
-	CFIndex nstreams = 2;
+	CMBaseObjectRef device = NULL, stream[MAX_STREAMS] = { NULL };
+	CFIndex nstreams = 0;
 	struct device *d;
 
 	(void)options;
+	if (out != NULL) {
+		*out = NULL;
+	}
 	if (!found) {
 		found = true;
 		usable = find_functions();
@@ -1113,18 +1049,28 @@ annibale_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options,
 	if (!usable || out == NULL) {
 		return ERR_UNSUPPORTED;
 	}
-	if ((stream[0] = stream_create(allocator, &cameras[0], port_back)) == NULL) {
-		return ERR_UNSUPPORTED;
-	}
-	if ((stream[1] = stream_create(allocator, &cameras[1], port_front)) == NULL) {
-		CFRelease(stream[0]);
-		return ERR_UNSUPPORTED;
-	}
-	if (port_front_sw != NULL) {
-		stream[2] = stream_create(allocator, &cameras[1], port_front_sw);
-		if (stream[2] != NULL) {
-			nstreams = 3;
+	for (unsigned i = 0; i < sizeof(cameras) / sizeof(cameras[0]); i++) {
+		struct annibale_camera_profile profile;
+		int torch_fd = cameras[i].sensor == 1 ? open("/dev/annibale-torch", O_RDWR) : -1;
+		int fd = camera_native_open(cameras[i].sensor, &profile);
+
+		if (fd < 0 && torch_fd < 0) {
+			continue;
 		}
+		if (fd >= 0) {
+			close(fd);
+		}
+		/* FigFlashlight requests the back port without stream control on iOS 26. */
+		CMBaseObjectRef one = stream_create(allocator, &cameras[i], cameras[i].sensor == 1 ? port_back : port_front,
+		    fd >= 0 ? &profile : NULL, torch_fd);
+		if (one != NULL) {
+			stream[nstreams++] = one;
+		} else if (torch_fd >= 0) {
+			close(torch_fd);
+		}
+	}
+	if (nstreams == 0) {
+		return ERR_NOT_AVAILABLE;
 	}
 	if (derived_create(allocator, &device_vtable, device_class_id(), &device) != 0 || device == NULL) {
 		for (CFIndex i = 0; i < nstreams; i++) {
@@ -1142,6 +1088,6 @@ annibale_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options,
 	}
 	d->supported = supported(device_props, sizeof(device_props) / sizeof(device_props[0]));
 	*out = device;
-	say("the device made: %ld streams (back and front cameras)", (long)nstreams);
+	say("the device made: %ld streams", (long)nstreams);
 	return 0;
 }

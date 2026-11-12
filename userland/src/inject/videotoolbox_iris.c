@@ -26,6 +26,7 @@
 #define IRIS_INFO_FW_PRESENT    0x02u
 #define IRIS_INFO_HW_READY      0x04u
 #define IRIS_FRAME_DECODED      0x01u
+#define IRIS_FRAME_CORRUPT      0x02u
 #define IRIS_FRAME_NEED_MORE    0x04u
 #define IRIS_FRAME_DRAIN        0x08u
 #define IRIS_FRAME_POLL         0x10u
@@ -166,7 +167,6 @@ struct iris_cm_vtable {
 struct iris_pending_frame {
 	bool in_use;
 	uint64_t tag;
-	uint64_t seq;
 	VTDecodeFrameRef frame_ref;
 };
 
@@ -351,7 +351,6 @@ iris_pending_push(struct iris_vt_decoder *dec, uint64_t tag, VTDecodeFrameRef fr
 		if (!dec->pending[i].in_use) {
 			dec->pending[i].in_use = true;
 			dec->pending[i].tag = tag;
-			dec->pending[i].seq = dec->next_tag;
 			dec->pending[i].frame_ref = frame_ref;
 			return true;
 		}
@@ -362,30 +361,24 @@ iris_pending_push(struct iris_vt_decoder *dec, uint64_t tag, VTDecodeFrameRef fr
 static VTDecodeFrameRef
 iris_pending_pop(struct iris_vt_decoder *dec, uint64_t tag)
 {
-	if (tag != 0) {
-		for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) {
-			if (dec->pending[i].in_use && dec->pending[i].tag == tag) {
-				VTDecodeFrameRef ref = dec->pending[i].frame_ref;
-				memset(&dec->pending[i], 0, sizeof(dec->pending[i]));
-				return ref;
-			}
-		}
-		return NULL;
-	}
-	uint32_t best = IRIS_VT_PENDING_MAX;
-	uint64_t best_seq = UINT64_MAX;
+	if (tag == 0) return NULL;
 	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) {
-		if (dec->pending[i].in_use && dec->pending[i].seq < best_seq) {
-			best_seq = dec->pending[i].seq;
-			best = i;
+		if (dec->pending[i].in_use && dec->pending[i].tag == tag) {
+			VTDecodeFrameRef ref = dec->pending[i].frame_ref;
+			memset(&dec->pending[i], 0, sizeof(dec->pending[i]));
+			return ref;
 		}
-	}
-	if (best < IRIS_VT_PENDING_MAX) {
-		VTDecodeFrameRef ref = dec->pending[best].frame_ref;
-		memset(&dec->pending[best], 0, sizeof(dec->pending[best]));
-		return ref;
 	}
 	return NULL;
+}
+
+static bool
+iris_pending_any(const struct iris_vt_decoder *dec)
+{
+	for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) {
+		if (dec->pending[i].in_use) return true;
+	}
+	return false;
 }
 
 static void
@@ -700,12 +693,25 @@ iris_run_decode_step_Locked(struct iris_vt_decoder *dec, VTDecodeFrameRef alloc_
 		return kVTVideoDecoderBadDataErr;
 	}
 
-	if ((req.flags & IRIS_FRAME_DECODED) != 0) {
-		VTDecodeFrameRef target_ref = iris_pending_pop(dec, req.out_tag);
-		if (target_ref != NULL) {
-			status = VTDecoderSessionEmitDecodedFrame(dec->session, target_ref, noErr, 0, pixbuf);
-			*out_emitted = true;
+	bool decoded = (req.flags & IRIS_FRAME_DECODED) != 0;
+	bool corrupt = (req.flags & IRIS_FRAME_CORRUPT) != 0;
+	if (decoded || corrupt) {
+		if (decoded && corrupt) {
+			CFRelease(pixbuf);
+			return kVTVideoDecoderMalfunctionErr;
 		}
+		VTDecodeFrameRef target_ref = iris_pending_pop(dec, req.out_tag);
+		if (target_ref == NULL) {
+			iris_plugin_log("iris_vt[%d]: unmatched output sid=%u tag=%llu flags=0x%x\n",
+			    getpid(), dec->session_id, (unsigned long long)req.out_tag, req.flags);
+			CFRelease(pixbuf);
+			return kVTVideoDecoderMalfunctionErr;
+		}
+		/* A damaged delayed output completes its own token; other pending inputs remain valid. */
+		status = VTDecoderSessionEmitDecodedFrame(dec->session, target_ref,
+		    corrupt ? kVTVideoDecoderBadDataErr : noErr,
+		    corrupt ? kVTDecodeInfo_FrameDropped : 0, corrupt ? NULL : pixbuf);
+		*out_emitted = true;
 	}
 	CFRelease(pixbuf);
 	return status;
@@ -830,14 +836,7 @@ iris_vt_decode_frame(CFTypeRef decoder, VTDecodeFrameRef frame_ref, CMSampleBuff
 
 	while (emitted) {
 		emitted = false;
-		bool any_pending = false;
-		for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) {
-			if (dec->pending[i].in_use) {
-				any_pending = true;
-				break;
-			}
-		}
-		if (!any_pending) {
+		if (!iris_pending_any(dec)) {
 			break;
 		}
 		status = iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_POLL, &emitted);
@@ -871,30 +870,31 @@ iris_vt_finish_delayed_frames(CFTypeRef decoder)
 		return paramErr;
 	}
 	pthread_mutex_lock(&dec->lock);
+	OSStatus status = noErr;
 	if (dec->fd >= 0 && dec->session_id != 0 && dec->session != NULL) {
 		for (uint32_t step = 0; step < IRIS_VT_PENDING_MAX; step++) {
-			bool any_pending = false;
-			for (uint32_t i = 0; i < IRIS_VT_PENDING_MAX; i++) {
-				if (dec->pending[i].in_use) {
-					any_pending = true;
-					break;
+			if (!iris_pending_any(dec)) {
+				/* VT can finish repeatedly between samples without resetting the decoder. */
+				if (step == 0) {
+					pthread_mutex_unlock(&dec->lock);
+					return noErr;
 				}
-			}
-			if (!any_pending) {
 				break;
 			}
 			bool emitted = false;
-			OSStatus st = iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_DRAIN, &emitted);
-			if (st != noErr || !emitted) {
+			status = iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_DRAIN, &emitted);
+			if (status != noErr || !emitted) {
 				break;
 			}
 		}
 		uint32_t sid = dec->session_id;
-		(void)iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid);
-		iris_pending_abort_all(dec, kVTVideoDecoderMalfunctionErr);
+		if (iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid) != 0 && status == noErr)
+			status = kVTVideoDecoderMalfunctionErr;
+		if (iris_pending_any(dec) && status == noErr) status = kVTVideoDecoderMalfunctionErr;
+		iris_pending_abort_all(dec, status);
 	}
 	pthread_mutex_unlock(&dec->lock);
-	return noErr;
+	return status;
 }
 
 static const struct iris_cm_base_class g_iris_cm_base_class = {

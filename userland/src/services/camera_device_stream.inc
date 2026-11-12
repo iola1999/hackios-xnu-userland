@@ -4,8 +4,7 @@
  */
 
 /*
- * ModuleInfo and SensorRawOutputBufferPoolRequirements aligned with V57/CameraSetup.plist
- * (0x0904 BackWide, 0x0914 FrontSuperWide, ModuleIDSchemeVersion 1) and BWFigVideoCaptureDevice.
+ * ModuleInfo follows V57/CameraSetup.plist's ModuleIDSchemeVersion 1 and BWFigVideoCaptureDevice.
  */
 static CFDictionaryRef
 stream_module_info(const struct stream *s)
@@ -26,9 +25,8 @@ static CFDictionaryRef
 stream_raw_pool_requirements(const struct stream *s)
 {
 	CFMutableDictionaryRef r = (CFMutableDictionaryRef)new_dict();
-	int idx = (s->format_index >= 0 && s->format_index < MAX_CAMERA_FORMATS) ? s->format_index : 0;
-	int32_t w = s->camera->formats[idx][0] > 0 ? s->camera->formats[idx][0] : 1920;
-	int32_t h = s->camera->formats[idx][1] > 0 ? s->camera->formats[idx][1] : 1080;
+	int32_t w = (int32_t)s->profile.width;
+	int32_t h = (int32_t)s->profile.height;
 
 	put(r, "MinimumBufferCount", number_i32(4));
 	put(r, "Width", number_i32(w));
@@ -151,35 +149,25 @@ md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 
 /* the frame's metadata, as H10ISP's stream gives them (see md_names) */
 static CFDictionaryRef
-frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, const struct isp_stats *st, CFStringRef port)
+frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, CFStringRef port)
 {
 	CFMutableDictionaryRef m;
-	double exposure = f->exposure_lines * (double)f->line_ns / 1e9, analog = f->gain_unity ? (double)f->gain / f->gain_unity : 1;
-	double total = analog * isp->digital, fps = f->frame_lines && f->line_ns ? 1e9 / ((double)f->frame_lines * f->line_ns) : 30;
-	/* (green's level for a second at 1x, a quarter of it: a room's 70 or so, daylight's tens of thousands) */
-	double lux = exposure > 0 && total > 0 ? st->mean[1] / (exposure * total) / 4 : 0;
-
 	if (md_attachment == NULL) {
 		return NULL;
 	}
 	m = (CFMutableDictionaryRef)new_dict();
 	md_put(m, MD_PORT, CFRetain(port));
 	md_put(m, MD_PTS, CMTimeCopyAsDictionary(CMClockMakeHostTimeFromSystemUnits(f->time), NULL));
-	md_put(m, MD_EXPOSURE, number_f(exposure));
-	md_put(m, MD_AGC, number_i((int64_t)(analog * 256 + 0.5)));
+	if (f->exposure_lines != 0 && f->line_ns != 0) {
+		md_put(m, MD_EXPOSURE, number_f(f->exposure_lines * (double)f->line_ns / 1e9));
+	}
+	if (f->gain != 0 && f->gain_unity != 0) {
+		md_put(m, MD_AGC, number_i((int64_t)((double)f->gain / f->gain_unity * 256 + 0.5)));
+	}
 	md_put(m, MD_ISP_DGAIN, number_i((int64_t)(isp->digital * 256 + 0.5)));
-	md_put(m, MD_SENSOR_DGAIN, number_i(256));
-	md_put(m, MD_ISO_BASE, number_f(32));
-	md_put(m, MD_FRAME_RATE, number_f(fps));
-	md_put(m, MD_LUX, number_i((int64_t)(lux + 0.5)));
-	md_put(m, MD_SNR, number_f(40 - 10 * log10(total < 1 ? 1 : total)));
-	md_put(m, MD_AF_STATUS, number_i(0));
-	md_put(m, MD_FOCUSING, number_i(0));
-	md_put(m, MD_AE_STABLE, CFRetain(kCFBooleanTrue));
-	md_put(m, MD_AE_LOCKED, CFRetain(kCFBooleanFalse));
-	md_put(m, MD_AWB_STABLE, CFRetain(kCFBooleanTrue));
-	md_put(m, MD_AWB_LOCKED, CFRetain(kCFBooleanFalse));
-	md_put(m, MD_AF_LOCKED, CFRetain(kCFBooleanFalse));
+	if (f->frame_lines != 0 && f->line_ns != 0) {
+		md_put(m, MD_FRAME_RATE, number_f(1e9 / ((double)f->frame_lines * f->line_ns)));
+	}
 	/*
 	 * The zoom the picture was made with: the source node takes it for what the ISP applied
 	 * (-[BWMultiStreamCameraSourceNode _ispAppliedZoomFactorFromSampleBufferMetadataDictionary:outputIndex:])
@@ -299,6 +287,9 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 static float
 lux_index(const struct isp *isp, const struct annibale_camera_frame *f)
 {
+	if (f->exposure_lines == 0 || f->line_ns == 0 || f->gain == 0 || f->gain_unity == 0) {
+		return NAN;
+	}
 	double exposure = f->exposure_lines * (double)f->line_ns / 1e9 * f->gain / f->gain_unity * isp->digital;
 
 	return (float)(197 + 46 * log2(exposure > 1e-6 ? exposure / 0.0333 : 1e-6 / 0.0333));
@@ -526,17 +517,13 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 static void
 load_tuning(struct isp *isp, uint32_t sensor)
 {
-	static const char *const annibale_names[] = { "ov02b10", "ov50e40", "ov20b", "ov50m" };
-	static const char *const names[] = { "ov02b10", "s5khm2sd", "ov16a1q", "s5k4h7" };
+	static const char *const names[] = { "ov02b10", "ov50e40", "ov20b", "ov50m" };
 	char path[96];
 
 	if (sensor >= sizeof(names) / sizeof(names[0])) {
 		return;
 	}
-	snprintf(path, sizeof(path), "/annibale/fw/camera-%s.isp", annibale_names[sensor]);
-	if (access(path, R_OK) != 0) {
-		snprintf(path, sizeof(path), "/annibale/fw/camera-%s.isp", names[sensor]);
-	}
+	snprintf(path, sizeof(path), "/annibale/fw/camera-%s.isp", names[sensor]);
 	if (isp_load_tuning(isp, path)) {
 		say("the %s's colour tuning from %s: %u colour matrices' lights, %u lens shadings'", names[sensor], path,
 		    isp->tuning->ccm.lights, isp->tuning->lsc.lights);
@@ -552,16 +539,16 @@ worker(void *context)
 {
 	CMBaseObjectRef o = context;
 	struct stream *s = stream_of(o);
-	struct annibale_camera_frame head;
+	struct annibale_camera_profile profile;
+	struct annibale_camera_capture capture;
 	struct isp isp;
 	struct isp_stats st;
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
 	uint32_t tuned_for = ~0u;
-	bool switched = false;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
-	int device = open(ANNIBALE_CAMERA_DEVICE, O_RDWR), failures = 0;
+	int device = camera_native_open(s->camera->sensor, &profile);
 
 	pthread_setname_np("annibale-camera");
 	if (device < 0) {
@@ -569,46 +556,20 @@ worker(void *context)
 		s->state = CAM_STREAM_FAULTED;
 		return NULL;
 	}
+	bytes = sizeof(struct annibale_camera_frame) + (size_t)profile.stride * profile.height;
+	buffer = malloc(bytes);
+	if (buffer == NULL) {
+		close(device);
+		s->state = CAM_STREAM_FAULTED;
+		return NULL;
+	}
 	isp_init(&isp);
-	while ((s->state == CAM_STREAM_WARMING || s->state == CAM_STREAM_ACTIVE) && failures < 5) {
-		ssize_t n;
-
-		if (buffer == NULL) {
-			n = read(device, &head, sizeof(head));
-			if (n != (ssize_t)sizeof(head)) {
-				failures += n < 0 && errno == EAGAIN ? 0 : 1;
-				if (n < 0 && errno == EIO) {
-					say("the kernel's camera has had a fault: no frames");
-					break;
-				}
-				continue;
-			}
-			if (head.sensor != s->camera->sensor) {
-				/* another camera's frames (the kernel's last sensor): changed, and the next ones are this one's */
-				if (!switched) {
-					struct annibale_camera_command c = { .command = ANNIBALE_CAMERA_SENSOR, .a = s->camera->sensor, .b = ~0u };
-
-					switched = true;
-					say("the kernel's frames are camera %u's: to %u, the %s", head.sensor, s->camera->sensor, s->camera->name);
-					(void)write(device, &c, sizeof(c));
-				}
-				continue;
-			}
-			bytes = sizeof(head) + (size_t)head.stride * head.height;
-			buffer = malloc(bytes);
-			say("frames of %ux%u from the kernel (the %s)", head.width, head.height, s->camera->name);
-			continue;
+	while (s->state == CAM_STREAM_WARMING || s->state == CAM_STREAM_ACTIVE) {
+		if (camera_native_frame(device, &profile, buffer, bytes, &capture) < 0) {
+			say("capture failed: state %u flags %#x error %u (%s)", capture.state, capture.flags,
+			    capture.error, strerror(errno));
+			break;
 		}
-		n = read(device, buffer, bytes);
-		if (n != (ssize_t)bytes) {
-			if (n < 0 && errno == EIO) {
-				say("the kernel's camera has had a fault: no more frames");
-				break;
-			}
-			failures += n < 0 && errno == EAGAIN ? 0 : 1;
-			continue;
-		}
-		failures = 0;
 
 		const struct annibale_camera_frame *f = (const void *)buffer;
 		const uint8_t *raw = buffer + f->header_bytes;
@@ -624,9 +585,14 @@ worker(void *context)
 		 * Slowly, a second or so: the colour temperature is guessed from the white balance, the tuning it
 		 * picks changes what the white balance sees, and the colour matrix makes every swing of it plain.
 		 */
-		lux = lux < 0 ? lux_index(&isp, f) : lux * 0.9f + lux_index(&isp, f) * 0.1f;
+		float measured_lux = lux_index(&isp, f);
+		if (isfinite(measured_lux)) {
+			lux = lux < 0 ? measured_lux : lux * 0.9f + measured_lux * 0.1f;
+		}
 		cct = cct < 0 ? colour_temperature(&isp) : cct * 0.97f + colour_temperature(&isp) * 0.03f;
-		isp_tune(&isp, lux, cct);
+		if (lux >= 0) {
+			isp_tune(&isp, lux, cct);
+		}
 		isp.zoom = s->zoom;
 		isp.turned = s->camera->turned;
 		if (isp_ae(&isp, f, &st, &c)) {
@@ -651,7 +617,7 @@ worker(void *context)
 		af_frame(device, &af, f, raw, af_win, af_locked);
 		s->frames++;
 
-		CFDictionaryRef metadata = frame_metadata(&isp, f, &st, s->port);
+		CFDictionaryRef metadata = frame_metadata(&isp, f, s->port);
 
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
@@ -703,12 +669,12 @@ worker(void *context)
 			CFRelease(metadata);
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
-			say("frame %llu: exposure %.1f ms, gain %.1fx, digital %.2fx, green %.0f above black; white balance R %.2f "
-			    "B %.2f, lux index %.0f, about %.0f K", f->sequence, f->exposure_lines * (double)f->line_ns / 1e6,
-			    (double)f->gain / f->gain_unity, isp.digital, st.mean[1], isp.wb[0], isp.wb[2], lux, cct);
+			say("frame %llu: %ux%u RAW10, green %.0f above black; white balance R %.2f B %.2f",
+			    f->sequence, f->width, f->height, st.mean[1], isp.wb[0], isp.wb[2]);
 		}
 	}
 	free(buffer);
+	isp_destroy(&isp);
 	close(device);
 	if (s->state == CAM_STREAM_WARMING || s->state == CAM_STREAM_ACTIVE) {
 		s->state = CAM_STREAM_FAULTED;
@@ -723,8 +689,8 @@ worker(void *context)
  * takes a moment to settle and the exposure longer), the second only when the graph starts the
  * stream itself (`graph` true, the FigCaptureStream start method).
  */
-#define MAX_STREAMS 3
-static CMBaseObjectRef all_streams[MAX_STREAMS];  /* back, front, and optional front super-wide */
+#define MAX_STREAMS 2
+static CMBaseObjectRef all_streams[MAX_STREAMS];
 static OSStatus stream_stop(CMBaseObjectRef o);
 
 static OSStatus
@@ -732,6 +698,9 @@ stream_begin(CMBaseObjectRef o, bool graph)
 {
 	struct stream *s = stream_of(o);
 
+	if (s->profile.bytes == 0) {
+		return graph ? ERR_NOT_AVAILABLE : 0;
+	}
 	if (s->state == CAM_STREAM_FAULTED && s->worker_started) {
 		pthread_join(s->worker, NULL);
 		s->worker_started = false;
@@ -868,6 +837,11 @@ stream_finalize(CMBaseObjectRef o)
 	struct stream *s = stream_of(o);
 
 	(void)stream_stop(o);
+	for (int i = 0; i < MAX_STREAMS; i++) {
+		if (all_streams[i] == o) {
+			all_streams[i] = NULL;
+		}
+	}
 	for (int i = 0; i < OUTPUTS; i++) {
 		if (s->out[i].config) {
 			CFRelease(s->out[i].config);
@@ -902,8 +876,7 @@ stream_finalize(CMBaseObjectRef o)
 static CFStringRef
 stream_description(CMBaseObjectRef o)
 {
-	(void)o;
-	return CFRetain(CFSTR("<AnnibaleCaptureStream: the wide camera>"));
+	return CFStringCreateWithFormat(NULL, NULL, CFSTR("<AnnibaleCaptureStream: %s>"), stream_of(o)->camera->name);
 }
 
 static const struct base_class stream_base = {
@@ -914,11 +887,12 @@ static const struct stream_class stream_derived = { 2, stream_start, stream_stop
 static const struct stream_vtable stream_vtable = { NULL, &stream_base, &stream_derived };
 
 static CMBaseObjectRef
-stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef port)
+stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef port,
+    const struct annibale_camera_profile *profile, int torch_fd)
 {
 	CMBaseObjectRef o = NULL;
 	struct stream *s;
-	CFDictionaryRef f[MAX_CAMERA_FORMATS];
+	CFDictionaryRef f[3];
 	CFIndex nf = 0;
 
 	if (derived_create(allocator, &stream_vtable, stream_class_id(), &o) != 0 || o == NULL) {
@@ -929,27 +903,28 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
-	s->torch = -1;
-	s->min_fps = 2;
+	s->torch = torch_fd;
 	s->zoom = 1;
 	s->af_window[0] = s->af_window[1] = 0.3f;
 	s->af_window[2] = s->af_window[3] = 0.7f;
-	s->max_fps = 30;
 	s->camera = camera;
 	s->port = port;
 	for (int i = 0; i < OUTPUTS; i++) {
 		s->out[i].name = output_names[i];
 	}
 
-	for (int i = 0; i < MAX_CAMERA_FORMATS && camera->formats[i][0] > 0; i++) {
-		f[nf++] = format_crop(camera->formats[i][0], camera->formats[i][1],
-		    camera->formats[i][2], camera->formats[i][3],
-		    camera->formats[i][4], camera->formats[i][5],
-		    camera->formats[i][6], camera->formats[i][7],
-		    false, camera->fov);
+	if (profile != NULL) {
+		s->profile = *profile;
+		s->min_fps = s->max_fps = profile->fps_milli / 1000.0;
+		uint32_t sizes[3][2] = { { profile->width, profile->height }, { 1920, 1080 }, { 1280, 720 } };
+
+		for (int i = 0; i < 3; i++) {
+			f[nf++] = native_format(profile, sizes[i][0], sizes[i][1]);
+		}
 	}
 	s->formats = CFArrayCreate(NULL, (const void **)f, nf, &kCFTypeArrayCallBacks);
-	s->supported = supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0]));
+	s->supported = profile != NULL ? supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0])) :
+	    supported(torch_props, sizeof(torch_props) / sizeof(torch_props[0]));
 	for (CFIndex i = 0; i < nf; i++) {
 		CFRelease(f[i]);
 	}

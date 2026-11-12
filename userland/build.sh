@@ -782,16 +782,21 @@ if [ -d ../fw-gpu ]; then
 	mkdir -p root/fw
 	cp ../fw-gpu/* root/fw/
 fi
-# ... and the cameras' register tables (bsd/dev/annibale/annibale_camera.c, cam=2 and up), made by tools/camsensor.py out of
-# the sensors' module files of Android's camera stack, the phone's /vendor/lib64/camera/com.qti.sensormodule.
-# annibale_<maker>_<sensor>_<camera>.bin, in ../fw-camera (the vendor's: neither they nor the tables are in the
-# repository): camera-<sensor>.tab
-for module in ../fw-camera/com.qti.sensormodule.annibale_*.bin; do
-	[ -f "$module" ] || continue
-	sensor=$(basename "$module" .bin | sed 's/^com\.qti\.sensormodule\.annibale_[a-z]*_\([a-z0-9]*\)_.*/\1/')
-	mkdir -p root/fw
-	../tools/camsensor.py "$module" "root/fw/camera-$sensor.tab" >/dev/null
-done
+# Native front mode 4 uses the original Android sensor module and the kernel's checked exporter.
+camera_module=../fw-camera/com.qti.sensormodule.annibale_sunny_ov20b40_front_i.bin
+camera_tools=../../hackios-xnu-kernel/tools
+[ -f "$camera_tools/camsensor.py" ] || camera_tools=../tools
+if [ ! -f "$camera_module" ]; then
+	echo "build.sh: missing original camera sensor module: $camera_module" >&2
+	exit 1
+fi
+if [ ! -f "$camera_tools/camsensor.py" ]; then
+	echo "build.sh: missing camera profile exporter: $camera_tools/camsensor.py" >&2
+	exit 1
+fi
+mkdir -p root/fw
+python3 "$camera_tools/camsensor.py" --profile "$camera_module" 4 root/fw/camera-ov20b-front-mode4.tab >/dev/null
+unset camera_module camera_tools
 # ... and their colour tuning (libannibale-media's processor, src/camera_isp.c), made by tools/camtuning.py out of the
 # cameras' tuning files beside them, com.qti.tuned.annibale_<maker>_<sensor>_<camera>.bin: camera-<sensor>.isp
 for tuned in ../fw-camera/com.qti.tuned.annibale_*.bin; do

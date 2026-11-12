@@ -1,9 +1,11 @@
 /*
  * camera_test: the wide camera's frames as a program gets them (cam=5).
  *
- * usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]
+ * usage: camera_test native [OUTPUT]
+ *        camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]
  *        camera_test cycle [FRAMES]
  *        camera_test noise [SENSOR|all]
+ *   native: captures one checked front mode 4 frame and optionally saves its RWFRAME1 header and RAW10 bytes.
  *   raw: reads FRAMES frames (default 150) from the kernel's /dev/annibale-camera, with src/camera_isp.c's
  *   exposure (unless noae: the kernel's, boot-args cam_shutter and cam_gain) and white balance working
  *   on them, says what came and how fast, and leaves the last one as a picture for the host (xl
@@ -31,6 +33,69 @@
 #include <string.h>
 #include <unistd.h>
 #include "camera_isp.h"
+#include "camera_device_native.inc"
+
+static int
+native(const char *output)
+{
+	struct annibale_camera_profile profile;
+	struct annibale_camera_capture capture;
+	int device = camera_native_open(2, &profile);
+	int result = 1;
+
+	if (device < 0) {
+		perror("camera_test: native open");
+		return 1;
+	}
+	size_t bytes = sizeof(struct annibale_camera_frame) + (size_t)profile.stride * profile.height;
+	uint8_t *buffer = malloc(bytes);
+
+	if (buffer == NULL) {
+		perror("camera_test: native buffer");
+		close(device);
+		return 1;
+	}
+	ssize_t got = camera_native_frame(device, &profile, buffer, bytes, &capture);
+	int capture_error = errno;
+
+	printf("camera_test: native state=%u error=%u flags=%#x buf=%#x top=%#x rx=%#x path=%#x "
+	    "consumed=%#x fifo=%u reset=%#x wm=%#x\n", capture.state, capture.error, capture.flags,
+	    capture.buf_done, capture.top_irq, capture.rx_irq, capture.path_irq, capture.consumed_addr,
+	    capture.fifo_count, capture.reset_status, capture.wm_cfg);
+	if (got < 0) {
+		errno = capture_error;
+		perror("camera_test: native capture");
+		goto done;
+	}
+	const struct annibale_camera_frame *frame = (const void *)buffer;
+	struct isp_stats stats;
+
+	isp_measure(NULL, frame, buffer + frame->header_bytes, &stats);
+	printf("camera_test: native frame=%llu time=%llu %ux%u stride=%u bayer=%u bytes=%zd "
+	    "R=%.1f G=%.1f B=%.1f above black\n", frame->sequence, frame->time, frame->width, frame->height,
+	    frame->stride, frame->bayer, got, stats.mean[0], stats.mean[1], stats.mean[2]);
+	if (output != NULL) {
+		FILE *file = fopen(output, "wb");
+
+		if (file == NULL) {
+			perror("camera_test: native output");
+			goto done;
+		}
+		size_t written = fwrite(buffer, 1, bytes, file);
+		int closed = fclose(file);
+
+		if (written != bytes || closed != 0) {
+			fprintf(stderr, "camera_test: native output wrote %zu of %zu bytes, close=%d\n", written, bytes, closed);
+			goto done;
+		}
+		printf("camera_test: native saved %zu bytes to %s\n", bytes, output);
+	}
+	result = 0;
+done:
+	free(buffer);
+	close(device);
+	return result;
+}
 
 static double
 ms_since(uint64_t then)
@@ -413,6 +478,9 @@ int
 main(int argc, char **argv)
 {
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	if ((argc == 2 || argc == 3) && strcmp(argv[1], "native") == 0) {
+		return native(argc == 3 ? argv[2] : NULL);
+	}
 	if (argc >= 2 && strcmp(argv[1], "raw") == 0) {
 		bool ae = true, awb = true, keep_raw = false, full = false;
 		int sensor = -1;
@@ -445,6 +513,6 @@ main(int argc, char **argv)
 	if (argc >= 2 && strcmp(argv[1], "cycle") == 0) {
 		return cycle(argc >= 3 ? atoi(argv[2]) : 30);
 	}
-	fprintf(stderr, "usage: camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
+	fprintf(stderr, "usage: camera_test native [OUTPUT]\n       camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
 	return 2;
 }
