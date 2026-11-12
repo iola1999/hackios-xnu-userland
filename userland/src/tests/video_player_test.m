@@ -1,13 +1,12 @@
 /*
  * Play a file or HTTP(S) video through AVPlayer and inspect its NV12 output frames.
- * Usage: video_player_test [--deadline SECONDS] [--report-file PATH] FILE | --url HTTP_URL
+ * Usage: video_player_test [--deadline SECONDS] FILE | --url HTTP_URL
  * Default deadline: 150 seconds, including cold startup, playback and cleanup.
  * Exit: 0 ready, playing, advancing clock, valid pixels and end notification observed;
  *       1 input/player/pixel failure; 2 arguments; 124 whole-process deadline.
  * The player retains its default decoder, buffering and audio-session behavior.
  * Pixel hashes cover active NV12 bytes, excluding row padding. Logs omit paths,
  * NSError descriptions and userInfo. This probe does not present frames.
- * --report-file exclusively creates a file with every frame and a completion record.
  */
 #import <AVFoundation/AVFoundation.h>
 #include <errno.h>
@@ -86,16 +85,8 @@ publish_summary(struct summary_snapshot *snapshot)
 }
 
 static int
-complete_summary(struct summary_snapshot *snapshot, FILE *report)
+complete_summary(struct summary_snapshot *snapshot)
 {
-	if (report != NULL) {
-		bool report_failed = ferror(report) != 0;
-		if (fprintf(report, "video_player_test: stage=report_complete frames=%u pixel_errors=%u\n",
-		    snapshot->frames, snapshot->pixel_errors) < 0) report_failed = true;
-		if (fclose(report) != 0) report_failed = true;
-		if (report_failed) printf("video_player_test: stage=report_write result=fail\n");
-		snapshot->failed |= report_failed;
-	}
 	struct itimerval disabled = { 0 };
 	(void)setitimer(ITIMER_REAL, &disabled, NULL);
 	snapshot->finished = true;
@@ -219,10 +210,9 @@ pixel_summary(CVPixelBufferRef image, uint64_t *hash, uint64_t *bytes, unsigned 
 }
 
 static int
-play(const char *path, bool remote, const char *report_path)
+play(const char *path, bool remote)
 {
 	__block struct summary_snapshot summary = { .maximum = kCMTimeZero };
-	FILE *report = NULL;
 	started_monotonic_ms = monotonic_milliseconds();
 	publish_summary(&summary);
 	struct timeval wall;
@@ -232,20 +222,12 @@ play(const char *path, bool remote, const char *report_path)
 	if (!remote && stat(path, &st) != 0) {
 		printf("video_player_test: stage=input errno=%d\n", errno);
 		summary.failed = true;
-		return complete_summary(&summary, report);
+		return complete_summary(&summary);
 	}
 	if (!remote && !S_ISREG(st.st_mode)) {
 		printf("video_player_test: stage=input error=not_regular_file\n");
 		summary.failed = true;
-		return complete_summary(&summary, report);
-	}
-	if (report_path != NULL) {
-		report = fopen(report_path, "wx");
-		if (report == NULL) {
-			printf("video_player_test: stage=report_open errno=%d\n", errno);
-			summary.failed = true;
-			return complete_summary(&summary, report);
-		}
+		return complete_summary(&summary);
 	}
 	AVPlayer *player = nil;
 	AVPlayerItem *item = nil;
@@ -259,7 +241,7 @@ play(const char *path, bool remote, const char *report_path)
 		    (![url.scheme isEqualToString:@"http"] && ![url.scheme isEqualToString:@"https"]))) {
 			printf("video_player_test: stage=input error=invalid_http_url\n");
 			summary.failed = true;
-			return complete_summary(&summary, report);
+			return complete_summary(&summary);
 		}
 		item = [AVPlayerItem playerItemWithURL:url];
 		printf("video_player_test: stage=item_created elapsed_ms=%" PRIu64 "\n", elapsed_milliseconds());
@@ -338,18 +320,14 @@ play(const char *path, bool remote, const char *report_path)
 							summary.first_frame_ms = elapsed_milliseconds();
 							printf("video_player_test: stage=first_frame elapsed_ms=%" PRIu64 "\n", summary.first_frame_ms);
 						}
-						bool log_frame = error != 0 || index <= 3 || index % FRAME_LOG_EVERY == 0;
-						uint64_t frame_ms = elapsed_milliseconds();
-						FILE *outputs[] = { stdout, report };
-						for (unsigned copy = 0; copy < 2; copy++) {
-							if (outputs[copy] == NULL || (copy == 0 && !log_frame)) continue;
-							fprintf(outputs[copy], "video_player_test: stage=frame index=%u elapsed_ms=%" PRIu64
+						if (error != 0 || index <= 3 || index % FRAME_LOG_EVERY == 0) {
+							printf("video_player_test: stage=frame index=%u elapsed_ms=%" PRIu64
 							    " pts=%" PRId64 "/%d pts_flags=0x%x format=0x%08x width=%zu height=%zu"
 							    " pixel_error=%d bytes=%" PRIu64 " fnv1a64=%016" PRIx64 " min=%u max=%u\n",
-							    index, frame_ms, pts.value, pts.timescale, (unsigned)pts.flags,
+							    index, elapsed_milliseconds(), pts.value, pts.timescale, (unsigned)pts.flags,
 							    (unsigned)CVPixelBufferGetPixelFormatType(image), CVPixelBufferGetWidth(image),
 							    CVPixelBufferGetHeight(image), error, frame_bytes, hash, low, high);
-							if (copy == 0) summary.frame_logs++;
+							summary.frame_logs++;
 						}
 						CVPixelBufferRelease(image);
 						if (error != 0) { summary.failed = true; break; }
@@ -378,14 +356,14 @@ play(const char *path, bool remote, const char *report_path)
 	[player replaceCurrentItemWithPlayerItem:nil];
 	summary.failed |= !summary.ready || !summary.playing || !summary.advanced || !summary.ended ||
 	    summary.frames == 0 || summary.pixel_errors != 0;
-	return complete_summary(&summary, report);
+	return complete_summary(&summary);
 }
 
 int
 main(int argc, char **argv)
 {
 	double deadline = 150;
-	const char *path = NULL, *report_path = NULL;
+	const char *path = NULL;
 	bool remote = false;
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--deadline") && i + 1 < argc) {
@@ -396,8 +374,6 @@ main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--url") && i + 1 < argc && path == NULL) {
 			remote = true;
 			path = argv[++i];
-		} else if (!strcmp(argv[i], "--report-file") && i + 1 < argc && report_path == NULL) {
-			report_path = argv[++i];
 		} else if (argv[i][0] != '-' && path == NULL) {
 			path = argv[i];
 		} else goto usage;
@@ -422,9 +398,9 @@ main(int argc, char **argv)
 		return 1;
 	}
 	@autoreleasepool {
-		return play(path, remote, report_path);
+		return play(path, remote);
 	}
 usage:
-	fprintf(stderr, "usage: video_player_test [--deadline SECONDS] [--report-file PATH] FILE | --url HTTP_URL\n");
+	fprintf(stderr, "usage: video_player_test [--deadline SECONDS] FILE | --url HTTP_URL\n");
 	return 2;
 }

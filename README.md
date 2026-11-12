@@ -37,3 +37,5 @@ iOS 26 的 Metal 驱动在内核仓库的 `tools/userland-driver/`。根盘、Me
 - HackiOS 是独立研究项目，与 Apple Inc. 没有关联，也没有得到其授权或认可。
 
 上游作者：OOSEX GANG，动态见 [t.me/oosexgangdevs](https://t.me/oosexgangdevs)。
+
+Mesa 后端的宿主检查见[测试说明](tools/mesa/tests/README.md)。

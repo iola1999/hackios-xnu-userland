@@ -25,7 +25,6 @@
 
 #include "nir_builtin_builder.h"
 #include "util/u_math.h"
-#include "air_math_private.h"
 
 /* the dot-separated parts of an air.* name, after "air." */
 #define AIR_MAX_PARTS 8
@@ -249,10 +248,6 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_fsin(&c->b, a[0]);
    } else if (!strcmp(op, "fast_cos") || !strcmp(op, "cos")) {
       r = nir_fcos(&c->b, a[0]);
-   } else if (!strcmp(op, "cospi")) {
-      if (argc != 1 || !is_float || (a[0]->bit_size != 16 && a[0]->bit_size != 32))
-         return air_error(c, "intrinsic: cospi requires one half or float argument");
-      r = air_cospi(&c->b, a[0]);
    } else if (!strcmp(op, "fast_tan") || !strcmp(op, "tan")) {
       r = nir_fdiv(&c->b, nir_fsin(&c->b, a[0]), nir_fcos(&c->b, a[0]));
    } else if (!strcmp(op, "fast_atan2") || !strcmp(op, "atan2")) {

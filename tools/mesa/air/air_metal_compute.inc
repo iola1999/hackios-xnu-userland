@@ -8,13 +8,13 @@ static void *compute_state_for(struct rwa_compute *compute, const unsigned block
                                const struct rwa_yuv_key *yuv,
                                char *why, size_t why_size);
 
-static struct rwa_compute *
-compute_create(struct rwa_device *device, const void *bitcode, size_t size,
-                const char *entry, const struct rwa_stitched_kernel *kernel,
-                struct rwa_compute_info *info, char *why, size_t why_size)
+struct rwa_compute *
+rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
+                   const char *entry, struct rwa_compute_info *info,
+                   char *why, size_t why_size)
 {
    RWA_LOCKED;
-   if (!kernel && (!bitcode || size < 4)) {
+   if (!bitcode || size < 4) {
       say(why, why_size, "%zu bytes is not a shader module", size);
       return NULL;
    }
@@ -27,13 +27,25 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
    compute->device = device;
    compute->mem_ctx = ralloc_context(NULL);
 
-   struct air_constant_value *constants = NULL;
-   unsigned num_constants = kernel ? 0 :
+   /* Function constants are taken as zero. There is nothing to take them from: Metal's
+    * specialization goes through -[MTLFunction newFunctionWithConstantValues:], which
+    * is one of the methods that run inside Metal's own classes through a nil compiler
+    * and return nil before a driver sees them (docs/metal.md 10.7). A module that needs
+    * real values will say so -- the translator refuses what it cannot fold.
+    */
+   struct air_constant_value *constants;
+   unsigned num_constants =
       air_module_function_constants(compute->mem_ctx, bitcode, size, &constants);
+
+   /* library_wrapper is false, unlike air_run --library: a wrapped air.visible function
+    * is a shader made up to be measurable, not a pipeline anyone can dispatch. Metal
+    * stitches those into a caller at pipeline time (air.stitching_info), which this
+    * frontend does not implement, and a driver asked to make a compute pipeline out of
+    * one should be told that rather than handed a wrapper.
+    */
    const struct air_to_nir_options options = {
       .constants = constants,
       .num_constants = num_constants,
-      .kernel = (const struct air_stitched_kernel *)kernel,
    };
    const char *error;
    compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
@@ -156,33 +168,6 @@ fail:
    ralloc_free(compute->mem_ctx);
    free(compute);
    return NULL;
-}
-
-struct rwa_compute *
-rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
-                   const char *entry, struct rwa_compute_info *info,
-                   char *why, size_t why_size)
-{
-   return compute_create(device, bitcode, size, entry, NULL, info, why, why_size);
-}
-
-_Static_assert(sizeof(struct rwa_stitched_kernel) == sizeof(struct air_stitched_kernel) &&
-               sizeof(struct rwa_stitch_input) == sizeof(struct air_stitch_input) &&
-               offsetof(struct rwa_stitched_kernel, inputs) ==
-                  offsetof(struct air_stitched_kernel, inputs) &&
-               offsetof(struct rwa_stitch_input, byte_offset) ==
-                  offsetof(struct air_stitch_input, byte_offset), "stitch kernel ABI differs");
-
-struct rwa_compute *
-rwa_compute_create_stitched(struct rwa_device *device,
-                            const struct rwa_stitched_kernel *kernel,
-                            struct rwa_compute_info *info, char *why, size_t why_size)
-{
-   if (!kernel) {
-      say(why, why_size, "missing stitched kernel graph");
-      return NULL;
-   }
-   return compute_create(device, NULL, 0, NULL, kernel, info, why, why_size);
 }
 
 int

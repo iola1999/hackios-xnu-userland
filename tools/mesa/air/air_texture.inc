@@ -25,8 +25,7 @@
  *                        i32 component, i32 flags)   -> { <4 x T>, i8 }
  *   read_<kind>_<dim>   (tex, [plane,] coord, [i32 array,]
  *                        i32 lod_or_sample, i32 flags)
- *   read_texture_2d[_array]
- *                      (tex, builtin_read_sampler, coord, [array,] zero_offset, lod, access)
+ *   read_texture_2d    (tex, builtin_read_sampler, coord, zero_offset, lod, access)
  *                      AIR 2.8 form for read-only and sampled textures
  *   write_<kind>_<dim>  (tex, coord, [i32 array,] value, i32 lod, i32 flags)
  *   get_<what>_<kind>_<dim> (tex[, i32 lod])         -> i32
@@ -400,9 +399,10 @@ image_level_slot(struct air_ctx *c, const struct air_ptr *tex, nir_def *lod,
  * Vulkan says round to even, GLSL says nearest -- therefore never arises
  * here, because the value handed to it is always a whole number.
  *
- * Integer coordinates and array layers are widened to 32 bits. AIR read
- * signatures can use either i16 or i32 layers, including i16 layers with
- * the 16-bit coordinate variant.
+ * An integer coordinate is widened to 32 bits first so that the layer, which
+ * arrives as i32, does not have to be narrowed to meet it: air.read_texture_2d
+ * has a 16-bit coordinate variant and the layer in those signatures is 32-bit
+ * all the same.
  */
 static nir_def *
 tex_coord_and_layer(struct air_ctx *c, const struct air_inst *in,
@@ -563,43 +563,24 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    if (read_sampler) {
       /* AIR 2.8 ordinary read adds a builtin sampler and zero offset. Explicit
        * sampler reads also use this signature and need separate addressing semantics. */
-      if (t.dim != GLSL_SAMPLER_DIM_2D || t.depth || t.is_ms ||
-          in->num_operands != 7 + (unsigned)t.is_array)
-         return air_error(c, "intrinsic: builtin read sampler requires a 2D or 2D-array (texture, sampler, coord, [layer,] offset, lod, access) signature");
+      if (t.dim != GLSL_SAMPLER_DIM_2D || t.depth || t.is_array || t.is_ms || tex.is_image ||
+          in->num_operands != 7)
+         return air_error(c, "intrinsic: builtin read sampler requires a read-only 2D (texture, sampler, coord, offset, lod, access) signature");
       if (!tex_handle(c, in, arg++, AIR_PTR_READ_SAMPLER, &samp))
          return false;
       const struct air_type *coord = in->operands[arg]->type;
-      /* Array reads place the integer layer before the zero offset. The i16
-       * overload also narrows the layer; tex_coord_and_layer widens both. */
-      if (t.is_array && (in->operands[arg + 1]->type->kind != AIR_TYPE_INT ||
-                         (in->operands[arg + 1]->type->bits != 16 &&
-                          in->operands[arg + 1]->type->bits != 32)))
-         return air_error(c, "intrinsic: builtin read sampler requires an i16 or i32 array layer");
-      unsigned offset_arg = arg + 1 + (unsigned)t.is_array;
-      const struct air_type *offset = in->operands[offset_arg]->type;
-      const struct air_type *lod = in->operands[offset_arg + 1]->type;
+      const struct air_type *offset = in->operands[arg + 1]->type;
+      const struct air_type *lod = in->operands[arg + 2]->type;
       uint64_t access;
       if (coord->kind != AIR_TYPE_VECTOR || coord->count != 2 ||
           coord->elem->kind != AIR_TYPE_INT || (coord->elem->bits != 16 && coord->elem->bits != 32) ||
           offset->kind != AIR_TYPE_VECTOR || offset->count != 2 ||
           offset->elem->kind != AIR_TYPE_INT || offset->elem->bits != coord->elem->bits ||
           lod->kind != AIR_TYPE_INT || (lod->bits != 16 && lod->bits != 32) ||
-          in->operands[offset_arg + 2]->type->kind != AIR_TYPE_INT ||
-          in->operands[offset_arg + 2]->type->bits != 32 ||
-          !air_const_uint(in->operands[offset_arg + 2], &access))
+          in->operands[arg + 3]->type->kind != AIR_TYPE_INT ||
+          in->operands[arg + 3]->type->bits != 32 ||
+          !air_const_uint(in->operands[arg + 3], &access) || (access != 0 && access != 1))
          return air_error(c, "intrinsic: builtin read sampler has invalid coordinate, offset, lod or access types");
-      if (tex.is_image) {
-         bool readable = false;
-         for (unsigned i = 0; i < c->info->num_resources; i++) {
-            const struct air_resource *r = &c->info->resources[i];
-            if (r->kind == AIR_RESOURCE_IMAGE && r->index == tex.binding)
-               readable = r->read && r->write;
-         }
-         if (access != 3 || !readable)
-            return air_error(c, "intrinsic: builtin read sampler requires read_write image access");
-      } else if (access != 0 && access != 1) {
-         return air_error(c, "intrinsic: builtin read sampler requires sample or read texture access");
-      }
    }
    bool have_sampler = !strcmp(t.op, "sample") || !strcmp(t.op, "gather") ||
                        !strcmp(t.op, "lod");
@@ -714,9 +695,6 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
       nir_def *offset = air_get_ssa(c, in->operands[arg++]);
       if (!offset || !all_zero(offset))
          return air_error(c, "intrinsic: builtin read sampler requires a constant zero offset");
-      uint64_t level;
-      if (tex.is_image && (!air_const_uint(in->operands[arg], &level) || level != 0))
-         return air_error(c, "intrinsic: builtin read_write image load only supports level 0");
    }
 
    if (!strcmp(t.op, "read") && tex.is_image) {

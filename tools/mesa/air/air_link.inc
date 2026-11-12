@@ -193,88 +193,80 @@ inline_linked_function(struct air_ctx *c, struct air_linked_module *lm,
    return ok ? result : NULL;
 }
 
-/* Native stitching graphs list every data and control dependency before its use.
- * Validate the whole graph before reading results or translating any function. */
-static bool
-validate_stitch_graph(struct air_ctx *c, const struct air_linked_function *lf,
-                      unsigned num_inputs, bool kernel)
-{
-   if (!lf || !lf->name || (lf->num_nodes && !lf->nodes))
-      return air_error(c, "link: missing graph name or nodes");
-   if (lf->output != ~0u && lf->output >= lf->num_nodes)
-      return air_error(c, "link: %s has %u nodes and its output is node %u",
-                       lf->name, lf->num_nodes, lf->output);
-   if (kernel && lf->output != ~0u)
-      return air_error(c, "link: a stitched kernel cannot return a node value");
-   for (unsigned k = 0; k < lf->num_nodes; k++) {
-      const struct air_stitch_node *n = &lf->nodes[k];
-      bool early = !n->bitcode && !n->function;
-      if (early && (!kernel || n->num_args != 1 || !n->args))
-         return air_error(c, "link: node %u is not a valid EarlyReturnNode", k);
-      if (!early && (!n->bitcode || n->size < 4 || !n->function))
-         return air_error(c, "link: node %u has no function module", k);
-      if (n->num_after && !n->after)
-         return air_error(c, "link: node %u has no dependency array", k);
-      if (kernel && n->num_args && !n->args)
-         return air_error(c, "link: kernel node %u has no argument array", k);
-      for (unsigned a = 0; n->args && a < n->num_args; a++) {
-         int from = n->args[a];
-         if (from >= 0 && (unsigned)from >= num_inputs)
-            return air_error(c, "link: node %u reads input %d of %u", k, from, num_inputs);
-         if (from < 0 && (unsigned)(-1 - from) >= k)
-            return air_error(c, "link: node %u reads node %d before its definition",
-                             k, -1 - from);
-      }
-      for (unsigned d = 0; d < n->num_after; d++)
-         if (n->after[d] >= k)
-            return air_error(c, "link: node %u depends on node %u before its definition",
-                             k, n->after[d]);
-   }
-   return true;
-}
-
-/* A linked visible call uses its actual arguments and the output node's value. */
+/* A call of the declared function decl, which the pipeline linked as lf: the graph's nodes
+ * inlined in dependency order, and the output node's result as the call's. */
 static bool
 call_linked_function(struct air_ctx *c, const struct air_inst *in,
                      const struct air_function *decl, const struct air_linked_function *lf)
 {
    unsigned nin = in->num_operands - 1;
-   if (!validate_stitch_graph(c, lf, nin, false))
-      return false;
    struct air_val **inputs = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(nin, 1));
    for (unsigned i = 0; i < nin; i++) {
       inputs[i] = air_get(c, in->operands[i + 1]);
       if (!inputs[i])
          return false;
    }
+   if (lf->output >= lf->num_nodes)
+      return air_error(c, "link: %s has %u nodes and its output is node %u", lf->name,
+                       lf->num_nodes, lf->output);
+
    struct air_val **results = rzalloc_array(c->mem_ctx, struct air_val *,
                                             MAX2(lf->num_nodes, 1));
-   for (unsigned k = 0; k < lf->num_nodes; k++) {
-      const struct air_stitch_node *node = &lf->nodes[k];
-      struct air_linked_module *lm = linked_module(c, node->bitcode, node->size);
-      if (!lm)
-         return false;
-      const struct air_function *f = module_function(lm->m, node->function);
-      if (!f)
-         return air_error(c, "link: node %u calls undefined function %s", k, node->function);
-      unsigned nargs = node->args ? node->num_args : f->num_args;
-      if (f->num_args != nargs || (!node->args && nargs > nin))
-         return air_error(c, "link: node %u has an incompatible argument count", k);
-      struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(nargs, 1));
-      for (unsigned a = 0; a < nargs; a++) {
-         int from = node->args ? node->args[a] : (int)a;
-         argv[a] = from >= 0 ? inputs[from] : results[-1 - from];
-         if (!argv[a])
-            return air_error(c, "link: node %u reads a node that returns nothing", k);
+   bool *done = rzalloc_array(c->mem_ctx, bool, MAX2(lf->num_nodes, 1));
+   for (unsigned pass = 0, left = lf->num_nodes; left; pass++) {
+      bool progress = false;
+      for (unsigned k = 0; k < lf->num_nodes; k++) {
+         const struct air_stitch_node *node = &lf->nodes[k];
+         bool ready = !done[k];
+         for (unsigned a = 0; ready && node->args && a < node->num_args; a++)
+            ready = node->args[a] >= 0 || done[-1 - node->args[a]];
+         for (unsigned a = 0; ready && a < node->num_after; a++)
+            ready = node->after[a] < lf->num_nodes && done[node->after[a]];
+         if (!ready)
+            continue;
+
+         struct air_linked_module *lm = linked_module(c, node->bitcode, node->size);
+         if (!lm)
+            return false;
+         const struct air_function *f = module_function(lm->m, node->function);
+         if (!f)
+            return air_error(c, "link: node %u of %s calls %s, which its module does not "
+                                "define", k, lf->name, node->function);
+         unsigned nargs = node->args ? node->num_args : f->num_args;
+         if (f->num_args != nargs)
+            return air_error(c, "link: node %u of %s passes %u arguments to %s, which takes "
+                                "%u", k, lf->name, nargs, node->function, f->num_args);
+         struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(nargs, 1));
+         for (unsigned a = 0; a < nargs; a++) {
+            int from = node->args ? node->args[a] : (int)a;
+            if (from >= 0 && (unsigned)from >= nin)
+               return air_error(c, "link: node %u of %s reads argument %d of a call with %u",
+                                k, lf->name, from, nin);
+            if (from < 0 && (unsigned)(-1 - from) >= lf->num_nodes)
+               return air_error(c, "link: node %u of %s reads node %d of %u", k, lf->name,
+                                -1 - from, lf->num_nodes);
+            argv[a] = from >= 0 ? inputs[from] : results[-1 - from];
+            if (!argv[a])
+               return air_error(c, "link: node %u of %s reads the result of a node that "
+                                   "returns nothing", k, lf->name);
+         }
+         results[k] = inline_linked_function(c, lm, f, argv);
+         if (c->error[0])
+            return false;
+         done[k] = true;
+         left--;
+         progress = true;
       }
-      results[k] = inline_linked_function(c, lm, f, argv);
-      if (c->error[0])
-         return false;
+      if (!progress)
+         return air_error(c, "link: the nodes of %s depend on one another in a cycle",
+                          lf->name);
    }
+
    const struct air_type *rt = decl->fn_type->elem;
    if (rt && rt->kind != AIR_TYPE_VOID) {
-      if (lf->output == ~0u || !results[lf->output])
-         return air_error(c, "link: %s has no output value for this call", lf->name);
+      if (!results[lf->output])
+         return air_error(c, "link: the output node of %s returns nothing and the call "
+                             "wants a value", lf->name);
       air_set(c, &in->base, results[lf->output]);
    }
    return true;

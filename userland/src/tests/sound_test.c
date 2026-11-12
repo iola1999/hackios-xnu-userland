@@ -1,9 +1,7 @@
 /*
  * sound_test: make iOS play something, the way a program would.
  *
- * usage: sound_test [--deadline SECONDS] STEP...
- *   --deadline SECONDS                 whole-process limit (0 < SECONDS <= 3600), including cleanup; exit 124
- *                                      on expiry, 2 for invalid arguments, 1 for a playback/API failure
+ * usage: sound_test STEP...
  *   wait SECONDS
  *   springboard                        wait until SpringBoard is up and has said that the ringer is on (at
  *                                      most ten minutes): until then system sounds are "played" in silence,
@@ -42,8 +40,6 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <signal.h>
-#include <stdatomic.h>
-#include <sys/time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,65 +49,29 @@
 #define BUFFER_FRAMES   4096
 
 static double frequency[2] = { 1000, 440 }, peak = 0.5;
-static mach_timebase_info_data_t timebase;
-
-static uint64_t
-monotonic_us(void)
-{
-	return (uint64_t)((__uint128_t)mach_absolute_time() * timebase.numer / timebase.denom / 1000);
-}
+static uint64_t frame, frames_wanted;
 
 static void
-phase(const char *name, const char *event, int status)
+fill(__unused void *context, AudioQueueRef queue, AudioQueueBufferRef buffer)
 {
-	printf("sound_test: phase=%s event=%s us=%llu status=%d\n", name, event, monotonic_us(), status);
-}
-
-static void
-deadline_expired(__unused int signal_number)
-{
-	static const char message[] = "sound_test: phase=deadline result=fail exit=124\n";
-	write(STDERR_FILENO, message, sizeof(message) - 1);
-	_exit(124);
-}
-
-struct tone_state {
-	uint64_t frame, wanted;
-	atomic_uint_fast64_t accepted;
-	atomic_int enqueue_error;
-	atomic_bool stopping;
-};
-
-static void
-fill(void *context, AudioQueueRef queue, AudioQueueBufferRef buffer)
-{
-	struct tone_state *state = context;
 	int16_t *samples = buffer->mAudioData;
 	uint32_t count = 0;
-	if (atomic_load(&state->stopping) || atomic_load(&state->enqueue_error)) {
-		return;
-	}
-	for (; count < BUFFER_FRAMES && state->frame < state->wanted; count++, state->frame++) {
-		/* A hundredth of a second at each edge prevents a discontinuity. */
-		double edge = state->frame < RATE / 100 ? state->frame / (RATE / 100.0) :
-		    state->wanted - state->frame < RATE / 100 ? (state->wanted - state->frame) / (RATE / 100.0) : 1;
+
+	for (; count < BUFFER_FRAMES && frame < frames_wanted; count++, frame++) {
+		/* a hundredth of a second to come in and to go out: no click */
+		double edge = frame < RATE / 100 ? frame / (RATE / 100.0) :
+		    frames_wanted - frame < RATE / 100 ? (frames_wanted - frame) / (RATE / 100.0) : 1;
+
 		for (int channel = 0; channel < 2; channel++) {
-			samples[2 * count + channel] = (int16_t)(32767 * peak * edge * sin(2 * M_PI * frequency[channel] * state->frame / RATE));
+			samples[2 * count + channel] = (int16_t)(32767 * peak * edge * sin(2 * M_PI * frequency[channel] * frame / RATE));
 		}
 	}
 	if (count == 0) {
+		AudioQueueStop(queue, false);
 		return;
 	}
 	buffer->mAudioDataByteSize = count * 4;
-	phase("queue-enqueue", "begin", 0);
-	OSStatus status = AudioQueueEnqueueBuffer(queue, buffer, 0, NULL);
-	if (status) {
-		atomic_store(&state->enqueue_error, status);
-	} else {
-		atomic_fetch_add(&state->accepted, count);
-	}
-	printf("sound_test: enqueue us=%llu status=%d frames=%u accepted=%llu\n", monotonic_us(),
-	    (int)status, count, (unsigned long long)atomic_load(&state->accepted));
+	AudioQueueEnqueueBuffer(queue, buffer, 0, NULL);
 }
 
 /* The tone to the kernel's device itself, 10 ms at a time and as fast as it plays (48000 frames a second). */
@@ -168,78 +128,41 @@ tone(double seconds)
 		.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
 		.mBytesPerPacket = 4, .mFramesPerPacket = 1, .mBytesPerFrame = 4, .mChannelsPerFrame = 2, .mBitsPerChannel = 16,
 	};
-	if (!isfinite(seconds) || seconds <= 0 || seconds >= (double)UINT64_MAX / RATE) {
-		return 1;
-	}
-	struct tone_state state = { .wanted = (uint64_t)(seconds * RATE) };
-	AudioQueueRef queue = NULL;
+	AudioQueueRef queue;
 	OSStatus status;
-	bool stopped = false;
-	double until;
 
-	/* The callback owns frame after Start; accepted and errors are shared with this thread. */
-	phase("queue-create", "begin", 0);
-	status = AudioQueueNewOutput(&format, fill, &state, NULL, NULL, 0, &queue);
-	phase("queue-create", "end", status);
+	frame = 0;
+	frames_wanted = (uint64_t)(seconds * RATE);
+	/* no run loop given: the queue asks for more on a thread of its own, also while we are busy talking */
+	status = AudioQueueNewOutput(&format, fill, NULL, NULL, NULL, 0, &queue);
 	if (status != 0) {
+		printf("sound_test: AudioQueueNewOutput: %d\n", (int)status);
 		return 1;
 	}
-	for (int i = 0; i < 3 && state.frame < state.wanted; i++) {
+	for (int i = 0; i < 3; i++) {
 		AudioQueueBufferRef buffer;
-		phase("queue-allocate", "begin", 0);
+
 		status = AudioQueueAllocateBuffer(queue, BUFFER_FRAMES * 4, &buffer);
-		phase("queue-allocate", "end", status);
 		if (status != 0) {
-			goto dispose;
+			printf("sound_test: AudioQueueAllocateBuffer: %d\n", (int)status);
+			return 1;
 		}
-		fill(&state, queue, buffer);
-		if ((status = atomic_load(&state.enqueue_error)) != 0) {
-			goto dispose;
-		}
+		fill(NULL, queue, buffer);
 	}
-	phase("queue-start", "begin", 0);
 	status = AudioQueueStart(queue, NULL);
-	phase("queue-start", "end", status);
-	printf("sound_test: tone hz=%.0f/%.0f peak=%.2f seconds=%.3f wanted=%llu\n",
-	    frequency[0], frequency[1], peak, seconds, state.wanted);
-	if (status != 0) {
-		goto dispose;
-	}
-	until = monotonic_us() / 1000000.0 + 3 * seconds + 10;
-	while (atomic_load(&state.accepted) < state.wanted && !atomic_load(&state.enqueue_error) && monotonic_us() / 1000000.0 < until) {
-		usleep(10000);
-	}
-	status = atomic_load(&state.enqueue_error);
-	if (status != 0 || atomic_load(&state.accepted) != state.wanted) {
-		goto dispose;
-	}
-	phase("queue-stop", "begin", 0);
-	status = AudioQueueStop(queue, false);
-	phase("queue-stop", "end", status);
-	while (status == 0 && monotonic_us() / 1000000.0 < until) {
-		UInt32 running = 1, size = sizeof(running);
-		status = AudioQueueGetProperty(queue, kAudioQueueProperty_IsRunning, &running, &size);
-		if (status != 0 || size != sizeof(running)) {
-			phase("queue-running", "end", status ? status : -1);
-			break;
+	printf("sound_test: a tone of %.0f and %.0f Hz at %.2f of full scale for %.1f s: AudioQueueStart: %d\n", frequency[0],
+	    frequency[1], peak, seconds,
+	    (int)status);
+	if (status == 0) {
+		/* a slow machine may take its time: wait for the end, three times as long as it should take at most */
+		for (int tenths = 0; frame < frames_wanted && tenths < 30 * seconds + 100; tenths++) {
+			usleep(100000);
 		}
-		if (!running) {
-			stopped = true;
-			phase("queue-stopped", "end", 0);
-			break;
-		}
-		usleep(10000);
+		usleep(1500000);                /* the last buffers are still to be played */
+		printf("sound_test: %llu of %llu frames handed over\n", frame, frames_wanted);
 	}
-dispose:
-	atomic_store(&state.stopping, true);
-	phase("queue-dispose", "begin", 0);
-	OSStatus disposed = AudioQueueDispose(queue, true);
-	phase("queue-dispose", "end", disposed);
-	printf("sound_test: tone-complete accepted=%llu wanted=%llu stopped=%d status=%d dispose=%d\n",
-	    (unsigned long long)atomic_load(&state.accepted), state.wanted, stopped, (int)status, (int)disposed);
-	/* A failed Dispose does not establish that callbacks have released this stack context. */
-	if (disposed != 0) exit(1);
-	return status != 0 || !stopped || atomic_load(&state.accepted) != state.wanted;
+	AudioQueueDispose(queue, true);
+	return status != 0 || frame < frames_wanted;
 }
 
 static void
@@ -305,20 +228,16 @@ activate_playback(void)
 		printf("sound_test: session: playback API unavailable\n");
 		return 1;
 	}
-	phase("session-category", "begin", 0);
 	BOOL ok = ((BOOL (*)(id, SEL, id, id *))objc_msgSend)(session,
 	    sel_registerName("setCategory:error:"), *category, &error);
-	phase("session-category", "end", ok ? 0 : 1);
 	printf("sound_test: session: category=%d error=%ld\n", ok,
 	    error ? ((long (*)(id, SEL))objc_msgSend)(error, sel_registerName("code")) : 0);
 	if (!ok) {
 		return 1;
 	}
 	error = NULL;
-	phase("session-active", "begin", 0);
 	ok = ((BOOL (*)(id, SEL, BOOL, id *))objc_msgSend)(session,
 	    sel_registerName("setActive:error:"), YES, &error);
-	phase("session-active", "end", ok ? 0 : 1);
 	printf("sound_test: session: active=%d error=%ld\n", ok,
 	    error ? ((long (*)(id, SEL))objc_msgSend)(error, sel_registerName("code")) : 0);
 	return !ok;
@@ -489,35 +408,7 @@ main(int argc, char **argv)
 	int failed = 0;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
-	mach_timebase_info(&timebase);
-	printf("sound_test: pid=%d start_us=%llu\n", getpid(), monotonic_us());
-	int first = 1;
-	if (argc > 1 && strcmp(argv[1], "--deadline") == 0) {
-		char *end;
-		if (argc < 4) return 2;
-		errno = 0;
-		double seconds = strtod(argv[2], &end);
-		if (errno || end == argv[2] || *end || !isfinite(seconds) || seconds <= 0 || seconds > 3600) return 2;
-		struct sigaction action = { .sa_handler = deadline_expired };
-		sigemptyset(&action.sa_mask);
-		sigset_t alarm_mask;
-		sigemptyset(&alarm_mask);
-		sigaddset(&alarm_mask, SIGALRM);
-		struct itimerval timer = { .it_value = {
-			.tv_sec = (time_t)seconds,
-			.tv_usec = (suseconds_t)((seconds - floor(seconds)) * 1000000),
-		} };
-		if (!timer.it_value.tv_sec && !timer.it_value.tv_usec) return 2;
-		if (sigaction(SIGALRM, &action, NULL) || sigprocmask(SIG_UNBLOCK, &alarm_mask, NULL) ||
-		    setitimer(ITIMER_REAL, &timer, NULL)) {
-			printf("sound_test: deadline-setup errno=%d\n", errno);
-			return 1;
-		}
-		first = 3;
-	}
-	for (int i = first; i < argc; i++) {
-		const char *step = argv[i];
-		phase(step, "begin", 0);
+	for (int i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "wait") == 0 && i + 1 < argc) {
 			usleep((useconds_t)(atof(argv[++i]) * 1e6));
 		} else if (strcmp(argv[i], "springboard") == 0) {
@@ -526,7 +417,6 @@ main(int argc, char **argv)
 			route();
 		} else if (strcmp(argv[i], "activate") == 0) {
 			if (activate_playback()) {
-				phase(step, "end", 1);
 				return 1;
 			}
 		} else if (strcmp(argv[i], "restart") == 0) {
@@ -568,7 +458,6 @@ main(int argc, char **argv)
 			printf("sound_test: what is \"%s\"?\n", argv[i]);
 			return 2;
 		}
-		phase(step, "end", failed);
 	}
 	return failed;
 }

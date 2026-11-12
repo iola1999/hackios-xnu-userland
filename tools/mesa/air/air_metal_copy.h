@@ -1,7 +1,6 @@
 #ifndef AIR_METAL_COPY_H
 #define AIR_METAL_COPY_H
 #include <stddef.h>
-#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -50,63 +49,6 @@ struct rwa_texture *rwa_texture_from_buffer(struct rwa_device *device,
                                             struct rwa_buffer *source, size_t offset,
                                             unsigned row_bytes, char *why, size_t why_size);
 void rwa_buffer_textures_refresh(struct rwa_device *device);
-
-/*
- * A function linked into a stage at pipeline time (MTLLinkedFunctions): a call of a function
- * the stage's module only declares, under the name its air.visible_function_reference gives,
- * runs `nodes` in dependency order and takes node `output`'s result. Each node is a call of
- * `function` in the module `bitcode`; argument i is the linked call's argument args[i] when
- * args[i] >= 0, and the result of node -1 - args[i] otherwise; with args NULL, argument i is
- * the call's argument i. A stitching graph
- * (MTLFunctionStitchingGraph) maps onto this node for node; a visible function linked as it is,
- * is one node taking the call's own arguments. The modules are read during the call and not
- * kept.
- */
-struct rwa_stitch_node {
-	const void *bitcode;
-	size_t size;
-	const char *function;
-	unsigned num_args;
-	const int *args;
-	unsigned num_after;     /* controlDependencies: nodes that run first */
-	const unsigned *after;
-};
-struct rwa_linked_function {
-	const char *name;
-	unsigned num_nodes;
-	const struct rwa_stitch_node *nodes;
-	unsigned output;
-};
-
-/* GraphSPI inputs refer to Metal binding slots. A buffer address is constant memory;
- * dereference applies the callee's air.stitching_info copy/load helpers. */
-enum rwa_stitch_input_kind {
-   RWA_STITCH_TEXTURE,
-   RWA_STITCH_SAMPLER,
-   RWA_STITCH_BUFFER_ADDRESS,
-   RWA_STITCH_THREAD_POSITION,
-};
-struct rwa_stitch_input {
-   unsigned kind;
-   unsigned binding;
-   uint64_t byte_offset;
-   unsigned dereference;
-};
-/* A kernel graph has output UINT_MAX. An EarlyReturnNode has no bitcode/function,
- * one argument naming its boolean condition, and no value for later nodes to read.
- * The existing linked-function layout remains unchanged. Arrays are read only
- * during creation; the returned compute owns all translated state. */
-struct rwa_stitched_kernel {
-   struct rwa_linked_function graph;
-   unsigned num_inputs;
-   const struct rwa_stitch_input *inputs;
-};
-struct rwa_compute;
-struct rwa_compute_info;
-__attribute__((visibility("default")))
-struct rwa_compute *rwa_compute_create_stitched(struct rwa_device *device,
-   const struct rwa_stitched_kernel *kernel, struct rwa_compute_info *info,
-   char *why, size_t why_size);
 
 #ifdef __cplusplus
 }

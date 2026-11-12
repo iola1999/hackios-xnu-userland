@@ -1113,6 +1113,33 @@ struct rwa_render *rwa_render_create(struct rwa_device *device,
 				     const struct rwa_render_shape *shape,
 				     struct rwa_render_info *info, char *why, size_t why_size);
 
+/*
+ * A function linked into a stage at pipeline time (MTLLinkedFunctions): a call of a function
+ * the stage's module only declares, under the name its air.visible_function_reference gives,
+ * runs `nodes` in dependency order and takes node `output`'s result. Each node is a call of
+ * `function` in the module `bitcode`; argument i is the linked call's argument args[i] when
+ * args[i] >= 0, and the result of node -1 - args[i] otherwise; with args NULL, argument i is
+ * the call's argument i. A stitching graph
+ * (MTLFunctionStitchingGraph) maps onto this node for node; a visible function linked as it is,
+ * is one node taking the call's own arguments. The modules are read during the call and not
+ * kept.
+ */
+struct rwa_stitch_node {
+	const void *bitcode;
+	size_t size;
+	const char *function;
+	unsigned num_args;
+	const int *args;
+	unsigned num_after;     /* controlDependencies: nodes that run first */
+	const unsigned *after;
+};
+struct rwa_linked_function {
+	const char *name;
+	unsigned num_nodes;
+	const struct rwa_stitch_node *nodes;
+	unsigned output;
+};
+
 /* rwa_render_create with functions linked into the fragment stage. */
 struct rwa_render *rwa_render_create_linked(struct rwa_device *device,
 					    const void *vertex_bitcode, size_t vertex_size,

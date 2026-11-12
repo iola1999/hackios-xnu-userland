@@ -391,29 +391,6 @@ struct air_linked_function {
    unsigned output;
 };
 
-/* GraphSPI inputs refer to Metal binding slots. A buffer address is constant memory;
- * dereference applies the callee's air.stitching_info copy/load helpers. */
-enum air_stitch_input_kind {
-   AIR_STITCH_TEXTURE,
-   AIR_STITCH_SAMPLER,
-   AIR_STITCH_BUFFER_ADDRESS,
-   AIR_STITCH_THREAD_POSITION,
-};
-struct air_stitch_input {
-   unsigned kind;
-   unsigned binding;
-   uint64_t byte_offset;
-   unsigned dereference;
-};
-/* A kernel graph has output UINT_MAX. An EarlyReturnNode has no bitcode/function,
- * one argument naming its boolean condition, and no value for later nodes to read.
- * The existing linked-function layout remains unchanged. Arrays are read only
- * during creation; the returned compute owns all translated state. */
-struct air_stitched_kernel {
-   struct air_linked_function graph;
-   unsigned num_inputs;
-   const struct air_stitch_input *inputs;
-};
 struct air_to_nir_options {
    const struct air_constant_value *constants;
    unsigned num_constants;
@@ -422,16 +399,15 @@ struct air_to_nir_options {
     * that calls it: argument i read from device buffer 0 at byte 16*i, the
     * return value written to device buffer 1 at offset 0, one thread. Metal's
     * own way of using these functions is to stitch them into a caller at
-    * pipeline time. The wrapper measures a library function independently of
-    * its callers; production linked functions and GraphSPI kernels use the
-    * graph interfaces below. A shader produced this way is not an
+    * pipeline time (air.stitching_info in their metadata), which this frontend
+    * does not implement; the wrapper exists so that a library function's body
+    * can be run and compared at all. A shader produced this way is not an
     * entry point of the corpus and is counted separately.
     */
    bool library_wrapper;
 
    const struct air_linked_function *linked;
    unsigned num_linked;
-   const struct air_stitched_kernel *kernel;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may
