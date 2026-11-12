@@ -15,6 +15,21 @@ static const float expected[6][4] = {{.419433594f, .166503906f, 0, 1},
                                      {.426269531f, .204589844f, .029785156f, 1},
                                      {.447753906f, .215820312f, .019042969f, 1},
                                      {.436028235f, .199930980f, .014883137f, 1}};
+
+/* ITU-R code ranges and luma coefficients, independent of Mesa's matrix helpers. */
+static void p010_reference(unsigned c, const unsigned codes[3], float rgb[4]) {
+   const double kr[] = {.299, .2126, .2627}, kb[] = {.114, .0722, .0593};
+   double r = kr[c % 3], b = kb[c % 3], g = 1 - r - b;
+   double y = c / 3 ? codes[0] / 1023.0 : (codes[0] - 64.0) / 876.0;
+   double u = (codes[1] - 512.0) / (c / 3 ? 1023.0 : 896.0);
+   double v = (codes[2] - 512.0) / (c / 3 ? 1023.0 : 896.0);
+   double values[] = {y + 2 * (1 - r) * v,
+                      y - 2 * b * (1 - b) / g * u - 2 * r * (1 - r) / g * v,
+                      y + 2 * (1 - b) * u, 1};
+   for (unsigned i = 0; i < 4; i++)
+      rgb[i] = fmin(1, fmax(0, values[i]));
+}
+
 int main(int argc, char **argv) {
    char why[1024] = {0};
    CHECK(argc == 3);
@@ -32,12 +47,21 @@ int main(int argc, char **argv) {
    struct rwa_compute *cs =
        rwa_compute_create(d, air, length, "combined_sample", NULL, why, sizeof why);
    CHECK(cs);
-   for (unsigned c = 0; c < 6; c++) {
+   for (unsigned test = 0; test < 36; test++) {
+      unsigned sample = test / 6, c = test % 6;
+      const unsigned codes[][3] = {{64, 96, 160},
+                                    {c / 3 ? 0 : 64, 512, 512},
+                                    {c / 3 ? 1023 : 940, 512, 512},
+                                    {512, 512, 512}, {256, 384, 640}, {768, 640, 384}};
+      float rgb[4];
+      if (sample)
+         p010_reference(c, codes[sample], rgb);
       nir_shader *n = nir_shader_clone(NULL, cs->nir);
       struct rwa_yuv_key key = {.mask = 1,
                                 .full_range = c / 3,
                                 .bt709 = (c % 3) == 1,
                                 .bt2020 = (c % 3) == 2,
+                                .p010 = sample != 0,
                                 .uv_slot = {2}};
       CHECK(lower_yuv(n, &key, why, sizeof why));
       CHECK(BITSET_TEST(n->info.textures_used, 2));
@@ -64,9 +88,12 @@ int main(int argc, char **argv) {
                if (idx != 1)
                   CHECK(tex->op == nir_texop_txl);
                b.cursor = nir_after_instr(instr);
+               float scale = sample ? 64.f / 65535 : 1.f / 255;
                nir_def *v = idx == 2
-                                ? nir_imm_vec4(&b, 96.f / 255, 160.f / 255, 0, 1)
-                                : nir_imm_vec4(&b, idx == 0 ? 64.f / 255 : 128.f / 255, 0, 0, 1);
+                                ? nir_imm_vec4(&b, codes[sample][1] * scale,
+                                              codes[sample][2] * scale, 0, 1)
+                                : nir_imm_vec4(&b, idx == 0 ? codes[sample][0] * scale : 128.f / 255,
+                                              0, 0, 1);
                nir_def_rewrite_uses(&tex->def, v);
             }
          }
@@ -87,15 +114,21 @@ int main(int argc, char **argv) {
                unsigned offset = nir_src_as_uint(in->src[2]);
                const nir_const_value *values = nir_src_as_const_value(in->src[0]);
                const float gv[] = {128.f / 255, 0, 0, 1};
-               const float *want = offset ? gv : expected[c];
-               for (unsigned i = 0; i < 4; i++)
-                  CHECK(isfinite(values[i].f32) && fabsf(values[i].f32 - want[i]) < .002f);
+               const float *want = offset ? gv : sample ? rgb : expected[c];
+               float tolerance = sample ? .00002f : .002f;
+               for (unsigned i = 0; i < 4; i++) {
+                  if (!isfinite(values[i].f32) || fabsf(values[i].f32 - want[i]) >= tolerance)
+                     snprintf(why, sizeof why, "sample=%u case=%u offset=%u channel=%u: %.9f expected %.9f",
+                              sample, c, offset, i, values[i].f32, want[i]);
+                  CHECK(isfinite(values[i].f32) && fabsf(values[i].f32 - want[i]) < tolerance);
+               }
                stores++;
             }
          }
       }
       CHECK(stores == 2);
-      printf("nir case=%u Y=%u UV=%u guard=%u stores=%u pass\n", c, y, uv, guard, stores);
+      printf("nir depth=%u sample=%u case=%u Y=%u UV=%u guard=%u stores=%u pass\n",
+             sample ? 10 : 8, sample, c, y, uv, guard, stores);
       ralloc_free(n);
    }
    f = fopen(argv[2], "rb");
@@ -171,6 +204,11 @@ int main(int argc, char **argv) {
    CHECK(uv10);
    struct rwa_texture *t10 = rwa_texture_combine_yuv(y10, uv10, false, 9, why, sizeof why);
    CHECK(t10 && t10->shape.pixel_format == 505 && t10->yuv_bt2020);
+   struct rwa_texture *textures10[] = {t10, y};
+   struct rwa_bindings bindings10 = {.textures = textures10, .texture_count = 2};
+   struct rwa_yuv_key key10;
+   CHECK(yuv_key_for(&cs->info, &bindings10, NULL, 0, &key10, why, sizeof why));
+   CHECK(key10.mask == 1 && key10.p010 == 1 && key10.bt2020 == 1 && key10.uv_slot[0] == 2);
    rwa_texture_destroy(t10);
    rwa_texture_destroy(y10);
    rwa_texture_destroy(uv10);
@@ -182,7 +220,7 @@ int main(int argc, char **argv) {
    struct rwa_bindings bindings = {.textures = textures, .texture_count = 2};
    struct rwa_yuv_key key;
    CHECK(yuv_key_for(&cs->info, &bindings, NULL, 0, &key, why, sizeof why));
-   CHECK(key.mask == 1 && key.uv_slot[0] == 2);
+   CHECK(key.mask == 1 && key.p010 == 0 && key.uv_slot[0] == 2);
    rwa_texture_destroy(y);
    rwa_texture_destroy(uv);
    CHECK(t->storage_owner->references == 1 && t->chroma->references == 1);

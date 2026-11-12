@@ -1,15 +1,16 @@
 # AIR → NIR: a Metal shader frontend for Mesa
 
+This document preserves upstream AIR design notes and iOS 16.5 (20F66) measurements. Its corpus totals, device observations and historical file paths describe those runs; they have not been regenerated for the current K90 image.
+
+K90 now uses iOS 26 and an implemented Metal driver. Current entry points are the workspace [architecture overview](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/plan/architecture.md), [Mesa 26.x notes](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/analysis/mesa-rebase-2026-10.md), and the kernel repository's [Metal driver](https://github.com/iola1999/hackios-xnu-kernel/tree/k90-port/tools/userland-driver).
+
 This is the compiler third of running Metal on the Adreno of this port: a translator from Apple's
 shader bitcode (AIR, the contents of a `.metallib`) to Mesa's NIR, so that ir3 — the same compiler
 that already runs the port's OpenGL ES through freedreno — turns Metal shaders into Adreno code.
 
-The other two thirds are **not** here and are not started: the `_MTLDevice`/`IOGPUMetalDevice`
-object graph (AGXMetalA11 alone is 53 classes and 1158 methods, IOGPU.framework 711 more), and the
-kernel ABI that submits work. Where a decision below constrains them it says so, and section 7
-collects those constraints in one list.
+At the start of these notes, the `_MTLDevice`/`IOGPUMetalDevice` object graph and the kernel ABI that submits work had not been started. The analysis counted 53 classes and 1158 methods in AGXMetalA11, and 711 more methods in IOGPU.framework. Section 7 collects the frontend's constraints on those interfaces.
 
-Why this is worth doing at all, and what it costs, is argued in `docs/metal.md` section 9. This
+Why this is worth doing at all, and what it costs, is argued in the [upstream Metal analysis](https://github.com/oosexgang/hakios-xnu-kernel/blob/63fc2b4633bac3af8e57dadab9f5a8d4cb940438/docs/ru/metal.md), section 9. This
 document assumes those measurements and records the decisions taken on top of them.
 
 ## Where it stands, and what that does not mean
@@ -651,8 +652,7 @@ of counted. The numbers above are from suites where 11 of each conversion's 22 i
   **That latch now has a way out, behind a boot-arg — built, not yet run.** `gpu_recover=1`
   resets the 3D core's own half after a timeout, brings it back with the same two steps the boot
   uses, gives up the submission that hung and lets `gpuWait` wait again, so a hang costs one
-  dispatch instead of the rest of a boot. `docs/metal.md` section 10.36 has what is done and
-  which source says so; `userland/rc.jobs.metalrecover` is the measurement — the canary before
+  dispatch instead of the rest of a boot. The historical `userland/rc.jobs.metalrecover` script defines canary measurements before
   and after three hangs of two different shapes, with both outcomes written down in advance.
   Until a boot says it works, every number in this section stands as it is and the ordering rules
   above — hangers last, a canary between jobs, nothing below a wedge is evidence — stay in force.
@@ -891,7 +891,7 @@ before NIR. Neither is true of iOS 16.5.
 
 ## 3. What a translation unit is
 
-A `.metallib` is a container of **one LLVM module per function** (`docs/metal.md` 9.1). The unit
+A `.metallib` is a container of **one LLVM module per function** ([upstream Metal analysis](https://github.com/oosexgang/hakios-xnu-kernel/blob/63fc2b4633bac3af8e57dadab9f5a8d4cb940438/docs/ru/metal.md), section 9.1). The unit
 of translation is therefore **one module → one `nir_shader`**, and the stage of that shader is read
 from the module's named metadata, never from the container: the container's `TYPE` tag and the
 metadata are cross-checked by the corpus tool and disagreements are reported.
@@ -1880,7 +1880,7 @@ technical writing, while corpus bytes committed as an *input* — a fixture a te
 place to get Apple's shaders; it may be a place that explains them.
 
 By that line, two things in these documents are excerpts and are kept: the three sampler words
-above, and the six-line listing of `clearFragment01` in `docs/metal.md` section 9.5. Neither
+above, and the six-line listing of `clearFragment01` in the [upstream Metal analysis](https://github.com/oosexgang/hakios-xnu-kernel/blob/63fc2b4633bac3af8e57dadab9f5a8d4cb940438/docs/ru/metal.md), section 9.5. Neither
 substitutes for the thing it came from, and both carry the analysis they exist to support. Nothing
 committed anywhere is corpus bytes as an input: `docs/air-report.md` holds module names, counts and
 error strings, which are facts about Apple's shaders and not Apple's shaders, and no test here has
@@ -3419,7 +3419,7 @@ Needed on this machine: meson, ninja, bison, flex, python3 with venv, and LLVM's
 ## 6a. Handing this to a runtime: what it has to do, and what it gets for free
 
 Written for whoever builds subsystem (2), the `_MTLDevice`/`IOGPUMetalDevice` object graph
-(`docs/metal.md` section 4 weighs the three paths). This section is the interface, not advice: it
+([upstream Metal analysis](https://github.com/oosexgang/hakios-xnu-kernel/blob/63fc2b4633bac3af8e57dadab9f5a8d4cb940438/docs/ru/metal.md), section 4, weighs the three paths). This section is the interface, not advice: it
 says what this frontend hands over and what it needs back, so that nobody has to read
 `air_run.c` to find out. Where a claim here has been exercised, it says by what; the rest is a
 promise this side keeps and nothing has tested.
@@ -4227,7 +4227,7 @@ MTLReportFailure(0, "-[_MTLFunction newArgumentEncoderWithBufferIndex:reflection
 
 and returns **nil**. So the choice is not between Apple's implementation and ours; it is between
 nil and an encoder — and the information Metal was missing is the information this port has:
-`-[_MTLFunction bitcodeData]` works (docs/metal.md 10.12), and the set's layout is in those
+`-[_MTLFunction bitcodeData]` works, and the set's layout is in those
 bytes. The driver therefore **replaces that method at run time**, which is the first time this
 port has overridden a method of Apple's own class rather than subclassed one. What that costs is
 said where it is written: the method is replaced for every MTLFunction in the process, Apple's
@@ -4239,7 +4239,7 @@ category on `_MTLFunction` makes the driver's dylib import `_OBJC_CLASS_$__MTLFu
 private class symbol that does not bind is a dylib that does not **load** — which would take the
 whole driver down for every Metal client in the process rather than just this selector. The one
 private class symbol this driver does import, `_OBJC_CLASS_$__MTLDevice`, is imported by
-IOGPU.framework as well and has been measured loading on the phone (docs/metal.md 10.7);
+IOGPU.framework as well and has been measured loading on the phone;
 `ipsw dyld symaddr -b` finds nothing in the cache that imports `_MTLFunction`'s, so nothing says
 it would bind. `class_replaceMethod` on `objc_lookUpClass("_MTLFunction")` needs no symbol at all,
 and it is the same move `ensure_spi` already makes for MTLDeviceSPI. Measured rather than

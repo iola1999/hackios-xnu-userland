@@ -773,7 +773,6 @@ __attribute__((used, section("__DATA,__interpose"))) static const struct {
 };
 
 #include "inject_sb26_airdrop.inc"
-#include "inject_sb26_uninstall.inc"
 #include "inject_sb26_loc.inc"
 
 static void
@@ -834,7 +833,6 @@ discovery_image_callback(const struct mach_header *header, intptr_t slide)
     if (cal) install_calendar_icon_hooks(cal);
 
     sb26_install_localization_hooks();
-    install_uninstall_hooks();
 }
 
 static void
@@ -921,6 +919,4 @@ install_sb26(void)
 
     Class cal_cls = objc_getClass("SBCalendarIconImageProvider");
     if (cal_cls) install_calendar_icon_hooks(cal_cls);
-
-    install_uninstall_hooks();
 }

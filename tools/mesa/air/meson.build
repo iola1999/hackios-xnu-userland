@@ -45,6 +45,13 @@ air_reflection_test = executable(
   build_by_default : false,
 )
 
+air_stitch_link_test = executable(
+  'air_stitch_link_test',
+  files('air_stitch_link_test.c'),
+  dependencies : [idep_air],
+  build_by_default : false,
+)
+
 # air_run (air_run.c) draws with a translated shader and reads the pixels back,
 # so it needs libgallium -- which meson has not defined yet when this file is
 # read. Its executable is declared in src/gallium/drivers/freedreno instead,

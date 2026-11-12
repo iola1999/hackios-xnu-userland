@@ -95,6 +95,17 @@ llvm_op(struct air_ctx *c, const struct air_inst *in, const char *name)
       air_set(c, &in->base, air_val_ssa(c, nir_fabs(&c->b, a)));
       return true;
    }
+   /* NIR's min/max return the numeric operand for a single NaN and retain
+    * the input element width and vector shape. */
+   if (!strncmp(name, "llvm.minnum.", 12) || !strncmp(name, "llvm.maxnum.", 12)) {
+      nir_def *a = air_get_ssa(c, in->operands[1]);
+      nir_def *b = air_get_ssa(c, in->operands[2]);
+      if (!a || !b)
+         return false;
+      nir_def *r = name[6] == 'a' ? nir_fmax(&c->b, a, b) : nir_fmin(&c->b, a, b);
+      air_set(c, &in->base, air_val_ssa(c, r));
+      return true;
+   }
    /* LLVM's integer minimum and maximum, which the Metal compiler emits for
     * min()/max() of shorts (space::rasterizeArcFragment: llvm.smax.i16). */
    if (!strncmp(name, "llvm.smax.", 10) || !strncmp(name, "llvm.smin.", 10) ||

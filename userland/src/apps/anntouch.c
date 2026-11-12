@@ -56,27 +56,56 @@ say(const char *format, ...)
  * nothing" from "the replay sent samples and the display did not draw". */
 static unsigned long long posted;
 
-/* One record to the queue. A failure is said once and the rest of the gesture still goes: the
- * point of a failed write is to see it in the log, not to lose the other events with it. */
+/* Actions are serial and use one finger or button. close() does not release it. */
+static struct annibale_touch pending_release;
+
+static ssize_t
+write_record(const struct annibale_touch *record)
+{
+	ssize_t count;
+
+	do {
+		count = write(device, record, sizeof(*record));
+	} while (count < 0 && errno == EINTR);
+	/* touch_write queues complete records only; a short write has no tail to resume. */
+	return count;
+}
+
 static void
 send_record(const struct annibale_touch *record)
 {
-	if (write(device, record, sizeof(*record)) == (ssize_t)sizeof(*record)) {
+	ssize_t count = write_record(record);
+
+	if (count == (ssize_t)sizeof(*record)) {
 		posted++;
+		if (record->type == ANNIBALE_TOUCH_DOWN || record->type == ANNIBALE_BUTTON_DOWN) {
+			pending_release = *record;
+			pending_release.type = record->type == ANNIBALE_TOUCH_DOWN ? ANNIBALE_TOUCH_UP : ANNIBALE_BUTTON_UP;
+		} else if (record->type == ANNIBALE_TOUCH_MOVE && pending_release.type == ANNIBALE_TOUCH_UP) {
+			pending_release.x = record->x;
+			pending_release.y = record->y;
+		} else if (record->type == ANNIBALE_TOUCH_UP || record->type == ANNIBALE_BUTTON_UP) {
+			pending_release.type = 0;
+		}
 		return;
 	}
-	/* One line per run, at the first failure: a failing write repeated at 8 ms would bury
-	 * everything else, and the first one is the one that says where it started. */
-	{
-		static int said;
-		int error = errno;
+	int error = count < 0 ? errno : EIO;
 
-		if (!said) {
-			said = 1;
-			say("anntouch: post failed at event %llu errno %d (%s)\n", posted, error,
-			    strerror(error));
+	say("anntouch: post failed at event %llu type %u wrote %zd/%zu errno %d (%s)\n",
+	    posted, record->type, count, sizeof(*record), error, strerror(error));
+	if (pending_release.type != 0) {
+		/* Release only our accepted press, at its last accepted position; stop the replay. */
+		count = write_record(&pending_release);
+		if (count == (ssize_t)sizeof(pending_release)) {
+			posted++;
+			say("anntouch: release queued type %u finger %u\n", pending_release.type, pending_release.finger);
+		} else {
+			error = count < 0 ? errno : EIO;
+			say("anntouch: release failed type %u finger %u wrote %zd/%zu errno %d (%s); input may remain pressed\n",
+			    pending_release.type, pending_release.finger, count, sizeof(pending_release), error, strerror(error));
 		}
 	}
+	exit(1);
 }
 
 static void

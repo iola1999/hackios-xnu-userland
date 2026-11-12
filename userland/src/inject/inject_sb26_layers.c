@@ -412,19 +412,48 @@ text_of(id object, char *line, size_t size)
     return line;
 }
 
-static long
-number_of(id object, const char *selector)
+/* Private getters use the measured 23G90 signatures; reject a different ABI before calling. */
+static SEL
+checked_getter(id object, const char *name, const char *encoding)
 {
-    SEL sel = sel_registerName(selector);
-    return object && class_respondsToSelector(object_getClass(object), sel)
-        ? ((long (*)(id, SEL))objc_msgSend)(object, sel) : -1;
+    SEL selector = sel_registerName(name);
+    Method method = object ? class_getInstanceMethod(object_getClass(object), selector) : NULL;
+    const char *actual = method ? method_getTypeEncoding(method) : NULL;
+    return actual && strcmp(actual, encoding) == 0 ? selector : NULL;
+}
+
+static int
+checked_flag(id object, const char *name)
+{
+    SEL selector = checked_getter(object, name, "B16@0:8");
+    return selector ? ((BOOL (*)(id, SEL))objc_msgSend)(object, selector) : -1;
+}
+
+static id
+checked_object(id object, const char *name)
+{
+    SEL selector = checked_getter(object, name, "@16@0:8");
+    return selector ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
+}
+
+static long long
+number_of(id object, const char *name, const char *encoding)
+{
+    SEL selector = checked_getter(object, name, encoding);
+    if (!selector) return -1;
+    switch (encoding[0]) {
+    case 'c': return ((signed char (*)(id, SEL))objc_msgSend)(object, selector);
+    case 'q': return ((long long (*)(id, SEL))objc_msgSend)(object, selector);
+    case 'Q': return ((unsigned long long (*)(id, SEL))objc_msgSend)(object, selector);
+    default: return -1;
+    }
 }
 
 static void
 describe_scene(id view, unsigned depth)
 {
-    id scene = send(view, "scene");
-    char process[256], client[1200], value_text[1600];
+    id scene = checked_object(view, "scene");
+    char process[256], client[1200], value_text[1600], identifier[256];
 
     if (strcmp(name_of(view), "_UISceneLayerHostContainerView") == 0) {
         static const char *keys[] = { "_hostedLayers", "_hostViews", "_presentationContext", "_hiddenLayers" };
@@ -436,43 +465,38 @@ describe_scene(id view, unsigned depth)
             CFRelease(key);
         }
     }
+    /* This dump visits hosted scenes; a process without a hosted scene is absent. */
     if (!scene) return;
-    out("sb26 layer %2u scene of %s: %s valid %ld active %ld content %ld layers %ld process %s client %s\n",
-        depth, name_of(view), name_of(scene), number_of(scene, "isValid") & 0xff, number_of(scene, "isActive") & 0xff,
-        number_of(scene, "contentState"), number_of(send(send(scene, "layerManager"), "layers"), "count"),
-        text_of(send(scene, "clientProcess"), process, sizeof(process)),
-        text_of(send(scene, "clientSettings"), client, sizeof(client)));
+    id client_process = checked_object(scene, "clientProcess");
+    id settings = checked_object(scene, "settings");
+    id scene_id = checked_object(scene, "identifier");
+    id layers = checked_object(checked_object(scene, "layerManager"), "layers");
+    out("sb26 layer %2u scene of %s: %s valid %d active %d content %lld layers %lld process %s client %s"
+        " sceneID %s finishedLaunching %d isPendingExit %d taskState %lld versionedPID %lld"
+        " isForeground %d activityMode %lld\n",
+        depth, name_of(view), name_of(scene), checked_flag(scene, "isValid"), checked_flag(scene, "isActive"),
+        number_of(scene, "contentState", "q16@0:8"), number_of(layers, "count", "Q16@0:8"),
+        text_of(client_process, process, sizeof(process)),
+        text_of(checked_object(scene, "clientSettings"), client, sizeof(client)),
+        scene_id ? text_of(scene_id, identifier, sizeof(identifier)) : "unavailable",
+        checked_flag(client_process, "finishedLaunching"), checked_flag(client_process, "isPendingExit"),
+        number_of(client_process, "taskState", "q16@0:8"), number_of(client_process, "versionedPID", "q16@0:8"),
+        checked_flag(settings, "isForeground"), number_of(settings, "activityMode", "c16@0:8"));
     lines++;
 }
 
-/* SDF getters use the 23G90 signatures; an unavailable value is printed as nan or -1. */
-static SEL
-sdf_getter(id object, const char *name, const char *encoding)
-{
-    SEL selector = sel_registerName(name);
-    Method method = object ? class_getInstanceMethod(object_getClass(object), selector) : NULL;
-    const char *actual = method ? method_getTypeEncoding(method) : NULL;
-    return actual && strcmp(actual, encoding) == 0 ? selector : NULL;
-}
-
+/* An unavailable SDF value is printed as nan or -1. */
 static double
 sdf_number(id object, const char *name)
 {
-    SEL selector = sdf_getter(object, name, "d16@0:8");
+    SEL selector = checked_getter(object, name, "d16@0:8");
     return selector ? ((double (*)(id, SEL))objc_msgSend)(object, selector) : NAN;
-}
-
-static int
-sdf_flag(id object, const char *name)
-{
-    SEL selector = sdf_getter(object, name, "B16@0:8");
-    return selector ? ((BOOL (*)(id, SEL))objc_msgSend)(object, selector) : -1;
 }
 
 static const char *
 sdf_string(id object, const char *name, char *buffer, size_t size)
 {
-    SEL selector = sdf_getter(object, name, "@16@0:8");
+    SEL selector = checked_getter(object, name, "@16@0:8");
     id value = selector ? ((id (*)(id, SEL))objc_msgSend)(object, selector) : nil;
     if (!value || CFGetTypeID((CFTypeRef)value) != CFStringGetTypeID() ||
         !CFStringGetCString((CFStringRef)value, buffer, size, kCFStringEncodingUTF8))
@@ -490,17 +514,17 @@ describe_sdf(id layer, unsigned depth)
         element |= cls == element_class;
     }
     if (sdf) {
-        SEL selector = sdf_getter(layer, "effect", "@16@0:8");
+        SEL selector = checked_getter(layer, "effect", "@16@0:8");
         id effect = selector ? ((id (*)(id, SEL))objc_msgSend)(layer, selector) : nil;
         char color[32] = "unavailable";
-        selector = sdf_getter(effect, "color", "^{CGColor=}16@0:8");
+        selector = checked_getter(effect, "color", "^{CGColor=}16@0:8");
         if (selector) describe_color(((id (*)(id, SEL))objc_msgSend)(effect, selector), color, sizeof(color));
         out("sb26 layer %2u sdf effect=%.96s offset=%.6g smoothness=%.6g gaussian=%.6g merge=%d color=%s height=%.6g angle=%.6g curvature=%.6g amount=%.6g spread=%.6g maskOffset=%.6g global=%d\n",
             depth, name_of(effect), sdf_number(layer, "effectOffset"), sdf_number(layer, "smoothness"),
-            sdf_number(layer, "gaussianRadius"), sdf_flag(layer, "mergeElements"), color,
+            sdf_number(layer, "gaussianRadius"), checked_flag(layer, "mergeElements"), color,
             sdf_number(effect, "height"), sdf_number(effect, "angle"), sdf_number(effect, "curvature"),
             sdf_number(effect, "amount"), sdf_number(effect, "spread"), sdf_number(effect, "maskOffset"),
-            sdf_flag(effect, "global"));
+            checked_flag(effect, "global"));
         lines++;
     } else if (element) {
         char mode[48], operation[48];
@@ -508,7 +532,7 @@ describe_sdf(id layer, unsigned depth)
             depth, sdf_string(layer, "mode", mode, sizeof(mode)),
             sdf_string(layer, "operation", operation, sizeof(operation)),
             sdf_number(layer, "contentsZeroValueDistance"), sdf_number(layer, "contentsOneValueDistance"),
-            sdf_number(layer, "gradientOvalization"), sdf_flag(layer, "hitTestsAsFill"));
+            sdf_number(layer, "gradientOvalization"), checked_flag(layer, "hitTestsAsFill"));
         lines++;
     }
 }

@@ -90,6 +90,7 @@ yuv_key_for(const struct air_shader_info *info, const struct rwa_bindings *bindi
       key->full_range |= t->yuv_full_range ? bit : 0;
       key->bt709 |= t->yuv_bt709 ? bit : 0;
       key->bt2020 |= t->yuv_bt2020 ? bit : 0;
+      key->p010 |= t->shape.pixel_format == 505 ? bit : 0;
       key->uv_slot[r->index] = slot;
    }
    return true;
@@ -136,9 +137,11 @@ lower_yuv(nir_shader *nir, const struct rwa_yuv_key *key, char *why, size_t why_
       .yuv_full_range_external = key->full_range,
       .bt709_external = key->bt709,
       .bt2020_external = key->bt2020,
+      .lower_sx10_external = key->p010,
    };
    nir_lower_tex(nir, &options);
    nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             if (instr->type != nir_instr_type_tex)
@@ -148,6 +151,12 @@ lower_yuv(nir_shader *nir, const struct rwa_yuv_key *key, char *why, size_t why_
             if (source < 0)
                continue;
             unsigned plane = nir_src_as_uint(tex->src[source].src);
+            if (key->p010 & (1u << tex->texture_index)) {
+               /* Mesa's sx10 conversion consumes low ten bits; P010 stores them at bits 15:6. */
+               b.cursor = nir_after_instr(instr);
+               nir_def *low_bits = nir_fmul_imm(&b, &tex->def, 1.0f / 64.0f);
+               nir_def_rewrite_uses_after(&tex->def, low_bits);
+            }
             if (plane == 1) {
                tex->texture_index = key->uv_slot[tex->texture_index];
                /* gather_info does not update this mask; IR3 sizes fragment

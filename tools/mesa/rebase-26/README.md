@@ -18,7 +18,10 @@
 14. `0013-fd-transfer-stride-after-shadow.patch`：`fd_resource_transfer_map` 在 shadow 成功后按新布局重取 `stride` 与 `layer_stride`。传输的 stride 在调用 shadow 之前就从旧布局取好了，不重取时映射偏移和调用方逐行拷贝用的是两套布局。
 15. `0014-perf-probes-26.x.patch`：旧的 `draw-perf*.patch`、`fd-*.patch`、`fd6-*.patch`、`perf-*.patch` 在 26.2.5 上部分 hunk 失败，这个补丁补齐真机库里的状态：`fd_bo_cpu_prep` 与 `fd_perf_us` 只在 `FD_PERF_DRAW=1` 时计时；`fd6_draw.cc` 按段计时，超过 50 ms 的段打 `fd draw seg slow`；批次切分计数；定义旧补丁只声明的 `fd_perf_cache_misses`（缺了它库链接不过）；去掉 `ir3_cache.c` 里重复的一次未命中计数。
 16. `0015-fd-bo-heap-null-check.patch`：`fd_bo_heap_alloc` 在 `calloc`、`fd_bo_new` 或 `fd_bo_map` 返回 `NULL` 时释放已持有的锁与引用并返回 `NULL`，防止分配或映射失败时解引用空指针。
-17. `0016-nir-lower-fb-read-zero-layer.patch`：在 `nir_lower_fb_read.c` 中，当片元着色器未从顶点阶段读入 `VARYING_SLOT_LAYER` 时，将帧缓冲读取坐标的图层绑定为立即数 0，避免 `ir3_nir_lower_layer_id` 生成未链接的 `load_input(VARYING_SLOT_LAYER)` 并从 VPC 未初始化的脏寄存器 `r1.z` 读取非零图层编号，导致 Adreno A830 单图层 2D 目标数组越界返回全零颜色。
+17. `0015-ir3-disk-cache-darwin-uuid.patch`：Darwin 的 ir3 磁盘缓存使用所在 Mach-O 库的 `LC_UUID` 区分构建；未设置 `MESA_SHADER_CACHE_DIR` 时按 UUID 创建 `/private/var/db/annibale-ir3cache/<UUID>`。补丁还设置跨 UID 共享所需的目录与文件权限，并记录命中和写入次数。顶层 arm64e 构建启用 `shader-cache`，`mk-mesa.sh` 的独立构建仍默认关闭；跨开机验证见[ir3 磁盘缓存记录](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/analysis/2026-11-09-ir3-disk-cache.md)。
+18. `0016-nir-lower-fb-read-zero-layer.patch`：在 `nir_lower_fb_read.c` 中，当片元着色器未从顶点阶段读入 `VARYING_SLOT_LAYER` 时，将帧缓冲读取坐标的图层绑定为立即数 0，避免 `ir3_nir_lower_layer_id` 生成未链接的 `load_input(VARYING_SLOT_LAYER)` 并从 VPC 未初始化的脏寄存器 `r1.z` 读取非零图层编号，导致 Adreno A830 单图层 2D 目标数组越界返回全零颜色。
+19. `0017-nir-yuv-explicit-lod.patch`：YUV 平面采样接受 `nir_texop_tex`、`nir_texop_txl`、`nir_texop_txb` 与 `nir_texop_txd`，生成平面纹理指令时保留原操作，支持显式 LOD、bias 和导数采样。
+20. `0018-ir3-alias-relative-and-fsat.patch`：移植上游 `8511f446` 与 `5a9db0be`，相对常量输出保留原 MOV，`fsat` 仅合入浮点 cat2/cat3 指令的饱和标记。实际 ir3 回归测试在旧版复现 3 项失败，修复后 16 项通过；隔离 iOS arm64e 目标库已链接，GPU 像素待验。运行方法与范围见 [ir3 输出优化测试](../tests/README.md)。
 
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，改的文件互不重叠。打完这一层的源码树，加上 `tools/mesa/annibale-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只做到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 

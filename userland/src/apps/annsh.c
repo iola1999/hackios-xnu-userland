@@ -14,6 +14,7 @@
  *
  * iOS has no shell, so the words of TEXT are split on blanks with no quoting, and these are built in:
  *   ps                         pid, ppid, uid, user and system CPU seconds, threads, name
+ *   process PID                read-only path, start time, audit token and task suspension count
  *   threads PID                per thread: id, run state, current/base priority, user and system
  *                              CPU seconds, name
  *   dump PID                   kern.annibale.thread_dump: one kernel log line per thread of PID
@@ -43,6 +44,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <notify.h>
 #include <poll.h>
@@ -63,6 +66,7 @@
 extern int proc_listpids(uint32_t type, uint32_t typeinfo, void *buffer, int buffersize);
 extern int proc_pidinfo(int pid, int flavor, uint64_t arg, void *buffer, int buffersize);
 extern int proc_name(int pid, void *buffer, uint32_t buffersize);
+extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
 #define PROC_ALL_PIDS           1
 #define PROC_PIDTASKINFO        4
@@ -157,6 +161,108 @@ do_ps(void)
 		    mach_seconds(ti.pti_total_user), mach_seconds(ti.pti_total_system), ti.pti_threadnum, name);
 	}
 	return 0;
+}
+
+static int
+do_process(const char *word)
+{
+	char *end, path[1024] = { 0 };
+	long number;
+	struct kinfo_proc before, after;
+	size_t size = sizeof(before);
+	mach_port_t port = MACH_PORT_NULL;
+	mach_task_basic_info_data_t info;
+	audit_token_t audit_before, audit_after;
+	mach_msg_type_number_t count;
+	kern_return_t kr;
+	int failed = 0, have_audit = 0;
+
+	errno = 0;
+	number = strtol(word, &end, 10);
+	if (errno || end == word || *end || number <= 0 || number > INT_MAX) {
+		out("process: invalid pid %s", word);
+		return 1;
+	}
+	int pid = (int)number;
+	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
+	if (sysctl(mib, 4, &before, &size, NULL, 0) != 0 || size != sizeof(before)) {
+		out("process: pid %d unavailable errno %d bytes %zu", pid, errno, size);
+		return 1;
+	}
+	out("process: pid %d ppid %d uid %u bsd_state %d flags %#x start %lld.%06ld", pid,
+	    before.kp_eproc.e_ppid, before.kp_eproc.e_ucred.cr_uid, before.kp_proc.p_stat,
+	    before.kp_proc.p_flag, (long long)before.kp_proc.p_starttime.tv_sec,
+	    (long)before.kp_proc.p_starttime.tv_usec);
+	kr = task_name_for_pid(mach_task_self(), pid, &port);
+	if (kr != KERN_SUCCESS || !MACH_PORT_VALID(port)) {
+		out("process: task name unavailable kr %d", kr);
+		failed = 1;
+	} else {
+		count = TASK_AUDIT_TOKEN_COUNT;
+		kr = task_info(port, TASK_AUDIT_TOKEN, (task_info_t)&audit_before, &count);
+		if (kr == KERN_SUCCESS && count == TASK_AUDIT_TOKEN_COUNT) {
+			have_audit = 1;
+			out("process: audit %u %u %u %u %u %u %u %u", audit_before.val[0],
+			    audit_before.val[1], audit_before.val[2], audit_before.val[3],
+			    audit_before.val[4], audit_before.val[5], audit_before.val[6], audit_before.val[7]);
+		} else {
+			out("process: audit unavailable kr %d count %u", kr, count);
+			failed = 1;
+		}
+	}
+	errno = 0;
+	int length = proc_pidpath(pid, path, (uint32_t)sizeof(path));
+	if (length <= 0 || length >= (int)sizeof(path) || !memchr(path, 0, sizeof(path))) {
+		out("process: path failed errno %d bytes %d", errno, length);
+		failed = 1;
+	} else {
+		path[sizeof(path) - 1] = 0;
+		out("process: path %s", path);
+		struct stat st;
+		if (stat(path, &st) == 0) {
+			out("process: path_stat dev %llu inode %llu", (unsigned long long)st.st_dev,
+			    (unsigned long long)st.st_ino);
+		} else {
+			out("process: executable stat failed errno %d", errno);
+			failed = 1;
+		}
+	}
+	if (MACH_PORT_VALID(port)) {
+		count = MACH_TASK_BASIC_INFO_COUNT;
+		kr = task_info(port, MACH_TASK_BASIC_INFO, (task_info_t)&info, &count);
+		if (kr == KERN_SUCCESS && count == MACH_TASK_BASIC_INFO_COUNT) {
+			/* XNU reports user_stop_count here, separately from BSD p_stat and RBS taskState. */
+			out("process: task user_stop_count %d resident_bytes %llu", info.suspend_count,
+			    (unsigned long long)info.resident_size);
+		} else {
+			out("process: task info unavailable kr %d count %u", kr, count);
+			failed = 1;
+		}
+		if (have_audit) {
+			count = TASK_AUDIT_TOKEN_COUNT;
+			kr = task_info(port, TASK_AUDIT_TOKEN, (task_info_t)&audit_after, &count);
+			if (kr != KERN_SUCCESS || count != TASK_AUDIT_TOKEN_COUNT ||
+			    memcmp(&audit_before, &audit_after, sizeof(audit_before)) != 0) {
+				out("process: audit changed or unavailable during query kr %d", kr);
+				failed = 1;
+			}
+		}
+		kr = mach_port_deallocate(mach_task_self(), port);
+		if (kr != KERN_SUCCESS) {
+			out("process: task name release failed kr %d", kr);
+			failed = 1;
+		}
+	}
+	size = sizeof(after);
+	errno = 0;
+	if (sysctl(mib, 4, &after, &size, NULL, 0) != 0 || size != sizeof(after) ||
+	    after.kp_proc.p_starttime.tv_sec != before.kp_proc.p_starttime.tv_sec ||
+	    after.kp_proc.p_starttime.tv_usec != before.kp_proc.p_starttime.tv_usec) {
+		out("process: pid %d changed or exited during query errno %d", pid, errno);
+		failed = 1;
+	}
+	out("process: snapshot %s", failed ? "incomplete" : "complete");
+	return failed;
 }
 
 static int
@@ -594,6 +700,8 @@ run(char *text)
 		return 0;
 	if (strcmp(argv[0], "ps") == 0)
 		return do_ps();
+	if (strcmp(argv[0], "process") == 0 && argc == 2)
+		return do_process(argv[1]);
 	if (strcmp(argv[0], "maps") == 0 && argc == 2)
 		return do_maps(argv[1]);
 	if (strcmp(argv[0], "threads") == 0 && argc == 2)

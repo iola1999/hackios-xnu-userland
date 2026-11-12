@@ -16,7 +16,7 @@ struct rwa_bound_state {
 };
 
 struct rwa_yuv_key {
-   unsigned mask, full_range, bt709, bt2020;
+   unsigned mask, full_range, bt709, bt2020, p010;
    uint8_t uv_slot[RWA_MAX_TEXTURES];
 };
 
