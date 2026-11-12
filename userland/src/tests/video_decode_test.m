@@ -1,7 +1,7 @@
 /*
  * Decode a local video's compressed samples through AVAssetReader and VideoToolbox.
  * Usage: video_decode_test [--deadline SECONDS] [--frames COUNT]
- *                         [--require-hardware | --software] FILE
+ *                         [--require-hardware | --software] [--report-file PATH] FILE
  * Defaults: 12 seconds, 60 frames, hardware allowed. COUNT is limited to 10000.
  * Exit: 0 decoded every submitted frame; 1 input/decode/output failure; 2 arguments;
  *       124 whole-process deadline, including asset loading, draining and cleanup.
@@ -10,6 +10,7 @@
  * Empty timing markers do not count as frames. A reset of an active decoder fails explicitly.
  * Pixel hashes cover active NV12 bytes, excluding row padding. Paths, error descriptions
  * and media bytes are omitted from logs. This probe does not present frames or play audio.
+ * --report-file exclusively creates a file with every callback and a completion record.
  */
 #import <AVFoundation/AVFoundation.h>
 #import <VideoToolbox/VideoToolbox.h>
@@ -30,13 +31,14 @@ struct options {
 	double deadline;
 	unsigned frames;
 	bool require_hardware, software;
-	const char *path;
+	const char *path, *report_path;
 };
 
 struct decode_state {
 	pthread_mutex_t lock;
 	unsigned callbacks, frames, errors, dropped, empty, pixel_errors;
 	uint64_t bytes;
+	FILE *report;
 };
 
 static void
@@ -124,15 +126,19 @@ decoded_frame(void *context, void *source, OSStatus status, VTDecodeInfoFlags fl
 		state->frames++;
 		state->bytes += bytes;
 	}
-	printf("video_decode_test: stage=callback sample=%" PRIuPTR " status=%d flags=0x%x"
-	    " pts=%" PRId64 "/%d pts_flags=0x%x duration=%" PRId64 "/%d"
-	    " format=0x%08x width=%zu height=%zu pixel_error=%d bytes=%" PRIu64
-	    " fnv1a64=%016" PRIx64 " min=%u max=%u\n",
-	    (uintptr_t)source, (int)status, (unsigned)flags, pts.value, pts.timescale,
-	    (unsigned)pts.flags, duration.value, duration.timescale,
-	    image ? (unsigned)CVPixelBufferGetPixelFormatType(image) : 0,
-	    image ? CVPixelBufferGetWidth(image) : 0, image ? CVPixelBufferGetHeight(image) : 0,
-	    pixel_error, bytes, hash, low, high);
+	FILE *outputs[] = { stdout, state->report };
+	for (unsigned index = 0; index < 2; index++) {
+		if (outputs[index] == NULL) continue;
+		fprintf(outputs[index], "video_decode_test: stage=callback sample=%" PRIuPTR " status=%d flags=0x%x"
+		    " pts=%" PRId64 "/%d pts_flags=0x%x duration=%" PRId64 "/%d"
+		    " format=0x%08x width=%zu height=%zu pixel_error=%d bytes=%" PRIu64
+		    " fnv1a64=%016" PRIx64 " min=%u max=%u\n",
+		    (uintptr_t)source, (int)status, (unsigned)flags, pts.value, pts.timescale,
+		    (unsigned)pts.flags, duration.value, duration.timescale,
+		    image ? (unsigned)CVPixelBufferGetPixelFormatType(image) : 0,
+		    image ? CVPixelBufferGetWidth(image) : 0, image ? CVPixelBufferGetHeight(image) : 0,
+		    pixel_error, bytes, hash, low, high);
+	}
 	pthread_mutex_unlock(&state->lock);
 }
 
@@ -160,6 +166,14 @@ decode(const struct options *options)
 	unsigned submitted = 0, accepted = 0, markers = 0;
 	bool failed = false, limit_reached = false;
 	int hardware = -1;
+	if (options->report_path != NULL) {
+		state.report = fopen(options->report_path, "wx");
+		if (state.report == NULL) {
+			printf("video_decode_test: stage=report_open errno=%d\n", errno);
+			pthread_mutex_destroy(&state.lock);
+			return 1;
+		}
+	}
 	@try {
 		do {
 			struct stat st;
@@ -312,6 +326,15 @@ decode(const struct options *options)
 	failed |= options->software && hardware == 1;
 	failed |= accepted == 0 || accepted != submitted || state.callbacks != accepted || state.frames != accepted ||
 	    state.errors != 0 || state.dropped != 0 || state.empty != 0 || state.pixel_errors != 0;
+	if (state.report != NULL) {
+		/* Keep the report open through the session's callback cleanup. */
+		bool report_failed = ferror(state.report) != 0;
+		if (fprintf(state.report, "video_decode_test: stage=report_complete callbacks=%u frames=%u\n",
+		    state.callbacks, state.frames) < 0) report_failed = true;
+		if (fclose(state.report) != 0) report_failed = true;
+		if (report_failed) printf("video_decode_test: stage=report_write result=fail\n");
+		failed |= report_failed;
+	}
 	printf("video_decode_test: stage=summary result=%s submitted=%u accepted=%u callbacks=%u frames=%u"
 	    " callback_errors=%u dropped=%u empty=%u pixel_errors=%u hardware=%d require_hardware=%d software=%d"
 	    " limit_reached=%d reader_status=%ld markers=%u output_bytes=%" PRIu64 "\n",
@@ -342,6 +365,8 @@ main(int argc, char **argv)
 			options.require_hardware = true;
 		} else if (!strcmp(argv[i], "--software")) {
 			options.software = true;
+		} else if (!strcmp(argv[i], "--report-file") && i + 1 < argc && options.report_path == NULL) {
+			options.report_path = argv[++i];
 		} else if (argv[i][0] != '-' && options.path == NULL) {
 			options.path = argv[i];
 		} else goto usage;
@@ -367,6 +392,6 @@ main(int argc, char **argv)
 		return decode(&options);
 	}
 usage:
-	fprintf(stderr, "usage: video_decode_test [--deadline SECONDS] [--frames COUNT] [--require-hardware | --software] FILE\n");
+	fprintf(stderr, "usage: video_decode_test [--deadline SECONDS] [--frames COUNT] [--require-hardware | --software] [--report-file PATH] FILE\n");
 	return 2;
 }

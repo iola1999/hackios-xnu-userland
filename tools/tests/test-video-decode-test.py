@@ -119,6 +119,26 @@ class VideoDecodeTest(unittest.TestCase):
         # Apple's software decoder can report PropertyNotSupported for this query.
         self.assertIn(records(output, 'summary')[-1]['hardware'], ('-1', '0'))
 
+    def test_callback_report(self):
+        report = self.directory / 'callbacks.txt'
+        report.unlink(missing_ok=True)
+        output = self.run_probe('--software', '--report-file', report, self.movie)
+        frames = self.check_frames(output, 12)
+        recorded = report.read_text()
+        self.assertEqual(records(recorded, 'callback'), records(output, 'callback'))
+        self.assertEqual([row['fnv1a64'] for row in frames], self.reference)
+        completion = records(recorded, 'report_complete')
+        self.assertEqual(len(completion), 1)
+        self.assertEqual((completion[0]['callbacks'], completion[0]['frames']), ('12', '12'))
+
+    def test_existing_report_is_preserved(self):
+        report = self.directory / 'existing-report.txt'
+        contents = b'report content to preserve\n'
+        report.write_bytes(contents)
+        output = self.run_probe('--software', '--report-file', report, self.movie, status=1)
+        self.assertTrue(records(output, 'report_open'))
+        self.assertEqual(report.read_bytes(), contents)
+
     def test_required_hardware(self):
         result = subprocess.run([str(self.binary), '--require-hardware', str(self.movie)],
                                 capture_output=True, text=True, timeout=15)

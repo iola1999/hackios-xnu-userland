@@ -150,6 +150,30 @@ class VideoPlayerTest(unittest.TestCase):
                 self.assertNotEqual(records(output, 'item')[-1]['error'], '0')
                 self.assertNotIn(path.name, output)
 
+    def test_frame_report(self):
+        report = self.directory / 'frames.txt'
+        report.unlink(missing_ok=True)
+        output = self.run_probe('--report-file', report, self.movie)
+        summary = records(output, 'summary')[-1]
+        recorded = report.read_text()
+        frames = records(recorded, 'frame')
+        self.assertEqual(len(frames), int(summary['frames']))
+        self.assertEqual([int(row['index']) for row in frames], list(range(1, len(frames) + 1)))
+        self.assertEqual(records(recorded, 'report_complete')[0]['frames'], summary['frames'])
+        for frame in frames:
+            self.assertEqual(frame['pixel_error'], '0')
+            self.assertEqual(frame['fnv1a64'], self.reference[Fraction(frame['pts'])])
+        for frame in records(output, 'frame'):
+            self.assertIn(frame, frames)
+
+    def test_existing_report_is_preserved(self):
+        report = self.directory / 'existing-report.txt'
+        contents = b'report content to preserve\n'
+        report.write_bytes(contents)
+        output = self.run_probe('--report-file', report, self.movie, status=1)
+        self.assertTrue(records(output, 'report_open'))
+        self.assertEqual(report.read_bytes(), contents)
+
     def test_damaged_media_data(self):
         output = self.run_probe(self.damaged, status=1)
         summary = records(output, 'summary')[-1]
