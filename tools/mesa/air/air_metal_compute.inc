@@ -280,6 +280,7 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
    }
 
    if (!lower_yuv(cs, yuv, why, why_size) ||
+       !lower_rgb2p_samples(cs, &compute->info, yuv, why, why_size) ||
        !lower_half_for_backend(cs, device, &compute->info, why, why_size)) {
       ralloc_free(cs);
       return NULL;

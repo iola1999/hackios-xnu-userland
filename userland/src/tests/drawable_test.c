@@ -166,7 +166,7 @@ refusals(void)
 	unsigned cpp = 0;
 
 	why[0] = 0;
-	CHECK(ann_texture_for_surface(NULL, NULL, 0, &shape, why, sizeof(why)) == NULL,
+	CHECK(ann_texture_for_surface(NULL, NULL, 0, &shape, NULL, why, sizeof(why)) == NULL,
 	    "a texture with no device");
 	printf("drawable_test: no device      -> %s\n", why);
 
@@ -322,7 +322,7 @@ main(int argc, char **argv)
 	};
 
 	why[0] = 0;
-	texture = ann_texture_for_surface(device, &described, 0, &shape, why,
+	texture = ann_texture_for_surface(device, &described, 0, &shape, NULL, why,
 	    sizeof(why));
 	if (texture == NULL) {
 		printf("drawable_test: NOT MEASURED: no texture over the surface: %s\n", why);

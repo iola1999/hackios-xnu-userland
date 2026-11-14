@@ -538,10 +538,14 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
                             struct rwa_texture *t, unsigned index,
                             char *why, size_t why_size)
 {
+   bool rgb2p = rgb2p_format(t->shape.pixel_format) && t->chroma;
+   if (rgb2p && !rgb2p_prepare_sample(t, why, why_size)) return false;
    if (t->view)
       return true;
    struct pipe_sampler_view tmpl = { 0 };
-   u_sampler_view_default_template(&tmpl, t->res, texture_format(t));
+   struct pipe_resource *sampled = rgb2p ? t->rgb2p_sample : t->res;
+   enum pipe_format format = rgb2p ? sampled->format : texture_format(t);
+   u_sampler_view_default_template(&tmpl, sampled, format);
    tmpl.u.tex.first_level = t->first_level;
    tmpl.u.tex.last_level = t->first_level + texture_levels(t) - 1;
    if (t->swizzle_r || t->swizzle_g || t->swizzle_b || t->swizzle_a) {
@@ -552,7 +556,7 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
       tmpl.swizzle_b = t->swizzle_b < 6 ? swz[t->swizzle_b] : PIPE_SWIZZLE_0;
       tmpl.swizzle_a = t->swizzle_a < 6 ? swz[t->swizzle_a] : PIPE_SWIZZLE_0;
    }
-   t->view = pipe->create_sampler_view(pipe, t->res, &tmpl);
+   t->view = pipe->create_sampler_view(pipe, sampled, &tmpl);
    if (!t->view) {
       say(why, why_size, "%s would not make a sampler view of the %s bound at "
                          "texture %u", rwa_device_name(device), t->format_name, index);
@@ -583,6 +587,7 @@ rwa_texture_destroy(struct rwa_texture *texture)
    /* Released, not destroyed: a draw may have left the view bound (air_metal_state.inc),
     * and the context's reference then keeps it until it is unbound. */
    pipe_sampler_view_release_ptr(&texture->view);
+   pipe_resource_reference(&texture->rgb2p_sample, NULL);
    pipe_resource_reference(&texture->res, NULL);
    struct rwa_texture *owner = texture->storage_owner;
    struct rwa_texture *chroma = texture->chroma;

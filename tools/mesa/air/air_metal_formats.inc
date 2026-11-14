@@ -97,6 +97,11 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    ASTC(12, 10, 10), ASTC(13, 12, 10), ASTC(14, 12, 12),
 #undef ASTC
 
+   /* RGB2P renders per-fragment codes here and stores both planes at pass end. */
+   { 540, "MTLPixelFormatRGB8_420_2P",      PIPE_FORMAT_R8G8B8A8_UINT },
+   { 543, "MTLPixelFormatRGB10_420_2P",     PIPE_FORMAT_R16G16B16A16_UINT },
+   { 544, "MTLPixelFormatRGB10_422_2P",     PIPE_FORMAT_R16G16B16A16_UINT },
+
    /* Depth and stencil. These are in the same table because a depth texture is a
     * texture (air_metal.h) and every caller asks for one the same way; what the format
     * changes is which binding it can have and how its texels are read, and both of

@@ -1,6 +1,6 @@
 /*
- * inject_sb26_airdrop.inc: AirDrop mutex hang elimination, Screen Mirroring
- * asynchronous route discovery, and Calendar dynamic icon fallback.
+ * inject_sb26_airdrop.inc: AirDrop mutex hang elimination and Screen Mirroring
+ * asynchronous route discovery.
  * Pure C99 implementation using ObjC runtime primitives.
  */
 
@@ -317,92 +317,4 @@ install_mru_mirroring_hooks(Class cls)
 
     mru_done = 1;
     fprintf(stderr, "sb26: MRUMirroringController async interception installed\n");
-}
-
-/* --- Calendar Dynamic Icon Fallback Implementation --- */
-
-/*
- * SBIconImageInfo is an ARM64 Homogeneous Floating-point Aggregate (HFA) consisting
- * of 4 doubles: CGSize size (width, height), double scale, double continuousCornerRadius.
- * AAPCS64 passes it in d0..d3 floating-point registers. traitCollection is in x2 and options is in x3.
- */
-struct SBIconImageInfo {
-    CGSize size;
-    double scale;
-    double continuousCornerRadius;
-};
-typedef struct SBIconImageInfo SBIconImageInfo;
-
-static id (*orig_calendar_layer)(id self, SEL cmd, SBIconImageInfo info, id tc, unsigned long opts);
-
-static id
-sb26_calendar_icon_layer_fallback(id self, SEL _cmd, SBIconImageInfo info, id tc, unsigned long opts)
-{
-    id layer = NULL;
-    if (orig_calendar_layer) {
-        layer = orig_calendar_layer(self, _cmd, info, tc, opts);
-    }
-    if (layer != NULL) {
-        return layer;
-    }
-
-    /*
-     * If native layer generation returns nil (due to missing ICRIconLayer in ISImage),
-     * call iconImageWithInfo:traitCollection:options: and wrap the resulting CGImage in a CALayer.
-     */
-    SEL img_sel = sel_registerName("iconImageWithInfo:traitCollection:options:");
-    Class self_cls = object_getClass(self);
-    Method m_img = self_cls ? class_getInstanceMethod(self_cls, img_sel) : NULL;
-    if (m_img) {
-        id (*img_fn)(id, SEL, SBIconImageInfo, id, unsigned long) =
-            (id (*)(id, SEL, SBIconImageInfo, id, unsigned long))method_getImplementation(m_img);
-        id image = img_fn(self, img_sel, info, tc, opts);
-        if (image != NULL) {
-            SEL cg_sel = sel_registerName("CGImage");
-            Class img_cls = object_getClass(image);
-            if (img_cls && class_getInstanceMethod(img_cls, cg_sel)) {
-                id cg_img = ((id (*)(id, SEL))objc_msgSend)(image, cg_sel);
-                if (cg_img != NULL) {
-                    Class layer_cls = objc_getClass("CALayer");
-                    if (layer_cls) {
-                        /*
-                         * Wrap CALayer creation and property modification with an explicit
-                         * CATransaction so CA_ASSERT_MAIN_THREAD_TRANSACTIONS assertion
-                         * (which aborts on implicit transactions on background threads) is avoided.
-                         */
-                        Class tx_cls = objc_getClass("CATransaction");
-                        if (tx_cls) {
-                            ((void (*)(Class, SEL))objc_msgSend)(tx_cls, sel_registerName("begin"));
-                            ((void (*)(Class, SEL, BOOL))objc_msgSend)(tx_cls, sel_registerName("setDisableActions:"), YES);
-                        }
-                        id new_layer = ((id (*)(Class, SEL))objc_msgSend)(layer_cls, sel_registerName("layer"));
-                        if (new_layer != NULL) {
-                            ((void (*)(id, SEL, id))objc_msgSend)(new_layer, sel_registerName("setContents:"), cg_img);
-                        }
-                        if (tx_cls) {
-                            ((void (*)(Class, SEL))objc_msgSend)(tx_cls, sel_registerName("commit"));
-                        }
-                        return new_layer;
-                    }
-                }
-            }
-        }
-    }
-
-    return NULL;
-}
-
-static void
-install_calendar_icon_hooks(Class cls)
-{
-    static int cal_done;
-    if (cal_done || !cls) return;
-
-    Method m_layer = class_getInstanceMethod(cls, sel_registerName("iconLayerWithInfo:traitCollection:options:"));
-    if (m_layer) {
-        orig_calendar_layer = (id (*)(id, SEL, SBIconImageInfo, id, unsigned long))method_getImplementation(m_layer);
-        method_setImplementation(m_layer, (IMP)sb26_calendar_icon_layer_fallback);
-        cal_done = 1;
-        fprintf(stderr, "sb26: SBCalendarIconImageProvider fallback hook installed\n");
-    }
 }

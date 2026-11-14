@@ -76,6 +76,10 @@ yuv_key_for(const struct air_shader_info *info, const struct rwa_bindings *bindi
          return false;
       }
       unsigned bit = 1u << r->index;
+      if (rgb2p_format(t->shape.pixel_format)) {
+         key->rgb2p |= bit;
+         continue;
+      }
       if (key->mask & bit)
          continue;
       unsigned slot = 0;

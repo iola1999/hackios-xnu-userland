@@ -1,5 +1,5 @@
 /*
- * SpringBoard startup state, software icon selection and unlocking for 23G90.
+ * SpringBoard startup state and unlocking for 23G90.
  * MobileActivation is not implemented; this sets SBLockdownManager's local
  * activation state so SpringBoard can finish startup. The implementation and
  * object layout are specific to the checked 23G90 shared cache.
@@ -34,7 +34,6 @@
 #include <unistd.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *);
-extern id MTLCreateSystemDefaultDevice(void);
 void sb26_install_layer_dump(void);   /* inject_sb26_layers.c */
 void sb26_install_rate(uintptr_t slide);   /* inject_sb26_rate.c */
 static void sb26_sync_initial_brightness(int call_bks_set);
@@ -69,80 +68,6 @@ checked_method(const char *class_name, const char *selector_name, const char *en
     return match ? method : NULL;
 }
 
-static IMP original_bitmap_selection;
-static dispatch_once_t metal_device_once;
-static int has_metal_device;
-static SEL appearance_selector, glass_selector;
-
-static void
-query_metal_device(void *context)
-{
-    (void)context;
-    id device = MTLCreateSystemDefaultDevice();
-    has_metal_device = device != nil;
-    /* MTLCreateSystemDefaultDevice returns a retained object. */
-    if (device) ((void (*)(id, SEL))objc_msgSend)(device, sel_registerName("release"));
-    fprintf(stderr, "sb26: icon rendering Metal device=%d\n", has_metal_device);
-}
-
-static BOOL
-software_bitmap_selection(id self, SEL selector)
-{
-	BOOL original = ((BOOL (*)(id, SEL))original_bitmap_selection)(self, selector);
-	if (original) {
-		return original;
-	}
-
-	/*
-	 * If the current icon view carries a Calendar icon (e.g. SBHCalendarApplicationIcon),
-	 * force bitmap rasterization. In iOS 26 with Liquid Glass enabled, SBCalendarIconImageProvider
-	 * attempts to invoke [ISImage ICRIconLayer], which is unimplemented and returns nil,
-	 * leaving CALayer.contents empty and making the icon transparent.
-	 */
-	id icon = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("icon"));
-	if (icon != nil) {
-		const char *icon_class = object_getClassName(icon);
-		if (icon_class && strstr(icon_class, "Calendar") != NULL) {
-			return YES;
-		}
-	}
-
-	Method appearance_method = class_getInstanceMethod(object_getClass(self), appearance_selector);
-	if (!method_encoding_matches(appearance_method, "@16@0:8")) {
-		return original;
-	}
-	id appearance = ((id (*)(id, SEL))objc_msgSend)(self, appearance_selector);
-	Method glass = appearance ? class_getInstanceMethod(object_getClass(appearance), glass_selector) : NULL;
-	if (!method_encoding_matches(glass, "B16@0:8")) {
-		return original;
-	}
-	if (((BOOL (*)(id, SEL))objc_msgSend)(appearance, glass_selector)) {
-		return original;
-	}
-
-	dispatch_once_f(&metal_device_once, NULL, query_metal_device);
-	return has_metal_device ? original : YES;
-}
-
-static void
-install_bitmap_selection(uintptr_t slide)
-{
-    static const unsigned char bytes[16] = {
-        0x7f,0x23,0x03,0xd5,0xf6,0x57,0xbd,0xa9,0xf4,0x4f,0x01,0xa9,0xfd,0x7b,0x02,0xa9
-    };
-    Method method = checked_method("SBIconImageView", "shouldForceBitmapImages", "B16@0:8",
-        0x1c1a37ae0UL + slide, bytes);
-    Method appearance = checked_method("SBIconImageView", "effectiveIconImageAppearance", "@16@0:8",
-        0x1c17cc92cUL + slide, bytes);
-    if (!method || !appearance) return;
-    appearance_selector = sel_registerName("effectiveIconImageAppearance");
-    glass_selector = sel_registerName("hasGlass");
-    original_bitmap_selection = method_getImplementation(method);
-    method_setImplementation(method, (IMP)software_bitmap_selection);
-    int installed = code_address(method_getImplementation(method)) == code_address((IMP)software_bitmap_selection);
-    fprintf(stderr, "sb26: build=23G90 software_icons_installed=%d\n", installed);
-}
-
 static void
 setup_activation_state(id self, SEL selector)
 {
@@ -156,8 +81,8 @@ setup_activation_state(id self, SEL selector)
         fprintf(stderr, "sb26: activation call=%u previous=%d applied=2\n", call + 1, previous);
 }
 
-/* What the cover sheet passes to -[SBLockScreenManager unlockUIFromSource:withOptions:] on 16.5. */
-#define UNLOCK_SOURCE_COVER_SHEET 24
+/* CoverSheet unlock source on iOS 26. */
+#define UNLOCK_SOURCE_COVER_SHEET 25
 /*
  * The lock screen takes input about 21 s after SpringBoard connects to backboardd: on 2026-10-29
  * the boot overlay came down 18 s in and the backlight stayed off 3 s more, and two swipes sent
@@ -178,7 +103,6 @@ lock_screen_manager(void)
 }
 
 /* 1: locked, an unlock was asked for; 0: not locked; -1: no lock screen manager to ask. */
-static void sb26_schedule_stepped_refresh(void);
 static int sb26_wallpaper_suspended;
 static int sb26_suspend_token = NOTIFY_TOKEN_INVALID;
 
@@ -196,7 +120,6 @@ sb26_on_unlocked(void)
         }
         notify_post("com.annibale.wallpaper.suspend");
     }
-    sb26_schedule_stepped_refresh();
 }
 
 static void
@@ -216,6 +139,8 @@ wake_screen_for_unlock(void)
     sb26_sync_initial_brightness(1);
 }
 
+static unsigned boot_unlock_wait_appear;
+
 static int
 unlock_once(const char *why)
 {
@@ -232,6 +157,29 @@ unlock_once(const char *why)
         return 0;
     }
     wake_screen_for_unlock();
+    Class cspm_cls = objc_getClass("SBCoverSheetPresentationManager");
+    SEL shared_if_exists = sel_registerName("sharedInstanceIfExists");
+    id cspm = (cspm_cls && class_getClassMethod(cspm_cls, shared_if_exists))
+        ? ((id (*)(Class, SEL))objc_msgSend)(cspm_cls, shared_if_exists) : nil;
+    id sliding = nil;
+    if (cspm) {
+        SEL sliding_if_loaded_sel = sel_registerName("coverSheetSlidingViewControllerIfLoaded");
+        SEL sliding_sel = sel_registerName("coverSheetSlidingViewController");
+        if (class_respondsToSelector(object_getClass(cspm), sliding_if_loaded_sel)) {
+            sliding = ((id (*)(id, SEL))objc_msgSend)(cspm, sliding_if_loaded_sel);
+        } else if (class_respondsToSelector(object_getClass(cspm), sliding_sel)) {
+            sliding = ((id (*)(id, SEL))objc_msgSend)(cspm, sliding_sel);
+        }
+    }
+    SEL appear_sel = sel_registerName("_appearState");
+    int32_t appear = (sliding && class_respondsToSelector(object_getClass(sliding), appear_sel))
+        ? ((int32_t (*)(id, SEL))objc_msgSend)(sliding, appear_sel) : -1;
+    if (appear != 2) {
+        boot_unlock_wait_appear++;
+        fprintf(stderr, "sb26: unlock %s: waiting for CoverSheet _appearState==2 (appear=%d wait=%u)\n",
+            why, appear, boot_unlock_wait_appear);
+        return 1;
+    }
     BOOL answer = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, nil);
     int locked_after = ((BOOL (*)(id, SEL))objc_msgSend)(manager, locked);
     fprintf(stderr, "sb26: unlock %s: answer=%d locked_after=%d\n", why, answer, locked_after);
@@ -242,195 +190,6 @@ unlock_once(const char *why)
 }
 
 static int boot_unlock_seen_locked;
-
-static unsigned sb26_logged_icon_labels;
-
-static void
-refresh_view_recursive(id view, int depth)
-{
-    if (!view || depth > 8) return;
-
-    SEL layout_sel = sel_registerName("setNeedsLayout");
-    SEL update_label_sel = sel_registerName("_updateLabel");
-    SEL icon_sel = sel_registerName("icon");
-    SEL disp_sel = sel_registerName("displayName");
-    SEL utf8_sel = sel_registerName("UTF8String");
-    SEL update_img_anim = sel_registerName("updateImageAnimated:");
-    SEL update_icon_img_anim = sel_registerName("updateIconImageViewAnimated:");
-    SEL update_img = sel_registerName("updateImage");
-    SEL subviews_sel = sel_registerName("subviews");
-    SEL count_sel = sel_registerName("count");
-    SEL obj_at_idx = sel_registerName("objectAtIndex:");
-
-    Class view_cls = object_getClass(view);
-    const char *cls_name = class_getName(view_cls);
-
-    if (cls_name && (strstr(cls_name, "Icon") != NULL)) {
-        if (class_respondsToSelector(view_cls, update_label_sel)) {
-            ((void (*)(id, SEL))objc_msgSend)(view, update_label_sel);
-        }
-        if (sb26_logged_icon_labels < 12 && class_respondsToSelector(view_cls, icon_sel)) {
-            id icon = ((id (*)(id, SEL))objc_msgSend)(view, icon_sel);
-            if (icon && class_respondsToSelector(object_getClass(icon), disp_sel)) {
-                id dname = ((id (*)(id, SEL))objc_msgSend)(icon, disp_sel);
-                const char *cstr = (dname && class_respondsToSelector(object_getClass(dname), utf8_sel))
-                    ? ((const char *(*)(id, SEL))objc_msgSend)(dname, utf8_sel) : NULL;
-                if (cstr && cstr[0]) {
-                    fprintf(stderr, "sb26: icon[%u] displayName='%s'\n", sb26_logged_icon_labels++, cstr);
-                    if (sb26_logged_icon_labels == 4) {
-                        mach_timebase_info_data_t tb = { 0 };
-                        mach_timebase_info(&tb);
-                        uint64_t ns = tb.denom ? (mach_absolute_time() * tb.numer / tb.denom) : 0;
-                        char mline[128];
-                        snprintf(mline, sizeof(mline), "milestone: icons_ready at %llu.%03llu s (icons=%u)\n",
-                            (unsigned long long)(ns / 1000000000ULL),
-                            (unsigned long long)((ns / 1000000ULL) % 1000ULL),
-                            sb26_logged_icon_labels);
-                        sysctlbyname("kern.annibale.say", NULL, NULL, mline, strlen(mline) + 1);
-                    }
-                }
-            }
-        }
-        if (class_respondsToSelector(view_cls, update_img_anim)) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(view, update_img_anim, NO);
-        } else if (class_respondsToSelector(view_cls, update_icon_img_anim)) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(view, update_icon_img_anim, NO);
-        } else if (class_respondsToSelector(view_cls, update_img)) {
-            ((void (*)(id, SEL))objc_msgSend)(view, update_img);
-        }
-        if (class_respondsToSelector(view_cls, layout_sel)) {
-            ((void (*)(id, SEL))objc_msgSend)(view, layout_sel);
-        }
-    }
-
-    if (class_respondsToSelector(view_cls, subviews_sel)) {
-        id subviews = ((id (*)(id, SEL))objc_msgSend)(view, subviews_sel);
-        if (subviews && class_respondsToSelector(object_getClass(subviews), count_sel)) {
-            unsigned long count = ((unsigned long (*)(id, SEL))objc_msgSend)(subviews, count_sel);
-            for (unsigned long i = 0; i < count; i++) {
-                id child = ((id (*)(id, SEL, unsigned long))objc_msgSend)(subviews, obj_at_idx, i);
-                refresh_view_recursive(child, depth + 1);
-            }
-        }
-    }
-}
-
-static void
-refresh_windows_array(id windows_array)
-{
-    if (!windows_array) return;
-    SEL count_sel = sel_registerName("count");
-    SEL obj_at_idx = sel_registerName("objectAtIndex:");
-    if (!class_respondsToSelector(object_getClass(windows_array), count_sel) ||
-        !class_respondsToSelector(object_getClass(windows_array), obj_at_idx)) {
-        return;
-    }
-    unsigned long win_count = ((unsigned long (*)(id, SEL))objc_msgSend)(windows_array, count_sel);
-    for (unsigned long i = 0; i < win_count; i++) {
-        id window = ((id (*)(id, SEL, unsigned long))objc_msgSend)(windows_array, obj_at_idx, i);
-        if (window) {
-            refresh_view_recursive(window, 0);
-        }
-    }
-}
-
-static void
-sb26_check_wifi_status(unsigned long step_idx)
-{
-    Class wifi_cls = objc_getClass("SBWiFiManager");
-    SEL shared_sel = sel_registerName("sharedInstance");
-    if (!wifi_cls || !class_getClassMethod(wifi_cls, shared_sel)) return;
-    id mgr = ((id (*)(Class, SEL))objc_msgSend)(wifi_cls, shared_sel);
-    if (!mgr) return;
-
-    SEL powered_sel = sel_registerName("isPowered");
-    SEL assoc_sel = sel_registerName("isAssociated");
-    SEL prim_sel = sel_registerName("isPrimaryInterface");
-    SEL bars_sel = sel_registerName("signalStrengthBars");
-    SEL rssi_sel = sel_registerName("signalStrengthRSSI");
-    SEL prim_chg_sel = sel_registerName("_primaryInterfaceChanged:");
-    SEL upd_sig_sel = sel_registerName("_updateSignalStrength");
-
-    int powered = class_respondsToSelector(wifi_cls, powered_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, powered_sel) : -1;
-    int assoc = class_respondsToSelector(wifi_cls, assoc_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, assoc_sel) : -1;
-    int prim = class_respondsToSelector(wifi_cls, prim_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, prim_sel) : -1;
-    int bars = class_respondsToSelector(wifi_cls, bars_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, bars_sel) : -1;
-    int rssi = class_respondsToSelector(wifi_cls, rssi_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, rssi_sel) : 0;
-
-    if (assoc == 1 && prim == 0 && class_respondsToSelector(wifi_cls, prim_chg_sel)) {
-        ((void (*)(id, SEL, BOOL))objc_msgSend)(mgr, prim_chg_sel, YES);
-        prim = class_respondsToSelector(wifi_cls, prim_sel) ? ((BOOL (*)(id, SEL))objc_msgSend)(mgr, prim_sel) : -1;
-    }
-    if (assoc == 1 && bars <= 0 && class_respondsToSelector(wifi_cls, upd_sig_sel)) {
-        ((void (*)(id, SEL))objc_msgSend)(mgr, upd_sig_sel);
-        bars = class_respondsToSelector(wifi_cls, bars_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, bars_sel) : -1;
-        rssi = class_respondsToSelector(wifi_cls, rssi_sel) ? ((int (*)(id, SEL))objc_msgSend)(mgr, rssi_sel) : 0;
-    }
-    fprintf(stderr, "sb26: wifi step=%lu powered=%d associated=%d primary=%d bars=%d rssi=%d\n",
-        step_idx, powered, assoc, prim, bars, rssi);
-}
-
-static void
-sb26_stepped_refresh_step(void *context)
-{
-    uintptr_t step_idx = (uintptr_t)context;
-    fprintf(stderr, "sb26: stepped icon refresh step %lu executing on main thread\n", (unsigned long)step_idx);
-    sb26_check_wifi_status((unsigned long)step_idx);
-
-    Class app_class = objc_getClass("UIApplication");
-    Class window_class = objc_getClass("UIWindow");
-    Class catrans_class = objc_getClass("CATransaction");
-
-    /* Only refresh VISIBLE windows and do NOT recurse into hidden internal touch windows */
-    SEL all_win_sel = sel_registerName("allWindowsIncludingInternalWindows:onlyVisibleWindows:");
-    if (window_class && class_respondsToSelector(object_getClass((id)window_class), all_win_sel)) {
-        id visible_windows = ((id (*)(id, SEL, BOOL, BOOL))objc_msgSend)((id)window_class, all_win_sel, NO, YES);
-        refresh_windows_array(visible_windows);
-    } else if (app_class) {
-        SEL shared_sel = sel_registerName("sharedApplication");
-        if (class_respondsToSelector(object_getClass((id)app_class), shared_sel)) {
-            id app = ((id (*)(id, SEL))objc_msgSend)((id)app_class, shared_sel);
-            if (app) {
-                SEL win_sel = sel_registerName("windows");
-                if (class_respondsToSelector(object_getClass(app), win_sel)) {
-                    id app_windows = ((id (*)(id, SEL))objc_msgSend)(app, win_sel);
-                    refresh_windows_array(app_windows);
-                }
-            }
-        }
-    }
-
-    if (catrans_class) {
-        SEL commit_sel = sel_registerName("commit");
-        if (class_respondsToSelector(object_getClass((id)catrans_class), commit_sel)) {
-            ((void (*)(id, SEL))objc_msgSend)((id)catrans_class, commit_sel);
-        }
-    }
-
-    fprintf(stderr, "sb26: stepped icon refresh step %lu completed\n", (unsigned long)step_idx);
-}
-
-static void
-sb26_schedule_stepped_refresh(void)
-{
-    static int scheduled = 0;
-    if (scheduled) return;
-    scheduled = 1;
-
-    static const int delays[] = { 3, 6, 10, 15, 22, 30, 45, 65, 90, 110 };
-    const size_t num_delays = sizeof(delays) / sizeof(delays[0]);
-
-    fprintf(stderr, "sb26: scheduling stepped icon refresh after unlock (%zu steps: +3s..+110s)\n", num_delays);
-
-    for (size_t i = 0; i < num_delays; i++) {
-        dispatch_after_f(
-            dispatch_time(DISPATCH_TIME_NOW, (int64_t)delays[i] * NSEC_PER_SEC),
-            dispatch_get_main_queue(),
-            (void *)(uintptr_t)(i + 1),
-            sb26_stepped_refresh_step
-        );
-    }
-}
 
 static void
 boot_unlock(void *context)
@@ -450,18 +209,6 @@ boot_unlock(void *context)
     }
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, UNLOCK_EVERY_SECONDS * NSEC_PER_SEC),
         dispatch_get_main_queue(), (void *)attempt, boot_unlock);
-}
-
-static BOOL (*orig_unlock_ui)(id, SEL, long, id);
-static BOOL
-sb26_hook_unlock_ui(id self, SEL cmd, long source, id options)
-{
-    BOOL ans = orig_unlock_ui ? orig_unlock_ui(self, cmd, source, options) : NO;
-    SEL locked = sel_registerName("isUILocked");
-    if (!((BOOL (*)(id, SEL))objc_msgSend)(self, locked)) {
-        sb26_on_unlocked();
-    }
-    return ans;
 }
 
 int
@@ -495,15 +242,6 @@ install_unlock(void)
             });
         }
     });
-
-    Class cls = objc_getClass("SBLockScreenManager");
-    if (cls) {
-        Method m = class_getInstanceMethod(cls, sel_registerName("unlockUIFromSource:withOptions:"));
-        if (m) {
-            orig_unlock_ui = (BOOL (*)(id, SEL, long, id))method_getImplementation(m);
-            method_setImplementation(m, (IMP)sb26_hook_unlock_ui);
-        }
-    }
 
     if (!sb26_boot_arg_present("autounlock=1")) {
         fprintf(stderr, "sb26: autounlock!=1, the lock screen stays until it is swiped away\n");
@@ -829,9 +567,6 @@ discovery_image_callback(const struct mach_header *header, intptr_t slide)
     Class mru = objc_getClass("MRUMirroringController");
     if (mru) install_mru_mirroring_hooks(mru);
 
-    Class cal = objc_getClass("SBCalendarIconImageProvider");
-    if (cal) install_calendar_icon_hooks(cal);
-
     sb26_install_localization_hooks();
 }
 
@@ -910,13 +645,9 @@ install_sb26(void)
         int installed = code_address(method_getImplementation(method)) == code_address((IMP)setup_activation_state);
         fprintf(stderr, "sb26: build=23G90 activation_installed=%d\n", installed);
     }
-    install_bitmap_selection(slide);
     install_unlock();
     sb26_install_layer_dump();
     sb26_install_rate(slide);
     install_powerdown_hooks();
     sb26_install_localization_hooks();
-
-    Class cal_cls = objc_getClass("SBCalendarIconImageProvider");
-    if (cal_cls) install_calendar_icon_hooks(cal_cls);
 }

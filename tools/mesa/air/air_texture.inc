@@ -907,6 +907,9 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    if (tex.offset)   /* a texture chosen at run time (choosable_texture, air_to_nir.c) */
       srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_texture_offset,
                                     .src = nir_src_for_ssa(tex.offset) };
+   if (have_sampler && samp.offset)
+      srcs[nsrc++] = (nir_tex_src){ .src_type = nir_tex_src_sampler_offset,
+                                    .src = nir_src_for_ssa(samp.offset) };
    nir_tex_instr *tex_instr = nir_tex_instr_create(c->nir, nsrc);
    tex_instr->op = op;
    tex_instr->sampler_dim = t.dim;

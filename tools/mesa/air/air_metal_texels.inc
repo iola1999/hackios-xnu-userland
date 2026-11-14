@@ -121,6 +121,10 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
       say(why, why_size, "no bytes to write into a texture");
       return -1;
    }
+   if (texture->chroma && rgb2p_format(texture->shape.pixel_format)) {
+      say(why, why_size, "combined RGB2P writes require both planes");
+      return -1;
+   }
    /* A depth or stencil texture is refused here and read through rwa_depth_read, and
     * the two go together on purpose: a texel of Depth32Float_Stencil8 holds two values
     * of two kinds, so a call whose only argument is "bytes" cannot say which of them
@@ -202,6 +206,10 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
 
    if (!bytes) {
       say(why, why_size, "nowhere to read a texture into");
+      return -1;
+   }
+   if (texture->chroma && rgb2p_format(texture->shape.pixel_format)) {
+      say(why, why_size, "combined RGB2P reads require both planes");
       return -1;
    }
    if (format_is_depth_stencil(texture->res->format)) {

@@ -90,7 +90,6 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
    void *cso = compute_state_for(compute, group_size, &yuv, why, why_size);
    if (!cso)
       return -1;
-   pipe->bind_compute_state(pipe, cso);
 
    /* The binding is bind_stage's, shared with the fragment stage of a draw. On a
     * failure mid-bind nothing has been set yet (the set_* calls are at its end), so
@@ -98,10 +97,11 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
     * the next dispatch or dropped at delete, as before.
     */
    struct rwa_bound bound = { 0 };
-   if (bind_stage(device, MESA_SHADER_COMPUTE, &compute->info, compute->own_sampler,
+   if (bind_stage(device, MESA_SHADER_COMPUTE, &compute->info, compute->slots, compute->own_sampler,
                   compute->compare_sampler, &yuv,
                   bindings, table, table_count, name, &bound, why, why_size) != 0)
       return -1;
+   pipe->bind_compute_state(pipe, cso);
 
    struct pipe_grid_info grid = {
       .work_dim = 3,

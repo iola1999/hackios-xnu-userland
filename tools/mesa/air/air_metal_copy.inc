@@ -2,6 +2,45 @@
  * match rwa_dispatch. Gallium may choose a CPU fallback, so hardware execution
  * must be checked separately from pixel correctness. */
 int
+rwa_buffer_fill(struct rwa_buffer *dst, size_t offset, size_t size, uint8_t value,
+                char *why, size_t why_size)
+{
+   RWA_LOCKED;
+   if (!dst || !dst->res || dst->res->target != PIPE_BUFFER ||
+       offset > dst->size || size > dst->size - offset || offset > UINT_MAX || size > UINT_MAX) {
+      say(why, why_size, "buffer fill range is out of bounds");
+      return -1;
+   }
+   if (dst->encodings) {
+      say(why, why_size, "filling buffers with argument-buffer encodings is unsupported");
+      return -1;
+   }
+   if (!size) return 0;
+   struct rwa_device *device = dst->device;
+   struct pipe_context *pipe = device->pipe;
+   if (!pipe->clear_buffer) {
+      say(why, why_size, "the driver has no buffer fill operation");
+      return -1;
+   }
+   /* Copied texture views may hold newer bytes from an earlier draw. Store those
+    * bytes first so a later texture refresh cannot overwrite the filled range. */
+   buffer_mirror_pull(dst);
+   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
+      if (b->source == dst && b->written && buffer_texture_download(b, why, why_size))
+         return -1;
+   pipe->clear_buffer(pipe, dst->res, (unsigned)offset, (unsigned)size, &value, 1);
+   if (finish_or_say_why(device, true, "buffer fill", why, why_size)) return -1;
+   if (dst->mirror) {
+      memcpy((char *)dst->mirror + offset, (char *)dst->map + offset, size);
+      dst->mirror_hashed = false;
+      buffer_mirror_pull(dst);
+   }
+   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
+      if (b->source == dst && buffer_texture_upload(b, why, why_size)) return -1;
+   return 0;
+}
+
+int
 rwa_buffer_copy(struct rwa_buffer *src, size_t src_offset,
                 struct rwa_buffer *dst, size_t dst_offset, size_t size,
                 char *why, size_t why_size)
@@ -75,6 +114,11 @@ rwa_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice
    RWA_LOCKED;
    if (!src || !dst || src->device != dst->device) {
       say(why, why_size, "texture copy requires two textures from one device");
+      return -1;
+   }
+   if ((src->chroma && rgb2p_format(src->shape.pixel_format)) ||
+       (dst->chroma && rgb2p_format(dst->shape.pixel_format))) {
+      say(why, why_size, "combined RGB2P copies require both planes");
       return -1;
    }
    if (src->res->format != dst->res->format || src->shape.pixel_format != dst->shape.pixel_format) {

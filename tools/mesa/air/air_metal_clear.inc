@@ -8,7 +8,13 @@ clear_bound_attachments(struct pipe_context *pipe, const struct rwa_draw *draw)
    for (unsigned n = 0; n < color_clear_count; n++) {
       const struct rwa_color_clear *item = &color_clears[n];
       union pipe_color_union clear = { 0 };
-      for (unsigned c = 0; c < 4; c++) clear.f[c] = item->rgba[c];
+      struct rwa_texture *target = draw->color[item->attachment];
+      for (unsigned c = 0; c < 4; c++) {
+         if (target && rgb2p_format(target->shape.pixel_format))
+            clear.ui[c] = c == 3 ? 1 : rgb2p_clear_code(target->shape.pixel_format, item->rgba[c]);
+         else
+            clear.f[c] = item->rgba[c];
+      }
       pipe->clear(pipe, PIPE_CLEAR_COLOR0 << item->attachment, item->write_mask, 0xff, NULL, &clear,
                   0.0, 0);
    }
@@ -48,6 +54,10 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_draw *draw, char *w
    for (unsigned i = 0; i <= draw->color_count; i++) {
       struct rwa_texture *t = i == draw->color_count ? draw->depth : draw->color[i];
       if (!t) continue;
+      if (rgb2p_format(t->shape.pixel_format) && !t->rgb2p_pass_open) {
+         say(why, why_size, "RGB2P clear requires a begun pass");
+         return -1;
+      }
       if (t->device != device) {
          say(why, why_size, "clear attachment belongs to another device");
          return -1;

@@ -16,7 +16,7 @@ struct rwa_bound_state {
 };
 
 struct rwa_yuv_key {
-   unsigned mask, full_range, bt709, bt2020, p010;
+   unsigned mask, full_range, bt709, bt2020, p010, rgb2p;
    uint8_t uv_slot[RWA_MAX_TEXTURES];
 };
 
@@ -79,6 +79,7 @@ struct rwa_device {
     */
    struct rwa_buffer_texture *buffer_textures;
 
+   void *rgb2p_csos[3][3];
    struct rwa_bound_state bound;
 };
 
@@ -178,8 +179,10 @@ struct rwa_texture {
    struct rwa_texture *storage_owner;
    struct rwa_texture *chroma;
    bool yuv_full_range, yuv_bt709, yuv_bt2020;
+   bool rgb2p_pass_open;
    struct rwa_device *device;
    struct pipe_resource *res;
+   struct pipe_resource *rgb2p_sample;
    struct pipe_sampler_view *view;  /* made when a dispatch first samples it, then kept */
    struct rwa_texture_shape shape;
    const char *format_name;         /* the MTLPixelFormat, spelled out */
@@ -214,6 +217,8 @@ texture_written(struct rwa_texture *t)
 {
    if (!t)
       return;
+   if (rgb2p_format(t->shape.pixel_format) && t->chroma)
+      return; /* The pass stores and marks the actual planes at its end. */
    if (t->storage_owner)
       t = t->storage_owner;
    if (t->backing)
