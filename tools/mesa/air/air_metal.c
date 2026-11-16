@@ -2174,22 +2174,6 @@ slot_shapes(nir_shader *cs, struct rwa_slot slots[RWA_MAX_TEXTURES],
 #include "air_metal_bicubic.inc"
 #include "air_metal_compute.inc"
 
-/* Wait for the work, and say so when it does not come.
- *
- * This matters more than it looks. On 20 October a dispatch hung the GPU -- our own
- * driver said "gpu: no answer: submission 2 is the last, the core has done 1" -- and
- * every dispatch for the rest of that boot was accepted, returned, and did nothing.
- * air_run did not wait on a fence, so it printed the buffer it had filled itself as
- * though the GPU had answered: 21 of the 47 kernels of one run were vacuous that way
- * before anyone noticed (docs/air.md section 5). A driver that returned such a buffer
- * to an application would be worse off than air_run, because nobody is reading the
- * numbers.
- *
- * `required` is the difference between the two callers. After a launch_grid there is
- * work outstanding, so a driver that hands over no fence has left nobody able to tell
- * whether the GPU finished, and that is a failure. rwa_finish may be called with
- * nothing outstanding at all, and then no fence means there was nothing to wait for.
- */
 static int
 finish_or_say_why(struct rwa_device *device, bool required, const char *what,
                   char *why, size_t why_size)
@@ -2197,10 +2181,8 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
    struct pipe_fence_handle *fence = NULL;
 
    device->pipe->flush(device->pipe, &fence, 0);
+   device->submit_seq++;
    if (fence) {
-      /* The fence of the flush that carried the work, or of an earlier one that
-       * nothing has waited for: a flush with nothing to send gives none, and the
-       * frame it already handed over is still outstanding. */
       device->screen->fence_reference(device->screen, &device->pending, NULL);
       device->pending = fence;
    }
@@ -2231,11 +2213,6 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
    return 0;
 }
 
-/* Hand the work over without waiting for it, keeping the fence for rwa_finish: a draw does not
- * finish itself (rwa_render_draw), the caller submits at the end of a command buffer and waits
- * when Metal says to. A wait of no time on the fence gives the kernel the submissions freedreno
- * merged (tools/mesa/fd-submit-merge.patch); the fence nobody has taken yet stays on the device.
- */
 int
 rwa_flush(struct rwa_device *device, char *why, size_t why_size)
 {
@@ -2244,6 +2221,7 @@ rwa_flush(struct rwa_device *device, char *why, size_t why_size)
 
    (void)why, (void)why_size;
    device->pipe->flush(device->pipe, &fence, 0);
+   device->submit_seq++;
    if (fence) {
       device->screen->fence_finish(device->screen, NULL, fence, 0);
       device->screen->fence_reference(device->screen, &device->pending, NULL);
@@ -3046,7 +3024,7 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
    uint64_t defaults_mark = draw_mark();
 
    for (unsigned i = 0; i < num_views; i++) {
-      if (!views[i] || samplers[i])
+      if (samplers[i])
          continue;
       samplers[i] = default_sampler(device);
       if (!samplers[i]) {
@@ -5960,6 +5938,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    }
    draw_phase_add(0, began);
    mark = draw_mark();
+   if (!rgb2p_prepare_bindings(&render->finfo, &draw->fragment, draw->fragment_buffer_table,
+                               draw->fragment_buffer_table_count, fname, why, why_size) ||
+       (!render->generated_vertex &&
+        !rgb2p_prepare_bindings(&render->vinfo, &draw->vertex, draw->vertex_buffer_table,
+                                draw->vertex_buffer_table_count, vname, why, why_size)))
+      return -1;
    struct pipe_surface surf[PIPE_MAX_COLOR_BUFS] = { 0 };
    struct pipe_surface zsurf = { 0 };
    /* pipe_framebuffer_state.samples is filled in although nothing here reads it: both

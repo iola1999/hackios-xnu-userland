@@ -82,6 +82,10 @@ def main():
         record["native"] = pixels(native, "normal")
         if record["native"] != {"pixels": 153, "sample_mismatches": 0, "read_mismatches": 0}:
             raise RuntimeError("native pixel reference failed")
+        _, native_render = run(probe + ["--render"], "native-render.log", limit=40)
+        if "RENDER mode=render plane_mismatches=0 linear_mismatches=0" not in native_render:
+            raise RuntimeError("native render/blend/linear reference failed")
+        record["native_render"] = "passed"
         _, swapped = run(probe + ["--swap-br", "--output", work / "swap-br.rgba32f"],
                          "swap-br.log", allowed=(1,), limit=40)
         record["swap_br"] = pixels(swapped, "swap-br")

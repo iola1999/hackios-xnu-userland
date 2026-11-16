@@ -42,15 +42,22 @@ head = r'''
 PRODUCTION_LOCK
 #define PIPE_BIND_SAMPLER_VIEW 1
 #define PIPE_BIND_RENDER_TARGET 4
+#define PIPE_SWIZZLE_X 0
+#define PIPE_SWIZZLE_Y 1
+#define PIPE_SWIZZLE_Z 2
+#define PIPE_SWIZZLE_W 3
+#define PIPE_SWIZZLE_0 4
+#define PIPE_SWIZZLE_1 5
 #define RWA_TYPE_2D 2
 #define u_minify(v,l) (((v) >> (l)) ? ((v) >> (l)) : 1)
 enum pipe_format { PIPE_FORMAT_NONE, PIPE_FORMAT_RGBA8, PIPE_FORMAT_RGBA8_SRGB };
 struct pipe_resource { unsigned height0, width0, last_level, bind, target, nr_samples, refs; enum pipe_format format; unsigned char bytes[256]; };
-struct pipe_sampler_view { int unused; };
+struct pipe_sampler_view { struct { struct { unsigned first_level, last_level; } tex; } u; unsigned swizzle_r, swizzle_g, swizzle_b, swizzle_a; int refs; };
+struct pipe_context { struct pipe_sampler_view *(*create_sampler_view)(struct pipe_context *, struct pipe_resource *, const struct pipe_sampler_view *); };
 struct rwa_texture_shape { unsigned pixel_format,type,width,height,depth,array_length,mip_levels,sample_count,usage; };
 struct rwa_pixel_format { enum pipe_format pipe; const char *name; };
 struct pipe_screen { bool (*is_format_supported)(struct pipe_screen *,enum pipe_format,unsigned,unsigned,unsigned,unsigned); };
-struct rwa_device { struct pipe_screen *screen; struct rwa_buffer_texture *buffer_textures; };
+struct rwa_device { struct pipe_screen *screen; struct pipe_context *pipe; struct rwa_buffer_texture *buffer_textures; };
 struct rwa_buffer { struct rwa_device *device; void *map,*mirror; size_t size; bool mirror_hashed; };
 '''
 pre = r'''
@@ -65,7 +72,11 @@ static unsigned util_format_get_blockheight(enum pipe_format f) { (void)f;return
 static bool format_is_depth_stencil(enum pipe_format f) { (void)f;return false; }
 static const char *rwa_device_name(struct rwa_device *d) { (void)d;return "host-memory"; }
 static void pipe_resource_reference(struct pipe_resource **p,struct pipe_resource *q) { if(q)q->refs++;if(*p && !--(*p)->refs){free(*p);releases++;}*p=q; }
-static void pipe_sampler_view_release_ptr(struct pipe_sampler_view **p) { (void)p; }
+static void pipe_sampler_view_reference(struct pipe_sampler_view **p,struct pipe_sampler_view *q) { if(q)q->refs++;if(*p && !--(*p)->refs)free(*p);*p=q; }
+static void pipe_sampler_view_release_ptr(struct pipe_sampler_view **p) { pipe_sampler_view_reference(p, NULL); }
+static void u_sampler_view_default_template(struct pipe_sampler_view *t,const struct pipe_resource *r,enum pipe_format f) { (void)r;(void)f;memset(t,0,sizeof(*t));t->swizzle_r=PIPE_SWIZZLE_X;t->swizzle_g=PIPE_SWIZZLE_Y;t->swizzle_b=PIPE_SWIZZLE_Z;t->swizzle_a=PIPE_SWIZZLE_W; }
+static struct pipe_sampler_view *make_sv(struct pipe_context *c,struct pipe_resource *r,const struct pipe_sampler_view *tmpl) { (void)c;(void)r;struct pipe_sampler_view *v=calloc(1,sizeof(*v));*v=*tmpl;v->refs=1;return v; }
+static bool rgb2p_prepare_sample(struct rwa_texture *t,char *why,size_t n) { (void)t;(void)why;(void)n;return true; }
 static void argbuf_scrub(struct rwa_device *d,void *b,struct rwa_texture *t,void *s) { (void)d;(void)b;(void)t;(void)s; }
 static void state_texture_gone(struct rwa_device *d,struct pipe_resource *p) { (void)d;(void)p; }
 static void buffer_mirror_pull(struct rwa_buffer *b) { (void)b; }
@@ -85,9 +96,24 @@ static struct rwa_texture *root_texture(struct rwa_device *device,struct rwa_buf
     struct rwa_buffer_texture *b=calloc(1,sizeof(*b));b->texture=t;b->source=buffer;b->row_bytes=24;b->next=device->buffer_textures;device->buffer_textures=b;t->backing=b;return t;
 }
 int main(int argc,char **argv) {
-    assert(argc==2);char why[256]={0};struct pipe_screen screen={supported};struct rwa_device d={.screen=&screen};
+    assert(argc==2);char why[256]={0};struct pipe_screen screen={supported};struct pipe_context pctx={make_sv};struct rwa_device d={.screen=&screen,.pipe=&pctx};
     unsigned char bytes[96];memset(bytes,0x33,sizeof(bytes));struct rwa_buffer buffer={.device=&d,.map=bytes,.size=sizeof(bytes)};
     struct rwa_texture *root=root_texture(&d,&buffer);
+    if(!strcmp(argv[1],"swizzle_propagation")) {
+        buffer_textures_forget(&buffer);
+        rwa_texture_set_swizzle(root, 2, 2, 2, 3);
+        assert(texture_ensure_sampler_view(&d, &pctx, root, 0, why, sizeof(why)));
+        assert(root->view && root->view->swizzle_r==PIPE_SWIZZLE_X && root->view->swizzle_g==PIPE_SWIZZLE_X &&
+               root->view->swizzle_b==PIPE_SWIZZLE_X && root->view->swizzle_a==PIPE_SWIZZLE_Y);
+        struct rwa_texture *inh = rwa_texture_view(root, 71, 0, 1, why, sizeof(why));assert(inh);
+        assert(texture_ensure_sampler_view(&d, &pctx, inh, 0, why, sizeof(why)));
+        assert(inh->view && inh->view->swizzle_a==PIPE_SWIZZLE_Y);
+        rwa_texture_set_swizzle(inh, 0, 0, 0, 0);
+        assert(!inh->view && texture_ensure_sampler_view(&d, &pctx, inh, 0, why, sizeof(why)));
+        assert(inh->view->swizzle_r==PIPE_SWIZZLE_0 && inh->view->swizzle_a==PIPE_SWIZZLE_0);
+        rwa_texture_destroy(inh);rwa_texture_destroy(root);assert(releases==1);
+        puts("case=swizzle_propagation ok=1");return 0;
+    }
     if(!strcmp(argv[1],"mipmap_lifetime")) {
         buffer_textures_forget(&buffer);root->res->last_level=2;root->shape.mip_levels=3;
         struct rwa_texture *first=rwa_texture_view(root,71,1,2,why,sizeof(why));assert(first);
@@ -122,7 +148,7 @@ def build(label, texts):
     alltext='\n'.join(texts)
     structs=structure(alltext,'rwa_texture')+structure(alltext,'rwa_buffer_texture')
     body='\n'.join(function(alltext,n) for n in ['rgb2p_format','texture_format','texture_levels','texture_written'])
-    later='\n'.join(function(alltext,n) for n in ['buffer_texture_bytes','rows_hash','buffer_texture_download','rwa_texture_view','buffer_textures_forget','rwa_buffer_textures_writeback','rwa_texture_destroy'])
+    later='\n'.join(function(alltext,n) for n in ['buffer_texture_bytes','rows_hash','buffer_texture_download','rwa_texture_view','rwa_texture_set_swizzle','buffer_textures_forget','rwa_buffer_textures_writeback','texture_ensure_sampler_view','rwa_texture_destroy'])
     init='t->references = 1;' if 'unsigned references;' in structs else ''
     lock_start = alltext.index('static pthread_mutex_t rwa_lock =')
     lock_end = alltext.index('#include \"nir.h\"', lock_start)
@@ -131,7 +157,7 @@ def build(label, texts):
     exe=OUT/label
     subprocess.run(['xcrun','clang','-std=c11','-Wall','-Wextra','-Werror','-Wno-unused-variable','-O1','-g','-fsanitize=address,undefined',str(path),'-o',str(exe)],check=True)
     results=[]
-    for case in ['view','owner_release','buffer_release','sibling_after_release','mipmap_lifetime']:
+    for case in ['view','owner_release','buffer_release','sibling_after_release','mipmap_lifetime','swizzle_propagation']:
         r=subprocess.run([str(exe),case],capture_output=True,text=True,timeout=10)
         print(label,r.returncode,r.stdout.strip());results.append(r.returncode)
         (OUT/(label+'-'+case+'.log')).write_text(r.stdout+r.stderr)
@@ -146,9 +172,11 @@ mutations = {
     'missing_owner_retain': ('   view->storage_owner->references++;', ''),
     'missing_owner_release': ('   rwa_texture_destroy(owner);', '   (void)owner;'),
     'nested_owner_not_original': ('texture->storage_owner ? texture->storage_owner : texture', 'texture'),
+    'lost_zero_swizzle_flag': ('   if (t->swizzled) {', '   if (t->swizzle_r || t->swizzle_g || t->swizzle_b || t->swizzle_a) {'),
+    'view_drops_swizzled': ('   view->swizzled = texture->swizzled;', ''),
 }
 for label, (before, after) in mutations.items():
     assert sum(text.count(before) for text in texts) == 1
     changed = [text.replace(before, after) for text in texts]
     assert any(code != 0 for code in build(label, changed)), label
-print('PASS: production scenarios and four rejected regression variants')
+print('PASS: production scenarios and six rejected regression variants')

@@ -1,0 +1,98 @@
+--- a/src/gallium/drivers/freedreno/freedreno_context.h
++++ b/src/gallium/drivers/freedreno/freedreno_context.h
+@@ -38,6 +38,7 @@
+    struct pipe_sampler_view *textures[PIPE_MAX_SAMPLERS];
+    unsigned num_textures;
+    unsigned valid_textures;
++   unsigned active_slots;
+    struct pipe_sampler_state *samplers[PIPE_MAX_SAMPLERS];
+    unsigned num_samplers;
+    unsigned valid_samplers;
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c
+@@ -915,6 +915,8 @@
+    ctx->launch_grid(ctx, info);
+ 
+    fd_batch_reference(&ctx->batch, save_batch);
++   if (ctx->batch)
++      fd_context_all_dirty(ctx);
+    fd_batch_reference(&save_batch, NULL);
+    fd_batch_reference(&batch, NULL);
+ }
+--- a/src/gallium/drivers/freedreno/freedreno_texture.c
++++ b/src/gallium/drivers/freedreno/freedreno_texture.c
+@@ -71,18 +71,23 @@
+          fd_resource_set_usage(tex->textures[p]->texture, FD_DIRTY_TEX);
+          fd_dirty_shader_resource(ctx, tex->textures[p]->texture,
+                                   shader, FD_DIRTY_SHADER_TEX, false);
+-         tex->valid_textures |= (1 << p);
++         tex->valid_textures |= (1u << p);
+       } else {
+-         tex->valid_textures &= ~(1 << p);
++         tex->valid_textures &= ~(1u << p);
+       }
++      if (views)
++         tex->active_slots |= (1u << p);
++      else
++         tex->active_slots &= ~(1u << p);
+    }
+    for (; i < nr + unbind_num_trailing_slots; i++) {
+       unsigned p = i + start;
+       pipe_sampler_view_reference(&tex->textures[p], NULL);
+-      tex->valid_textures &= ~(1 << p);
++      tex->valid_textures &= ~(1u << p);
++      tex->active_slots &= ~(1u << p);
+    }
+ 
+-   tex->num_textures = util_last_bit(tex->valid_textures);
++   tex->num_textures = util_last_bit(tex->valid_textures | tex->active_slots);
+ 
+    fd_context_dirty_shader(ctx, shader, FD_DIRTY_SHADER_TEX);
+ }
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_texture.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_texture.h
+@@ -93,6 +93,7 @@
+    uint16_t view_seqno[16];
+    uint16_t samp_seqno[16];
+    uint8_t type;
++   uint8_t num_textures;
+ };
+ 
+ struct fd6_texture_state {
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
+@@ -822,7 +822,7 @@
+ 
+    memset(&key, 0, sizeof(key));
+ 
+-   for (unsigned i = 0; i < tex->num_textures; i++) {
++   for (unsigned i = 0; i < MIN2(tex->num_textures, ARRAY_SIZE(key.view_seqno)); i++) {
+       if (!tex->textures[i])
+          continue;
+ 
+@@ -843,6 +843,7 @@
+    }
+ 
+    key.type = type;
++   key.num_textures = MIN2(tex->num_textures, 255u);
+ 
+    uint32_t hash = tex_key_hash(&key);
+    fd_screen_lock(ctx->screen);
+@@ -852,7 +853,7 @@
+ 
+    if (entry) {
+       state = (struct fd6_texture_state *)entry->data;
+-      for (unsigned i = 0; i < tex->num_textures; i++) {
++      for (unsigned i = 0; i < MIN2(tex->num_textures, ARRAY_SIZE(state->view_rsc_seqno)); i++) {
+          uint16_t seqno = tex->textures[i] ?
+                fd_resource(tex->textures[i]->texture)->seqno : 0;
+ 
+@@ -863,7 +864,7 @@
+ 
+    state = CALLOC_STRUCT(fd6_texture_state);
+ 
+-   for (unsigned i = 0; i < tex->num_textures; i++) {
++   for (unsigned i = 0; i < MIN2(tex->num_textures, ARRAY_SIZE(state->view_rsc_seqno)); i++) {
+       if (!tex->textures[i])
+          continue;
+ 

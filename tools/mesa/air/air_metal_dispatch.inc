@@ -97,6 +97,8 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
     * the next dispatch or dropped at delete, as before.
     */
    struct rwa_bound bound = { 0 };
+   if (!rgb2p_prepare_bindings(&compute->info, bindings, table, table_count, name, why, why_size))
+      return -1;
    if (bind_stage(device, MESA_SHADER_COMPUTE, &compute->info, compute->slots, compute->own_sampler,
                   compute->compare_sampler, &yuv,
                   bindings, table, table_count, name, &bound, why, why_size) != 0)

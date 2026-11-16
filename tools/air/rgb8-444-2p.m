@@ -84,13 +84,18 @@ static int create_surface(BOOL half, IOSurfaceRef *result)
     return 0;
 }
 
-static id<MTLTexture> import_texture(id<MTLDevice> device, IOSurfaceRef surface)
+static id<MTLTexture> import_texture_usage(id<MTLDevice> device, IOSurfaceRef surface, MTLTextureUsage usage)
 {
     MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
         (MTLPixelFormat)Format width:Width height:Height mipmapped:NO];
     desc.storageMode = MTLStorageModeShared;
-    desc.usage = MTLTextureUsageShaderRead;
+    desc.usage = usage;
     return [device newTextureWithDescriptor:desc iosurface:surface plane:0];
+}
+
+static id<MTLTexture> import_texture(id<MTLDevice> device, IOSurfaceRef surface)
+{
+    return import_texture_usage(device, surface, MTLTextureUsageShaderRead);
 }
 
 static BOOL texture_matches(id<MTLTexture> texture, IOSurfaceRef surface)
@@ -185,6 +190,134 @@ static int compare_pixels(id<MTLDevice> device, id<MTLTexture> texture,
     return failures[0] || failures[1] ? 1 : 0;
 }
 
+static int verify_render_blend_linear(id<MTLDevice> device, IOSurfaceRef surface, const char *metallib)
+{
+    NSError *error = nil;
+    NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:metallib]];
+    if (!data.length) { puts("ERROR stage=metallib-read"); return 2; }
+    dispatch_data_t wrapped = dispatch_data_create(data.bytes, data.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+    id<MTLLibrary> library = [[device newLibraryWithData:wrapped error:&error] autorelease];
+    dispatch_release(wrapped);
+    id<MTLFunction> vs = [[library newFunctionWithName:@"rgb8_444_2p_vs"] autorelease];
+    id<MTLFunction> blend_fs = [[library newFunctionWithName:@"rgb8_444_2p_blend_fs"] autorelease];
+    id<MTLFunction> linear_fs = [[library newFunctionWithName:@"rgb8_444_2p_linear_fs"] autorelease];
+    if (!vs || !blend_fs || !linear_fs) { puts("ERROR stage=render-functions"); return 2; }
+
+    id<MTLTexture> target542 = import_texture_usage(device, surface,
+        MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead);
+    if (!target542) { puts("UNSUPPORTED format=542 stage=render-import"); return 77; }
+
+    MTLRenderPipelineDescriptor *p1 = [[[MTLRenderPipelineDescriptor alloc] init] autorelease];
+    p1.vertexFunction = vs;
+    p1.fragmentFunction = blend_fs;
+    p1.colorAttachments[0].pixelFormat = (MTLPixelFormat)Format;
+    p1.colorAttachments[0].blendingEnabled = YES;
+    p1.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+    p1.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    p1.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+    p1.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    id<MTLRenderPipelineState> pso1 = [[device newRenderPipelineStateWithDescriptor:p1 error:&error] autorelease];
+    if (!pso1 || error) {
+        printf("ERROR stage=render-pso1 detail=%s\n", error.description.UTF8String ?: "unavailable");
+        [target542 release];
+        return 2;
+    }
+
+    MTLRenderPipelineDescriptor *p2 = [[[MTLRenderPipelineDescriptor alloc] init] autorelease];
+    p2.vertexFunction = vs;
+    p2.fragmentFunction = linear_fs;
+    p2.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    id<MTLRenderPipelineState> pso2 = [[device newRenderPipelineStateWithDescriptor:p2 error:&error] autorelease];
+    if (!pso2 || error) {
+        printf("ERROR stage=render-pso2 detail=%s\n", error.description.UTF8String ?: "unavailable");
+        [target542 release];
+        return 2;
+    }
+
+    MTLTextureDescriptor *outDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        width:Width * 2 height:Height * 2 mipmapped:NO];
+    outDesc.storageMode = MTLStorageModeShared;
+    outDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    id<MTLTexture> outTex = [[device newTextureWithDescriptor:outDesc] autorelease];
+    id<MTLCommandQueue> queue = [[device newCommandQueue] autorelease];
+    if (!outTex || !queue) { [target542 release]; puts("ERROR stage=render-setup"); return 2; }
+
+    /* Pass 1: clear 542 attachment to (0.20, 0.60, 0.80), draw left half blended with (0.80, 0.20, 0.40, 0.50). */
+    const float drawColor[4] = { 0.80f, 0.20f, 0.40f, 0.50f };
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    MTLRenderPassDescriptor *rp1 = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp1.colorAttachments[0].texture = target542;
+    rp1.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp1.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp1.colorAttachments[0].clearColor = MTLClearColorMake(0.20, 0.60, 0.80, 1.0);
+    id<MTLRenderCommandEncoder> enc1 = [cb renderCommandEncoderWithDescriptor:rp1];
+    [enc1 setRenderPipelineState:pso1];
+    [enc1 setScissorRect:(MTLScissorRect){ 0, 0, Width / 2, Height }];
+    [enc1 setFragmentBytes:drawColor length:sizeof(drawColor) atIndex:0];
+    [enc1 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc1 endEncoding];
+
+    /* Pass 2: sample 542 linearly in two draws within one pass to verify Pass 2 stays intact without mid-pass flush. */
+    MTLRenderPassDescriptor *rp2 = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp2.colorAttachments[0].texture = outTex;
+    rp2.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp2.colorAttachments[0].storeAction = MTLStoreActionStore;
+    rp2.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+    id<MTLRenderCommandEncoder> enc2 = [cb renderCommandEncoderWithDescriptor:rp2];
+    [enc2 setRenderPipelineState:pso2];
+    [enc2 setFragmentTexture:target542 atIndex:0];
+    [enc2 setScissorRect:(MTLScissorRect){ 0, 0, Width, Height * 2 }];
+    [enc2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc2 setScissorRect:(MTLScissorRect){ Width, 0, Width, Height * 2 }];
+    [enc2 drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [enc2 endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    [target542 release];
+    printf("command status=%lu error=%s\n", (unsigned long)cb.status, cb.error.description.UTF8String ?: "none");
+    if (cb.status != MTLCommandBufferStatusCompleted || cb.error) return 2;
+
+    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != KERN_SUCCESS) return 2;
+    const uint8_t *gPlane = IOSurfaceGetBaseAddressOfPlane(surface, 0);
+    const uint8_t *brPlane = IOSurfaceGetBaseAddressOfPlane(surface, 1);
+    size_t gRow = IOSurfaceGetBytesPerRowOfPlane(surface, 0);
+    size_t brRow = IOSurfaceGetBytesPerRowOfPlane(surface, 1);
+    unsigned plane_mismatches = 0;
+    /* Left half blended: RGB=(0.50, 0.40, 0.60)->(128, 102, 153); right half cleared: RGB=(0.20, 0.60, 0.80)->(51, 153, 204). */
+    for (unsigned y = 0; y < Height; y++) {
+        for (unsigned x = 0; x < Width; x++) {
+            int expR = x < Width / 2 ? 128 : 51;
+            int expG = x < Width / 2 ? 102 : 153;
+            int expB = x < Width / 2 ? 153 : 204;
+            int gotG = gPlane[y * gRow + x];
+            int gotB = brPlane[y * brRow + x * 2];
+            int gotR = brPlane[y * brRow + x * 2 + 1];
+            if (abs(gotR - expR) > 2 || abs(gotG - expG) > 2 || abs(gotB - expB) > 2)
+                plane_mismatches++;
+        }
+    }
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+
+    uint8_t rgba[Width * 2 * Height * 2 * 4];
+    [outTex getBytes:rgba bytesPerRow:Width * 2 * 4 fromRegion:MTLRegionMake2D(0, 0, Width * 2, Height * 2) mipmapLevel:0];
+    unsigned linear_mismatches = 0;
+    /* Interior left (x=2,y=4), boundary midpoint (x=Width/2*2, linear mix between left and right), interior right (x=Width*2-3,y=4). */
+    const uint8_t *leftPx = rgba + (4 * Width * 2 + 2) * 4;
+    const uint8_t *midPx = rgba + (4 * Width * 2 + (Width / 2) * 2) * 4;
+    const uint8_t *rightPx = rgba + (4 * Width * 2 + (Width * 2 - 3)) * 4;
+    if (abs((int)leftPx[0] - 128) > 3 || abs((int)leftPx[1] - 102) > 3 || abs((int)leftPx[2] - 153) > 3 || leftPx[3] < 250)
+        linear_mismatches++;
+    if (abs((int)rightPx[0] - 51) > 3 || abs((int)rightPx[1] - 153) > 3 || abs((int)rightPx[2] - 204) > 3 || rightPx[3] < 250)
+        linear_mismatches++;
+    /* Seam sample must lie strictly between left and right colours (proving linear filter + Draw 1 & Draw 2 preserved). */
+    if (!(midPx[0] > 60 && midPx[0] < 120 && midPx[1] > 108 && midPx[1] < 148 && midPx[2] > 160 && midPx[2] < 198))
+        linear_mismatches++;
+
+    printf("RENDER mode=render plane_mismatches=%u linear_mismatches=%u seam_rgba=%u,%u,%u,%u\n",
+           plane_mismatches, linear_mismatches, midPx[0], midPx[1], midPx[2], midPx[3]);
+    return (plane_mismatches || linear_mismatches) ? 1 : 0;
+}
+
 static id<MTLDevice> select_device(const char *driver)
 {
     if (!driver) return [MTLCreateSystemDefaultDevice() autorelease];
@@ -216,13 +349,14 @@ int main(int argc, char **argv) { @autoreleasepool { @try {
     if (console >= 0) { dup2(console, 1); dup2(console, 2); if (console > 2) close(console); }
 #endif
     signal(SIGALRM, deadline); alarm(30);
-    if (argc < 2) { fprintf(stderr, "usage: %s METALLIB [--driver DYLIB] [--swap-br | --half-plane] [--output FILE]\n", argv[0]); return 2; }
+    if (argc < 2) { fprintf(stderr, "usage: %s METALLIB [--driver DYLIB] [--swap-br | --half-plane | --render] [--output FILE]\n", argv[0]); return 2; }
     const char *driver = NULL, *output = NULL, *mode = "normal";
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--driver") && i + 1 < argc) driver = argv[++i];
         else if (!strcmp(argv[i], "--output") && i + 1 < argc) output = argv[++i];
         else if (!strcmp(mode, "normal") && !strcmp(argv[i], "--swap-br")) mode = "swap-br";
         else if (!strcmp(mode, "normal") && !strcmp(argv[i], "--half-plane")) mode = "half-plane";
+        else if (!strcmp(mode, "normal") && !strcmp(argv[i], "--render")) mode = "render";
         else return 2;
     }
     plane_offset = dlsym(RTLD_DEFAULT, "IOSurfaceGetOffsetOfPlane");
@@ -250,6 +384,8 @@ int main(int argc, char **argv) { @autoreleasepool { @try {
     }
     if (!texture_matches(texture, surface)) {
         puts("ERROR stage=texture-identity"); status = 2;
+    } else if (!strcmp(mode, "render")) {
+        status = verify_render_blend_linear(device, surface, argv[1]);
     } else {
         status = fill_surface(surface, !strcmp(mode, "swap-br"));
         if (!status) status = compare_pixels(device, texture, argv[1], mode, output);

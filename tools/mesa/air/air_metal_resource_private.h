@@ -80,6 +80,7 @@ struct rwa_device {
    struct rwa_buffer_texture *buffer_textures;
 
    void *rgb2p_csos[4][3];
+   uint64_t submit_seq;
    struct rwa_bound_state bound;
 };
 
@@ -179,7 +180,8 @@ struct rwa_texture {
    struct rwa_texture *storage_owner;
    struct rwa_texture *chroma;
    bool yuv_full_range, yuv_bt709, yuv_bt2020;
-   bool rgb2p_pass_open;
+   bool rgb2p_pass_open, rgb2p_sampled_once, imported;
+   uint64_t write_seq, rgb2p_plane_seq, rgb2p_submit_seq;
    struct rwa_device *device;
    struct pipe_resource *res;
    struct pipe_resource *rgb2p_sample;
@@ -206,7 +208,8 @@ struct rwa_texture {
     * made its own resource. Read through texture_levels(). */
    unsigned first_level, num_levels;
 
-   /* Channel swizzle for sampler views (0 = default/identity). */
+   /* Channel swizzle for sampler views (applied when swizzled is true). */
+   bool swizzled;
    uint8_t swizzle_r, swizzle_g, swizzle_b, swizzle_a;
 };
 
@@ -221,6 +224,7 @@ texture_written(struct rwa_texture *t)
       return; /* The pass stores and marks the actual planes at its end. */
    if (t->storage_owner)
       t = t->storage_owner;
+   t->write_seq++;
    if (t->backing)
       t->backing->written = true;
 }

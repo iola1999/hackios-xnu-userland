@@ -129,7 +129,20 @@ texture_checks(struct rwa_device *device, struct rwa_device *other, unsigned for
    assert(rwa_texture_copy(a, 0, 2, from, b, 0, 0, to, size, why, sizeof(why)) != 0);
    assert(rwa_texture_copy(a, 0, 1, from, foreign, 0, 0, to, size, why, sizeof(why)) != 0);
    assert(rwa_texture_copy(a, 0, 1, from, different, 0, 0, to, size, why, sizeof(why)) != 0);
-   assert(rwa_texture_copy(b, 0, 0, to, b, 0, 0, to, size, why, sizeof(why)) != 0);
+   /* Exact same-origin self-copy is a well-defined identity copy. */
+   assert(rwa_texture_copy(b, 0, 0, to, b, 0, 0, to, size, why, sizeof(why)) == 0);
+   /* Partially overlapping self-copy stages through a temporary surface without corrupting overlap. */
+   unsigned ov_to[3] = { 7, 2, 0 };
+   uint8_t *patch = malloc(size[1] * read_stride);
+   assert(patch);
+   for (unsigned y = 0; y < size[1]; y++)
+      memcpy(patch + y * read_stride,
+             expected + (to[1] + y) * read_stride + to[0] * texel, size[0] * texel);
+   for (unsigned y = 0; y < size[1]; y++)
+      memcpy(expected + (ov_to[1] + y) * read_stride + ov_to[0] * texel,
+             patch + y * read_stride, size[0] * texel);
+   free(patch);
+   assert(rwa_texture_copy(b, 0, 0, to, b, 0, 0, ov_to, size, why, sizeof(why)) == 0);
    unsigned bad[3] = { UINT32_MAX, 0, 0 }, empty[3] = { 0, 5, 1 };
    assert(rwa_texture_copy(a, 0, 1, bad, b, 0, 0, to, size, why, sizeof(why)) != 0);
    assert(rwa_texture_copy(a, 0, 1, from, b, 0, 0, to, empty, why, sizeof(why)) != 0);

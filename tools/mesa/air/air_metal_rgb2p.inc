@@ -341,6 +341,11 @@ rgb2p_prepare_sample(struct rwa_texture *t, char *why, size_t why_size)
       say(why, why_size, "RGB2P sampling requires readable, stored planes");
       return false;
    }
+   uint64_t pseq = t->storage_owner->write_seq + t->chroma->write_seq;
+   bool ext = t->storage_owner->imported || t->chroma->imported;
+   if (t->rgb2p_sample && t->rgb2p_sampled_once && pseq == t->rgb2p_plane_seq &&
+       (!ext || t->rgb2p_submit_seq == t->device->submit_seq))
+      return true;
    if (!t->rgb2p_sample) {
       struct rwa_texture_shape shape = t->shape;
       shape.pixel_format = t->shape.pixel_format == 543 || t->shape.pixel_format == 544 ? 90 : 70;
@@ -350,7 +355,35 @@ rgb2p_prepare_sample(struct rwa_texture *t, char *why, size_t why_size)
       pipe_resource_reference(&t->rgb2p_sample, made->res);
       rwa_texture_destroy(made);
    }
-   return rgb2p_convert(t, t->rgb2p_sample, 2, why, why_size);
+   if (!rgb2p_convert(t, t->rgb2p_sample, 2, why, why_size))
+      return false;
+   t->rgb2p_sampled_once = true;
+   t->rgb2p_plane_seq = pseq;
+   t->rgb2p_submit_seq = t->device->submit_seq;
+   return true;
+}
+
+static bool
+rgb2p_prepare_bindings(const struct air_shader_info *info, const struct rwa_bindings *bindings,
+                       const struct rwa_buffer_bind *table, unsigned table_count, const char *name,
+                       char *why, size_t why_size)
+{
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      const struct air_resource *r = &info->resources[i];
+      if (r->kind != AIR_RESOURCE_TEXTURE)
+         continue;
+      struct rwa_texture *t = NULL;
+      if (r->argbuf_set != ~0u) {
+         if (argbuf_member(r, table, table_count, name, NULL, NULL, &t, NULL, why, why_size) != 0)
+            return false;
+      } else if (bindings && r->index < bindings->texture_count) {
+         t = bindings->textures[r->index];
+      }
+      if (t && t->chroma && rgb2p_format(t->shape.pixel_format) &&
+          !rgb2p_prepare_sample(t, why, why_size))
+         return false;
+   }
+   return true;
 }
 
 int

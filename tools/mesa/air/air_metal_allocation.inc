@@ -377,7 +377,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
 
    unsigned bind = (read ? PIPE_BIND_SAMPLER_VIEW : 0) |
                    (write ? PIPE_BIND_SHADER_IMAGE : 0) |
-                   ((shape->usage & RWA_USAGE_RENDER_TARGET) || (depth_stencil && !shape->usage)
+                   ((shape->usage & RWA_USAGE_RENDER_TARGET) || (!compressed && !shape->usage)
                        ? (depth_stencil ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET)
                        : 0);
    if (!bind) {
@@ -400,6 +400,18 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
     * and a multisample one is its own count to both.
     */
    unsigned query_samples = samples > 1 ? samples : 0;
+   /* Non-compressed colour textures created with MTLTextureUsageShaderRead (such as
+    * MapKit.SnapshotService's 492x492 BGRA8Unorm_sRGB snapshot targets) are rendered into
+    * on Apple GPUs without explicit MTLTextureUsageRenderTarget. Enable PIPE_BIND_RENDER_TARGET
+    * whenever non-imported or when linear import pitch/offset already satisfies 64-byte alignment. */
+   if (!depth_stencil && !compressed &&
+       !(bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SHADER_IMAGE)) &&
+       (!import || (import->row_bytes % 64 == 0 && import->offset % 64 == 0)) &&
+       device->screen->is_format_supported(device->screen, fmt->pipe, target,
+                                           query_samples, query_samples,
+                                           bind | PIPE_BIND_RENDER_TARGET)) {
+      bind |= PIPE_BIND_RENDER_TARGET;
+   }
 
    /* Asked before it is allocated, so that a format the driver does not do for this
     * binding is a sentence naming both rather than a NULL from resource_create naming
@@ -435,6 +447,7 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
    texture->layers = array_size;
    texture->shader_read = read;
    texture->shader_write = write;
+   texture->imported = import != NULL;
 
    struct pipe_resource templ = {
       .target = target, .format = fmt->pipe,

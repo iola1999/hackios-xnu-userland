@@ -103,11 +103,14 @@ test_fsat(struct ir3_compiler *compiler, nir_op op, bool second_use)
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_FRAGMENT, ir3_get_compiler_options(compiler),
       "fsat_%s_%s", name, second_use ? "two_uses" : "one_use");
-   nir_def *inputs = nir_load_input(&b, 2, 32, nir_imm_int(&b, 0),
+   nir_def *inputs = nir_load_input(&b, 3, 32, nir_imm_int(&b, 0),
       .base = 0, .dest_type = nir_type_uint32,
       .io_semantics = {.location = VARYING_SLOT_VAR0, .num_slots = 1});
-   nir_def *value = nir_build_alu(&b, op, nir_channel(&b, inputs, 0),
-                                 nir_channel(&b, inputs, 1), NULL, NULL);
+   nir_def *value = op == nir_op_bcsel ?
+      nir_bcsel(&b, nir_uge(&b, nir_channel(&b, inputs, 0), nir_channel(&b, inputs, 1)),
+                nir_channel(&b, inputs, 1), nir_channel(&b, inputs, 2)) :
+      nir_build_alu(&b, op, nir_channel(&b, inputs, 0),
+                    nir_channel(&b, inputs, 1), NULL, NULL);
    nir_store_output(&b, nir_fsat(&b, value), nir_imm_int(&b, 0),
       .base = 0, .write_mask = 1, .src_type = nir_type_float32,
       .io_semantics = {.location = FRAG_RESULT_DATA0, .num_slots = 1});
@@ -135,13 +138,17 @@ test_fsat(struct ir3_compiler *compiler, nir_op op, bool second_use)
    if (!ret) {
       unsigned nonfloat_sat = 0, float_sat = 0, producers = 0;
       opc_t producer = op == nir_op_ixor ? OPC_XOR_B :
-                      op == nir_op_iadd ? OPC_ADD_U : OPC_ADD_F;
+                      op == nir_op_iadd ? OPC_ADD_U :
+                      op == nir_op_bcsel ? OPC_SEL_F32 : OPC_ADD_F;
       foreach_block (block, &v->ir->block_list) {
          foreach_instr (instr, &block->instr_list) {
-            producers += instr->opc == producer;
+            producers += instr->opc == producer ||
+               (op == nir_op_bcsel && instr->opc == OPC_SEL_B32);
             if (!(instr->flags & IR3_INSTR_SAT))
                continue;
-            if (is_cat2_float(instr->opc) || is_cat3_float(instr->opc))
+            if ((is_cat2_float(instr->opc) &&
+                 instr->opc != OPC_CMPS_F && instr->opc != OPC_CMPV_F) ||
+                instr->opc == OPC_MAD_F16 || instr->opc == OPC_MAD_F32)
                float_sat++;
             else
                nonfloat_sat++;
@@ -177,6 +184,7 @@ main(void)
    test_fsat(compiler, nir_op_iadd, false);
    test_fsat(compiler, nir_op_ixor, true);
    test_fsat(compiler, nir_op_fadd, false);
+   test_fsat(compiler, nir_op_bcsel, false);
    ir3_compiler_destroy(compiler);
    glsl_type_singleton_decref();
    printf("failures=%u\n", failures);

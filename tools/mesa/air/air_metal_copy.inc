@@ -204,13 +204,12 @@ copy_texture_box(struct rwa_texture *texture, unsigned level, unsigned slice,
    return true;
 }
 
-int
-rwa_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice,
-                 const unsigned src_origin[3], struct rwa_texture *dst,
-                 unsigned dst_level, unsigned dst_slice, const unsigned dst_origin[3],
-                 const unsigned size[3], char *why, size_t why_size)
+static int
+do_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice,
+                const unsigned src_origin[3], struct rwa_texture *dst,
+                unsigned dst_level, unsigned dst_slice, const unsigned dst_origin[3],
+                const unsigned size[3], bool wait, char *why, size_t why_size)
 {
-   RWA_LOCKED;
    if (!src || !dst || src->device != dst->device) {
       say(why, why_size, "texture copy requires two textures from one device");
       return -1;
@@ -230,21 +229,56 @@ rwa_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice
        !copy_texture_box(src, src_level, src_slice, src_origin, size, &from, why, why_size) ||
        !copy_texture_box(dst, dst_level, dst_slice, dst_origin, size, &to, why, why_size))
       return -1;
-   if (src->res == dst->res && src_level == dst_level && src_slice == dst_slice &&
-       from.x < to.x + to.width && to.x < from.x + from.width &&
-       from.y < to.y + to.height && to.y < from.y + from.height) {
-      say(why, why_size, "overlapping texture copy regions are unsupported");
-      return -1;
-   }
    struct pipe_context *pipe = src->device->pipe;
    if (!pipe->resource_copy_region) {
       say(why, why_size, "the driver has no resource copy operation");
       return -1;
    }
-   pipe->resource_copy_region(pipe, dst->res, dst_level, to.x, to.y, to.z,
-                              src->res, src_level, &from);
+   bool overlap = src->res == dst->res && src_level == dst_level && src_slice == dst_slice &&
+                  from.x < to.x + to.width && to.x < from.x + from.width &&
+                  from.y < to.y + to.height && to.y < from.y + from.height;
+   if (overlap) {
+      if (from.x == to.x && from.y == to.y) {
+         texture_written(dst);
+         return wait ? finish_or_say_why(src->device, false, "texture copy", why, why_size) : 0;
+      }
+      struct pipe_resource tmpl = {
+         .target = PIPE_TEXTURE_2D,
+         .format = src->res->format,
+         .width0 = (unsigned)from.width,
+         .height0 = (unsigned)from.height,
+         .depth0 = 1,
+         .array_size = 1,
+         .bind = PIPE_BIND_SAMPLER_VIEW,
+         .usage = PIPE_USAGE_DEFAULT,
+      };
+      struct pipe_resource *stage = src->device->screen->resource_create(src->device->screen, &tmpl);
+      if (!stage) {
+         say(why, why_size, "out of memory staging an overlapping texture copy");
+         return -1;
+      }
+      struct pipe_box stage_box = { .x = 0, .y = 0, .z = 0,
+                                    .width = from.width, .height = from.height, .depth = 1 };
+      pipe->resource_copy_region(pipe, stage, 0, 0, 0, 0, src->res, src_level, &from);
+      pipe->resource_copy_region(pipe, dst->res, dst_level, to.x, to.y, to.z, stage, 0, &stage_box);
+      pipe_resource_reference(&stage, NULL);
+   } else {
+      pipe->resource_copy_region(pipe, dst->res, dst_level, to.x, to.y, to.z,
+                                 src->res, src_level, &from);
+   }
    texture_written(dst);
-   return finish_or_say_why(src->device, true, "texture copy", why, why_size);
+   return wait ? finish_or_say_why(src->device, true, "texture copy", why, why_size) : 0;
+}
+
+int
+rwa_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice,
+                 const unsigned src_origin[3], struct rwa_texture *dst,
+                 unsigned dst_level, unsigned dst_slice, const unsigned dst_origin[3],
+                 const unsigned size[3], char *why, size_t why_size)
+{
+   RWA_LOCKED;
+   return do_texture_copy(src, src_level, src_slice, src_origin, dst, dst_level, dst_slice,
+                          dst_origin, size, true, why, why_size);
 }
 
 int
@@ -254,38 +288,6 @@ rwa_texture_copy_nowait(struct rwa_texture *src, unsigned src_level, unsigned sr
                         const unsigned size[3], char *why, size_t why_size)
 {
    RWA_LOCKED;
-   if (!src || !dst || src->device != dst->device) {
-      say(why, why_size, "texture copy requires two textures from one device");
-      return -1;
-   }
-   if ((src->chroma && rgb2p_format(src->shape.pixel_format)) ||
-       (dst->chroma && rgb2p_format(dst->shape.pixel_format))) {
-      say(why, why_size, "combined RGB2P copies require both planes");
-      return -1;
-   }
-   if (src->res->format != dst->res->format || src->shape.pixel_format != dst->shape.pixel_format) {
-      say(why, why_size, "texture copy requires identical pixel formats");
-      return -1;
-   }
-   struct pipe_box from, to;
-   if (!resource_level(src, &src_level, why, why_size) ||
-       !resource_level(dst, &dst_level, why, why_size) ||
-       !copy_texture_box(src, src_level, src_slice, src_origin, size, &from, why, why_size) ||
-       !copy_texture_box(dst, dst_level, dst_slice, dst_origin, size, &to, why, why_size))
-      return -1;
-   if (src->res == dst->res && src_level == dst_level && src_slice == dst_slice &&
-       from.x < to.x + to.width && to.x < from.x + from.width &&
-       from.y < to.y + to.height && to.y < from.y + from.height) {
-      say(why, why_size, "overlapping texture copy regions are unsupported");
-      return -1;
-   }
-   struct pipe_context *pipe = src->device->pipe;
-   if (!pipe->resource_copy_region) {
-      say(why, why_size, "the driver has no resource copy operation");
-      return -1;
-   }
-   pipe->resource_copy_region(pipe, dst->res, dst_level, to.x, to.y, to.z,
-                              src->res, src_level, &from);
-   texture_written(dst);
-   return 0;
+   return do_texture_copy(src, src_level, src_slice, src_origin, dst, dst_level, dst_slice,
+                          dst_origin, size, false, why, why_size);
 }

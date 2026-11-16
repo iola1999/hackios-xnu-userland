@@ -441,6 +441,7 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
    view->shader_read = texture->shader_read;
    view->shader_write = texture->shader_write;
    view->view_format = fmt->pipe;
+   view->swizzled = texture->swizzled;
    view->swizzle_r = texture->swizzle_r;
    view->swizzle_g = texture->swizzle_g;
    view->swizzle_b = texture->swizzle_b;
@@ -453,6 +454,7 @@ rwa_texture_set_swizzle(struct rwa_texture *texture, uint8_t r, uint8_t g, uint8
 {
    if (!texture)
       return;
+   texture->swizzled = true;
    texture->swizzle_r = r;
    texture->swizzle_g = g;
    texture->swizzle_b = b;
@@ -548,7 +550,7 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
    u_sampler_view_default_template(&tmpl, sampled, format);
    tmpl.u.tex.first_level = t->first_level;
    tmpl.u.tex.last_level = t->first_level + texture_levels(t) - 1;
-   if (t->swizzle_r || t->swizzle_g || t->swizzle_b || t->swizzle_a) {
+   if (t->swizzled) {
       unsigned swz[6] = { PIPE_SWIZZLE_0, PIPE_SWIZZLE_1, PIPE_SWIZZLE_X,
                           PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z, PIPE_SWIZZLE_W };
       tmpl.swizzle_r = t->swizzle_r < 6 ? swz[t->swizzle_r] : PIPE_SWIZZLE_0;

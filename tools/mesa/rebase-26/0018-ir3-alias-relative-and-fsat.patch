@@ -6,8 +6,8 @@ Upstream: 5a9db0be64e090164930593c6cd13d08ad45123f
 https://gitlab.freedesktop.org/mesa/mesa/-/commit/5a9db0be64e090164930593c6cd13d08ad45123f
 
 Keep relative constants out of alias.rt. Fold fsat only onto floating-point
-cat2/cat3 instructions. The helper moves below the category predicates for
-26.2.5 declaration order; the upstream conditions are unchanged.
+cat2/cat3 instructions that support saturation on a6xx+ (excluding sel.f16/f32
+and integer-output cmps.f/cmpv.f).
 
 --- a/src/freedreno/ir3/ir3_alias.c
 +++ b/src/freedreno/ir3/ir3_alias.c
@@ -56,14 +56,16 @@ cat2/cat3 instructions. The helper moves below the category predicates for
  is_mad(opc_t opc)
  {
     switch (opc) {
-@@ -830,6 +806,13 @@
+@@ -830,6 +806,15 @@
  }
  
  static inline bool
 +is_sat_compatible(opc_t opc)
 +{
-+   /* On a6xx saturation doesn't work on cat4 */
-+   return is_cat2_float(opc) || is_cat3_float(opc);
++   /* On a6xx+ saturation doesn't work on cat4, sel.*, or integer-output compares */
++   if (opc == OPC_CMPS_F || opc == OPC_CMPV_F)
++      return false;
++   return is_cat2_float(opc) || opc == OPC_MAD_F16 || opc == OPC_MAD_F32;
 +}
 +
 +static inline bool

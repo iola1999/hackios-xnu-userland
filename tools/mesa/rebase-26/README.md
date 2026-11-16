@@ -22,6 +22,7 @@
 18. `0016-nir-lower-fb-read-zero-layer.patch`：在 `nir_lower_fb_read.c` 中，若片元着色器未从顶点阶段读入 `VARYING_SLOT_LAYER`，将帧缓冲读取坐标的图层绑定为立即数 0，避免 `ir3_nir_lower_layer_id` 生成未链接的 `load_input(VARYING_SLOT_LAYER)` 并从 VPC 未初始化的脏寄存器 `r1.z` 读取非零图层编号，导致 Adreno A830 单图层 2D 目标数组越界返回全零颜色。
 19. `0017-nir-yuv-explicit-lod.patch`：YUV 平面采样接受 `nir_texop_tex`、`nir_texop_txl`、`nir_texop_txb` 与 `nir_texop_txd`，生成平面纹理指令时保留原操作，支持显式 LOD、bias 和导数采样。
 20. `0018-ir3-alias-relative-and-fsat.patch`：移植上游 `8511f446` 与 `5a9db0be`，相对常量输出保留原 MOV，`fsat` 仅合入浮点 cat2/cat3 指令的饱和标记。实际 ir3 回归测试在旧版复现 3 项失败，修复后 16 项通过；隔离 iOS arm64e 目标库已链接，GPU 像素待验。运行方法与范围见 [ir3 输出优化测试](../tests/README.md)。
+21. `0019-fd6-zero-unbound-texture-slots.patch`：`fd_set_sampler_views` 保留调用方显式传入槽位范围中的尾部空视图槽位，并在 `fd6_texture_key` 中记录 `num_textures`，使 `CP_LOAD_STATE6_0` 对未绑定的可空纹理槽位写入全零硬件描述符（`dummy_view`）；同时在 `fd_launch_grid` 恢复已保存的 3D `ctx->batch` 时调用 `fd_context_all_dirty`，防止计算核分发末尾 `fd_context_all_clean` 清空 3D 脏位导致后续绘制漏发常量与采样状态。
 
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，修改的文件互不重叠。应用这一层补丁后的源码树，加上 `tools/mesa/annibale-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只执行到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 

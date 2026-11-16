@@ -216,7 +216,11 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'soft
         # iOS 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
         'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
-        'nearbyd')
+        'nearbyd',
+        # fairplayd.H2 requires FairPlayIOKit (absent here) and exits(0) immediately while launchd keeps
+        # com.apple.fairplayd.versioned / HostSpecialPort 17 receive rights alive, hanging locationd SAPInit
+        # MIG 5395 -> passd -> Passbook; fairplaydeviceidentityd remains allowed below.
+        'fairplayd.H2')
 
 # cameracaptured and fontservicesd must not be blocked:
 # - cameracaptured allows on-demand camera capture service for Control Center and Camera.
