@@ -52,6 +52,22 @@ stitch_value_matches(struct air_ctx *c, const struct air_val *v, const struct ai
           v->def->bit_size == air_nir_bit_size(c, t);
 }
 
+static struct air_val *
+stitch_adapt_value(struct air_ctx *c, struct air_val *v, const struct air_type *t)
+{
+   if (stitch_value_matches(c, v, t))
+      return v;
+   if (v && v->kind == AIR_VAL_AGG && v->num_elems == 1 && stitch_value_matches(c, v->elems[0], t))
+      return v->elems[0];
+   if (t && t->kind == AIR_TYPE_STRUCT && t->num_members == 1 &&
+       stitch_value_matches(c, v, t->members[0])) {
+      struct air_val *w = air_val_agg(c, 1);
+      w->elems[0] = v;
+      return w;
+   }
+   return NULL;
+}
+
 /* Reflection reports one API binding even if several nodes use it. Native GraphSPI
  * constant buffers are opaque, with size zero and four-byte binding alignment. */
 static bool
@@ -109,15 +125,19 @@ resource:
 
 static struct air_val *
 stitch_input(struct air_ctx *c, struct air_linked_module *lm, const struct air_function *f,
-              unsigned arg, const struct air_stitch_input *input, struct air_val **temporary)
+              unsigned arg, unsigned fi, const struct air_stitch_input *input,
+              struct air_val **temporary)
 {
-   const struct air_type *t = f->args[arg].type;
+   const struct air_type *t = f->args[fi].type;
    const struct air_md *st = stitch_argument_type(lm->m, f, arg);
    const struct air_md *type = st && st->num_ops > 1 ? st->ops[1] : NULL;
    const char *kind = md_str(type, 0);
    uint64_t size = 0, align = 0;
-   if (!kind || !md_int(type, 1, &size) || !md_int(type, 2, &align) ||
-       !align || (align & (align - 1)) || size > UINT32_MAX || align > UINT32_MAX) {
+   if (!st && input->kind == AIR_STITCH_BUFFER_ADDRESS) {
+      size = air_type_alloc_size(lm->m, t);
+      align = MAX2(air_type_abi_align(lm->m, t), 1);
+   } else if (!kind || !md_int(type, 1, &size) || !md_int(type, 2, &align) ||
+              !align || (align & (align - 1)) || size > UINT32_MAX || align > UINT32_MAX) {
       air_error(c, "link: %s argument %u lacks a supported stitching type", f->base.name, arg);
       return NULL;
    }
@@ -148,12 +168,22 @@ stitch_input(struct air_ctx *c, struct air_linked_module *lm, const struct air_f
          .offset = nir_imm_int(&c->b, input->byte_offset), .pointee = t->elem,
       });
       if (!input->dereference) {
-         if (strcmp(kind, "air.pointer_type") ||
+         if ((st && strcmp(kind, "air.pointer_type") &&
+              strcmp(kind, "air.lvalue_reference_type")) ||
              t->kind != AIR_TYPE_POINTER || t->addrspace != 2) {
             air_error(c, "link: a buffer address requires a constant pointer argument");
             return NULL;
          }
          return buffer;
+      }
+      if (!st) {
+         if (!ret_member_is_number(t)) {
+            air_error(c, "link: %s argument %u lacks stitching copy/load helpers",
+                      f->base.name, arg);
+            return NULL;
+         }
+         nir_def *d = air_load_ptr(c, buffer->ptr, t, (unsigned)align);
+         return d ? air_val_ssa(c, d) : NULL;
       }
       const struct air_function *copy = stitch_helper(st, 5);
       const struct air_function *load = stitch_helper(st, 2);
@@ -264,19 +294,44 @@ translate_stitched_kernel(struct air_ctx *c, const struct air_stitched_kernel *k
       if (!lm)
          return false;
       const struct air_function *f = module_function(lm->m, n->function);
-      if (!f || f->num_args != n->num_args)
+      if (!f || f->num_args < n->num_args)
          return air_error(c, "link: node %u has an unknown function or wrong argument count", k);
-      struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(n->num_args, 1));
+      struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(f->num_args, 1));
       struct air_val **temporaries = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(n->num_args, 1));
+      unsigned fi = 0;
       for (unsigned a = 0; a < n->num_args; a++) {
          int from = n->args[a];
-         argv[a] = from < 0 ? results[-1 - from] :
-                    stitch_input(c, lm, f, a, &kernel->inputs[from], &temporaries[a]);
-         if (!stitch_value_matches(c, argv[a], f->args[a].type))
-            return air_error(c, "link: node %u argument %u has no compatible value", k, a);
-         if (c->error[0])
-            return false;
+         if (fi >= f->num_args)
+            return air_error(c, "link: node %u has an unknown function or wrong argument count", k);
+         if (from < 0) {
+            struct air_val *val = results[-1 - from];
+            struct air_val *adapted = stitch_adapt_value(c, val, f->args[fi].type);
+            if (adapted) {
+               argv[fi++] = adapted;
+            } else if (val && val->kind == AIR_VAL_AGG && val->num_elems > 0 &&
+                       fi + val->num_elems <= f->num_args) {
+               for (unsigned e = 0; e < val->num_elems; e++) {
+                  struct air_val *elem = stitch_adapt_value(c, val->elems[e], f->args[fi + e].type);
+                  if (!elem)
+                     return air_error(c, "link: node %u argument %u has no compatible value", k, a);
+                  argv[fi + e] = elem;
+               }
+               fi += val->num_elems;
+            } else {
+               return air_error(c, "link: node %u argument %u has no compatible value", k, a);
+            }
+         } else {
+            struct air_val *in_val = stitch_input(c, lm, f, a, fi, &kernel->inputs[from], &temporaries[a]);
+            argv[fi] = stitch_adapt_value(c, in_val, f->args[fi].type);
+            if (!argv[fi])
+               return air_error(c, "link: node %u argument %u has no compatible value", k, a);
+            if (c->error[0])
+               return false;
+            fi++;
+         }
       }
+      if (fi != f->num_args)
+         return air_error(c, "link: node %u has an unknown function or wrong argument count", k);
       results[k] = inline_linked_function(c, lm, f, argv);
       for (unsigned a = 0; a < n->num_args && !c->error[0]; a++)
          if (temporaries[a])

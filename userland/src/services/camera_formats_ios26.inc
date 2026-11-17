@@ -41,6 +41,7 @@ static const struct ios26_stream_format_spec v57_back_specs[] = {
 	{ 4224, 3024, 0, 0, 0,    0,    0,  60, 1, 2, 0, 0 },
 	{ 2112, 1512, 1, 0, 1, 1440, 1080,   0, 0, 0, 0, 0 },
 	{ 4224, 3024, 0, 0, 1, 2464, 1764,  30, 1, 2, 0, 0 },
+	{ 4224, 3024, 0, 0, 1, 2464, 1764,  30, 1, 1, 0, 0 },
 	{ 4224, 2376, 0, 0, 1, 2304, 1296, 120, 0, 0, 0, 0 },
 	{ 2112, 1192, 1, 0, 0,    0,    0, 240, 0, 0, 0, 0 },
 };
@@ -72,6 +73,8 @@ static const struct ios26_stream_format_spec v57_front_specs[] = {
 	{ 3072, 4896, 0, 0, 1, 2520, 4032,  60, 0, 0, 0, 0 },
 	{ 1840, 2448, 1, 0, 0,    0,    0,  60, 1, 2, 0, 0 },
 	{ 4896, 4896, 0, 0, 1, 2112, 2112,  30, 1, 2, 0, 0 },
+	{ 4896, 4896, 0, 0, 1, 2496, 2496,   0, 1, 1, 0, 0 },
+	{ 4896, 4896, 0, 0, 1, 2112, 2112,   0, 1, 1, 0, 0 },
 	{ 1392, 2448, 1, 0, 1,  864, 1536, 120, 0, 0, 0, 0 },
 	{ 1392, 2448, 1, 0, 1,  864, 1536,  60, 1, 2, 0, 0 },
 	{ 1392, 2448, 1, 0, 0,    0,    0,  60, 1, 2, 0, 0 },
@@ -104,6 +107,7 @@ output_info(int width, int height, double max_fps)
 	put(o, "SashimiRawPixelFormat", number_i(PF_BGRA));
 	put(o, "SushiRawPixelFormat", number_i(PF_BGRA));
 	put(o, "FocusPixelDataSupported", CFRetain(kCFBooleanFalse));
+	put(o, "GeometricDistortionCorrectionSupported", CFRetain(kCFBooleanTrue));
 	return o;
 }
 
@@ -213,7 +217,7 @@ v57_stream_format(const struct ios26_stream_format_spec *sp, double field_of_vie
 static CFArrayRef
 build_stream_formats(const struct annibale_camera_profile *profile, double field_of_view)
 {
-	CFDictionaryRef list[32];
+	CFDictionaryRef list[40];
 	CFIndex nf = 0;
 
 	if (profile != NULL) {

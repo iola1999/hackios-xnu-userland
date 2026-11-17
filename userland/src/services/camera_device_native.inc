@@ -57,7 +57,13 @@ camera_native_open(uint32_t sensor, struct annibale_camera_profile *profile)
 		errno = EINVAL;
 		goto fail;
 	}
-	device = open(ANNIBALE_CAMERA_DEVICE, O_RDWR);
+	for (int tries = 0; tries < 20; tries++) {
+		device = open(ANNIBALE_CAMERA_DEVICE, O_RDWR);
+		if (device >= 0 || errno != EBUSY) {
+			break;
+		}
+		usleep(25000);
+	}
 	if (device < 0 || ioctl(device, CAMIOC_G_INFO, &info) != 0) {
 		goto fail;
 	}

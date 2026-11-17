@@ -78,19 +78,60 @@ descriptor_kind_key(const struct air_md *desc)
  * to record for a member that is not one.
  */
 static bool
-argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_type *st,
-               struct air_argbuf *ab)
+argbuf_members_rec(struct air_ctx *c, const struct air_md *sti, const struct air_type *st,
+                   uint64_t base_off, unsigned base_id, struct air_argbuf *ab)
 {
-   unsigned n = 0;
-   for (unsigned i = 0; i < sti->num_ops; n++) {
-      uint64_t off = 0, msize = 0, flag = 0;
+   unsigned field = 0;
+   for (unsigned i = 0; i < sti->num_ops; field++) {
+      uint64_t off = 0, msize = 0, flag = 0, sub_id = 0;
+      const char *first = md_str(sti, i);
+      if (first && !strcmp(first, "air.struct_type_info")) {
+         const struct air_md *sub_sti = (i + 1 < sti->num_ops && sti->ops[i + 1] &&
+                                         sti->ops[i + 1]->kind == AIR_MD_NODE)
+                                           ? sti->ops[i + 1] : NULL;
+         const char *mtype = md_str(sti, i + 5), *mname = md_str(sti, i + 6);
+         const char *key = md_str(sti, i + 7);
+         if (!sub_sti || !md_int(sti, i + 2, &off) || !md_int(sti, i + 3, &msize) ||
+             !md_int(sti, i + 4, &flag) || !mtype || !mname ||
+             !key || strcmp(key, "air.indirect_argument") || !md_int(sti, i + 8, &sub_id)) {
+            return air_error(c, "interface: nested struct member %u of the argument buffer %s "
+                                "has an invalid air.struct_type_info descriptor",
+                             field, ab->name ? ab->name : "unnamed");
+         }
+         const struct air_type *mt = NULL;
+         if (st) {
+            if (field >= st->num_members)
+               return air_error(c, "interface: the argument buffer %s declares more members "
+                                   "than the %u its struct type has",
+                                ab->name ? ab->name : "unnamed", st->num_members);
+            mt = st->members[field];
+            uint64_t tyoff = air_struct_member_offset(c->m, st, field);
+            uint64_t tysize = air_type_alloc_size(c->m, mt);
+            if (mt->kind != AIR_TYPE_STRUCT || tyoff != off || tysize != msize)
+               return air_error(c, "interface: nested struct member %s of the argument buffer %s "
+                                   "does not match the module's struct layout",
+                                mname, ab->name ? ab->name : "unnamed");
+         } else {
+            char *sub_sname = ralloc_asprintf(c->mem_ctx, "struct.%s", mtype);
+            mt = named_struct(c->m, sub_sname);
+            if (mt && air_type_alloc_size(c->m, mt) != msize)
+               return air_error(c, "interface: nested struct member %s of the argument buffer %s "
+                                   "does not match struct.%s size",
+                                mname, ab->name ? ab->name : "unnamed", mtype);
+         }
+         i += 9;
+         if (!argbuf_members_rec(c, sub_sti, mt, base_off + off, base_id + (unsigned)sub_id, ab))
+            return false;
+         continue;
+      }
+
       const char *mtype = md_str(sti, i + 3), *mname = md_str(sti, i + 4);
       if (!md_int(sti, i, &off) || !md_int(sti, i + 1, &msize) ||
           !md_int(sti, i + 2, &flag) || !mtype || !mname) {
          const char *key = md_str(sti, i);
          return air_error(c, "interface: member %u of the argument buffer %s is "
                              "described by %s and not by five fields and a descriptor",
-                          n, ab->name ? ab->name : "unnamed",
+                          field, ab->name ? ab->name : "unnamed",
                           key ? key : "something this translator cannot read");
       }
 
@@ -105,13 +146,50 @@ argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_typ
                           mname, ab->name ? ab->name : "unnamed", key ? key : "nothing");
       i += 7;
 
-      /* A set inside a set. The member's descriptor would have a member table
-       * of its own, reached through a pointer LOADED out of this one and then
-       * walked -- which is the general pointer model and not this one.
-       */
       if (md_key(desc, "air.indirect_buffer") >= 0)
          return air_error(c, "interface: member %s of the argument buffer %s is itself an "
                              "argument buffer", mname, ab->name ? ab->name : "unnamed");
+
+      const struct air_type *mt = NULL;
+      if (st) {
+         if (field >= st->num_members)
+            return air_error(c, "interface: the argument buffer %s declares more members "
+                                "than the %u its struct type has",
+                             ab->name ? ab->name : "unnamed", st->num_members);
+         mt = st->members[field];
+         uint64_t tyoff = air_struct_member_offset(c->m, st, field);
+         uint64_t tysize = air_type_alloc_size(c->m, mt);
+         if (tyoff != off || tysize != msize)
+            return air_error(c, "interface: member %s of the argument buffer %s is %u bytes "
+                                "at byte %u, and the module's struct type puts %u bytes "
+                                "there at %u", mname, ab->name ? ab->name : "unnamed",
+                             (unsigned)msize, (unsigned)off, (unsigned)tysize,
+                             (unsigned)tyoff);
+      }
+
+      int mli = md_key(desc, "air.location_index");
+      uint64_t mid = 0, mspan = 1;
+      if (mli < 0 || !md_int(desc, mli + 1, &mid))
+         return air_error(c, "interface: member %s of the argument buffer %s has no "
+                             "air.location_index", mname,
+                          ab->name ? ab->name : "unnamed");
+
+      if (md_key(desc, "air.indirect_constant") >= 0) {
+         if (mt && mt->kind == AIR_TYPE_POINTER)
+            return air_error(c, "interface: inline constant %s of the argument buffer %s "
+                                "is declared as a pointer", mname, ab->name ? ab->name : "unnamed");
+         unsigned n = ab->num_members;
+         ab->members = reralloc(c->mem_ctx, ab->members, struct air_argbuf_member, n + 1);
+         ab->members[n] = (struct air_argbuf_member) {
+            .offset = base_off + off, .size = msize,
+            .kind = AIR_RESOURCE_CONSTANT_BUFFER, .metal_id = base_id + (unsigned)mid,
+            .index = ~0u, .span = 1, .slots = 0, .read = true, .is_constant = true,
+            .name = mname, .type_name = mtype, .node = desc,
+         };
+         ab->num_members = n + 1;
+         ab->has_constants = true;
+         continue;
+      }
 
       bool is_buffer = md_key(desc, "air.buffer") >= 0;
       bool is_texture = md_key(desc, "air.texture") >= 0;
@@ -126,91 +204,95 @@ argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_typ
                              : what ? what : "a kind this translator does not know");
       }
 
-      int mli = md_key(desc, "air.location_index");
-      uint64_t mid = 0, mspan = 1;
-      if (mli < 0 || !md_int(desc, mli + 1, &mid))
-         return air_error(c, "interface: member %s of the argument buffer %s has no "
-                             "air.location_index", mname,
-                          ab->name ? ab->name : "unnamed");
-      /* An ARRAY of descriptors in one member: the shader could then pick one
-       * at run time, which no resolution can do. Every one of Resident Evil
-       * 4's 82 048 members spans exactly one index, so this is a guard on a
-       * shape not yet seen rather than a gap with modules behind it.
-       */
-      if (md_int(desc, mli + 2, &mspan) && mspan != 1)
-         return air_error(c, "interface: member %s of the argument buffer %s spans %u "
-                             "descriptor indices", mname,
-                          ab->name ? ab->name : "unnamed", (unsigned)mspan);
-
-      /* against the module's own struct type */
-      if (n >= st->num_members)
-         return air_error(c, "interface: the argument buffer %s declares more members "
-                             "than the %u its struct type has",
-                          ab->name ? ab->name : "unnamed", st->num_members);
-      const struct air_type *mt = st->members[n];
-      uint64_t tyoff = air_struct_member_offset(c->m, st, n);
-      uint64_t tysize = air_type_alloc_size(c->m, mt);
-      if (tyoff != off || tysize != msize)
-         return air_error(c, "interface: member %s of the argument buffer %s is %u bytes "
-                             "at byte %u, and the module's struct type puts %u bytes "
-                             "there at %u", mname, ab->name ? ab->name : "unnamed",
-                          (unsigned)msize, (unsigned)off, (unsigned)tysize,
-                          (unsigned)tyoff);
-
-      enum air_resource_kind rk;
-      unsigned addrspace;
       bool read = md_key(desc, "air.read") >= 0 || md_key(desc, "air.read_write") >= 0 ||
                   md_key(desc, "air.sample") >= 0;
       bool write = md_key(desc, "air.write") >= 0 || md_key(desc, "air.read_write") >= 0;
+      if (md_int(desc, mli + 2, &mspan) && mspan != 1) {
+         if (!is_texture || write || !mspan)
+            return air_error(c, "interface: member %s of the argument buffer %s spans %u "
+                                "descriptor indices", mname,
+                             ab->name ? ab->name : "unnamed", (unsigned)mspan);
+      }
 
+      enum air_resource_kind rk;
+      unsigned addrspace;
       if (is_buffer) {
-         /* The member IS the pointer, and its address space is the only thing
-          * that says whether the descriptor is a constant buffer or a device
-          * one. A frontend that reused the direct-argument path unchanged
-          * would read air.address_space, find none, and refuse at "a buffer in
-          * address space 0" -- which is the better of the two ways to be
-          * wrong.
-          */
-         if (mt->kind != AIR_TYPE_POINTER || (mt->addrspace != 1 && mt->addrspace != 2))
-            return air_error(c, "interface: the buffer member %s of the argument buffer "
-                                "%s is not a device or constant pointer in the module's "
-                                "struct type", mname, ab->name ? ab->name : "unnamed");
-         addrspace = mt->addrspace;
-         rk = mt->addrspace == 1 ? AIR_RESOURCE_DEVICE_BUFFER : AIR_RESOURCE_CONSTANT_BUFFER;
+         uint64_t md_as = 0;
+         if (mt) {
+            if (mt->kind != AIR_TYPE_POINTER || (mt->addrspace != 1 && mt->addrspace != 2))
+               return air_error(c, "interface: the buffer member %s of the argument buffer "
+                                   "%s is not a device or constant pointer in the module's "
+                                   "struct type", mname, ab->name ? ab->name : "unnamed");
+            addrspace = mt->addrspace;
+         } else if (md_key_int(desc, "air.address_space", &md_as) && (md_as == 1 || md_as == 2)) {
+            addrspace = (unsigned)md_as;
+         } else {
+            return air_error(c, "interface: an argument buffer (%s) whose struct type %s the "
+                                "module does not declare, so its members' address spaces "
+                                "cannot be read", ab->name ? ab->name : "unnamed",
+                             ab->type_name ? ab->type_name : "(unnamed)");
+         }
+         rk = addrspace == 1 ? AIR_RESOURCE_DEVICE_BUFFER : AIR_RESOURCE_CONSTANT_BUFFER;
+      } else if (mspan > 1) {
+         if (mt) {
+            const struct air_type *et = (mt->kind == AIR_TYPE_STRUCT && mt->name &&
+                                         !strncmp(mt->name, "struct.metal::array", 19) &&
+                                         mt->num_members == 1 &&
+                                         mt->members[0]->kind == AIR_TYPE_ARRAY &&
+                                         mt->members[0]->count == mspan)
+                                           ? mt->members[0]->elem : NULL;
+            if (!et || et->kind != AIR_TYPE_STRUCT || !et->name ||
+                strncmp(et->name, "struct.metal::", 14) || et->num_members != 1 ||
+                et->members[0]->kind != AIR_TYPE_POINTER)
+               return air_error(c, "interface: texture array member %s of the argument buffer "
+                                   "%s is not a metal::array of metal:: texture wrappers",
+                                mname, ab->name ? ab->name : "unnamed");
+            addrspace = et->members[0]->addrspace;
+         } else {
+            addrspace = 1;
+         }
+         rk = AIR_RESOURCE_TEXTURE;
       } else {
-         /* A texture or a sampler arrives as the one-field `metal::texture2d`
-          * / `metal::sampler` wrapper the CoreImage stitched functions take
-          * (section 7.8), here as a struct member instead of a parameter and
-          * with the handle LOADED rather than passed. Keyed on Apple's own
-          * name, as the library wrapper is: "a struct with one pointer in it"
-          * would quietly accept anything shaped alike.
-          */
-         if (mt->kind != AIR_TYPE_STRUCT || !mt->name ||
-             strncmp(mt->name, "struct.metal::", 14) || mt->num_members != 1 ||
-             mt->members[0]->kind != AIR_TYPE_POINTER)
-            return air_error(c, "interface: the %s member %s of the argument buffer %s is "
-                                "not one of Apple's one-field metal:: wrappers in the "
-                                "module's struct type", is_sampler ? "sampler" : "texture",
-                             mname, ab->name ? ab->name : "unnamed");
-         addrspace = mt->members[0]->addrspace;
+         if (mt) {
+            if (mt->kind != AIR_TYPE_STRUCT || !mt->name ||
+                strncmp(mt->name, "struct.metal::", 14) || mt->num_members != 1 ||
+                mt->members[0]->kind != AIR_TYPE_POINTER)
+               return air_error(c, "interface: the %s member %s of the argument buffer %s is "
+                                   "not one of Apple's one-field metal:: wrappers in the "
+                                   "module's struct type", is_sampler ? "sampler" : "texture",
+                                mname, ab->name ? ab->name : "unnamed");
+            addrspace = mt->members[0]->addrspace;
+         } else {
+            addrspace = is_sampler ? 2 : 1;
+         }
          rk = is_sampler ? AIR_RESOURCE_SAMPLER
                          : write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE;
       }
 
+      unsigned n = ab->num_members;
       ab->members = reralloc(c->mem_ctx, ab->members, struct air_argbuf_member, n + 1);
       ab->members[n] = (struct air_argbuf_member) {
-         .offset = off, .kind = rk, .metal_id = (unsigned)mid, .index = ~0u,
+         .offset = base_off + off, .size = msize, .kind = rk,
+         .metal_id = base_id + (unsigned)mid, .index = ~0u,
+         .span = (unsigned)mspan, .slots = 1,
          .addrspace = addrspace, .read = read, .write = write,
          .name = mname, .type_name = mtype, .node = desc,
       };
       ab->num_members = n + 1;
    }
 
-   if (n != st->num_members)
+   if (st && field != st->num_members)
       return air_error(c, "interface: the argument buffer %s declares %u members and its "
-                          "struct type has %u", ab->name ? ab->name : "unnamed", n,
+                          "struct type has %u", ab->name ? ab->name : "unnamed", field,
                        st->num_members);
    return true;
+}
+
+static bool
+argbuf_members(struct air_ctx *c, const struct air_md *sti, const struct air_type *st,
+               struct air_argbuf *ab)
+{
+   return argbuf_members_rec(c, sti, st, 0, 0, ab);
 }
 
 /* Metal's argument buffer: `air.indirect_buffer`, one struct of descriptors
@@ -253,10 +335,6 @@ translate_argument_buffer(struct air_ctx *c, const struct air_md *node, unsigned
       char *sname = ralloc_asprintf(c->mem_ctx, "struct.%s", tn);
       st = named_struct(c->m, sname);
    }
-   if (!st)
-      return air_error(c, "interface: an argument buffer (%s) whose struct type %s the "
-                          "module does not declare, so its members' address spaces "
-                          "cannot be read", name ? name : "unnamed", tn ? tn : "(unnamed)");
 
    /* Two sets at one Metal buffer index would have one record at draw time and
     * two sets of members wanting it. */
@@ -271,18 +349,25 @@ translate_argument_buffer(struct air_ctx *c, const struct air_md *node, unsigned
    struct air_argbuf *ab = &c->argbufs[c->num_argbufs];
    *ab = (struct air_argbuf) {
       .metal_index = (unsigned)set_index, .size = (unsigned)size, .param = param,
-      .name = name, .type_name = tn,
+      .const_ubo_index = ~0u, .name = name, .type_name = tn,
    };
    if (!argbuf_members(c, sti, st, ab))
       return false;
-   /* eight bytes per member is what MTLArgumentEncoder writes and what the
-    * runtime's encodedLength has to answer; a set whose declared size is not
-    * that is a layout this frontend has not seen */
-   if (size != 8ull * ab->num_members)
-      return air_error(c, "interface: the argument buffer %s is %u bytes with %u members, "
-                          "and this frontend knows the eight-bytes-per-member layout "
-                          "only", name ? name : "unnamed", (unsigned)size,
-                       ab->num_members);
+   if (st) {
+      uint64_t expected_size = air_type_alloc_size(c->m, st);
+      if (size != expected_size)
+         return air_error(c, "interface: the argument buffer %s is %u bytes, and its struct "
+                             "type is %u bytes", name ? name : "unnamed", (unsigned)size,
+                          (unsigned)expected_size);
+   } else {
+      uint64_t max_end = 0;
+      for (unsigned i = 0; i < ab->num_members; i++)
+         max_end = MAX2(max_end, ab->members[i].offset + ab->members[i].size);
+      if (size < max_end)
+         return air_error(c, "interface: the argument buffer %s is %u bytes, smaller than "
+                             "its members (%u bytes)", name ? name : "unnamed",
+                          (unsigned)size, (unsigned)max_end);
+   }
 
    struct air_ptr p = { .class = AIR_PTR_ARGBUF, .binding = c->num_argbufs++ };
    c->params[param] = air_val_ptr(c, p);
@@ -336,8 +421,36 @@ allocate_argbuf_indices(struct air_ctx *c)
 
    for (unsigned s = 0; s < c->num_argbufs; s++) {
       struct air_argbuf *ab = &c->argbufs[s];
+      if (ab->has_constants) {
+         ab->const_ubo_index = next_buffer++;
+         struct air_resource *cr = add_resource(c, AIR_RESOURCE_CONSTANT_BUFFER,
+                                                ab->const_ubo_index, ab->size, true, false,
+                                                ab->param, NULL);
+         if (!cr)
+            return;
+         cr->argbuf_set = ab->metal_index;
+         cr->argbuf_id = ~0u;
+      }
       for (unsigned k = 0; k < ab->num_members; k++) {
          struct air_argbuf_member *m = &ab->members[k];
+         if (m->is_constant)
+            continue;
+         if (m->span > 1) {
+            unsigned avail = next_texture < 16 ? (16 - next_texture) : 1;
+            m->slots = MIN2(m->span, avail);
+            m->index = next_texture;
+            next_texture += m->slots;
+            for (unsigned j = 0; j < m->slots; j++) {
+               struct air_resource *r = add_resource(c, m->kind, m->index + j, 0,
+                                                     m->read, m->write, ab->param, m->node);
+               if (!r)
+                  return;
+               r->argbuf_set = ab->metal_index;
+               r->argbuf_id = m->metal_id + j;
+               r->nullable = true;
+            }
+            continue;
+         }
          switch (m->kind) {
          case AIR_RESOURCE_CONSTANT_BUFFER:
          case AIR_RESOURCE_DEVICE_BUFFER:
@@ -351,6 +464,7 @@ allocate_argbuf_indices(struct air_ctx *c)
             m->index = next_sampler++;
             break;
          }
+         m->slots = 1;
          struct air_resource *r = add_resource(c, m->kind, m->index, 0, m->read, m->write,
                                                ab->param, m->node);
          if (!r)
@@ -372,7 +486,8 @@ allocate_argbuf_indices(struct air_ctx *c)
  * it and no second path to keep right.
  */
 static struct air_val *
-argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
+argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
+            unsigned align)
 {
    const struct air_argbuf *ab = &c->argbufs[ptr.binding];
    const char *abname = ab->name ? ab->name : "unnamed";
@@ -380,6 +495,40 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
    uint64_t off = 0;
    if (ptr.offset) {
       if (!nir_src_is_const(nir_src_for_ssa(ptr.offset))) {
+         if (type->kind == AIR_TYPE_POINTER) {
+            const struct air_argbuf_member *arr = NULL;
+            for (unsigned i = 0; i < ab->num_members; i++) {
+               if (!ab->members[i].is_constant && ab->members[i].span > 1) {
+                  arr = &ab->members[i];
+                  break;
+               }
+            }
+            if (arr && type->addrspace == arr->addrspace && arr->slots > 0) {
+               nir_def *rel = arr->offset ? nir_iadd_imm(&c->b, ptr.offset, -(int)arr->offset)
+                                          : ptr.offset;
+               nir_def *elem = nir_umin_imm(&c->b, nir_ushr_imm(&c->b, rel, 3),
+                                            arr->slots - 1);
+               struct air_ptr tp = {
+                  .class = AIR_PTR_TEXTURE,
+                  .is_image = (arr->kind == AIR_RESOURCE_IMAGE),
+                  .binding = 0,
+                  .offset = nir_iadd_imm(&c->b, elem, arr->index),
+                  .pointee = type->elem,
+               };
+               if (!tp.is_image) {
+                  for (unsigned k = 0; k < arr->slots; k++)
+                     air_texture_may_be_unbound(c, arr->index + k);
+               }
+               return air_val_ptr(c, tp);
+            }
+         } else if (ab->has_constants && ab->const_ubo_index != ~0u) {
+            struct air_ptr up = {
+               .class = AIR_PTR_UBO, .binding = ab->const_ubo_index,
+               .offset = ptr.offset, .pointee = type,
+            };
+            nir_def *val = air_load_ptr(c, up, type, align);
+            return val ? air_val_ssa(c, val) : NULL;
+         }
          air_error(c, "instruction: a load through the argument buffer %s at an offset "
                       "that is not constant, which is a descriptor chosen at run time",
                    abname);
@@ -389,21 +538,44 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
    }
 
    const struct air_argbuf_member *m = NULL;
-   for (unsigned i = 0; i < ab->num_members; i++)
-      if (ab->members[i].offset == off)
-         m = &ab->members[i];
+   for (unsigned i = 0; i < ab->num_members; i++) {
+      const struct air_argbuf_member *cand = &ab->members[i];
+      if (cand->is_constant) {
+         if (off >= cand->offset && off < cand->offset + cand->size) {
+            m = cand;
+            break;
+         }
+      } else if (cand->span > 1) {
+         if (off >= cand->offset && off < cand->offset + 8ull * cand->span &&
+             ((off - cand->offset) & 7ull) == 0) {
+            m = cand;
+            break;
+         }
+      } else if (cand->offset == off) {
+         m = cand;
+         break;
+      }
+   }
    if (!m) {
       air_error(c, "instruction: a load from byte %u of the argument buffer %s, which "
                    "declares no member there", (unsigned)off, abname);
       return NULL;
    }
 
-   /* A number read out of the set rather than a descriptor: Metal's
-    * `constantDataAtIndex:`. Every member of this set is a resource -- that is
-    * what argbuf_members checked -- so this is a load of a descriptor's bytes,
-    * which are the runtime's 8-byte handle and mean nothing to a driver that
-    * binds by index.
-    */
+   if (m->is_constant) {
+      if (type->kind == AIR_TYPE_POINTER) {
+         air_error(c, "instruction: a pointer load from inline constant %s of the "
+                      "argument buffer %s", m->name ? m->name : "unnamed", abname);
+         return NULL;
+      }
+      struct air_ptr up = {
+         .class = AIR_PTR_UBO, .binding = ab->const_ubo_index,
+         .offset = nir_imm_int(&c->b, off), .pointee = type,
+      };
+      nir_def *val = air_load_ptr(c, up, type, align);
+      return val ? air_val_ssa(c, val) : NULL;
+   }
+
    if (type->kind != AIR_TYPE_POINTER) {
       air_error(c, "instruction: a load of a value out of the argument buffer %s, whose "
                    "member %s at byte %u is a resource and has no bytes to read",
@@ -411,12 +583,6 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
       return NULL;
    }
 
-   /* The address space of the pointer the shader LOADS, against the one the
-    * module's struct type declares for that member. The two come from
-    * different records -- the load instruction's own result type and the
-    * module's type table -- and either one alone would bind a constant buffer
-    * as a device buffer without a word if it were wrong.
-    */
    if (type->addrspace != m->addrspace) {
       air_error(c, "instruction: a pointer in address space %u loaded from member %s of "
                    "the argument buffer %s, which the module's struct type puts in "
@@ -425,7 +591,10 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type)
       return NULL;
    }
 
-   struct air_ptr p = { .binding = m->index, .pointee = type->elem };
+   unsigned elem_idx = (unsigned)((off - m->offset) >> 3);
+   if (elem_idx >= m->slots)
+      elem_idx = m->slots - 1;
+   struct air_ptr p = { .binding = m->index + elem_idx, .pointee = type->elem };
    switch (m->kind) {
    case AIR_RESOURCE_CONSTANT_BUFFER: p.class = AIR_PTR_UBO; break;
    case AIR_RESOURCE_DEVICE_BUFFER:   p.class = AIR_PTR_SSBO; break;

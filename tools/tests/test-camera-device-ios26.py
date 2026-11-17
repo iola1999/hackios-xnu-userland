@@ -49,7 +49,8 @@ static struct annibale_camera_frame next_frame;
 static size_t profile_offset;
 static int profile_present = 1, native_capable = 1, device_open, installed;
 static int profile_eintr, short_install, short_frame, capture_errno, hold_after_capture, transient_fail_remaining;
-static unsigned install_calls, capture_calls, pixel_reads;
+static int open_ebusy_remaining;
+static unsigned install_calls, capture_calls, pixel_reads, ebusy_sleeps;
 static int torch_present, torch_open, short_torch_read, short_torch_write, fail_stream_create;
 static uint32_t torch_shown = 173, torch_wanted;
 static unsigned torch_reads, torch_writes;
@@ -82,6 +83,11 @@ static int fake_open(const char *path, int flags, ...) {
     }
     if (strcmp(path, ANNIBALE_CAMERA_DEVICE) == 0) {
         assert(flags == O_RDWR && !device_open);
+        if (open_ebusy_remaining > 0) {
+            open_ebusy_remaining--;
+            errno = EBUSY;
+            return -1;
+        }
         device_open = 1;
         installed = 0;
         return CAMERA_FD;
@@ -217,6 +223,12 @@ static void *fake_dlsym(void *handle, const char *symbol) {
     return NULL;
 }
 
+static int fake_usleep(useconds_t usec) {
+    assert(usec == 25000);
+    ebusy_sleeps++;
+    return 0;
+}
+
 #define dlsym fake_dlsym
 #define open fake_open
 #define fstat fake_fstat
@@ -224,6 +236,7 @@ static void *fake_dlsym(void *handle, const char *symbol) {
 #define write fake_write
 #define ioctl fake_ioctl
 #define close fake_close
+#define usleep fake_usleep
 #include "camera_device.c"
 #undef dlsym
 #undef open
@@ -232,6 +245,7 @@ static void *fake_dlsym(void *handle, const char *symbol) {
 #undef write
 #undef ioctl
 #undef close
+#undef usleep
 
 static int64_t get_int(CFDictionaryRef d, CFStringRef k) {
     CFNumberRef n = CFDictionaryGetValue(d, k);
@@ -554,6 +568,109 @@ static void pixel_buffer_consumer(CMBaseObjectRef front) {
     assert(x422_callbacks == 1);
     hold_after_capture = 0;
     assert(stream_stop(front) == 0);
+
+    /* Verify forced flash still capture lights /dev/annibale-torch (1000), warms up 2 frames, tags {Exif} Flash=1, and extinguishes (0) */
+    pool = NULL;
+    attributes = (CFMutableDictionaryRef)new_dict();
+    put(attributes, "Width", number_i(640));
+    put(attributes, "Height", number_i(480));
+    put(attributes, "PixelFormatType", number_i(PF_420F));
+    put(attributes, "IOSurfaceProperties", new_dict());
+    assert(CVPixelBufferPoolCreate(NULL, NULL, attributes, &pool) == kCVReturnSuccess);
+    CFRelease(attributes);
+    configs = (CFMutableDictionaryRef)new_dict();
+    CFMutableDictionaryRef still_cfg = (CFMutableDictionaryRef)new_dict();
+    put(still_cfg, "BufferPool", pool);
+    put(configs, "StillImage", still_cfg);
+    assert(stream_set_property(front, CFSTR("VideoOutputConfigurations"), configs) == 0);
+    CFRelease(configs);
+    CFMutableDictionaryRef still_en = (CFMutableDictionaryRef)new_dict();
+    put(still_en, "StillImage", CFRetain(kCFBooleanTrue));
+    assert(stream_set_property(front, CFSTR("VideoOutputsEnabled"), still_en) == 0);
+    CFRelease(still_en);
+    __block unsigned flash_still_callbacks = 0;
+    pixel_buffer_handler flash_still_handler = Block_copy(^(CVPixelBufferRef image, CMTime pts) {
+        (void)pts;
+        assert(torch_wanted == 1000);
+        CFDictionaryRef metadata = CVBufferCopyAttachment(image, md_attachment, NULL);
+        assert(metadata != NULL);
+        CFDictionaryRef exif = CFDictionaryGetValue(metadata, CFSTR("{Exif}"));
+        assert(exif != NULL && get_int(exif, CFSTR("Flash")) == 1);
+        CFRelease(metadata);
+        flash_still_callbacks++;
+        stream_of(front)->state = CAM_STREAM_STOPPED;
+    });
+    handlers = (CFMutableDictionaryRef)new_dict();
+    entry = (CFMutableDictionaryRef)new_dict();
+    put(entry, "PixelBufferHandler", flash_still_handler);
+    put(handlers, "StillImage", entry);
+    assert(stream_set_property(front, CFSTR("VideoOutputHandlers"), handlers) == 0);
+    CFRelease(handlers);
+    stream_of(front)->torch = TORCH_FD;
+    assert(stream_set_property(front, CFSTR("FlashMode"), CFSTR("ForceFlashOn")) == 0);
+    CFDictionaryRef cap_opts = new_dict();
+    assert(stream_set_property(front, CFSTR("StillImageCaptureNow"), cap_opts) == 0);
+    CFRelease(cap_opts);
+    complete_capture();
+    unsigned writes_before = torch_writes;
+    unsigned frames_before = pixel_reads;
+    stream_of(front)->state = CAM_STREAM_ACTIVE;
+    assert(worker(front) == NULL);
+    assert(flash_still_callbacks == 1);
+    assert(pixel_reads == frames_before + 4);
+    assert(torch_writes == writes_before + 2 && torch_wanted == 0);
+
+    /* Verify GenerateRedEyeAuxiliaryImage=1 emits unlit pre-flash auxiliary frame (Flash=16, RedEyeAuxiliaryImage=true) then main flash frame (Flash=1), plus transient EBUSY retry on open */
+    __block unsigned redeye_callbacks = 0;
+    pixel_buffer_handler redeye_handler = Block_copy(^(CVPixelBufferRef image, CMTime pts) {
+        (void)pts;
+        CFDictionaryRef metadata = CVBufferCopyAttachment(image, md_attachment, NULL);
+        assert(metadata != NULL);
+        assert(get_int(metadata, CFSTR("SensorID")) == 0x0914);
+        assert(get_int(metadata, CFSTR("ExifOrientation")) == 6);
+        assert(get_int(metadata, CFSTR("AWBGGain")) == 4096);
+        CFDictionaryRef exif = CFDictionaryGetValue(metadata, CFSTR("{Exif}"));
+        assert(exif != NULL);
+        if (redeye_callbacks == 0) {
+            assert(torch_wanted == 0);
+            assert(CFDictionaryGetValue(metadata, CFSTR("RedEyeAuxiliaryImage")) == kCFBooleanTrue);
+            assert(get_int(exif, CFSTR("Flash")) == 16);
+        } else {
+            assert(torch_wanted == 1000);
+            assert(CFDictionaryGetValue(metadata, CFSTR("RedEyeAuxiliaryImage")) == NULL);
+            assert(get_int(exif, CFSTR("Flash")) == 1);
+            stream_of(front)->state = CAM_STREAM_STOPPED;
+        }
+        CFRelease(metadata);
+        redeye_callbacks++;
+    });
+    handlers = (CFMutableDictionaryRef)new_dict();
+    entry = (CFMutableDictionaryRef)new_dict();
+    put(entry, "PixelBufferHandler", redeye_handler);
+    put(handlers, "StillImage", entry);
+    assert(stream_set_property(front, CFSTR("VideoOutputHandlers"), handlers) == 0);
+    CFRelease(handlers);
+    assert(stream_set_property(front, CFSTR("FlashMode"), CFSTR("Auto")) == 0);
+    CFMutableDictionaryRef redeye_opts = (CFMutableDictionaryRef)new_dict();
+    put(redeye_opts, "AutoFocusDuringPreFlash", number_i(1));
+    put(redeye_opts, "GenerateRedEyeAuxiliaryImage", number_i(1));
+    assert(stream_set_property(front, CFSTR("StillImageCaptureNow"), redeye_opts) == 0);
+    CFRelease(redeye_opts);
+    complete_capture();
+    open_ebusy_remaining = 3;
+    ebusy_sleeps = 0;
+    writes_before = torch_writes;
+    frames_before = pixel_reads;
+    stream_of(front)->state = CAM_STREAM_ACTIVE;
+    assert(worker(front) == NULL);
+    assert(ebusy_sleeps == 3 && open_ebusy_remaining == 0);
+    assert(redeye_callbacks == 2);
+    assert(pixel_reads == frames_before + 5);
+    assert(torch_writes == writes_before + 2 && torch_wanted == 0);
+
+    stream_of(front)->torch = -1;
+    assert(stream_set_property(front, CFSTR("FlashMode"), CFSTR("ForceFlashOff")) == 0);
+    assert(stream_stop(front) == 0);
 }
 
 static bool get_bool_opt(CFDictionaryRef d, CFStringRef k) {
@@ -713,13 +830,37 @@ int main(void) {
     assert(stream_set_property(front, CFSTR("FormatIndex"), fmt1) == 0);
     CFRelease(fmt1);
 
-    /* ModuleInfo, SensorRawOutputBufferPoolRequirements, and FaceDetectionConfiguration */
+    /* ModuleInfo, SensorRawOutputBufferPoolRequirements, FaceDetectionConfiguration, and FlashMode */
     CFDictionaryRef sup = NULL;
     assert(stream_copy_property(front, CFSTR("SupportedPropertiesDictionary"), kCFAllocatorDefault, &sup) == 0);
     assert(CFDictionaryContainsKey(sup, CFSTR("ModuleInfo")));
     assert(CFDictionaryContainsKey(sup, CFSTR("SensorRawOutputBufferPoolRequirements")));
     assert(CFDictionaryContainsKey(sup, CFSTR("FaceDetectionConfiguration")));
+    CFDictionaryRef fm_desc = CFDictionaryGetValue(sup, CFSTR("FlashMode"));
+    assert(fm_desc != NULL && CFEqual(CFDictionaryGetValue(fm_desc, CFSTR("PropertyType")), CFSTR("String")));
+    assert(!CFDictionaryContainsKey(sup, CFSTR("TorchLevel")));
     CFRelease(sup);
+
+    CFTypeRef fm_val = NULL;
+    assert(stream_copy_property(front, CFSTR("FlashMode"), kCFAllocatorDefault, &fm_val) == 0);
+    assert(CFEqual(fm_val, CFSTR("ForceFlashOff")));
+    CFRelease(fm_val);
+    assert(stream_set_property(front, CFSTR("FlashMode"), CFSTR("ForceFlashOn")) == 0);
+    assert(stream_copy_property(front, CFSTR("FlashMode"), kCFAllocatorDefault, &fm_val) == 0);
+    assert(CFEqual(fm_val, CFSTR("ForceFlashOn")));
+    CFRelease(fm_val);
+    assert(stream_set_property(front, CFSTR("FlashMode"), CFSTR("ForceFlashOff")) == 0);
+
+    /* Rear stream with both native profile and torch fd must advertise both TorchLevel and FlashMode */
+    CMBaseObjectRef back_with_profile = stream_create(kCFAllocatorDefault, &cameras[0], k_back, &back_profile, 999);
+    assert(back_with_profile != NULL);
+    assert(stream_copy_property(back_with_profile, CFSTR("SupportedPropertiesDictionary"), kCFAllocatorDefault, &sup) == 0);
+    assert(CFDictionaryContainsKey(sup, CFSTR("TorchLevel")));
+    assert(CFDictionaryContainsKey(sup, CFSTR("FlashMode")));
+    CFRelease(sup);
+    stream_of(back_with_profile)->torch = -1;
+    stream_finalize(back_with_profile);
+    CFRelease(back_with_profile);
 
     CFDictionaryRef mod_front = NULL;
     assert(stream_copy_property(front, CFSTR("ModuleInfo"), kCFAllocatorDefault, &mod_front) == 0);

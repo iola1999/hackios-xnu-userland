@@ -348,6 +348,7 @@ struct air_shader_info {
     */
    struct rwa_compute_reflection *reflection;
    const char *reflection_error;
+   unsigned imageblock_data_size; /* explicit compute imageblock texel byte size, or 0 */
 };
 
 /* The word, field by field. A runtime that holds only `sampler_state` can call
@@ -432,6 +433,8 @@ struct air_to_nir_options {
    const struct air_linked_function *linked;
    unsigned num_linked;
    const struct air_stitched_kernel *kernel;
+   unsigned imageblock_width;
+   unsigned imageblock_height;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may

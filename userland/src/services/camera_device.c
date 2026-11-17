@@ -286,7 +286,7 @@ static const struct prop stream_props[] = {
 	{ "VideoOutputsEnabled", "Collection", "ReadWrite" }, { "VideoOutputHandlers", "Collection", "WriteOnly" },
 	{ "DeferAdditionOfAttachments", "Boolean", "ReadWrite" },
 	{ "ColorSpace", "Number", "ReadWrite" }, { "ZoomFactor", "Number", "ReadWrite" },
-	{ "ExposureBias", "Number", "ReadWrite" }, { "DeviceOrientation", "Number", "ReadWrite" }, { "FlashMode", "Number", "ReadWrite" },
+	{ "ExposureBias", "Number", "ReadWrite" }, { "DeviceOrientation", "Number", "ReadWrite" }, { "FlashMode", "String", "ReadWrite" },
 	{ "StillImageCaptureNow", "Collection", "WriteOnly" }, { "LockAENow", "Boolean", "WriteOnly" }, { "UnlockAENow", "Boolean", "WriteOnly" },
 	{ "LockAWBNow", "Boolean", "WriteOnly" }, { "UnlockAWBNow", "Boolean", "WriteOnly" }, { "MaxIntegrationTime", "Number", "ReadWrite" },
 	{ "AEMaxGain", "Number", "ReadWrite" }, { "AEMinGain", "Number", "ReadWrite" }, { "FaceDetectionEnabled", "Boolean", "ReadWrite" },
@@ -294,6 +294,7 @@ static const struct prop stream_props[] = {
 	{ "VideoRecordingInProgress", "Boolean", "ReadWrite" }, { "MemoryPoolID", "Number", "ReadWrite" },
 	{ "ChromaNoiseReductionEnabled", "Boolean", "ReadWrite" }, { "TemporalNoiseReductionEnabled", "Boolean", "ReadWrite" },
 	{ "MultipleOutputSupportEnabled", "Boolean", "ReadWrite" }, { "VideoOutputsColorInfo", "Collection", "ReadOnly" },
+	{ "GeometricDistortionCorrectedRects", "Collection", "ReadOnly" },
 	{ "RegionOfInterestForCameraControls", "Collection", "ReadWrite" }, { "AEMeteringMode", "Number", "ReadWrite" },
 	{ "MaxFrameCoalescingDuration", "Number", "ReadWrite" }, { "LimitAERange", "Boolean", "ReadWrite" },
 	{ "TimeMachineSuspendNow", "Boolean", "WriteOnly" }, { "TimeMachineResumeNow", "Boolean", "WriteOnly" },
@@ -302,6 +303,8 @@ static const struct prop stream_props[] = {
 	{ "FocusNow", "Collection", "WriteOnly" }, { "PeakTrackingFocusNow", "Collection", "WriteOnly" },
 	{ "LockAFNow", "Boolean", "WriteOnly" }, { "ManualFocusNow", "Collection", "WriteOnly" },
 	{ "AFWindowParams", "Collection", "ReadWrite" }, { "AutoFocusMode", "Number", "ReadWrite" },
+	{ "AFPeakPredictionEnabled", "Boolean", "ReadWrite" }, { "AFSearchPositions", "Collection", "ReadWrite" },
+	{ "AFEarlyOutParams", "Collection", "ReadWrite" },
 }, device_props[] = {
 	{ "StreamArray", "Collection", "ReadOnly" }, { "Clock", "Clock", "ReadOnly" }, { "ClientIsActive", "Boolean", "ReadWrite" },
 	{ "SupportedSynchronizedStreamsGroups", "Collection", "ReadOnly" }, { "MemoryPoolID", "Number", "ReadWrite" },
@@ -421,6 +424,12 @@ struct stream {
 	volatile int    state;
 	bool            worker_started;
 	int             torch;
+	int             flash_mode;     /* 0 ForceFlashOff, 1 ForceFlashOn, 2 Auto */
+	bool            still_flash_wanted;
+	bool            still_redeye_wanted;
+	bool            flash_lit;
+	unsigned        flash_warmup;
+	float           last_lux, last_cct;
 	uint64_t        frames, stills_given;
 };
 
@@ -443,6 +452,7 @@ output_index(CFStringRef name)
 
 static CFDictionaryRef stream_module_info(const struct stream *s);
 static CFDictionaryRef stream_raw_pool_requirements(const struct stream *s);
+static CFDictionaryRef stream_gdc_rects(const struct stream *s);
 
 static OSStatus
 stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocator, void *out)
@@ -590,10 +600,19 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 
 		value = CFArrayCreate(NULL, (const void **)&srgb, 1, &kCFTypeArrayCallBacks);
 		CFRelease(srgb);
-	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation") || key_is(key, "FlashMode")) {
+	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation")) {
 		value = number_i(0);
+	} else if (key_is(key, "FlashMode")) {
+		pthread_mutex_lock(&s->lock);
+		int fm = s->flash_mode;
+		pthread_mutex_unlock(&s->lock);
+		value = CFRetain(fm == 1 ? CFSTR("ForceFlashOn") : (fm == 2 ? CFSTR("Auto") : CFSTR("ForceFlashOff")));
 	} else if (key_is(key, "HasAutoFocusPositionSensor") || key_is(key, "DeferAdditionOfAttachments")) {
 		value = CFRetain(kCFBooleanFalse);
+	} else if (key_is(key, "GeometricDistortionCorrectedRects")) {
+		pthread_mutex_lock(&s->lock);
+		value = stream_gdc_rects(s);
+		pthread_mutex_unlock(&s->lock);
 	} else {
 		say_once("stream: no answer for", key, NULL);
 		return ERR_NOT_AVAILABLE;
@@ -603,6 +622,52 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 }
 
 static OSStatus torch_set(struct stream *s, CFTypeRef value);
+
+static bool
+dict_bool(CFDictionaryRef d, CFStringRef k)
+{
+	CFTypeRef v = d != NULL ? CFDictionaryGetValue(d, k) : NULL;
+
+	if (v == NULL) {
+		return false;
+	}
+	if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
+		return CFBooleanGetValue(v);
+	}
+	if (CFGetTypeID(v) == CFNumberGetTypeID()) {
+		int64_t n = 0;
+
+		return CFNumberGetValue(v, kCFNumberSInt64Type, &n) && n != 0;
+	}
+	return false;
+}
+
+static int
+parse_flash_mode(CFTypeRef value, int fallback)
+{
+	if (value == NULL) {
+		return fallback;
+	}
+	if (CFGetTypeID(value) == CFStringGetTypeID()) {
+		if (key_is(value, "ForceFlashOn") || key_is(value, "On")) {
+			return 1;
+		}
+		if (key_is(value, "Auto")) {
+			return 2;
+		}
+		if (key_is(value, "ForceFlashOff") || key_is(value, "Off")) {
+			return 0;
+		}
+		return fallback;
+	}
+	if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+		int64_t n = fallback;
+		if (CFNumberGetValue(value, kCFNumberSInt64Type, &n)) {
+			return n == 1 ? 1 : (n == 2 ? 2 : 0);
+		}
+	}
+	return fallback;
+}
 
 static double
 dict_number(CFDictionaryRef d, const char *name, double otherwise)
@@ -793,11 +858,43 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
+	if (key_is(key, "FlashMode")) {
+		int fm = parse_flash_mode(value, -1);
+
+		if (fm < 0) {
+			return ERR_PARAM;
+		}
+		pthread_mutex_lock(&s->lock);
+		s->flash_mode = fm;
+		pthread_mutex_unlock(&s->lock);
+		say("stream: flash mode %s", fm == 1 ? "ForceFlashOn" : (fm == 2 ? "Auto" : "ForceFlashOff"));
+		return 0;
+	}
 	if (key_is(key, "StillImageCaptureNow")) {
 		pthread_mutex_lock(&s->lock);
-		s->stills_wanted++;
+		int fm = s->flash_mode;
+		bool redeye = false;
+
+		if (value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+			fm = parse_flash_mode(CFDictionaryGetValue(value, CFSTR("FlashMode")), fm);
+			redeye = dict_bool(value, CFSTR("GenerateRedEyeAuxiliaryImage"));
+			CFTypeRef ov = CFDictionaryGetValue(value, CFSTR("BracketedCaptureOverrides"));
+
+			if (ov != NULL && CFGetTypeID(ov) == CFDictionaryGetTypeID()) {
+				fm = parse_flash_mode(CFDictionaryGetValue(ov, CFSTR("FlashMode")), fm);
+			}
+		}
+		if (s->torch >= 0 && (redeye || fm == 1 || (fm == 2 && s->last_lux > 320.0f))) {
+			s->still_flash_wanted = true;
+		}
+		if (redeye) {
+			s->still_redeye_wanted = true;
+			s->stills_wanted += 2;
+		} else {
+			s->stills_wanted++;
+		}
 		pthread_mutex_unlock(&s->lock);
-		say_once("stream: a photograph asked for", key, value);
+		say_value("stream: a photograph asked for", key, value);
 		return 0;
 	}
 	if (key_is(key, "FaceDetectionConfiguration")) {

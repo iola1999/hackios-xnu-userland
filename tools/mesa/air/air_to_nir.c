@@ -158,7 +158,8 @@ static bool
 offset_is_value(enum air_ptr_class class)
 {
    return class == AIR_PTR_UBO || class == AIR_PTR_SSBO || class == AIR_PTR_SHARED ||
-          class == AIR_PTR_SCRATCH || class == AIR_PTR_CONSTANT_DATA;
+          class == AIR_PTR_SCRATCH || class == AIR_PTR_CONSTANT_DATA ||
+          class == AIR_PTR_TEXTURE_ARRAY;
 }
 
 static struct air_val *
@@ -222,7 +223,11 @@ air_nir_bit_size(struct air_ctx *c, const struct air_type *t)
 unsigned
 air_nir_components(const struct air_type *t)
 {
-   return t->kind == AIR_TYPE_VECTOR ? t->count : 1;
+   if (t->kind != AIR_TYPE_VECTOR)
+      return 1;
+   if (!nir_num_components_valid(t->count) && t->count <= NIR_MAX_VEC_COMPONENTS)
+      return t->count <= 8 ? 8 : 16;
+   return t->count;
 }
 
 /* The glsl type a NIR function parameter needs to carry a value of this AIR
@@ -376,6 +381,9 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
          }
          return v;
       }
+      if (!nir_num_components_valid(air_nir_components(t)))
+         return air_error(c, "instruction: a vector constant of %u elements",
+                          air_nir_components(t)), NULL;
       return air_val_ssa(c, nir_imm_zero(&c->b, air_nir_components(t), air_nir_bit_size(c, t)));
 
    case AIR_CONST_UNDEF:
@@ -383,11 +391,6 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
       if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
          unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
          struct air_val *v = air_val_agg(c, n);
-         /* Fields stay NONE until insertvalue puts something there, except a field that
-          * is an aggregate itself: insertvalue reaches into it by a longer index path
-          * (`insertvalue %"struct.metal::matrix.12" poison, <4 x float> %c, 0, 0`, a
-          * float4x4 built column by column in space::rasterizeBackgroundFragment).
-          */
          for (unsigned i = 0; i < n; i++) {
             const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
             if (et->kind != AIR_TYPE_STRUCT && et->kind != AIR_TYPE_ARRAY)
@@ -403,17 +406,23 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
          struct air_ptr p = { .class = AIR_PTR_NONE, .pointee = t->elem };
          return air_val_ptr(c, p);
       }
+      if (!nir_num_components_valid(air_nir_components(t)))
+         return air_error(c, "instruction: a vector undef of %u elements",
+                          air_nir_components(t)), NULL;
       return air_val_ssa(c, nir_undef(&c->b, air_nir_components(t), air_nir_bit_size(c, t)));
 
    case AIR_CONST_AGGREGATE: {
       if (t->kind == AIR_TYPE_VECTOR) {
+         unsigned nc = air_nir_components(t);
          nir_def *comps[NIR_MAX_VEC_COMPONENTS];
-         if (k->num_elems > NIR_MAX_VEC_COMPONENTS)
+         if (!nir_num_components_valid(nc) || k->num_elems > nc)
             return air_error(c, "instruction: a vector constant of %u elements", k->num_elems), NULL;
          for (unsigned i = 0; i < k->num_elems; i++)
             if (!(comps[i] = air_get_ssa(c, k->elems[i])))
                return NULL;
-         return air_val_ssa(c, nir_vec(&c->b, comps, k->num_elems));
+         for (unsigned i = k->num_elems; i < nc; i++)
+            comps[i] = nir_undef(&c->b, 1, air_nir_bit_size(c, t));
+         return air_val_ssa(c, nir_vec(&c->b, comps, nc));
       }
       struct air_val *v = air_val_agg(c, k->num_elems);
       for (unsigned i = 0; i < k->num_elems; i++)
@@ -427,12 +436,15 @@ air_constant_val(struct air_ctx *c, const struct air_constant *k)
       if (!et)
          return air_error(c, "instruction: a data constant of a struct type"), NULL;
       if (t->kind == AIR_TYPE_VECTOR) {
+         unsigned nc = air_nir_components(t);
          nir_def *comps[NIR_MAX_VEC_COMPONENTS];
-         if (k->num_elems > NIR_MAX_VEC_COMPONENTS)
+         if (!nir_num_components_valid(nc) || k->num_elems > nc)
             return air_error(c, "instruction: a vector constant of %u elements", k->num_elems), NULL;
          for (unsigned i = 0; i < k->num_elems; i++)
             comps[i] = reinterpret_float(c, et, scalar_constant(c, et, k->data[i]));
-         return air_val_ssa(c, nir_vec(&c->b, comps, k->num_elems));
+         for (unsigned i = k->num_elems; i < nc; i++)
+            comps[i] = nir_undef(&c->b, 1, air_nir_bit_size(c, et));
+         return air_val_ssa(c, nir_vec(&c->b, comps, nc));
       }
       struct air_val *v = air_val_agg(c, k->num_elems);
       for (unsigned i = 0; i < k->num_elems; i++)
@@ -555,6 +567,8 @@ ptr_offset(struct air_ctx *c, struct air_ptr ptr)
 nir_def *
 air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type, unsigned align)
 {
+   if (type->kind == AIR_TYPE_VECTOR && !nir_num_components_valid(type->count))
+      return air_error(c, "instruction: a vector load of %u elements", (unsigned)type->count), NULL;
    unsigned comps = air_nir_components(type);
    unsigned bits = air_nir_bit_size(c, type);
    if (type->kind == AIR_TYPE_POINTER)
@@ -847,7 +861,7 @@ enum air_sysval {
    AIR_SV_THREAD_POS_GRID, AIR_SV_THREAD_POS_TG, AIR_SV_TG_POS_GRID,
    AIR_SV_THREADS_PER_TG, AIR_SV_TGS_PER_GRID, AIR_SV_THREAD_INDEX_TG,
    AIR_SV_THREADS_PER_GRID, AIR_SV_SIMD_LANE, AIR_SV_SIMD_INDEX, AIR_SV_SIMD_WIDTH,
-   AIR_SV_SIMDS_PER_TG,
+   AIR_SV_SIMDS_PER_TG, AIR_SV_QUAD_LANE, AIR_SV_QUAD_INDEX, AIR_SV_QUADS_PER_TG,
 };
 
 static const struct { const char *key; enum air_sysval sv; } sysvals[] = {
@@ -870,6 +884,9 @@ static const struct { const char *key; enum air_sysval sv; } sysvals[] = {
    { "air.simdgroup_index_in_threadgroup", AIR_SV_SIMD_INDEX },
    { "air.threads_per_simdgroup", AIR_SV_SIMD_WIDTH },
    { "air.simdgroups_per_threadgroup", AIR_SV_SIMDS_PER_TG },
+   { "air.thread_index_in_quadgroup", AIR_SV_QUAD_LANE },
+   { "air.quadgroup_index_in_threadgroup", AIR_SV_QUAD_INDEX },
+   { "air.quadgroups_per_threadgroup", AIR_SV_QUADS_PER_TG },
 };
 
 static nir_def *
@@ -903,6 +920,15 @@ load_sysval(struct air_ctx *c, enum air_sysval sv)
     * to a constant whenever the workgroup size is one (ir3_nir.c).
     */
    case AIR_SV_SIMDS_PER_TG: return nir_load_num_subgroups(&c->b);
+   case AIR_SV_QUAD_LANE: return nir_iand_imm(&c->b, nir_load_subgroup_invocation(&c->b), 3);
+   case AIR_SV_QUAD_INDEX: return nir_ushr_imm(&c->b, nir_load_local_invocation_index(&c->b), 2);
+   case AIR_SV_QUADS_PER_TG: {
+      nir_def *wg = nir_load_workgroup_size(&c->b);
+      nir_def *tot = nir_imul(&c->b, nir_imul(&c->b, nir_channel(&c->b, wg, 0),
+                                              nir_channel(&c->b, wg, 1)),
+                              nir_channel(&c->b, wg, 2));
+      return nir_ushr_imm(&c->b, nir_iadd_imm(&c->b, tot, 3), 2);
+   }
    }
    return NULL;
 }
@@ -1299,27 +1325,35 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
    if (md_key(node, "air.indirect_buffer") >= 0)
       return translate_argument_buffer(c, node, param);
 
+   if (md_key(node, "air.imageblock") >= 0) {
+      uint64_t ib_size = 0;
+      md_key_int(node, "air.imageblock_data_size", &ib_size);
+      return air_translate_imageblock_input(c, (unsigned)param, t,
+                                            md_key(node, "explicit") >= 0, ib_size);
+   }
+
    if (md_key(node, "air.texture") >= 0) {
-      uint64_t index = 0;
-      md_key_int(node, "air.location_index", &index);
+      int li = md_key(node, "air.location_index");
+      uint64_t index = 0, span = 1;
+      if (li >= 0) {
+         md_int(node, li + 1, &index);
+         if (!md_int(node, li + 2, &span) || !span)
+            span = 1;
+      }
       bool sample = md_key(node, "air.sample") >= 0;
       bool read = md_key(node, "air.read") >= 0 || md_key(node, "air.read_write") >= 0;
       bool write = md_key(node, "air.write") >= 0 || md_key(node, "air.read_write") >= 0;
-      /* A texture the shader writes is an image to Gallium, with its own
-       * binding space; one it only samples or reads is a sampler view.
-       */
       struct air_ptr p = {
-         .class = AIR_PTR_TEXTURE,
+         .class = span > 1 ? AIR_PTR_TEXTURE_ARRAY : AIR_PTR_TEXTURE,
          .binding = index,
+         .span = span,
          .is_image = write,
       };
-      /* An argument marked air.arg_unused is one Metal reports as inactive, and an
-       * application need not bind it: QuartzCore leaves [[texture(1)]] of some of its
-       * fill shaders empty. Listing it would make check_bindings refuse the draw.
-       */
-      if (md_key(node, "air.arg_unused") < 0)
-         add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index, 0,
-                      sample || read, write, param, node);
+      if (md_key(node, "air.arg_unused") < 0) {
+         for (uint64_t k = 0; k < span; k++)
+            add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index + k, 0,
+                         sample || read, write, param, node);
+      }
       c->params[param] = air_val_ptr(c, p);
       return true;
    }
@@ -1560,8 +1594,11 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
 
    /* the one thing left that is not an error: an argument nothing reads */
    if (md_key(node, "air.arg_unused") >= 0) {
-      c->params[param] = air_val_ssa(c, nir_undef(&c->b, air_nir_components(t),
-                                                  air_nir_bit_size(c, t)));
+      if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY)
+         c->params[param] = air_val_agg(c, t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count);
+      else
+         c->params[param] = air_val_ssa(c, nir_undef(&c->b, MAX2(air_nir_components(t), 1),
+                                                     MAX2(air_nir_bit_size(c, t), 1)));
       return true;
    }
 
@@ -1762,13 +1799,25 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
    const struct air_type *dt = in->base.type;
    const struct air_type *st = in->operands[0]->type;
 
-   if (in->sub == AIR_CAST_BITCAST && dt->kind == AIR_TYPE_POINTER) {
+   if (in->sub == AIR_CAST_PTRTOINT) {
       struct air_val *v = air_get(c, in->operands[0]);
-      if (!v || v->kind != AIR_VAL_PTR)
-         return air_error(c, "instruction: a bitcast of something that is not a pointer");
-      struct air_ptr p = v->ptr;
-      p.pointee = dt->elem;
-      air_set(c, &in->base, air_val_ptr(c, p));
+      if (!v || !val_is_pointerish(v))
+         return air_error(c, "instruction: ptrtoint of something that is not a pointer");
+      air_set(c, &in->base, v);
+      return true;
+   }
+   if ((in->sub == AIR_CAST_BITCAST || in->sub == AIR_CAST_INTTOPTR) &&
+       dt->kind == AIR_TYPE_POINTER) {
+      struct air_val *v = air_get(c, in->operands[0]);
+      if (!v || !val_is_pointerish(v))
+         return air_error(c, "instruction: a pointer cast of something that is not a pointer");
+      if (v->kind == AIR_VAL_PTR) {
+         struct air_ptr p = v->ptr;
+         p.pointee = dt->elem;
+         air_set(c, &in->base, air_val_ptr(c, p));
+      } else {
+         air_set(c, &in->base, v);
+      }
       return true;
    }
 
@@ -1854,10 +1903,8 @@ translate_cast(struct air_ctx *c, const struct air_inst *in)
       unsigned db = bits, sb = air_nir_bit_size(c, st);
       if (dn == sn && db == sb)
          res = nir_mov(&c->b, x);
-      else if (sn == 1 && sb == 32 && dn == 2 && db == 16)
-         res = nir_unpack_32_2x16(&c->b, x);
-      else if (sn == 2 && sb == 16 && dn == 1 && db == 32)
-         res = nir_pack_32_2x16(&c->b, x);
+      else if (sn * sb == dn * db && (db == 8 || db == 16 || db == 32 || db == 64))
+         res = nir_bitcast_vector(&c->b, x, db);
       else
          return air_error(c, "instruction: a bitcast from %u x %u bits to %u x %u bits, "
                              "which is a repacking this frontend does not do",
@@ -2001,6 +2048,9 @@ nir_block_of(struct air_ctx *c, const struct air_block *b)
    return n;
 }
 
+static bool emit_callee_agg_return(struct air_ctx *c, const struct air_type *t,
+                                   const struct air_val *v, unsigned *fidx);
+
 static bool
 emit_return(struct air_ctx *c, const struct air_inst *in)
 {
@@ -2015,28 +2065,8 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
     * has no such parameter and its return is its render targets, below.
     */
    if (c->num_ret_fields) {
-      /* A callee returning a struct: one out-parameter per member, because a
-       * NIR parameter carries a number and a struct here is a tree of values.
-       * The members with no parameter are the ones nothing can read (see
-       * ret_fields in air_private.h), and a member the callee left out of its
-       * insertvalue chain is undef -- Metal's own vertex-output structs leave
-       * their padding field exactly that way, so this is the normal case and
-       * not a defect.
-       */
-      if (v->kind != AIR_VAL_AGG || v->num_elems != c->num_ret_fields)
-         return air_error(c, "instruction: a returned struct that was never built, "
-                             "from a function called in the module");
-      for (unsigned i = 0; i < v->num_elems; i++) {
-         if (!c->ret_fields[i] || !v->elems[i])
-            continue;
-         if (v->elems[i]->kind != AIR_VAL_SSA)
-            return air_error(c, "instruction: field %u of a returned struct is not a "
-                                "number, from a function called in the module", i);
-         nir_def *d = v->elems[i]->def;
-         nir_store_deref(&c->b, c->ret_fields[i], d,
-                         nir_component_mask(d->num_components));
-      }
-      return true;
+      unsigned fidx = 0;
+      return emit_callee_agg_return(c, c->fn->fn_type->elem, v, &fidx);
    }
    if (c->ret_deref) {
       nir_def *d = air_get_ssa(c, in->operands[0]);
@@ -2122,6 +2152,8 @@ static bool call_linked_function(struct air_ctx *c, const struct air_inst *in,
                                  const struct air_function *decl,
                                  const struct air_linked_function *lf);
 static void materialise_globals(struct air_ctx *c);
+static struct air_val *inline_module_function(struct air_ctx *c, const struct air_function *f,
+                                              struct air_val **argv);
 
 #include "air_call.inc"
 
@@ -2347,10 +2379,15 @@ translate_body(struct air_ctx *c)
           * not what is wrong with it.
           */
          if (in->base.type->kind == AIR_TYPE_STRUCT ||
-             in->base.type->kind == AIR_TYPE_ARRAY)
-            return air_error(c, "instruction: a phi of %s, which NIR has no register for",
-                             in->base.type->kind == AIR_TYPE_STRUCT ? "a struct"
-                                                                    : "an array");
+             in->base.type->kind == AIR_TYPE_ARRAY) {
+            if (agg_type_has_pointer(in->base.type))
+               return air_error(c, "instruction: a phi of %s containing a pointer",
+                                in->base.type->kind == AIR_TYPE_STRUCT ? "a struct"
+                                                                       : "an array");
+            _mesa_hash_table_insert(c->phi_regs, in,
+                                    decl_agg_phi_regs(c, &entry, in->base.type));
+            continue;
+         }
          nir_def *reg = nir_decl_reg(&entry, air_nir_components(in->base.type),
                                      air_nir_bit_size(c, in->base.type), 0);
          _mesa_hash_table_insert(c->phi_regs, in, reg);
@@ -2386,6 +2423,11 @@ translate_body(struct air_ctx *c)
             continue;
          }
          struct hash_entry *e = _mesa_hash_table_search(c->phi_regs, in);
+         if (in->base.type->kind == AIR_TYPE_STRUCT ||
+             in->base.type->kind == AIR_TYPE_ARRAY) {
+            air_set(c, &in->base, load_agg_phi_regs(c, in->base.type, e->data));
+            continue;
+         }
          air_set(c, &in->base,
                  air_val_ssa(c, nir_load_reg(&c->b, e->data)));
       }
@@ -2545,6 +2587,13 @@ translate_body(struct air_ctx *c)
                                          "names a different resource on the way back");
                   val = from->ptr.offset ? from->ptr.offset : nir_imm_int(&c->b, 0);
                }
+            } else if (in->base.type->kind == AIR_TYPE_STRUCT ||
+                       in->base.type->kind == AIR_TYPE_ARRAY) {
+               struct air_val *agg_from = air_get(c, in->operands[k]);
+               if (!agg_from || !store_agg_phi_regs(c, in->base.type, re->data, agg_from))
+                  return false;
+               *(nir_cursor *)ce->data = c->b.cursor;
+               continue;
             } else {
                val = air_get_ssa(c, in->operands[k]);
             }
@@ -2751,62 +2800,6 @@ run_static_initializers(struct air_ctx *c)
 }
 
 /* -- the entry point ---------------------------------------------------- */
-
-/* Whether a kernel's threads read anything about their threadgroup: its position or size, a
- * neighbour through a SIMD-group operation, a barrier or threadgroup memory. A kernel that reads
- * none of them computes the same under any threadgroup size (air_shader_info.group_free).
- * threads_per_grid is num_workgroups times workgroup_size here, so it counts as a read. */
-static bool
-reads_threadgroup(nir_shader *nir)
-{
-   nir_foreach_function_impl(impl, nir) {
-      nir_foreach_block(block, impl) {
-         nir_foreach_instr(instr, block) {
-            if (instr->type != nir_instr_type_intrinsic)
-               continue;
-            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
-            case nir_intrinsic_barrier:
-            case nir_intrinsic_load_local_invocation_id:
-            case nir_intrinsic_load_local_invocation_index:
-            case nir_intrinsic_load_workgroup_id:
-            case nir_intrinsic_load_num_workgroups:
-            case nir_intrinsic_load_workgroup_size:
-            case nir_intrinsic_load_subgroup_invocation:
-            case nir_intrinsic_load_subgroup_id:
-            case nir_intrinsic_load_num_subgroups:
-            case nir_intrinsic_load_subgroup_size:
-            case nir_intrinsic_ballot:
-            case nir_intrinsic_read_invocation:
-            case nir_intrinsic_read_first_invocation:
-            case nir_intrinsic_shuffle:
-            case nir_intrinsic_shuffle_xor:
-            case nir_intrinsic_shuffle_up:
-            case nir_intrinsic_shuffle_down:
-            case nir_intrinsic_reduce:
-            case nir_intrinsic_inclusive_scan:
-            case nir_intrinsic_exclusive_scan:
-            case nir_intrinsic_vote_any:
-            case nir_intrinsic_vote_all:
-            case nir_intrinsic_vote_feq:
-            case nir_intrinsic_vote_ieq:
-            case nir_intrinsic_elect:
-            case nir_intrinsic_quad_broadcast:
-            case nir_intrinsic_quad_swap_horizontal:
-            case nir_intrinsic_quad_swap_vertical:
-            case nir_intrinsic_quad_swap_diagonal:
-            case nir_intrinsic_load_shared:
-            case nir_intrinsic_store_shared:
-            case nir_intrinsic_shared_atomic:
-            case nir_intrinsic_shared_atomic_swap:
-               return true;
-            default:
-               break;
-            }
-         }
-      }
-   }
-   return false;
-}
 
 #include "air_stitch.inc"
 #include "air_entry.inc"

@@ -4,9 +4,16 @@
 
 #include "air_metal_reflection.h"
 
-static void *compute_state_for(struct rwa_compute *compute, const unsigned block[3],
-                               const struct rwa_yuv_key *yuv,
-                               char *why, size_t why_size);
+static void *compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
+                                  const struct rwa_yuv_key *yuv, const unsigned ib_dim[2],
+                                  char *why, size_t why_size);
+
+static void *
+compute_state_for(struct rwa_compute *compute, const unsigned block[3],
+                  const struct rwa_yuv_key *yuv, char *why, size_t why_size)
+{
+   return compute_state_for_ib(compute, block, yuv, NULL, why, why_size);
+}
 
 static struct rwa_compute *
 compute_create(struct rwa_device *device, const void *bitcode, size_t size,
@@ -144,6 +151,15 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                       &compute->caps.argbuf_mask, why, why_size) != 0)
       goto fail;
 
+   if (compute->info.imageblock_data_size > 0 && bitcode && size >= 4) {
+      compute->bitcode_copy = malloc(size);
+      if (compute->bitcode_copy) {
+         memcpy(compute->bitcode_copy, bitcode, size);
+         compute->bitcode_size = size;
+         compute->entry_copy = entry ? strdup(entry) : NULL;
+      }
+   }
+
    /* The hardware pipeline reports the limit of the same variable-workgroup
     * CSO that dispatch will use. Softpipe requires a fixed block at dispatch. */
    if (!device->software && !compute_state_for(compute, NULL, &compute->yuv, why, why_size))
@@ -153,6 +169,8 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
    return compute;
 
 fail:
+   free(compute->bitcode_copy);
+   free(compute->entry_copy);
    ralloc_free(compute->mem_ctx);
    free(compute);
    return NULL;
@@ -206,6 +224,12 @@ rwa_compute_get_reflection(struct rwa_compute *compute,
    return 0;
 }
 
+unsigned
+rwa_compute_imageblock_data_size(struct rwa_compute *compute)
+{
+   return compute ? compute->info.imageblock_data_size : 0;
+}
+
 /* Unbound before it is deleted, always. A Gallium context keeps a pointer to the state
  * bound in it, and softpipe asserts that the one being deleted is not that pointer
  * (sp_state_shader.c, softpipe_delete_compute_state) -- rightly, since the alternative
@@ -240,6 +264,8 @@ rwa_compute_destroy(struct rwa_compute *compute)
       if (compute->own_sampler[i])
          compute->device->pipe->delete_sampler_state(compute->device->pipe,
                                                      compute->own_sampler[i]);
+   free(compute->bitcode_copy);
+   free(compute->entry_copy);
    ralloc_free(compute->mem_ctx);
    free(compute);
 }
@@ -248,8 +274,9 @@ rwa_compute_destroy(struct rwa_compute *compute)
  * Softpipe's TGSI path requires a fixed block, so it recompiles on size changes.
  * Compile a clone because the driver takes ownership of the input NIR. */
 static void *
-compute_state_for(struct rwa_compute *compute, const unsigned block[3],
-                  const struct rwa_yuv_key *yuv, char *why, size_t why_size)
+compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
+                     const struct rwa_yuv_key *yuv, const unsigned ib_dim[2],
+                     char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
    if (device->software && yuv->mask) {
@@ -257,9 +284,21 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
       return NULL;
    }
 
-   if (compute->cso && memcmp(&compute->yuv, yuv, sizeof(*yuv)) == 0 && (!device->software ||
-       (compute->cso_block[0] == block[0] && compute->cso_block[1] == block[1] &&
-        compute->cso_block[2] == block[2])))
+   unsigned eff_ib[2] = { 0, 0 };
+   if (compute->info.imageblock_data_size > 0 && ib_dim && (ib_dim[0] || ib_dim[1])) {
+      unsigned w = ib_dim[0] ? ib_dim[0] : (block ? block[0] : 0);
+      unsigned h = ib_dim[1] ? ib_dim[1] : (block ? block[1] : 0);
+      if (!block || w != block[0] || h != block[1]) {
+         eff_ib[0] = w;
+         eff_ib[1] = h;
+      }
+   }
+
+   if (compute->cso && memcmp(&compute->yuv, yuv, sizeof(*yuv)) == 0 &&
+       compute->cso_ib_dim[0] == eff_ib[0] && compute->cso_ib_dim[1] == eff_ib[1] &&
+       (!device->software ||
+        (compute->cso_block[0] == block[0] && compute->cso_block[1] == block[1] &&
+         compute->cso_block[2] == block[2])))
       return compute->cso;
 
    if (compute->cso) {
@@ -267,7 +306,34 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
       compute->cso = NULL;
    }
 
-   nir_shader *cs = nir_shader_clone(NULL, compute->nir);
+   nir_shader *cs = NULL;
+   if ((eff_ib[0] || eff_ib[1]) && compute->bitcode_copy) {
+      void *tmp_ctx = ralloc_context(NULL);
+      struct air_constant_value *constants = NULL;
+      unsigned num_constants =
+         air_module_function_constants(tmp_ctx, compute->bitcode_copy,
+                                       compute->bitcode_size, &constants);
+      const struct air_to_nir_options ib_opts = {
+         .constants = constants,
+         .num_constants = num_constants,
+         .imageblock_width = eff_ib[0],
+         .imageblock_height = eff_ib[1],
+      };
+      struct air_shader_info ib_info;
+      const char *ib_err = NULL;
+      nir_shader *ib_nir = air_to_nir(tmp_ctx, compute->bitcode_copy, compute->bitcode_size,
+                                      compute->entry_copy, &ib_opts, device->nir_options,
+                                      &ib_info, &ib_err);
+      if (!ib_nir) {
+         say(why, why_size, "%s", ib_err ? ib_err : "imageblock re-translation failed");
+         ralloc_free(tmp_ctx);
+         return NULL;
+      }
+      cs = nir_shader_clone(NULL, ib_nir);
+      ralloc_free(tmp_ctx);
+   } else {
+      cs = nir_shader_clone(NULL, compute->nir);
+   }
    if (!cs) {
       say(why, why_size, "out of memory compiling the shader");
       return NULL;
@@ -326,6 +392,8 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
 
    compute->cso = cso;
    compute->yuv = *yuv;
+   compute->cso_ib_dim[0] = eff_ib[0];
+   compute->cso_ib_dim[1] = eff_ib[1];
    if (device->software) {
       compute->cso_block[0] = block[0];
       compute->cso_block[1] = block[1];

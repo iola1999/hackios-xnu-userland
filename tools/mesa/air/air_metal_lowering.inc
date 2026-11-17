@@ -64,7 +64,9 @@ check_half_instructions(nir_shader *nir, const struct air_shader_info *info,
                nir_alu_instr *alu = nir_instr_as_alu(instr);
                if (half_copy_op(alu->op) ||
                    (half_cast_op(alu->op) && alu->src[0].src.ssa->bit_size == 32) ||
-                   (alu->op == nir_op_f2f32 && alu->src[0].src.ssa->bit_size == 16))
+                   (alu->op == nir_op_u2u16 && alu->src[0].src.ssa->bit_size == 32) ||
+                   ((alu->op == nir_op_f2f32 || alu->op == nir_op_u2u32) &&
+                    alu->src[0].src.ssa->bit_size == 16))
                   continue;
                say(why, why_size, "softpipe half lowering does not support ALU %s",
                    nir_op_infos[alu->op].name);
@@ -76,7 +78,8 @@ check_half_instructions(nir_shader *nir, const struct air_shader_info *info,
                    in->src[3].ssa->bit_size == 16 &&
                    in->src[0].ssa->bit_size == 32 && in->src[1].ssa->bit_size == 32 &&
                    in->src[2].ssa->bit_size == 32 && in->src[4].ssa->bit_size == 32 &&
-                   half_image_declared(in, info))
+                   (nir_intrinsic_src_type(in) == nir_type_float16 ||
+                    half_image_declared(in, info)))
                   continue;
                say(why, why_size, "softpipe half lowering does not support intrinsic %s",
                    nir_intrinsic_infos[in->intrinsic].name);
@@ -317,6 +320,9 @@ lower_half_for_backend(nir_shader *nir, struct rwa_device *device,
                   nir_def *wide = nir_iand_imm(&b, raw, 0xffff);
                   _mesa_set_add(halves, wide);
                   nir_def_replace(&alu->def, wide);
+               } else if (alu->op == nir_op_u2u32 && _mesa_set_search(halves, alu->src[0].src.ssa)) {
+                  nir_def_replace(&alu->def,
+                     nir_iand_imm(&b, nir_ssa_for_alu_src(&b, alu, 0), 0xffff));
                } else if (alu->op == nir_op_f2f32 && _mesa_set_search(halves, alu->src[0].src.ssa)) {
                   nir_def_replace(&alu->def,
                      unpack_half_components(&b, nir_ssa_for_alu_src(&b, alu, 0)));
@@ -372,6 +378,10 @@ finalize_for_gallium(nir_shader *nir, struct pipe_screen *screen)
       }
    }
    NIR_PASS(_, nir, nir_lower_system_values);
+   if (nir->info.stage == MESA_SHADER_COMPUTE && !exec_list_is_empty(&nir->variables)) {
+      NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+   }
    /* An options struct of all-false and not NULL, which are not the same thing here and
     * the difference is a trap. nir_lower_system_values *introduces*
     * load_base_workgroup_id when it lowers SYSTEM_VALUE_WORKGROUP_ID, and the only

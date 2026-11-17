@@ -201,7 +201,11 @@ struct rwa_compute {
     * fixed-block state when cso_block changes. */
    void *cso;
    unsigned cso_block[3];
+   unsigned cso_ib_dim[2];
    struct rwa_yuv_key yuv;
+   void *bitcode_copy;
+   size_t bitcode_size;
+   char *entry_copy;
 };
 
 /* The argument-buffer recorder, whose own block is further down beside the encode calls
@@ -895,6 +899,7 @@ rwa_device_close(struct rwa_device *device)
    rwa_vertex_cso_cache_destroy(device);
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
+   pipe_resource_reference(&device->null_ssbo, NULL);
    /* Before the pipe goes: a fence outlives the context that made it, and one nobody
     * waited for is still the screen's to release. */
    if (device->pending)
@@ -1888,19 +1893,13 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
           kind, member, r->argbuf_set, table_count, table_count == 1 ? "" : "s");
       return -1;
    }
-
-   /*
-    * THE REFUSAL THIS FEATURE IS MOSTLY MADE OF: a buffer is bound there, and it was
-    * never filled through an MTLArgumentEncoder.
-    *
-    * Metal's argument buffer holds 8-byte handles, and an application may put them there
-    * by any means: the processor writing them, a compute kernel writing them, a blit
-    * copying them from another buffer. This library binds a member from the RECORD an
-    * encoder left and never from the buffer's contents, so for those three there is
-    * nothing to bind -- and nothing distinguishes such a buffer from a correctly encoded
-    * one except the absence of that record. The alternative to this sentence is not a
-    * worse picture, it is drawing over whatever resource index 0 happens to hold.
-    */
+   /* Inline `air.indirect_constant` bytes read straight from the bound set buffer. */
+   if (r->argbuf_id == ~0u && r->kind == AIR_RESOURCE_CONSTANT_BUFFER) {
+      if (buffer) *buffer = bind->buffer;
+      if (offset) *offset = bind->offset;
+      return 0;
+   }
+   /* Resource descriptors must have been recorded via MTLArgumentEncoder. */
    if (rwa_argbuf_encoded_members(bind->buffer, bind->offset) == 0) {
       say(why, why_size, "the buffer bound as the argument buffer at Metal buffer index "
                          "%u (offset %zu) was never filled through an MTLArgumentEncoder, "
@@ -2535,6 +2534,9 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
          struct rwa_buffer *b = mbuffer;
 
          if (!member) {
+            if (!member && r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->nullable &&
+                (r->index >= bindings->buffer_count || !bindings->buffers[r->index]))
+               break;
             if (r->index >= bindings->buffer_count || !bindings->buffers[r->index]) {
                say(why, why_size, "%s reads buffer %u and %u buffer%s bound", name,
                    r->index, bindings->buffer_count,
@@ -2797,10 +2799,10 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
          switch (r->kind) {
          case AIR_RESOURCE_DEVICE_BUFFER:
          case AIR_RESOURCE_CONSTANT_BUFFER:
-            b = bindings->buffers[r->index];
+            b = r->index < bindings->buffer_count ? bindings->buffers[r->index] : NULL;
             /* and Metal's own offset on it, which check_bindings has already judged */
-            if (direct_buffer_offset(r, bindings, table, table_count, name, &boffset, why,
-                                     why_size) != 0)
+            if (b && direct_buffer_offset(r, bindings, table, table_count, name, &boffset, why,
+                                          why_size) != 0)
                return -1;
             break;
          case AIR_RESOURCE_TEXTURE:
@@ -2822,6 +2824,22 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             say(why, why_size, "%s binds a buffer at index %u, past the %u Gallium has "
                                "slots for", name, r->index, (unsigned)ARRAY_SIZE(sb));
             return -1;
+         }
+         if (!b) {
+            if (!device->null_ssbo) {
+               device->null_ssbo = pipe_buffer_create(device->screen,
+                                                      PIPE_BIND_SHADER_BUFFER,
+                                                      PIPE_USAGE_IMMUTABLE, 16);
+               if (!device->null_ssbo) {
+                  say(why, why_size, "%s could not allocate placeholder SSBO", name);
+                  return -1;
+               }
+            }
+            sb[r->index].buffer = device->null_ssbo;
+            sb[r->index].buffer_offset = 0;
+            sb[r->index].buffer_size = 0;
+            num_ssbo = MAX2(num_ssbo, r->index + 1);
+            break;
          }
          sb[r->index].buffer = b->res;
          /* Metal's own `offset:`, for a member of a set and for a buffer argument
@@ -3561,6 +3579,10 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
          l->metal_index = r->argbuf_set;
          l->alignment = 8;
       }
+      if (r->argbuf_id == ~0u) {
+         l->encoded_length = MAX2(l->encoded_length, r->size);
+         continue;
+      }
 
       if (l->member_count >= RWA_MAX_ARGBUF_MEMBERS) {
          say(why, why_size, "the argument buffer %s declares at Metal buffer index %u has "
@@ -3593,15 +3615,9 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
 
    for (unsigned k = 0; k < n; k++) {
       struct rwa_argbuf_layout *l = &out[k];
-
-      /* The ids have to be 0..member_count-1 with nothing missing and nothing twice,
-       * because that is what makes `8 x members` the length Metal would have answered.
-       * A set that is not dense is refused by name: the alternative is an application
-       * allocating its buffer too short and encoding one member over another.
-       */
       uint64_t seen = 0;
       for (unsigned i = 0; i < l->member_count; i++) {
-         if (l->members[i].id >= l->member_count) {
+         if (l->encoded_length == 0 && l->members[i].id >= l->member_count) {
             say(why, why_size, "the argument buffer %s declares at Metal buffer index %u "
                                "has %u members and one of them (`%s`) is id %u: Metal's "
                                "encodedLength is over the highest id, so this library "
@@ -3620,7 +3636,8 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
          }
          seen |= 1ull << l->members[i].id;
       }
-      l->encoded_length = 8 * l->member_count;
+      if (l->encoded_length == 0)
+         l->encoded_length = 8 * l->member_count;
    }
 
    if (count)
@@ -4608,229 +4625,7 @@ rt_blend_equal(const struct pipe_rt_blend_state *a, const struct pipe_rt_blend_s
  * fragment shader and every one of air_metal_test's own designated initialisers is that
  * case, so the proven path is not merely preserved, it is the same struct.
  */
-static bool
-blend_state_from_metal(const struct rwa_render_shape *shape, struct pipe_screen *screen,
-                       struct pipe_blend_state *out, unsigned *enabled_mask,
-                       unsigned *write_masks, char *why, size_t why_size)
-{
-   *out = (struct pipe_blend_state){ .rt[0].colormask = PIPE_MASK_RGBA };
-   *enabled_mask = 0;
-   *write_masks = 0;
-
-   if (shape->color_blend_count == 0) {
-      /* The state every draw before now used, and the mask reported for it is the
-       * PIPE_MASK_RGBA actually programmed on render target 0 -- which governs them all
-       * with independent blending off.
-       */
-      for (unsigned i = 0; i < shape->color_count && i < 8; i++)
-         *write_masks |= PIPE_MASK_RGBA << (4 * i);
-      return true;
-   }
-   if (shape->color_blend_count < shape->color_count) {
-      say(why, why_size, "this pipeline has %u colour attachment%s and blend state for "
-                         "only %u: the attachment%s after that would silently draw with "
-                         "blending off and all four channels written, which is what a "
-                         "struct filled in only as far as the caller cared about looks "
-                         "like", shape->color_count, shape->color_count == 1 ? "" : "s",
-          shape->color_blend_count, shape->color_count - shape->color_blend_count == 1
-                                       ? "" : "s");
-      return false;
-   }
-   if (shape->color_blend_count > 8) {
-      say(why, why_size, "blend state for %u colour attachments, and Metal's descriptor "
-                         "has eight", shape->color_blend_count);
-      return false;
-   }
-
-   out->max_rt = shape->color_count ? shape->color_count - 1 : 0;
-
-   for (unsigned i = 0; i < shape->color_count; i++) {
-      const struct rwa_color_blend *b = &shape->color_blend[i];
-      struct pipe_rt_blend_state *rt = &out->rt[i];
-      char what[160];
-      unsigned v;
-
-      snprintf(what, sizeof(what), "colour attachment %u's writeMask", i);
-      if (!color_write_mask_from_metal(b->write_mask, &v, what, why, why_size))
-         return false;
-      rt->colormask = v;
-      *write_masks |= v << (4 * i);
-
-      if (!b->blending_enabled) {
-         /*
-          * AND NOTHING ELSE OF THIS ENTRY IS READ, which is Metal's own rule -- with
-          * blending disabled the source replaces the destination and the factors and
-          * operations are not consulted -- and on this device it is also the difference
-          * between a correct home screen and a doubly blended one.
-          *
-          * 504 of the 1079 pipelines in this device's own CoreAnimation archive blend
-          * INSIDE THE FRAGMENT SHADER and leave this descriptor untouched, at Apple's
-          * defaults: source factor One, write mask 0xf, both operations Add. Every one of
-          * those fields is non-zero, so any rule of the form "some field is set,
-          * therefore this descriptor means to blend" would enable the blender for all
-          * 504 and blend them twice. `blendingEnabled` is the only field that says so,
-          * and a refusal over a factor such a pipeline was never going to use would
-          * refuse a perfectly legal one.
-          */
-         rt->blend_enable = 0;
-         continue;
-      }
-
-      /*
-       * Blending on an integer attachment has no meaning, and NOTHING BELOW THIS LINE
-       * would say so. Metal forbids it, GL and Vulkan forbid it, and in Mesa the refusal
-       * lives in the GL state tracker (st_atom_blend.c skips blend_enable for a draw
-       * buffer in _IntegerDrawBuffers) -- which this library does not go through.
-       * freedreno excludes pure-integer formats from PIPE_BIND_BLENDABLE as a
-       * CAPABILITY (fd6_screen.cc) and then programs the blender with whatever it is
-       * given; softpipe has no integer guard in sp_quad_blend.c at all and would
-       * reinterpret the integer bit patterns as floats. So the sentence has to be
-       * written here, with the format named.
-       */
-      const struct rwa_pixel_format *pf = pixel_format(shape->color_format[i]);
-      if (pf && util_format_is_pure_integer(pf->pipe)) {
-         say(why, why_size, "colour attachment %u is %s and this pipeline enables "
-                            "blending on it: a blend equation over integers has no "
-                            "defined meaning in Metal, in GL or in Vulkan", i, pf->name);
-         return false;
-      }
-
-      rt->blend_enable = 1;
-      *enabled_mask |= 1u << i;
-
-      snprintf(what, sizeof(what), "colour attachment %u's rgbBlendOperation", i);
-      if (!blend_operation_from_metal(b->rgb_blend_operation, &v, what, why, why_size))
-         return false;
-      rt->rgb_func = v;
-      snprintf(what, sizeof(what), "colour attachment %u's alphaBlendOperation", i);
-      if (!blend_operation_from_metal(b->alpha_blend_operation, &v, what, why, why_size))
-         return false;
-      rt->alpha_func = v;
-
-      snprintf(what, sizeof(what), "colour attachment %u's sourceRGBBlendFactor", i);
-      if (!blend_factor_from_metal(b->source_rgb_blend_factor, false, &v, what, why,
-                                   why_size))
-         return false;
-      rt->rgb_src_factor = v;
-      snprintf(what, sizeof(what), "colour attachment %u's destinationRGBBlendFactor", i);
-      if (!blend_factor_from_metal(b->destination_rgb_blend_factor, false, &v, what, why,
-                                   why_size))
-         return false;
-      rt->rgb_dst_factor = v;
-      snprintf(what, sizeof(what), "colour attachment %u's sourceAlphaBlendFactor", i);
-      if (!blend_factor_from_metal(b->source_alpha_blend_factor, true, &v, what, why,
-                                   why_size))
-         return false;
-      rt->alpha_src_factor = v;
-      snprintf(what, sizeof(what), "colour attachment %u's destinationAlphaBlendFactor",
-               i);
-      if (!blend_factor_from_metal(b->destination_alpha_blend_factor, true, &v, what, why,
-                                   why_size))
-         return false;
-      rt->alpha_dst_factor = v;
-
-      /*
-       * MIN AND MAX WITH A FACTOR OTHER THAN ONE, refused by name, and this is the one
-       * refusal here that is about a disagreement between the two SPECIFICATIONS rather
-       * than about something missing.
-       *
-       * Metal writes one equation for every operation -- source times its factor OP
-       * destination times its factor -- so under Metal's own reading
-       * MTLBlendOperationMin with a source factor of SourceAlpha takes the minimum of
-       * the SCALED terms. GL does not: it defines MIN and MAX as min(Cs, Cd) and
-       * max(Cs, Cd) with the factors IGNORED.
-       *
-       * Gallium's own convention is GL's, and it is enforced NOWHERE BELOW THE STATE
-       * TRACKER: st_atom_blend.c rewrites both factors to PIPE_BLENDFACTOR_ONE when the
-       * equation is GL_MIN or GL_MAX ("Min/max are special"), and that is the only place
-       * it happens. Below it the two back ends behind this library do different things
-       * with a factor that survives -- softpipe multiplies into source[] and
-       * blend_dest[] and THEN takes the minimum (sp_quad_blend.c), while fd6_blend.cc
-       * writes the factors into A6XX_RB_MRT_BLEND_CONTROL beside the MIN opcode without
-       * inspecting them, so what the Adreno's blender does with a scaled minimum is not
-       * readable from here at all.
-       *
-       * One is the identity under both readings, so every Min or Max that asks for One
-       * and One is served and is the only form anything real uses (it is how a
-       * maximum-blend is written). Anything else is refused with the field named,
-       * because the alternative is a picture that is right on one back end and wrong on
-       * the other, with no way to tell from the picture which.
-       */
-      for (unsigned half = 0; half < 2; half++) {
-         unsigned op = half ? rt->alpha_func : rt->rgb_func;
-         unsigned sf = half ? rt->alpha_src_factor : rt->rgb_src_factor;
-         unsigned df = half ? rt->alpha_dst_factor : rt->rgb_dst_factor;
-         unsigned msf = half ? b->source_alpha_blend_factor : b->source_rgb_blend_factor;
-         unsigned mdf = half ? b->destination_alpha_blend_factor
-                             : b->destination_rgb_blend_factor;
-
-         if ((op != PIPE_BLEND_MIN && op != PIPE_BLEND_MAX) ||
-             (sf == PIPE_BLENDFACTOR_ONE && df == PIPE_BLENDFACTOR_ONE))
-            continue;
-         say(why, why_size, "colour attachment %u's %sBlendOperation is %s and its "
-                            "factors are %s and %s: Metal's equation multiplies by the "
-                            "factors and then takes the minimum or maximum, GL ignores "
-                            "the factors for these two operations entirely, and the two "
-                            "readings differ unless both factors are "
-                            "MTLBlendFactorOne -- which is served, and is the only form "
-                            "a maximum-blend is written in", i,
-             half ? "alpha" : "rgb",
-             blend_operation_name(half ? b->alpha_blend_operation
-                                       : b->rgb_blend_operation),
-             blend_factor_name(msf), blend_factor_name(mdf));
-         return false;
-      }
-
-      /*
-       * A format with no alpha channel, and this is a FIX-UP rather than a refusal
-       * because both APIs agree on what it means: an attachment that stores no alpha
-       * reads as alpha = 1 on the destination side. Gallium has the conversion by name
-       * (util_blend_dst_alpha_to_one, src/util/blend.h: DST_ALPHA becomes ONE and
-       * INV_DST_ALPHA becomes ZERO) and it is applied here, where the format is known,
-       * rather than left to a driver that may or may not do it -- on a surface with no
-       * alpha the undisturbed factor reads whatever the hardware keeps in those bits,
-       * which on an RGBX surface is not 1 and not reliably 0 either.
-       */
-      if (pf && !util_format_has_alpha(pf->pipe)) {
-         rt->rgb_dst_factor =
-            util_blend_dst_alpha_to_one((enum pipe_blendfactor)rt->rgb_dst_factor);
-         rt->rgb_src_factor =
-            util_blend_dst_alpha_to_one((enum pipe_blendfactor)rt->rgb_src_factor);
-         rt->alpha_dst_factor =
-            util_blend_dst_alpha_to_one((enum pipe_blendfactor)rt->alpha_dst_factor);
-         rt->alpha_src_factor =
-            util_blend_dst_alpha_to_one((enum pipe_blendfactor)rt->alpha_src_factor);
-      }
-   }
-
-   /*
-    * Independent blending, which Gallium does not merely allow but REQUIRES to be
-    * declared: with independent_blend_enable clear, rt[0] governs every attachment and
-    * rt[1..] are not read at all. So a pipeline whose attachments differ needs the bit,
-    * and a screen without the capability has to be told no by name -- the alternative is
-    * the second attachment silently taking the first one's equation.
-    */
-   bool differ = false;
-   for (unsigned i = 1; i < shape->color_count; i++)
-      differ = differ || !rt_blend_equal(&out->rt[i], &out->rt[0]);
-   if (differ) {
-      bool enable = screen->caps.indep_blend_enable;
-      bool func = screen->caps.indep_blend_func;
-      if (!enable || !func) {
-         say(why, why_size, "this pipeline's %u colour attachments do not all ask for "
-                            "the same blend state, and %s reports %s: with independent "
-                            "blending off Gallium reads render target 0's state for "
-                            "every attachment, so the others would silently blend with "
-                            "the first one's equation", shape->color_count,
-             screen->get_name(screen),
-             !enable ? "no independent blend enable at all"
-                     : "independent enables but a single blend equation");
-         return false;
-      }
-      out->independent_blend_enable = 1;
-   }
-   return true;
-}
+#include "air_metal_blend.inc"
 
 struct rwa_render *
 rwa_render_create(struct rwa_device *device,
@@ -4985,6 +4780,8 @@ rwa_render_create_linked(struct rwa_device *device,
     * of why the measurement below this is the Adreno's and not this machine's.
     */
    for (unsigned i = 0; i < shape->color_count; i++) {
+      if (shape->color_format[i] == 0)
+         continue;
       const struct rwa_pixel_format *fmt = pixel_format(shape->color_format[i]);
       if (!fmt) {
          say(why, why_size, "colour attachment %u: pixel format %u is %s", i,
@@ -5816,9 +5613,12 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
     */
    unsigned samples = render->shape.sample_count ? render->shape.sample_count : 1;
    unsigned w = 0, h = 0;
+   bool have_size = false;
    for (unsigned i = 0; i < draw->color_count; i++) {
       struct rwa_texture *t = draw->color ? draw->color[i] : NULL;
       char what[48];
+      if (render->shape.color_format[i] == 0 && !t)
+         continue;
       if (!t) {
          say(why, why_size, "colour attachment %u is not a texture", i);
          return -1;
@@ -5843,8 +5643,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       unsigned tw = t->shape.width;
       unsigned th = t->shape.height ? t->shape.height : 1;
-      w = i == 0 ? tw : MIN2(w, tw);
-      h = i == 0 ? th : MIN2(h, th);
+      w = !have_size ? tw : MIN2(w, tw);
+      h = !have_size ? th : MIN2(h, th);
+      have_size = true;
    }
 
    /* The depth/stencil attachment, by the same checks and one more: it is the only
@@ -5874,8 +5675,9 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
       }
       unsigned tw = t->shape.width;
       unsigned th = t->shape.height ? t->shape.height : 1;
-      w = draw->color_count == 0 ? tw : MIN2(w, tw);   /* a depth-only pass: its size */
-      h = draw->color_count == 0 ? th : MIN2(h, th);
+      w = !have_size ? tw : MIN2(w, tw);   /* a depth-only pass: its size */
+      h = !have_size ? th : MIN2(h, th);
+      have_size = true;
    }
 
 
@@ -5956,6 +5758,8 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
                                         .nr_cbufs = draw->color_count,
                                         .samples = samples };
    for (unsigned i = 0; i < draw->color_count; i++) {
+      if (!draw->color[i])
+         continue;
       pipe_surface_init(pipe, &surf[i], draw->color[i]->res, draw->color[i]->first_level, 0);
       texture_written(draw->color[i]);
       surf[i].format = texture_format(draw->color[i]);
@@ -6192,10 +5996,10 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    if (draw->resolve) {
       for (unsigned i = 0; i < draw->color_count; i++) {
          struct rwa_texture *into = draw->resolve[i];
-         struct pipe_resource *from = draw->color[i]->res;
 
-         if (!into)
+         if (!into || !draw->color[i])
             continue;
+         struct pipe_resource *from = draw->color[i]->res;
          /* CoreAnimation names a resolve texture on passes whose attachment is NOT
           * multisampled -- measured: 354 times in one 420 s run, all of them with
           * storeAction 2 on a one-sample target. The driver draws those straight into

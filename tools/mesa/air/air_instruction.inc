@@ -13,6 +13,39 @@ air_element_index(struct air_ctx *c, nir_def *i)
 }
 
 static bool
+translate_pointer_cmp(struct air_ctx *c, const struct air_inst *in, bool *handled)
+{
+   *handled = false;
+   if (!in->operands[0]->type || in->operands[0]->type->kind != AIR_TYPE_POINTER ||
+       (in->sub != AIR_ICMP_EQ && in->sub != AIR_ICMP_NE))
+      return true;
+   struct air_val *pa = air_get(c, in->operands[0]);
+   struct air_val *pb = air_get(c, in->operands[1]);
+   if (!pa || !pb)
+      return false;
+   if (pa->kind != AIR_VAL_PTR || pb->kind != AIR_VAL_PTR)
+      return true;
+   bool a_null = pa->ptr.class == AIR_PTR_NONE;
+   bool b_null = pb->ptr.class == AIR_PTR_NONE;
+   if (a_null && b_null) {
+      *handled = true;
+      air_set(c, &in->base, air_val_ssa(c, nir_imm_bool(&c->b, in->sub == AIR_ICMP_EQ)));
+      return true;
+   }
+   const struct air_ptr *other = a_null ? &pb->ptr : (b_null ? &pa->ptr : NULL);
+   if (other && other->class == AIR_PTR_SSBO) {
+      *handled = true;
+      air_buffer_may_be_unbound(c, other->binding);
+      nir_def *sz = nir_get_ssbo_size(&c->b, 32, nir_imm_int(&c->b, other->binding));
+      nir_def *eq = in->sub == AIR_ICMP_EQ ? nir_ieq_imm(&c->b, sz, 0)
+                                           : nir_ine_imm(&c->b, sz, 0);
+      air_set(c, &in->base, air_val_ssa(c, eq));
+      return true;
+   }
+   return true;
+}
+
+static bool
 translate_instruction(struct air_ctx *c, const struct air_inst *in)
 {
    switch (in->op) {
@@ -27,8 +60,12 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
    }
    case AIR_OP_CAST:
       return translate_cast(c, in);
-   case AIR_OP_CMP:
-      return translate_cmp(c, in);
+   case AIR_OP_CMP: {
+      bool handled = false;
+      if (!translate_pointer_cmp(c, in, &handled))
+         return false;
+      return handled ? true : translate_cmp(c, in);
+   }
    case AIR_OP_GEP:
       return translate_gep(c, in);
    case AIR_OP_SELECT: {
@@ -145,13 +182,16 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       struct air_val *mv = air_get(c, in->operands[2]);
       if (!x || !y || !mv)
          return false;
+      unsigned raw_n = in->base.type->kind == AIR_TYPE_VECTOR ? in->base.type->count : 1;
+      unsigned xn = in->operands[0]->type->kind == AIR_TYPE_VECTOR ? in->operands[0]->type->count : 1;
+      unsigned yn = in->operands[1]->type->kind == AIR_TYPE_VECTOR ? in->operands[1]->type->count : 1;
       unsigned n = air_nir_components(in->base.type);
       nir_def *comps[NIR_MAX_VEC_COMPONENTS];
-      if (n > NIR_MAX_VEC_COMPONENTS)
-         return air_error(c, "instruction: a shuffle of %u components", n);
+      if (!nir_num_components_valid(n))
+         return air_error(c, "instruction: a shuffle of %u components", raw_n);
       /* the mask is a constant vector, or zeroinitializer, or undef */
       const struct air_constant *mk = air_value_as_constant(in->operands[2]);
-      for (unsigned i = 0; i < n; i++) {
+      for (unsigned i = 0; i < raw_n; i++) {
          int64_t sel = 0;
          bool undef = false;
          if (mk && mk->ckind == AIR_CONST_DATA && i < mk->num_elems) {
@@ -181,18 +221,20 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
             return air_error(c, "instruction: a shuffle mask that is %s, with %u of the "
                                 "%u elements it needs",
                              air_value_kind_name(in->operands[2]),
-                             mk ? mk->num_elems : 0, n);
+                             mk ? mk->num_elems : 0, raw_n);
          }
          if (undef) {
             comps[i] = nir_undef(&c->b, 1, x->bit_size);
-         } else if (sel < x->num_components) {
+         } else if (sel < xn) {
             comps[i] = nir_channel(&c->b, x, sel);
-         } else if (sel - x->num_components < y->num_components) {
-            comps[i] = nir_channel(&c->b, y, sel - x->num_components);
+         } else if (sel - xn < yn) {
+            comps[i] = nir_channel(&c->b, y, sel - xn);
          } else {
             return air_error(c, "instruction: a shuffle index past its inputs");
          }
       }
+      for (unsigned i = raw_n; i < n; i++)
+         comps[i] = nir_undef(&c->b, 1, x->bit_size);
       air_set(c, &in->base, air_val_ssa(c, nir_vec(&c->b, comps, n)));
       return true;
    }
@@ -241,6 +283,8 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       c->scratch_size = ALIGN_POT(c->scratch_size, MAX2(align, 1));
       struct air_ptr p = {
          .class = AIR_PTR_SCRATCH,
+         .span = (unsigned)size,
+         .scratch_base = c->scratch_size,
          .offset = nir_imm_int(&c->b, c->scratch_size),
          .pointee = in->aux_type,
       };
@@ -261,7 +305,9 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       }
       if (p->kind != AIR_VAL_PTR)
          return air_error(c, "instruction: a load from something that is not a pointer");
-      struct air_val *stored = in->base.type && in->base.type->kind == AIR_TYPE_POINTER
+      struct air_val *stored = in->base.type &&
+         (in->base.type->kind == AIR_TYPE_POINTER ||
+          (in->base.type->kind == AIR_TYPE_INT && in->base.type->bits == 64))
          ? stored_pointer(c, p) : NULL;
       if (stored) {
          struct air_val *value = val_in_current_impl(c, stored);
@@ -275,10 +321,37 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
        * becomes a pointer and not an instruction.
        */
       if (p->ptr.class == AIR_PTR_ARGBUF) {
-         struct air_val *res = argbuf_load(c, p->ptr, in->base.type);
+         struct air_val *res = argbuf_load(c, p->ptr, in->base.type, in->align);
          if (!res)
             return false;
          air_set(c, &in->base, res);
+         return true;
+      }
+      if (p->ptr.class == AIR_PTR_TEXTURE_ARRAY) {
+         if (!in->base.type || in->base.type->kind != AIR_TYPE_POINTER || !p->ptr.span)
+            return air_error(c, "instruction: invalid load from texture array");
+         nir_def *byte_off = ptr_offset(c, p->ptr);
+         struct air_ptr tp = {
+            .class = AIR_PTR_TEXTURE,
+            .is_image = p->ptr.is_image,
+            .pointee = in->base.type->elem,
+         };
+         if (nir_src_is_const(nir_src_for_ssa(byte_off))) {
+            unsigned idx = (unsigned)(nir_src_as_uint(nir_src_for_ssa(byte_off)) >> 3);
+            if (idx >= p->ptr.span)
+               idx = p->ptr.span - 1;
+            tp.binding = p->ptr.binding + idx;
+         } else {
+            nir_def *elem = nir_umin_imm(&c->b, nir_ushr_imm(&c->b, byte_off, 3),
+                                         p->ptr.span - 1);
+            tp.binding = 0;
+            tp.offset = nir_iadd_imm(&c->b, elem, p->ptr.binding);
+            if (!p->ptr.is_image) {
+               for (unsigned k = 0; k < p->ptr.span; k++)
+                  air_texture_may_be_unbound(c, p->ptr.binding + k);
+            }
+         }
+         air_set(c, &in->base, air_val_ptr(c, tp));
          return true;
       }
       nir_def *res = air_load_ptr(c, p->ptr, in->base.type, in->align);
@@ -295,10 +368,14 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
       if (!sv)
          return false;
       if (val_is_pointerish(sv))
-         return store_pointer(c, p, sv);
+         return air_store_pointer_slot(c, p, sv);
       if (p->kind == AIR_VAL_PTR_SELECT)
          return air_error(c, "instruction: a store through a chosen pointer, which would "
                              "have to write both of them");
+      if (in->operands[0]->type && in->operands[0]->type->kind == AIR_TYPE_VECTOR &&
+          !nir_num_components_valid(in->operands[0]->type->count))
+         return air_error(c, "instruction: a vector store of %u elements",
+                          (unsigned)in->operands[0]->type->count);
       nir_def *v = air_get_ssa(c, in->operands[0]);
       if (!v)
          return false;

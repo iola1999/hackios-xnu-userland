@@ -20,8 +20,8 @@ ptr_slot_place(const struct air_val *at)
           (!at->ptr.offset || nir_src_is_const(nir_src_for_ssa(at->ptr.offset)));
 }
 
-static bool
-store_pointer(struct air_ctx *c, const struct air_val *at, struct air_val *v)
+bool
+air_store_pointer_slot(struct air_ctx *c, const struct air_val *at, struct air_val *v)
 {
    if (!ptr_slot_place(at))
       return air_error(c, "instruction: a store of a pointer into memory other than a local "
@@ -41,8 +41,45 @@ store_pointer(struct air_ctx *c, const struct air_val *at, struct air_val *v)
 static struct air_val *
 stored_pointer(struct air_ctx *c, const struct air_val *at)
 {
-   return ptr_slot_place(at) && c->ptr_slots
-      ? _mesa_hash_table_u64_search(c->ptr_slots, ptr_slot_key(&at->ptr)) : NULL;
+   if (!c->ptr_slots)
+      return NULL;
+   if (ptr_slot_place(at))
+      return _mesa_hash_table_u64_search(c->ptr_slots, ptr_slot_key(&at->ptr));
+   if (at->kind == AIR_VAL_PTR && at->ptr.class == AIR_PTR_SCRATCH &&
+       at->ptr.span >= 8 && at->ptr.offset) {
+      struct air_val *slots[32];
+      uint32_t offs[32];
+      unsigned n = 0;
+      uint32_t end = at->ptr.scratch_base + at->ptr.span;
+      for (uint32_t off = at->ptr.scratch_base; off + 8 <= end && n < 32; off += 8) {
+         struct air_val *sv = _mesa_hash_table_u64_search(c->ptr_slots, (uint64_t)off + 1);
+         if (!sv)
+            continue;
+         if (sv->kind != AIR_VAL_PTR || sv->ptr.class != AIR_PTR_TEXTURE ||
+             sv->ptr.is_null || sv->ptr.offset)
+            return NULL;
+         if (n > 0 && sv->ptr.is_image != slots[0]->ptr.is_image)
+            return NULL;
+         offs[n] = off;
+         slots[n++] = sv;
+      }
+      if (n == 0)
+         return NULL;
+      nir_def *tex_idx = nir_imm_int(&c->b, slots[n - 1]->ptr.binding);
+      for (int i = (int)n - 2; i >= 0; i--) {
+         tex_idx = nir_bcsel(&c->b, nir_ieq_imm(&c->b, at->ptr.offset, offs[i]),
+                             nir_imm_int(&c->b, slots[i]->ptr.binding), tex_idx);
+      }
+      if (!slots[0]->ptr.is_image) {
+         for (unsigned i = 0; i < n; i++)
+            air_texture_may_be_unbound(c, slots[i]->ptr.binding);
+      }
+      struct air_ptr tp = slots[0]->ptr;
+      tp.binding = 0;
+      tp.offset = tex_idx;
+      return air_val_ptr(c, tp);
+   }
+   return NULL;
 }
 
 /* Pointer slots retain values across function translation. Constants are

@@ -146,6 +146,22 @@ inline_linked_function(struct air_ctx *c, struct air_linked_module *lm,
    c->inline_ret = NULL;
    c->inline_ret_reg = NULL;
    if (has_ret && rets > 1) {
+      if (!ret_member_is_number(rt)) {
+         c->m = saved_m;
+         c->global_plan = saved_plan;
+         c->fn = saved_fn;
+         c->values = sv;
+         c->blocks = sb;
+         c->phi_cursors = sp;
+         c->phi_regs = sr;
+         c->inline_entry = saved_entry;
+         c->inline_exit = saved_exit;
+         c->inline_ret = saved_ret;
+         c->inline_ret_reg = saved_ret_reg;
+         air_error(c, "link: a linked function returns something other than a number "
+                      "from more than one place");
+         return NULL;
+      }
       nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
       c->inline_ret_reg = nir_decl_reg(&entry, air_nir_components(rt),
                                        air_nir_bit_size(c, rt), 0);
@@ -191,6 +207,13 @@ inline_linked_function(struct air_ctx *c, struct air_linked_module *lm,
    c->inline_ret = saved_ret;
    c->inline_ret_reg = saved_ret_reg;
    return ok ? result : NULL;
+}
+
+static struct air_val *
+inline_module_function(struct air_ctx *c, const struct air_function *f, struct air_val **argv)
+{
+   struct air_linked_module self = { .m = c->m, .plan = c->global_plan };
+   return inline_linked_function(c, &self, f, argv);
 }
 
 /* Native stitching graphs list every data and control dependency before its use.
@@ -258,15 +281,29 @@ call_linked_function(struct air_ctx *c, const struct air_inst *in,
       if (!f)
          return air_error(c, "link: node %u calls undefined function %s", k, node->function);
       unsigned nargs = node->args ? node->num_args : f->num_args;
-      if (f->num_args != nargs || (!node->args && nargs > nin))
+      if (f->num_args < nargs || (!node->args && nargs > nin))
          return air_error(c, "link: node %u has an incompatible argument count", k);
-      struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(nargs, 1));
+      struct air_val **argv = rzalloc_array(c->mem_ctx, struct air_val *, MAX2(f->num_args, 1));
+      unsigned fi = 0;
       for (unsigned a = 0; a < nargs; a++) {
          int from = node->args ? node->args[a] : (int)a;
-         argv[a] = from >= 0 ? inputs[from] : results[-1 - from];
-         if (!argv[a])
+         struct air_val *val = from >= 0 ? inputs[from] : results[-1 - from];
+         if (!val || fi >= f->num_args)
             return air_error(c, "link: node %u reads a node that returns nothing", k);
+         if (f->num_args > nargs && val->kind == AIR_VAL_AGG && val->num_elems > 0 &&
+             !(f->args[fi].type->kind == AIR_TYPE_STRUCT &&
+               f->args[fi].type->num_members == val->num_elems) &&
+             !(f->args[fi].type->kind == AIR_TYPE_ARRAY &&
+               f->args[fi].type->count == val->num_elems) &&
+             fi + val->num_elems <= f->num_args) {
+            for (unsigned e = 0; e < val->num_elems; e++)
+               argv[fi++] = val->elems[e];
+         } else {
+            argv[fi++] = val;
+         }
       }
+      if (fi != f->num_args)
+         return air_error(c, "link: node %u has an incompatible argument count", k);
       results[k] = inline_linked_function(c, lm, f, argv);
       if (c->error[0])
          return false;

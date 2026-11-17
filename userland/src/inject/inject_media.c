@@ -96,7 +96,6 @@ shared_vendor_with_func(id self, SEL selector, void *func)
 		func = (void *)annibale_camera_device_create;
 		say("annibale: media: supplying annibale_camera_device_create to sharedCaptureDeviceVendor\n");
 	}
-	*(int *)(0x1ecd7b640UL + slide) = 2; /* CoreMedia fig_notes = stderr */
 	return ((id (*)(id, SEL, void *))original_shared_vendor_with_func)(self, selector, func);
 }
 
@@ -656,8 +655,12 @@ annibale_media_init(void)
 		    kCFPreferencesCurrentUser, kCFPreferencesCurrentHost);
 		CFPreferencesSynchronize(CFSTR("com.apple.cameracapture.volatile"),
 		    kCFPreferencesCurrentUser, kCFPreferencesCurrentHost);
-		CFPreferencesSetAppValue(CFSTR("fig_notes"), CFSTR("stderr"), CFSTR("com.apple.coremedia"));
-		*(int *)(0x1ecd7b640UL + slide) = 2;
+		const char *fn = getenv("ANNIBALE_FIG_NOTES");
+		bool want_notes = (fn != NULL && fn[0] != '\0' && strcmp(fn, "0") != 0) ||
+		    access("/private/var/tmp/fig_notes", F_OK) == 0;
+		CFPreferencesSetAppValue(CFSTR("fig_notes"), want_notes ? CFSTR("stderr") : NULL,
+		    CFSTR("com.apple.coremedia"));
+		CFPreferencesAppSynchronize(CFSTR("com.apple.coremedia"));
 		(void)dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY | RTLD_GLOBAL);
 	}
 	{

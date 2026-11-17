@@ -32,7 +32,8 @@ static int
 dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
               const struct rwa_buffer_bind *table, unsigned table_count,
               const unsigned groups[3], const unsigned group_size[3],
-              unsigned threadgroup_bytes, bool wait, char *why, size_t why_size)
+              unsigned threadgroup_bytes, const unsigned ib_dim[2],
+              bool wait, char *why, size_t why_size)
 {
    RWA_LOCKED;
    struct rwa_device *device = compute->device;
@@ -84,10 +85,23 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                       name, why, why_size) != 0)
       return -1;
 
+   unsigned ib_bytes = 0;
+   if (compute->info.imageblock_data_size > 0) {
+      unsigned ib_w = (ib_dim && ib_dim[0]) ? ib_dim[0] : group_size[0];
+      unsigned ib_h = (ib_dim && ib_dim[1]) ? ib_dim[1] : group_size[1];
+      ib_bytes = ALIGN_POT(ib_w * ib_h * compute->info.imageblock_data_size, 16);
+   }
+   unsigned var_shared = ib_bytes + (compute->dynamic_threadgroup ? threadgroup_bytes : 0);
+   if (!device->software && compute->caps.static_shared_bytes + var_shared > 32768) {
+      say(why, why_size, "%s asks for %u bytes of shared/imageblock memory and this GPU takes at most 32768",
+          name, compute->caps.static_shared_bytes + var_shared);
+      return -1;
+   }
+
    struct rwa_yuv_key yuv;
    if (!yuv_key_for(&compute->info, bindings, table, table_count, &yuv, why, why_size))
       return -1;
-   void *cso = compute_state_for(compute, group_size, &yuv, why, why_size);
+   void *cso = compute_state_for_ib(compute, group_size, &yuv, ib_dim, why, why_size);
    if (!cso)
       return -1;
 
@@ -109,7 +123,7 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
       .work_dim = 3,
       .block = { group_size[0], group_size[1], group_size[2] },
       .grid = { groups[0], groups[1], groups[2] },
-      .variable_shared_mem = compute->dynamic_threadgroup ? threadgroup_bytes : 0,
+      .variable_shared_mem = var_shared,
    };
    pipe->launch_grid(pipe, &grid);
 
@@ -129,7 +143,7 @@ rwa_dispatch_threadgroup(struct rwa_compute *compute, const struct rwa_bindings 
                          unsigned threadgroup_bytes, char *why, size_t why_size)
 {
    return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
-                        threadgroup_bytes, true, why, why_size);
+                        threadgroup_bytes, NULL, true, why, why_size);
 }
 
 int
@@ -139,5 +153,16 @@ rwa_dispatch_nowait(struct rwa_compute *compute, const struct rwa_bindings *bind
                     unsigned threadgroup_bytes, char *why, size_t why_size)
 {
    return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
-                        threadgroup_bytes, false, why, why_size);
+                        threadgroup_bytes, NULL, false, why, why_size);
+}
+
+int
+rwa_dispatch_nowait_imageblock(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+                               const struct rwa_buffer_bind *table, unsigned table_count,
+                               const unsigned groups[3], const unsigned group_size[3],
+                               unsigned threadgroup_bytes, const unsigned imageblock_size[2],
+                               char *why, size_t why_size)
+{
+   return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
+                        threadgroup_bytes, imageblock_size, false, why, why_size);
 }

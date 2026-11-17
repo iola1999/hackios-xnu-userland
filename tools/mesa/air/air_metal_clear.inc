@@ -9,6 +9,8 @@ clear_bound_attachments(struct pipe_context *pipe, const struct rwa_draw *draw)
       const struct rwa_color_clear *item = &color_clears[n];
       union pipe_color_union clear = { 0 };
       struct rwa_texture *target = draw->color[item->attachment];
+      if (!target)
+         continue;
       for (unsigned c = 0; c < 4; c++) {
          if (target && rgb2p_full(target->shape.pixel_format))
             clear.f[c] = c == 3 ? 1.0f : item->rgba[c];   /* 542 has no alpha to clear */

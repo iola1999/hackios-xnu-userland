@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "util/macros.h"
@@ -325,6 +326,29 @@ reflect_texture(struct reflection_ctx *c, const char *name, const struct air_md 
       { "depth2d_ms", 4, true }, { "depthcube", 5, true },
       { "depthcube_array", 6, true }, { "depth2d_ms_array", 8, true },
    };
+   char unwrapped[96];
+   if (name && !strncmp(name, "array<", 6)) {
+      const char *inner = name + 6;
+      const char *inner_end = strchr(inner, '>');
+      if (!inner_end || inner_end[1] != ',')
+         return reflection_error(c, "reflection: texture array %s has malformed type %s",
+                                 out->name, name);
+      const char *len_str = inner_end + 2;
+      while (*len_str == ' ')
+         len_str++;
+      char *after = NULL;
+      unsigned long parsed_len = strtoul(len_str, &after, 10);
+      if (!after || strcmp(after, ">") || parsed_len != out->array_length ||
+          (size_t)(inner_end + 1 - inner) >= sizeof(unwrapped))
+         return reflection_error(c, "reflection: texture array %s length mismatches type %s",
+                                 out->name, name);
+      memcpy(unwrapped, inner, (size_t)(inner_end + 1 - inner));
+      unwrapped[inner_end + 1 - inner] = '\0';
+      name = unwrapped;
+   } else if (out->array_length != 1) {
+      return reflection_error(c, "reflection: texture %s span %u lacks array<> type %s",
+                              out->name, out->array_length, name ? name : "(missing)");
+   }
    for (unsigned i = 0; name && i < ARRAY_SIZE(kinds); i++) {
       size_t n = strlen(kinds[i].name);
       if (strncmp(name, kinds[i].name, n) || name[n] != '<')
@@ -381,7 +405,9 @@ is_builtin(const struct air_md *node)
       "air.threadgroups_per_grid", "air.thread_index_in_threadgroup",
       "air.threads_per_grid", "air.thread_index_in_simdgroup",
       "air.simdgroup_index_in_threadgroup", "air.threads_per_simdgroup",
-      "air.simdgroups_per_threadgroup",
+      "air.simdgroups_per_threadgroup", "air.imageblock",
+      "air.thread_index_in_quadgroup", "air.quadgroup_index_in_threadgroup",
+      "air.quadgroups_per_threadgroup",
    };
    for (unsigned i = 0; i < ARRAY_SIZE(keys); i++)
       if (md_key(node, keys[i]) >= 0)
@@ -444,7 +470,8 @@ air_compute_reflection(void *mem_ctx, const struct air_module *module,
       };
       if (!name || !*name || !type_name || location < 0 ||
           !md_uint(node, location + 1, &arg.index) ||
-          !md_uint(node, location + 2, &arg.array_length) || arg.array_length != 1) {
+          !md_uint(node, location + 2, &arg.array_length) || !arg.array_length ||
+          (!texture && arg.array_length != 1)) {
          reflection_error(&c, "reflection: parameter %u has incomplete name, type or location span",
                           param);
          goto fail;
@@ -492,7 +519,9 @@ air_compute_reflection(void *mem_ctx, const struct air_module *module,
             goto fail;
       }
       for (unsigned j = 0; j < out->argument_count; j++) {
-         if (args[j].type == arg.type && args[j].index == arg.index) {
+         if (args[j].type == arg.type &&
+             arg.index < args[j].index + args[j].array_length &&
+             args[j].index < arg.index + arg.array_length) {
             reflection_error(&c, "reflection: arguments %s and %s share one binding index",
                              args[j].name, arg.name);
             goto fail;

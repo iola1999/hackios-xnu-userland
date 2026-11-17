@@ -249,10 +249,19 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       r = nir_fsin(&c->b, a[0]);
    } else if (!strcmp(op, "fast_cos") || !strcmp(op, "cos")) {
       r = nir_fcos(&c->b, a[0]);
-   } else if (!strcmp(op, "cospi")) {
+   } else if (!strcmp(op, "cospi") || !strcmp(op, "fast_cospi")) {
       if (argc != 1 || !is_float || (a[0]->bit_size != 16 && a[0]->bit_size != 32))
          return air_error(c, "intrinsic: cospi requires one half or float argument");
       r = air_cospi(&c->b, a[0]);
+   } else if (!strcmp(op, "sinpi") || !strcmp(op, "fast_sinpi")) {
+      if (argc != 1 || !is_float || (a[0]->bit_size != 16 && a[0]->bit_size != 32))
+         return air_error(c, "intrinsic: sinpi requires one half or float argument");
+      r = nir_fsin(&c->b, nir_fmul_imm(&c->b, a[0], M_PI));
+   } else if (!strcmp(op, "tanpi") || !strcmp(op, "fast_tanpi")) {
+      if (argc != 1 || !is_float || (a[0]->bit_size != 16 && a[0]->bit_size != 32))
+         return air_error(c, "intrinsic: tanpi requires one half or float argument");
+      nir_def *ang = nir_fmul_imm(&c->b, a[0], M_PI);
+      r = nir_fdiv(&c->b, nir_fsin(&c->b, ang), nir_fcos(&c->b, ang));
    } else if (!strcmp(op, "fast_tan") || !strcmp(op, "tan")) {
       r = nir_fdiv(&c->b, nir_fsin(&c->b, a[0]), nir_fcos(&c->b, a[0]));
    } else if (!strcmp(op, "fast_atan2") || !strcmp(op, "atan2")) {
@@ -544,25 +553,59 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
          r = nir_f2fN(&c->b, r, a[0]->bit_size);
    } else if (!strcmp(op, "get_simd_width") || !strcmp(op, "get_thread_execution_width")) {
       r = nir_load_subgroup_size(&c->b);
+   } else if (!strcmp(op, "get_local_size")) {
+      nir_def *wg = nir_load_workgroup_size(&c->b);
+      nir_def *ch = nir_vector_extract(&c->b, wg, nir_umin_imm(&c->b, nir_u2u32(&c->b, a[0]), 2));
+      r = nir_u2uN(&c->b, ch, air_nir_bit_size(c, in->base.type));
+   } else if (!strcmp(op, "pack") && n->num >= 2 &&
+              (!strcmp(n->part[1], "snorm2x16") || !strcmp(n->part[1], "unorm2x16") ||
+               !strcmp(n->part[1], "snorm4x8") || !strcmp(n->part[1], "unorm4x8"))) {
+      nir_def *f = nir_f2f32(&c->b, a[0]);
+      r = !strcmp(n->part[1], "snorm2x16") ? nir_pack_snorm_2x16(&c->b, f) :
+          !strcmp(n->part[1], "unorm2x16") ? nir_pack_unorm_2x16(&c->b, f) :
+          !strcmp(n->part[1], "snorm4x8")  ? nir_pack_snorm_4x8(&c->b, f)  :
+                                             nir_pack_unorm_4x8(&c->b, f);
+   } else if (!strcmp(op, "pack") && n->num >= 3 &&
+              !strcmp(n->part[1], "unorm") && !strcmp(n->part[2], "rgb10a2")) {
+      nir_def *f = nir_fsat(&c->b, nir_f2f32(&c->b, a[0]));
+      nir_def *rc = nir_f2u32(&c->b, nir_ffloor(&c->b, nir_fadd_imm(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, f, 0), 1023.0), 0.5)));
+      nir_def *gc = nir_f2u32(&c->b, nir_ffloor(&c->b, nir_fadd_imm(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, f, 1), 1023.0), 0.5)));
+      nir_def *bc = nir_f2u32(&c->b, nir_ffloor(&c->b, nir_fadd_imm(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, f, 2), 1023.0), 0.5)));
+      nir_def *ac = nir_f2u32(&c->b, nir_ffloor(&c->b, nir_fadd_imm(&c->b, nir_fmul_imm(&c->b, nir_channel(&c->b, f, 3), 3.0), 0.5)));
+      r = nir_ior(&c->b, nir_ior(&c->b, rc, nir_ishl_imm(&c->b, gc, 10)),
+                  nir_ior(&c->b, nir_ishl_imm(&c->b, bc, 20), nir_ishl_imm(&c->b, ac, 30)));
    } else if (!strcmp(op, "all")) {
       r = nir_ball(&c->b, a[0]);
    } else if (!strcmp(op, "any")) {
       r = nir_bany(&c->b, a[0]);
    } else if (!strcmp(op, "simd_sum")) {
-      /* Metal's simd_sum: the sum over the SIMD group, given to every lane.
-       * NIR's reduce with cluster_size 0 is that, and ir3 has it
-       * (nir_intrinsic_reduce in ir3_compiler_nir.c) and splits a vector into
-       * scalars on the way (nir_lower_subgroups with lower_to_scalar).
-       *
-       * Only the sum, because only the sum occurs: Apple's vocabulary carries
-       * sixteen more air.simd_* names (product, min, max, and, or, ballot,
-       * shuffle, the prefix scans) and no module of either corpus calls one,
-       * so each would be code with no case behind it. A float reduction has no
-       * defined order in Metal or in NIR, so nothing here could be checked
-       * bit-exactly even on the phone.
-       */
       r = nir_reduce(&c->b, a[0],
                      .reduction_op = is_float ? nir_op_fadd : nir_op_iadd);
+   } else if (!strcmp(op, "simd_product")) {
+      r = nir_reduce(&c->b, a[0],
+                     .reduction_op = is_float ? nir_op_fmul : nir_op_imul);
+   } else if (!strcmp(op, "simd_min")) {
+      r = nir_reduce(&c->b, a[0],
+                     .reduction_op = is_float ? nir_op_fmin : (is_signed ? nir_op_imin : nir_op_umin));
+   } else if (!strcmp(op, "simd_max")) {
+      r = nir_reduce(&c->b, a[0],
+                     .reduction_op = is_float ? nir_op_fmax : (is_signed ? nir_op_imax : nir_op_umax));
+   } else if (!strcmp(op, "simd_and") || !strcmp(op, "simd_or") || !strcmp(op, "simd_xor")) {
+      nir_op rop = !strcmp(op, "simd_and") ? nir_op_iand :
+                   !strcmp(op, "simd_or")  ? nir_op_ior  : nir_op_ixor;
+      r = nir_reduce(&c->b, a[0], .reduction_op = rop);
+   } else if (!strcmp(op, "simd_prefix_inclusive_sum") ||
+              !strcmp(op, "simd_prefix_exclusive_sum")) {
+      nir_op rop = is_float ? nir_op_fadd : nir_op_iadd;
+      r = !strcmp(op, "simd_prefix_inclusive_sum")
+         ? nir_inclusive_scan(&c->b, a[0], .reduction_op = rop)
+         : nir_exclusive_scan(&c->b, a[0], .reduction_op = rop);
+   } else if (!strcmp(op, "simd_prefix_inclusive_product") ||
+              !strcmp(op, "simd_prefix_exclusive_product")) {
+      nir_op rop = is_float ? nir_op_fmul : nir_op_imul;
+      r = !strcmp(op, "simd_prefix_inclusive_product")
+         ? nir_inclusive_scan(&c->b, a[0], .reduction_op = rop)
+         : nir_exclusive_scan(&c->b, a[0], .reduction_op = rop);
    } else if (!strcmp(op, "normalize_function_constant_predicate")) {
       /* Metal's compiler stores the predicates that say whether a dependent
        * function constant applies in `__metal_implicit_fc_pred_N` bytes, and
@@ -584,14 +627,17 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
                    air_nir_bit_size(c, in->base.type));
    } else if (!strcmp(op, "unpack") && n->num >= 2 &&
               !strcmp(n->part[1], "unorm4x8")) {
-      /* four unsigned bytes of a word, each divided by 255. Component 0 is the
-       * LOW byte, which is both GLSL's unpackUnorm4x8 and Metal's
-       * unpack_unorm4x8_to_float, so NIR's opcode is the operation and not an
-       * approximation of it. ir3 has no instruction for it and does not need
-       * one: it sets lower_unpack_unorm_4x8, and nir_opt_algebraic turns it
-       * into four extract_u8 and a divide.
-       */
       r = nir_unpack_unorm_4x8(&c->b, a[0]);
+      if (air_nir_bit_size(c, in->base.type) == 16)
+         r = nir_f2f16(&c->b, r);
+   } else if (!strcmp(op, "unpack") && n->num >= 3 &&
+              !strcmp(n->part[1], "unorm") && !strcmp(n->part[2], "rgb10a2")) {
+      nir_def *w = nir_u2u32(&c->b, a[0]);
+      nir_def *rc = nir_fmul_imm(&c->b, nir_u2f32(&c->b, nir_iand_imm(&c->b, w, 0x3ff)), 1.0 / 1023.0);
+      nir_def *gc = nir_fmul_imm(&c->b, nir_u2f32(&c->b, nir_ubitfield_extract_imm(&c->b, w, 10, 10)), 1.0 / 1023.0);
+      nir_def *bc = nir_fmul_imm(&c->b, nir_u2f32(&c->b, nir_ubitfield_extract_imm(&c->b, w, 20, 10)), 1.0 / 1023.0);
+      nir_def *ac = nir_fmul_imm(&c->b, nir_u2f32(&c->b, nir_ushr_imm(&c->b, w, 30)), 1.0 / 3.0);
+      r = nir_vec4(&c->b, rc, gc, bc, ac);
       if (air_nir_bit_size(c, in->base.type) == 16)
          r = nir_f2f16(&c->b, r);
    } else if (!strcmp(op, "convert")) {
@@ -685,6 +731,27 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
    /* air.atomic.{global,local}.<op>[.<sign>].<type>(ptr, value?, order,
     * scope, volatile)
     */
+   if (n->num == 2 && !strcmp(n->part[1], "fence")) {
+      uint64_t flags = 0, scope_arg = 2;
+      if (in->num_operands > 1)
+         air_const_uint(in->operands[1], &flags);
+      if (in->num_operands > 3)
+         air_const_uint(in->operands[3], &scope_arg);
+      nir_variable_mode modes = 0;
+      if (flags & 1)
+         modes |= nir_var_mem_ssbo | nir_var_mem_global;
+      if (flags & (2 | 8))
+         modes |= nir_var_mem_shared;
+      if (flags & 4)
+         modes |= nir_var_image;
+      if (!modes)
+         modes = nir_var_mem_ssbo | nir_var_mem_global | nir_var_mem_shared;
+      nir_barrier(&c->b, .execution_scope = SCOPE_NONE,
+                  .memory_scope = scope_arg == 1 ? SCOPE_DEVICE : SCOPE_WORKGROUP,
+                  .memory_semantics = NIR_MEMORY_ACQ_REL,
+                  .memory_modes = modes);
+      return true;
+   }
    if (n->num < 3)
       return air_error(c, "intrinsic: an atomic without a name");
    const char *where = n->part[1];
@@ -732,10 +799,46 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
     * can make a wrong compare-exchange show, and an atomic that is only
     * compiled is the one kind this project will not claim.
     */
-   if (!strcmp(op, "cmpxchg"))
-      return air_error(c, "intrinsic: air.atomic.%s.cmpxchg -- compare-exchange, whose "
-                          "result is the old value and whose `expected` is a pointer "
-                          "this does not write back yet", where);
+   if (!strcmp(op, "cmpxchg")) {
+      if (in->num_operands < 6)
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg with %u arguments",
+                          where, in->num_operands - 1);
+      uint64_t sorder = 0, forder = 0;
+      if (!air_const_uint(in->operands[4], &sorder) ||
+          !air_const_uint(in->operands[5], &forder))
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg with a memory order "
+                             "that is not a constant", where);
+      if (sorder != 0 || forder != 0)
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg with memory_order "
+                             "%u/%u; only relaxed (0) is translated",
+                          where, (unsigned)sorder, (unsigned)forder);
+      struct air_val *ev = air_get(c, in->operands[2]);
+      nir_def *desired = air_get_ssa(c, in->operands[3]);
+      if (!ev || !desired)
+         return false;
+      if (ev->kind != AIR_VAL_PTR)
+         return air_error(c, "intrinsic: air.atomic.%s.cmpxchg expected argument "
+                             "is not a pointer", where);
+      nir_def *cmp = air_load_ptr(c, ev->ptr, in->base.type, 0);
+      if (!cmp)
+         return false;
+      nir_def *old;
+      if (shared) {
+         old = nir_shared_atomic_swap(&c->b, desired->bit_size, off, cmp, desired,
+                                      .atomic_op = nir_atomic_op_cmpxchg);
+      } else if (p.class == AIR_PTR_SSBO) {
+         old = nir_ssbo_atomic_swap(&c->b, desired->bit_size,
+                                    nir_imm_int(&c->b, p.binding), off, cmp, desired,
+                                    .atomic_op = nir_atomic_op_cmpxchg);
+      } else {
+         return air_error(c, "intrinsic: an atomic on a pointer that is not a buffer");
+      }
+      if (!air_store_ptr(c, ev->ptr, old, 0))
+         return false;
+      if (in->base.type && in->base.type->kind != AIR_TYPE_VOID)
+         air_set(c, &in->base, air_val_ssa(c, old));
+      return true;
+   }
 
    /* The memory order, which this lowering is right for exactly one value of.
     * That argument is Metal's memory_order, and every atomic in the corpus
@@ -800,29 +903,51 @@ atomic_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n
 /* -- barriers ----------------------------------------------------------- */
 
 static bool
-barrier_op(struct air_ctx *c, const struct air_inst *in)
+barrier_op(struct air_ctx *c, const struct air_inst *in, mesa_scope scope)
 {
-   /* air.wg.barrier(i32 flags, i32 scope): the flags say which memory is
-    * ordered. 2 is threadgroup memory, 1 device, 4 texture; the corpus only
-    * ever passes 2 with scope 1 (the threadgroup).
+   /* air.{wg,simdgroup}.barrier(i32 flags, i32 scope): the flags say which
+    * memory is ordered. 2 is threadgroup memory, 1 device, 4 texture, 0 none.
     */
-   uint64_t flags = 2;
-   if (in->num_operands > 1)
-      air_const_uint(in->operands[1], &flags); /* left alone when not readable */
+   uint64_t flags = scope == SCOPE_WORKGROUP ? 2 : 0;
+   bool have_flags = in->num_operands > 1 && air_const_uint(in->operands[1], &flags);
 
    nir_variable_mode modes = 0;
    if (flags & 1)
       modes |= nir_var_mem_ssbo | nir_var_mem_global;
-   if (flags & 2)
+   if (flags & (2 | 8))
       modes |= nir_var_mem_shared;
    if (flags & 4)
       modes |= nir_var_image;
-   if (!modes)
+   if (!modes && scope == SCOPE_WORKGROUP && (!have_flags || flags != 0))
       modes = nir_var_mem_shared;
 
-   nir_barrier(&c->b, .execution_scope = SCOPE_WORKGROUP,
-               .memory_scope = SCOPE_WORKGROUP, .memory_semantics = NIR_MEMORY_ACQ_REL,
+   nir_barrier(&c->b, .execution_scope = scope,
+               .memory_scope = scope,
+               .memory_semantics = modes ? NIR_MEMORY_ACQ_REL : 0,
                .memory_modes = modes);
+   return true;
+}
+
+static bool
+sincos_op(struct air_ctx *c, const struct air_inst *in)
+{
+   if (in->num_operands != 3)
+      return air_error(c, "intrinsic: air.sincos with %u arguments",
+                       in->num_operands - 1);
+   nir_def *x = air_get_ssa(c, in->operands[1]);
+   struct air_val *cp = air_get(c, in->operands[2]);
+   if (!x || !cp)
+      return false;
+   if (cp->kind != AIR_VAL_PTR)
+      return air_error(c, "intrinsic: air.sincos cosine output is not a pointer");
+   uint32_t was_math = c->b.fp_math_ctrl;
+   air_builder_set_exact(&c->b, false);
+   nir_def *s = nir_fsin(&c->b, x);
+   nir_def *cs = nir_fcos(&c->b, x);
+   c->b.fp_math_ctrl = was_math;
+   if (!air_store_ptr(c, cp->ptr, cs, 0))
+      return false;
+   air_set(c, &in->base, air_val_ssa(c, s));
    return true;
 }
 
@@ -911,199 +1036,10 @@ discard_op(struct air_ctx *c, const struct air_inst *in)
    return true;
 }
 
-/* -- SIMD groups and quads ----------------------------------------------- */
-
-/* air.simd_* and air.quad_*: Metal's cross-lane operations.
- *
- * THE SIMD-GROUP HERE IS THE IMPLEMENTATION'S, NOT A 32-LANE ONE, and that is
- * the only way these can be translated honestly. Metal does not fix the width
- * -- a shader asks for it with air.get_simd_width (this file answers with
- * nir_load_subgroup_size) and a host asks MTLComputePipelineState for
- * threadExecutionWidth -- and it is 32 on every Apple GPU, which is why a
- * shader compiled for one may have the number built into it. This hardware's
- * is 64 or 128: `threadsize_base` is 64 for the A635 this port targets and ir3
- * doubles it per variant in the compute and fragment stages
- * (ir3_shader_get_subgroup_size, IR3_SINGLE_OR_DOUBLE).
- *
- * So the width a translated shader is TOLD and the width its votes are taken
- * over are the same number, whatever that number is: a shader that reads
- * air.get_simd_width and works from it is right, and a shader with 32 written
- * into it is wrong -- as it would be on any Metal implementation whose
- * SIMD-group is not 32 wide. Each of these leaves a note saying so, because it
- * is a thing the hardware cannot do exactly rather than a thing this frontend
- * chose.
- *
- * One more thing decides whether that consistency holds, and it is a property
- * of the GPU and not of this file: ir3 declares a fragment or vertex
- * subgroup to be ONE LANE and lowers a vote to its own argument on a device
- * without `has_getfiberid` (ir3_nir.c: `options.subgroup_size = 1`,
- * `lower_vote_trivial`). The A635 has it -- it is an a6xx gen4, and
- * freedreno_devices.py sets the flag for gen4 and above -- so the votes here
- * are real in every stage, and air.get_simd_width answers with the real width
- * in the same stages. On an a6xx below gen4 both would read 1, which is still
- * self-consistent and still not Metal's 32.
- *
- * air.simd_ballot is the one that cannot be translated at all, and it is
- * refused by name below rather than noted: its result is a 64-bit mask with
- * one bit per lane, and a lane count this frontend cannot bound at 64. A
- * popcount of a truncated mask is a smaller number and not a worse one.
- *
- * The QUAD operations are a different matter and are exact: a quad is four
- * consecutive lanes on both machines -- it is what a fragment derivative is
- * computed over -- so a swap inside one has the same meaning whatever the
- * SIMD-group's width is, and nir_lower_subgroups leaves the quad intrinsics
- * alone for ir3 (no lower_quad, and lower_vote_trivial does not reach them).
- */
-static bool
-simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
-        bool *handled)
-{
-   const char *op = n->part[0];
-
-   /* THE NAME IS DECIDED BEFORE AN ARGUMENT IS TOUCHED, which is the same rule
-    * math_op states above it and fc_defined_op exists for -- and getting it
-    * wrong here cost 46 modules of the 456 for the length of one commit. This
-    * function used to resolve its first argument before asking whether the
-    * name was one of its own, and every texture operation passes a texture
-    * HANDLE as that argument: air.sample_texture_2d came back "instruction: a
-    * pointer where a number belongs", which reads like a broken module and
-    * names no operation at all. The count was the only visible symptom and it
-    * was briefly attributed to somebody else's commit.
-    */
-   if (strncmp(op, "simd_", 5) && strncmp(op, "quad_", 5) &&
-       strcmp(op, "get_sample_position")) {
-      *handled = false;
-      return true;
-   }
-   *handled = true;
-
-   if (!strcmp(op, "simd_is_helper_thread")) {
-      /* Exact, and width-independent: a helper thread is one whose results
-       * are discarded, which is a property of the thread and not of a group.
-       * ir3 runs nir_lower_is_helper_invocation itself, and this is the other
-       * half of the discard above -- a demoted lane must answer yes here.
-       */
-      if (c->nir->info.stage != MESA_SHADER_FRAGMENT)
-         return air_error(c, "intrinsic: air.simd_is_helper_thread in a %s shader "
-                             "(there are no helper threads outside the fragment "
-                             "stage)", _mesa_shader_stage_to_string(c->nir->info.stage));
-      air_set(c, &in->base, air_val_ssa(c, nir_is_helper_invocation(&c->b, 1)));
-      return true;
-   }
-
-   if (!strcmp(op, "simd_ballot"))
-      return air_error(c, "intrinsic: air.%s -- a 64-bit mask with one bit per lane "
-                          "of the SIMD group, and ir3 runs this hardware's groups at "
-                          "64 or 128 lanes (threadsize_base 64, doubled per variant), "
-                          "so the mask this would produce cannot be known to hold "
-                          "every lane; a truncated one makes popcount answer a "
-                          "smaller number rather than an obviously wrong one",
-                       n->part[0]);
-
-   nir_def *a0 = in->num_operands > 1 ? air_get_ssa(c, in->operands[1]) : NULL;
-   if (in->num_operands > 1 && !a0)
-      return false;
-
-   if (!strcmp(op, "simd_all") || !strcmp(op, "simd_any")) {
-      bool all = !strcmp(op, "simd_all");
-      air_note(c, "air.%s is taken over the SIMD group this implementation has, "
-                  "which is not Metal's 32 lanes: ir3 runs 64 or 128 of them on this "
-                  "hardware. air.get_simd_width answers with the same number, so a "
-                  "shader that reads it is right and one with 32 built into it is not",
-               n->part[0]);
-      air_set(c, &in->base,
-              air_val_ssa(c, all ? nir_vote_all(&c->b, 1, a0)
-                                 : nir_vote_any(&c->b, 1, a0)));
-      return true;
-   }
-
-   if (!strcmp(op, "simd_broadcast_first")) {
-      air_note(c, "air.%s reads the first active lane of the SIMD group this "
-                  "implementation has, which is not Metal's 32 lanes; the value is "
-                  "the same one Metal would give wherever it is uniform across the "
-                  "group, and another lane's where it is not", n->part[0]);
-      air_set(c, &in->base, air_val_ssa(c, nir_read_first_invocation(&c->b, a0)));
-      return true;
-   }
-
-   if (!strcmp(op, "simd_shuffle")) {
-      nir_def *lane = air_get_ssa(c, in->operands[2]);
-      if (!lane)
-         return false;
-      air_note(c, "air.%s takes its lane number in the SIMD group this "
-                  "implementation has, which is not Metal's 32 lanes", n->part[0]);
-      air_set(c, &in->base,
-              air_val_ssa(c, nir_shuffle(&c->b, a0, nir_u2u32(&c->b, lane))));
-      return true;
-   }
-
-   if (!strcmp(op, "quad_shuffle_xor")) {
-      /* quad_shuffle_xor(data, mask) hands each lane the value of the lane
-       * whose number is its own exclusive-ored with the mask. Within a quad
-       * that is one of three fixed swaps, which is exactly the three NIR has:
-       * 1 swaps the two columns, 2 the two rows, 3 the diagonal. A mask of 0
-       * is the identity.
-       *
-       * A mask that is not a constant, or is 4 or more, is refused rather
-       * than translated: the first would need a selection over the three
-       * swaps, and the second leaves the quad, where Metal's own definition
-       * stops. Every call in Resident Evil 4's three modules passes a
-       * constant.
-       */
-      nir_def *mask = air_get_ssa(c, in->operands[2]);
-      if (!mask)
-         return false;
-      if (!nir_src_is_const(nir_src_for_ssa(mask)))
-         return air_error(c, "intrinsic: air.%s with a mask that is not a constant",
-                          n->part[0]);
-      uint64_t m = nir_src_as_uint(nir_src_for_ssa(mask));
-      switch (m) {
-      case 0: air_set(c, &in->base, air_val_ssa(c, a0)); return true;
-      case 1: air_set(c, &in->base,
-                      air_val_ssa(c, nir_quad_swap_horizontal(&c->b, a0)));
-              return true;
-      case 2: air_set(c, &in->base,
-                      air_val_ssa(c, nir_quad_swap_vertical(&c->b, a0)));
-              return true;
-      case 3: air_set(c, &in->base,
-                      air_val_ssa(c, nir_quad_swap_diagonal(&c->b, a0)));
-              return true;
-      default:
-         return air_error(c, "intrinsic: air.%s with mask %u, which leaves the quad",
-                          n->part[0], (unsigned)m);
-      }
-   }
-
-   /* air.get_sample_position(index, 0): the position of one sample within the
-    * pixel, which the hardware's sample pattern decides.
-    *
-    * REFUSED BY NAME, and the reason is half a pixel. NIR has the operation
-    * and the Adreno has the instruction -- nir_load_sample_pos_from_id, which
-    * ir3 emits as RGETPOS -- but that intrinsic's convention is an OFFSET
-    * from the pixel's centre, in [-0.5, 0.5]: ir3's own lowering of
-    * gl_SamplePosition adds (0.5, 0.5) to it and cites the dEQP case that
-    * fixes the difference (ir3_nir_lower_load_barycentric_at_sample.c).
-    * Metal's convention is not stated by anything on this machine -- not by
-    * the metal_graphics header on the device, which only names the function
-    * and its MSL section, and not by any string in the compiler libraries --
-    * and the two readings differ by exactly half a pixel, which is the kind
-    * of wrongness that looks like a slightly soft image rather than like a
-    * bug. 4 of Resident Evil 4's 7 879 modules call it, and the way to settle
-    * it is a measurement on the phone (draw one multisampled pixel, read the
-    * positions back) rather than a choice made here.
-    */
-   if (!strcmp(op, "get_sample_position"))
-      return air_error(c, "intrinsic: air.%s -- NIR's sample position is an offset "
-                          "from the pixel centre and Metal's convention is not "
-                          "attested anywhere on this machine; the two differ by half "
-                          "a pixel, so this is left to a measurement", n->part[0]);
-
-   *handled = false;
-   return true;
-}
-
+#include "air_simd.inc"
 #include "air_llvm.inc"
 #include "air_texture.inc"
+#include "air_imageblock.inc"
 
 /* -- the dispatcher ----------------------------------------------------- */
 
@@ -1126,13 +1062,22 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
    if (!strcmp(n.part[0], "is_function_constant_defined"))
       return fc_defined_op(c, in);
    if (n.num >= 2 && !strcmp(n.part[0], "wg") && !strcmp(n.part[1], "barrier"))
-      return barrier_op(c, in);
+      return barrier_op(c, in, SCOPE_WORKGROUP);
+   if (n.num >= 2 && !strcmp(n.part[0], "simdgroup") && !strcmp(n.part[1], "barrier"))
+      return barrier_op(c, in, SCOPE_SUBGROUP);
+   if (!strcmp(n.part[0], "sincos") || !strcmp(n.part[0], "fast_sincos"))
+      return sincos_op(c, in);
    if (!strcmp(n.part[0], "atomic"))
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))
       return discard_op(c, in);
 
    bool handled = false;
+   if (!air_imageblock_op(c, in, &n, &handled))
+      return false;
+   if (handled)
+      return true;
+
    /* before math_op, which resolves every argument as a number: these take a
     * lane number or nothing at all, and air.simd_sum falls through to it
     */

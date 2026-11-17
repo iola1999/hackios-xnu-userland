@@ -1,5 +1,57 @@
 /* AIR entry selection and common NIR finalization. Included by air_to_nir.c. */
 
+static bool
+reads_threadgroup(nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
+            case nir_intrinsic_barrier:
+            case nir_intrinsic_load_local_invocation_id:
+            case nir_intrinsic_load_local_invocation_index:
+            case nir_intrinsic_load_workgroup_id:
+            case nir_intrinsic_load_num_workgroups:
+            case nir_intrinsic_load_workgroup_size:
+            case nir_intrinsic_load_subgroup_invocation:
+            case nir_intrinsic_load_subgroup_id:
+            case nir_intrinsic_load_num_subgroups:
+            case nir_intrinsic_load_subgroup_size:
+            case nir_intrinsic_ballot:
+            case nir_intrinsic_read_invocation:
+            case nir_intrinsic_read_first_invocation:
+            case nir_intrinsic_shuffle:
+            case nir_intrinsic_shuffle_xor:
+            case nir_intrinsic_shuffle_up:
+            case nir_intrinsic_shuffle_down:
+            case nir_intrinsic_reduce:
+            case nir_intrinsic_inclusive_scan:
+            case nir_intrinsic_exclusive_scan:
+            case nir_intrinsic_vote_any:
+            case nir_intrinsic_vote_all:
+            case nir_intrinsic_vote_feq:
+            case nir_intrinsic_vote_ieq:
+            case nir_intrinsic_elect:
+            case nir_intrinsic_quad_broadcast:
+            case nir_intrinsic_quad_swap_horizontal:
+            case nir_intrinsic_quad_swap_vertical:
+            case nir_intrinsic_quad_swap_diagonal:
+            case nir_intrinsic_load_shared:
+            case nir_intrinsic_store_shared:
+            case nir_intrinsic_shared_atomic:
+            case nir_intrinsic_shared_atomic_swap:
+               return true;
+            default:
+               break;
+            }
+         }
+      }
+   }
+   return false;
+}
+
 nir_shader *
 air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_point,
            const struct air_to_nir_options *options,
@@ -160,10 +212,12 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
        * threadgroup buffer the dispatch sizes starts where the static arrays end. The
        * pointer value is the one air_set stored, and the body is translated after this.
        */
-      if (!c.error[0] && c.dynamic_threadgroup && c.shared_size) {
+      if (!c.error[0] && c.dynamic_threadgroup && c.shared_size && !c.imageblock_data_size) {
          c.shared_size = ALIGN_POT(c.shared_size, 16);
          c.dynamic_threadgroup->ptr.offset = nir_imm_int(&c.b, c.shared_size);
       }
+      if (!c.error[0] && c.imageblock_data_size)
+         air_plan_imageblock(&c);
       if (!c.error[0])
          materialise_globals(&c);
       if (!c.error[0])
@@ -259,9 +313,17 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       NIR_PASS(_, c.nir, nir_lower_returns);
       NIR_PASS(_, c.nir, nir_lower_scratch_to_var);
    }
+   if (c.imageblock_dim_var) {
+      NIR_PASS(_, c.nir, nir_lower_global_vars_to_local);
+      NIR_PASS(_, c.nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, c.nir, nir_opt_copy_prop);
+      NIR_PASS(_, c.nir, nir_opt_algebraic);
+      NIR_PASS(_, c.nir, nir_opt_constant_folding);
+      NIR_PASS(_, c.nir, nir_opt_dce);
+   }
    nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
    c.info->group_free = stage == MESA_SHADER_COMPUTE && !c.shared_size &&
-                        !reads_threadgroup(c.nir);
+                        !c.imageblock_data_size && !reads_threadgroup(c.nir);
 
    if (info) {
       if (kernel)

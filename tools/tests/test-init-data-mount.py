@@ -56,6 +56,11 @@ static int no_package(const char *path, struct stat *st) { (void)path; (void)st;
 static int fake_chmod(const char *path, int mode) {
     assert(!strcmp(path, "/dev/console") && mode == 0666); return 0;
 }
+static int fake_unlink(const char *path) {
+    assert(!strcmp(path, "/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist") ||
+           !strcmp(path, "/private/var/root/Library/Preferences/com.apple.cameracapture.volatile.plist"));
+    return 0;
+}
 static void check(int ok, const char *what) { (void)what; checks++; failures += !ok; }
 static const char *in_image(const char *path) { return path; }
 static ssize_t read_whole(const char *path, char *buf, size_t size) {
@@ -94,7 +99,7 @@ static int fake_sysctlbyname(const char *name, void *old, size_t *oldlen, void *
 #define pread fake_pread
 #define close fake_close
 #define symlink(...) unexpected()
-#define unlink(...) unexpected()
+#define unlink fake_unlink
 #define graft_tree(...) unexpected()
 #define own_tree(...) unexpected()
 #define fork(...) unexpected()

@@ -47,11 +47,14 @@ enum air_ptr_class {
     */
    AIR_PTR_ARGBUF,
    AIR_PTR_READ_SAMPLER,  /* compiler-provided integer-read handle; no resource binding */
+   AIR_PTR_TEXTURE_ARRAY, /* direct array<texture*, N> parameter; .binding is base, .span length */
 };
 
 struct air_ptr {
    enum air_ptr_class class;
    unsigned binding;
+   unsigned span;
+   unsigned scratch_base;
    bool is_image;                    /* a texture the shader writes: an image, not a view */
    bool is_null;                     /* air.get_null_texture_*: nothing behind it */
    nir_def *offset;                  /* bytes, 32-bit; NULL means zero. For a texture
@@ -102,9 +105,12 @@ struct air_val {
  */
 struct air_argbuf_member {
    uint64_t offset;        /* bytes from the start of the set: the KEY */
+   uint64_t size;          /* byte size of the member in the set */
    enum air_resource_kind kind;
    unsigned metal_id;      /* the member's own air.location_index: Metal's [[id(n)]] */
    unsigned index;         /* the flat per-kind index this frontend allocated */
+   unsigned span;          /* declared descriptor span (1 for scalar, >1 for texture array) */
+   unsigned slots;         /* allocated Gallium descriptor slots (1..span) */
 
    /* A buffer member: 1 device, 2 constant. The metadata does not say -- not
     * one of the 82 048 members of Resident Evil 4's 7 857 argument buffers
@@ -113,15 +119,17 @@ struct air_argbuf_member {
     * against it (argbuf_load). 0 for a texture or a sampler.
     */
    unsigned addrspace;
-   bool read, write;
+   bool read, write, is_constant;
    const char *name, *type_name;
    const struct air_md *node;   /* the member's own air.indirect_argument descriptor */
 };
 
 struct air_argbuf {
    unsigned metal_index;   /* the SET's own Metal [[buffer(n)]] */
-   unsigned size;          /* air.buffer_size: eight bytes per member */
+   unsigned size;          /* air.buffer_size */
    unsigned param;         /* the entry point's parameter the set arrives as */
+   unsigned const_ubo_index;
+   bool has_constants;
    const char *name, *type_name;
    unsigned num_members;
    struct air_argbuf_member *members;
@@ -237,6 +245,11 @@ struct air_ctx {
    unsigned shared_size;
    /* the threadgroup buffer argument the dispatch sizes, if the kernel has one */
    struct air_val *dynamic_threadgroup;
+   unsigned imageblock_data_size;
+   unsigned imageblock_base;
+   unsigned num_ib_helpers;
+   struct air_val *imageblock_param_ptr;
+   nir_variable *imageblock_dim_var;
 
    /* module-scope variables, by their air_global */
    struct hash_table *globals;
@@ -273,6 +286,7 @@ nir_def *air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_ty
                       unsigned align);
 bool air_store_ptr(struct air_ctx *c, struct air_ptr ptr, nir_def *value, unsigned align);
 struct air_ptr air_ptr_add(struct air_ctx *c, struct air_ptr ptr, nir_def *bytes);
+bool air_store_pointer_slot(struct air_ctx *c, const struct air_val *at, struct air_val *v);
 
 /* air.* and llvm.* calls; the result is set on the instruction by the callee */
 bool air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *name);
@@ -283,7 +297,12 @@ bool air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char
 void air_gather_quad_helpers(nir_shader *nir);
 /* AIR_DEBUG_SOLID / AIR_DEBUG_NODISCARD for one fragment shader (air_debug.inc) */
 void air_debug_fragment(nir_shader *nir);
-/* the texture at this binding may be left unbound by the application (air_resource.nullable) */
+/* the texture or buffer at this binding may be left unbound by the application (air_resource.nullable) */
 void air_texture_may_be_unbound(struct air_ctx *c, unsigned binding);
+void air_buffer_may_be_unbound(struct air_ctx *c, unsigned binding);
+bool air_translate_imageblock_input(struct air_ctx *c, unsigned param,
+                                    const struct air_type *t, bool is_explicit,
+                                    uint64_t data_size);
+void air_plan_imageblock(struct air_ctx *c);
 
 #endif /* AIR_PRIVATE_H */

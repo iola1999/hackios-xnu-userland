@@ -216,3 +216,83 @@ resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *re
    air_set(c, &in->base, air_val_ptr(c, p));
    return true;
 }
+
+static bool
+agg_type_has_pointer(const struct air_type *t)
+{
+   if (!t)
+      return true;
+   if (t->kind == AIR_TYPE_POINTER)
+      return true;
+   if (t->kind == AIR_TYPE_ARRAY)
+      return agg_type_has_pointer(t->elem);
+   if (t->kind == AIR_TYPE_STRUCT) {
+      for (unsigned i = 0; i < t->num_members; i++)
+         if (agg_type_has_pointer(t->members[i]))
+            return true;
+   }
+   return false;
+}
+
+static void *
+decl_agg_phi_regs(struct air_ctx *c, nir_builder *entry, const struct air_type *t)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+      void **subs = rzalloc_array(c->mem_ctx, void *, MAX2(n, 1));
+      for (unsigned i = 0; i < n; i++) {
+         const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
+         subs[i] = decl_agg_phi_regs(c, entry, et);
+      }
+      return subs;
+   }
+   return nir_decl_reg(entry, air_nir_components(t), air_nir_bit_size(c, t), 0);
+}
+
+static struct air_val *
+load_agg_phi_regs(struct air_ctx *c, const struct air_type *t, void *reg_tree)
+{
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+      void **subs = reg_tree;
+      struct air_val *agg = air_val_agg(c, n);
+      for (unsigned i = 0; i < n; i++) {
+         const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
+         agg->elems[i] = load_agg_phi_regs(c, et, subs[i]);
+      }
+      return agg;
+   }
+   return air_val_ssa(c, nir_load_reg(&c->b, (nir_def *)reg_tree));
+}
+
+static bool
+store_agg_phi_regs(struct air_ctx *c, const struct air_type *t, void *reg_tree,
+                   struct air_val *from)
+{
+   if (!from)
+      return false;
+   if (t->kind == AIR_TYPE_STRUCT || t->kind == AIR_TYPE_ARRAY) {
+      unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+      void **subs = reg_tree;
+      for (unsigned i = 0; i < n; i++) {
+         const struct air_type *et = t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem;
+         struct air_val *sub_val = (from->kind == AIR_VAL_AGG && i < from->num_elems)
+            ? from->elems[i] : NULL;
+         if (!sub_val) {
+            if (et->kind == AIR_TYPE_STRUCT || et->kind == AIR_TYPE_ARRAY)
+               return false;
+            nir_store_reg(&c->b,
+                          nir_imm_zero(&c->b, air_nir_components(et), air_nir_bit_size(c, et)),
+                          (nir_def *)subs[i]);
+            continue;
+         }
+         if (!store_agg_phi_regs(c, et, subs[i], sub_val))
+            return false;
+      }
+      return true;
+   }
+   if (from->kind != AIR_VAL_SSA || !from->def)
+      return false;
+   nir_store_reg(&c->b, from->def, (nir_def *)reg_tree);
+   return true;
+}

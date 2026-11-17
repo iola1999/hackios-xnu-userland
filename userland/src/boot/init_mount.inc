@@ -294,6 +294,9 @@ mount_writable(void)
 	}
 	printf("  %d directories, %d files\n", made, files);
 	check(ok && made > 50, "create the directories of the data volume");
+	/* Clear cached camera source backings so mounted V57 changes take effect on every boot. */
+	(void)unlink("/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist");
+	(void)unlink("/private/var/root/Library/Preferences/com.apple.cameracapture.volatile.plist");
 
 	/*
 	 * and the package manager's prefix, when the image was built with one (tools/mk-jb.sh): /jb of

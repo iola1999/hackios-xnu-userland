@@ -21,6 +21,22 @@ val_holds_ptr(const struct air_val *v)
    return false;
 }
 
+static bool
+type_holds_ptr(const struct air_type *t)
+{
+   if (!t)
+      return false;
+   if (t->kind == AIR_TYPE_POINTER)
+      return true;
+   if (t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_ARRAY)
+      return false;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   for (unsigned i = 0; i < n; i++)
+      if (type_holds_ptr(t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem))
+         return true;
+   return false;
+}
+
 /* Does this value hold a def the CALLER's impl built? A pointer is a resolution
  * rather than a def, and an aggregate of undef fields (Metal's `[8 x i8]` tail
  * padding, passed as undef) holds nothing at all; anything else would be a use
@@ -57,7 +73,67 @@ enum call_param_kind {
    CALL_PARAM_VALUE,
    CALL_PARAM_OFFSET,
    CALL_PARAM_AGG,
+   CALL_PARAM_PTR_SELECT,
 };
+
+static int
+ptr_select_params_count(const struct air_val *v)
+{
+   if (!v)
+      return -1;
+   if (v->kind == AIR_VAL_PTR_SELECT) {
+      if (!v->def || v->def->num_components != 1)
+         return -1;
+      int a = ptr_select_params_count(v->elems[0]);
+      int b = ptr_select_params_count(v->elems[1]);
+      return (a < 0 || b < 0) ? -1 : 1 + a + b;
+   }
+   if (v->kind == AIR_VAL_PTR) {
+      return v->ptr.offset && !nir_src_is_const(nir_src_for_ssa(v->ptr.offset)) ? 1 : 0;
+   }
+   return -1;
+}
+
+static void
+ptr_select_decl_params(const struct air_val *v, nir_function *fn, unsigned *idx)
+{
+   if (v->kind == AIR_VAL_PTR_SELECT) {
+      fn->params[(*idx)++] = (nir_parameter){ .num_components = 1, .bit_size = v->def->bit_size };
+      ptr_select_decl_params(v->elems[0], fn, idx);
+      ptr_select_decl_params(v->elems[1], fn, idx);
+   } else if (v->ptr.offset && !nir_src_is_const(nir_src_for_ssa(v->ptr.offset))) {
+      fn->params[(*idx)++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };
+   }
+}
+
+static struct air_val *
+ptr_select_from_params(struct air_ctx *c, struct air_val *v, unsigned *pidx)
+{
+   if (v->kind == AIR_VAL_PTR_SELECT) {
+      nir_def *cond = nir_load_param(&c->b, (*pidx)++);
+      struct air_val *a = ptr_select_from_params(c, v->elems[0], pidx);
+      struct air_val *b = ptr_select_from_params(c, v->elems[1], pidx);
+      return (a && b) ? air_val_ptr_select(c, cond, a, b) : NULL;
+   }
+   if (v->ptr.offset && !nir_src_is_const(nir_src_for_ssa(v->ptr.offset))) {
+      struct air_ptr p = v->ptr;
+      p.offset = nir_load_param(&c->b, (*pidx)++);
+      return air_val_ptr(c, p);
+   }
+   return val_in_current_impl(c, v);
+}
+
+static void
+ptr_select_to_sources(const struct air_val *v, nir_call_instr *call, unsigned *idx)
+{
+   if (v->kind == AIR_VAL_PTR_SELECT) {
+      call->params[(*idx)++] = nir_src_for_ssa(v->def);
+      ptr_select_to_sources(v->elems[0], call, idx);
+      ptr_select_to_sources(v->elems[1], call, idx);
+   } else if (v->ptr.offset && !nir_src_is_const(nir_src_for_ssa(v->ptr.offset))) {
+      call->params[(*idx)++] = nir_src_for_ssa(v->ptr.offset);
+   }
+}
 
 /* A struct or array passed by value travels as one parameter per number inside
  * it, in member order (CALL_PARAM_AGG): NIR has no aggregate parameter, and
@@ -139,6 +215,108 @@ agg_to_sources(struct air_ctx *c, const struct air_type *t, const struct air_val
    return true;
 }
 
+static bool
+ret_type_is_agg(const struct air_type *rt)
+{
+   if (!rt || rt->kind == AIR_TYPE_VOID || ret_member_is_number(rt))
+      return false;
+   if (rt->kind == AIR_TYPE_STRUCT)
+      return true;
+   return rt->kind == AIR_TYPE_ARRAY && agg_leaves(rt) > 0;
+}
+
+static unsigned
+ret_agg_count(const struct air_type *t)
+{
+   if (ret_member_is_number(t))
+      return 1;
+   if (t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_ARRAY)
+      return 0;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count, sum = 0;
+   for (unsigned i = 0; i < n; i++)
+      sum += ret_agg_count(t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem);
+   return sum;
+}
+
+static void
+ret_agg_params(struct air_ctx *c, const struct air_type *t, nir_function *fn, unsigned *idx)
+{
+   if (ret_member_is_number(t)) {
+      fn->params[(*idx)++] = (nir_parameter){
+         .num_components = 1, .bit_size = 32,
+         .is_return = true,
+         .mode = nir_var_function_temp,
+         .type = param_glsl_type(c, t),
+      };
+      return;
+   }
+   if (t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_ARRAY)
+      return;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   for (unsigned i = 0; i < n; i++)
+      ret_agg_params(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem, fn, idx);
+}
+
+static void
+ret_agg_vars(struct air_ctx *c, const struct air_type *t, nir_variable **fields,
+             nir_call_instr *call, unsigned *fidx, unsigned *pidx)
+{
+   if (ret_member_is_number(t)) {
+      nir_variable *var = nir_local_variable_create(c->b.impl, param_glsl_type(c, t), "callret");
+      fields[(*fidx)++] = var;
+      call->params[(*pidx)++] = nir_src_for_ssa(&nir_build_deref_var(&c->b, var)->def);
+      return;
+   }
+   if (t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_ARRAY)
+      return;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   for (unsigned i = 0; i < n; i++)
+      ret_agg_vars(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem,
+                   fields, call, fidx, pidx);
+}
+
+static struct air_val *
+ret_agg_load(struct air_ctx *c, const struct air_type *t, nir_variable **fields, unsigned *fidx)
+{
+   if (ret_member_is_number(t))
+      return air_val_ssa(c, nir_load_var(&c->b, fields[(*fidx)++]));
+   if (t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_ARRAY)
+      return NULL;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   struct air_val *agg = air_val_agg(c, n);
+   for (unsigned i = 0; i < n; i++)
+      agg->elems[i] = ret_agg_load(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem,
+                                   fields, fidx);
+   return agg;
+}
+
+static bool
+emit_callee_agg_return(struct air_ctx *c, const struct air_type *t,
+                       const struct air_val *v, unsigned *fidx)
+{
+   if (ret_member_is_number(t)) {
+      nir_deref_instr *dst = c->ret_fields[(*fidx)++];
+      if (!v)
+         return true;
+      if (v->kind != AIR_VAL_SSA)
+         return air_error(c, "instruction: a field of a returned aggregate is not a number");
+      nir_store_deref(&c->b, dst, v->def, nir_component_mask(v->def->num_components));
+      return true;
+   }
+   if (t->kind != AIR_TYPE_STRUCT && t->kind != AIR_TYPE_ARRAY)
+      return true;
+   unsigned n = t->kind == AIR_TYPE_STRUCT ? t->num_members : t->count;
+   if (v && (v->kind != AIR_VAL_AGG || v->num_elems != n))
+      return air_error(c, "instruction: a returned aggregate that was never built, "
+                          "from a function called in the module");
+   for (unsigned i = 0; i < n; i++) {
+      if (!emit_callee_agg_return(c, t->kind == AIR_TYPE_STRUCT ? t->members[i] : t->elem,
+                                  v ? v->elems[i] : NULL, fidx))
+         return false;
+   }
+   return true;
+}
+
 /* A function of the module, translated as a nir_function so that
  * nir_inline_functions can fold it into its callers afterwards.
  *
@@ -184,9 +362,14 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       bool ptr = argv && argv[i] && (argv[i]->kind == AIR_VAL_PTR ||
                                      val_holds_ptr(argv[i]));
       if (argv && argv[i] && argv[i]->kind == AIR_VAL_PTR_SELECT) {
-         air_error(c, "intrinsic: a call passing a pointer chosen at run time as "
-                      "argument %u", i);
-         return NULL;
+         if (ptr_select_params_count(argv[i]) < 0) {
+            air_error(c, "intrinsic: a call passing a pointer chosen at run time as "
+                         "argument %u", i);
+            return NULL;
+         }
+         kind[i] = CALL_PARAM_PTR_SELECT;
+         specialised = true;
+         continue;
       }
       if (ptr) {
          /* A constant byte offset is recreated in the callee, which keeps
@@ -240,17 +423,17 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * a number belongs", which was emit_return inside the callee asking for the
     * returned struct as a register.
     */
-   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
+   bool ret_struct = ret_type_is_agg(rt);
    unsigned nret = 0;
    if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++)
-         nret += ret_member_is_number(rt->members[i]);
+      nret = ret_agg_count(rt);
    } else if (has_ret) {
       nret = 1;
    }
    unsigned nparams = nret;
    for (unsigned i = 0; i < f->num_args; i++)
       nparams += kind[i] == CALL_PARAM_AGG ? (unsigned)agg_leaves(f->args[i].type) :
+                 kind[i] == CALL_PARAM_PTR_SELECT ? (unsigned)ptr_select_params_count(argv[i]) :
                  kind[i] != CALL_PARAM_NONE;
    nir_function *fn = nir_function_create(c->nir, f->base.name ? f->base.name : "callee");
    fn->num_params = nparams;
@@ -260,16 +443,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    unsigned idx = 0;
    const struct glsl_type *ret_glsl = NULL;
    if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
-            continue;
-         fn->params[idx++] = (nir_parameter){
-            .num_components = 1, .bit_size = 32,
-            .is_return = true,
-            .mode = nir_var_function_temp,
-            .type = param_glsl_type(c, rt->members[i]),
-         };
-      }
+      ret_agg_params(c, rt, fn, &idx);
    } else if (has_ret) {
       ret_glsl = param_glsl_type(c, rt);
       fn->params[idx++] = (nir_parameter){
@@ -284,6 +458,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
       if (kind[i] == CALL_PARAM_OFFSET) {
          /* the pointer's byte offset, 32-bit like every offset in air_ptr */
          fn->params[idx++] = (nir_parameter){ .num_components = 1, .bit_size = 32 };
+         continue;
+      }
+      if (kind[i] == CALL_PARAM_PTR_SELECT) {
+         ptr_select_decl_params(argv[i], fn, &idx);
          continue;
       }
       if (kind[i] == CALL_PARAM_AGG) {
@@ -346,17 +524,12 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * call's source at inline time and nir_opt_deref removes the cast afterwards.
     */
    if (ret_struct) {
-      c->ret_fields = rzalloc_array(c->mem_ctx, nir_deref_instr *,
-                                    MAX2(rt->num_members, 1));
-      c->num_ret_fields = rt->num_members;
-      unsigned p = 0;
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
-            continue;
-         c->ret_fields[i] =
-            nir_build_deref_cast(&c->b, nir_load_param(&c->b, p++),
-                                 nir_var_function_temp,
-                                 param_glsl_type(c, rt->members[i]), 0);
+      c->ret_fields = rzalloc_array(c->mem_ctx, nir_deref_instr *, MAX2(nret, 1));
+      c->num_ret_fields = nret;
+      for (unsigned p = 0; p < nret; p++) {
+         c->ret_fields[p] =
+            nir_build_deref_cast(&c->b, nir_load_param(&c->b, p),
+                                 nir_var_function_temp, fn->params[p].type, 0);
       }
    } else if (has_ret) {
       c->ret_deref = nir_build_deref_cast(&c->b, nir_load_param(&c->b, 0),
@@ -370,6 +543,15 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
          struct air_ptr p = argv[i]->ptr;
          p.offset = nir_load_param(&c->b, pidx++);
          air_set(c, &f->args[i], air_val_ptr(c, p));
+         continue;
+      }
+      if (kind[i] == CALL_PARAM_PTR_SELECT) {
+         struct air_val *value = ptr_select_from_params(c, argv[i], &pidx);
+         if (!value) {
+            ok = false;
+            break;
+         }
+         air_set(c, &f->args[i], value);
          continue;
       }
       if (kind[i] == CALL_PARAM_AGG) {
@@ -454,34 +636,34 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
          return false;
    }
 
+   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
+   if (type_holds_ptr(rt)) {
+      if (f == c->fn)
+         return air_error(c, "intrinsic: recursive call returning a pointer (%s)", name);
+      struct air_val *res = inline_module_function(c, f, argv);
+      if (c->error[0])
+         return false;
+      if (res)
+         air_set(c, &in->base, res);
+      return true;
+   }
+
    nir_function *fn = translate_callee(c, f, argv, kind);
    if (!fn)
       return false;   /* translate_callee has said why */
 
-   const struct air_type *rt = f->fn_type->elem;   /* FUNCTION: the return type */
    bool has_ret = rt && rt->kind != AIR_TYPE_VOID;
-   bool ret_struct = has_ret && rt->kind == AIR_TYPE_STRUCT;
+   bool ret_struct = ret_type_is_agg(rt);
+   unsigned nret = ret_struct ? ret_agg_count(rt) : 0;
 
    nir_variable *tmp = NULL;
-   /* One local per member for a struct return, in the member order
-    * translate_callee made its parameters from; the ones with no parameter stay
-    * NULL and the aggregate's element for them stays NULL too, which is the
-    * same thing an extractvalue of an undef field already reads.
-    */
    nir_variable **fields = ret_struct ?
-      rzalloc_array(c->mem_ctx, nir_variable *, MAX2(rt->num_members, 1)) : NULL;
+      rzalloc_array(c->mem_ctx, nir_variable *, MAX2(nret, 1)) : NULL;
    nir_call_instr *call = nir_call_instr_create(c->nir, fn);
    unsigned idx = 0;
    if (ret_struct) {
-      for (unsigned i = 0; i < rt->num_members; i++) {
-         if (!ret_member_is_number(rt->members[i]))
-            continue;
-         fields[i] = nir_local_variable_create(c->b.impl,
-                                               param_glsl_type(c, rt->members[i]),
-                                               "callret");
-         call->params[idx++] =
-            nir_src_for_ssa(&nir_build_deref_var(&c->b, fields[i])->def);
-      }
+      unsigned fidx = 0;
+      ret_agg_vars(c, rt, fields, call, &fidx, &idx);
    } else if (has_ret) {
       tmp = nir_local_variable_create(c->b.impl, param_glsl_type(c, rt), "callret");
       call->params[idx++] = nir_src_for_ssa(&nir_build_deref_var(&c->b, tmp)->def);
@@ -490,6 +672,10 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    for (unsigned i = 0; i < f->num_args; i++) {
       if (kind[i] == CALL_PARAM_OFFSET) {
          call->params[idx++] = nir_src_for_ssa(argv[i]->ptr.offset);
+         continue;
+      }
+      if (kind[i] == CALL_PARAM_PTR_SELECT) {
+         ptr_select_to_sources(argv[i], call, &idx);
          continue;
       }
       if (kind[i] == CALL_PARAM_AGG) {
@@ -508,11 +694,8 @@ air_call_in_module(struct air_ctx *c, const struct air_inst *in, const char *nam
    nir_builder_instr_insert(&c->b, &call->instr);
 
    if (ret_struct) {
-      struct air_val *agg = air_val_agg(c, rt->num_members);
-      for (unsigned i = 0; i < rt->num_members; i++)
-         if (fields[i])
-            agg->elems[i] = air_val_ssa(c, nir_load_var(&c->b, fields[i]));
-      air_set(c, &in->base, agg);
+      unsigned fidx = 0;
+      air_set(c, &in->base, ret_agg_load(c, rt, fields, &fidx));
    } else if (has_ret) {
       air_set(c, &in->base, air_val_ssa(c, nir_load_var(&c->b, tmp)));
    }

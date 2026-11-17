@@ -37,6 +37,54 @@ stream_raw_pool_requirements(const struct stream *s)
 	return r;
 }
 
+static CFDictionaryRef
+stream_gdc_rects(const struct stream *s)
+{
+	CFMutableDictionaryRef d = (CFMutableDictionaryRef)new_dict();
+	int32_t def_w = (int32_t)s->profile.width;
+	int32_t def_h = (int32_t)s->profile.height;
+
+	if (s->formats != NULL && s->format_index >= 0 && s->format_index < CFArrayGetCount(s->formats)) {
+		CFDictionaryRef fmt = CFArrayGetValueAtIndex(s->formats, s->format_index);
+		CFNumberRef fw = fmt != NULL ? CFDictionaryGetValue(fmt, CFSTR("VideoMaxWidth")) : NULL;
+		CFNumberRef fh = fmt != NULL ? CFDictionaryGetValue(fmt, CFSTR("VideoMaxHeight")) : NULL;
+
+		if (fw != NULL && CFGetTypeID(fw) == CFNumberGetTypeID()) {
+			CFNumberGetValue(fw, kCFNumberSInt32Type, &def_w);
+		}
+		if (fh != NULL && CFGetTypeID(fh) == CFNumberGetTypeID()) {
+			CFNumberGetValue(fh, kCFNumberSInt32Type, &def_h);
+		}
+	}
+	for (int i = 0; i < OUTPUTS; i++) {
+		CFDictionaryRef oc = s->out[i].config;
+		CFTypeRef cr = oc != NULL ? CFDictionaryGetValue(oc, CFSTR("CropRect")) : NULL;
+
+		if (cr != NULL && CFGetTypeID(cr) == CFDictionaryGetTypeID()) {
+			put(d, output_names[i], CFRetain(cr));
+			continue;
+		}
+		int32_t w = def_w, h = def_h;
+		CFNumberRef cw = oc != NULL ? CFDictionaryGetValue(oc, CFSTR("Width")) : NULL;
+		CFNumberRef ch = oc != NULL ? CFDictionaryGetValue(oc, CFSTR("Height")) : NULL;
+
+		if (cw != NULL && CFGetTypeID(cw) == CFNumberGetTypeID()) {
+			CFNumberGetValue(cw, kCFNumberSInt32Type, &w);
+		}
+		if (ch != NULL && CFGetTypeID(ch) == CFNumberGetTypeID()) {
+			CFNumberGetValue(ch, kCFNumberSInt32Type, &h);
+		}
+		CFMutableDictionaryRef r = (CFMutableDictionaryRef)new_dict();
+
+		put(r, "X", number_f(0));
+		put(r, "Y", number_f(0));
+		put(r, "Width", number_f(w));
+		put(r, "Height", number_f(h));
+		put(d, output_names[i], r);
+	}
+	return d;
+}
+
 /* ---- the frames ------------------------------------------------------------------------------------- */
 
 struct render_job {
@@ -257,6 +305,28 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	if (metadata != NULL) {
 		CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, metadata);
 
+		if (is_still) {
+			put(m, "SensorID", number_i32(s->camera->sensor == 1 ? 0x0904 : 0x0914));
+			put(m, "ExifOrientation", number_i32(6));
+			put(m, "AWBRGain", number_i32((int32_t)(isp->wb[0] * 4096.0f + 0.5f)));
+			put(m, "AWBGGain", number_i32(4096));
+			put(m, "AWBBGain", number_i32((int32_t)(isp->wb[2] * 4096.0f + 0.5f)));
+			if (s->last_lux >= 0 && isfinite(s->last_lux)) {
+				put(m, "LuxLevel", number_f(s->last_lux));
+			}
+			if (s->last_cct > 0 && isfinite(s->last_cct)) {
+				put(m, "CCT", number_f(s->last_cct));
+			}
+			if (s->still_redeye_wanted) {
+				put(m, "RedEyeAuxiliaryImage", CFRetain(kCFBooleanTrue));
+			}
+			if (s->torch >= 0) {
+				CFMutableDictionaryRef exif = (CFMutableDictionaryRef)new_dict();
+
+				put(exif, "Flash", number_i32(s->flash_lit ? 1 : 16));
+				put(m, "{Exif}", exif);
+			}
+		}
 		CVBufferSetAttachment(pb, md_attachment, m, kCVAttachmentMode_ShouldPropagate);
 		CFRelease(m);
 	}
@@ -617,6 +687,8 @@ worker(void *context)
 		bool af_now, af_locked;
 		float af_win[4];
 		pthread_mutex_lock(&s->lock);
+		s->last_lux = lux;
+		s->last_cct = cct;
 		af_now = s->af_now;
 		s->af_now = false;
 		af_locked = s->af_locked;
@@ -651,6 +723,25 @@ worker(void *context)
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
 		pthread_mutex_lock(&s->lock);
+		bool hold_still = false;
+		if (s->stills_wanted > 0 && !s->still_redeye_wanted && s->still_flash_wanted && s->torch >= 0) {
+			if (!s->flash_lit) {
+				uint32_t full = 1000;
+
+				if (write(s->torch, &full, sizeof(full)) == (ssize_t)sizeof(full)) {
+					s->flash_lit = true;
+					s->flash_warmup = 2;
+					hold_still = true;
+					say("still flash lit (1000/1000) for photograph warmup");
+				} else {
+					s->still_flash_wanted = false;
+					say("still flash write failed; delivering photograph without flash");
+				}
+			} else if (s->flash_warmup > 0) {
+				s->flash_warmup--;
+				hold_still = true;
+			}
+		}
 		bool gave_still = false;
 		for (int i = 0; s->state == CAM_STREAM_ACTIVE && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
@@ -668,7 +759,7 @@ worker(void *context)
 			if (out->handler == NULL || out->config == NULL || !(out->enabled || i == 0)) {
 				continue;
 			}
-			if (still && s->stills_wanted == 0) {
+			if (still && (s->stills_wanted == 0 || hold_still)) {
 				continue;
 			}
 			deliver(s, out, &isp, f, raw, metadata);
@@ -678,6 +769,18 @@ worker(void *context)
 		}
 		if (gave_still && s->stills_wanted > 0) {
 			s->stills_wanted--;
+			s->still_redeye_wanted = false;
+			if (s->stills_wanted == 0) {
+				if (s->flash_lit && s->torch >= 0) {
+					uint32_t dark = 0;
+
+					(void)write(s->torch, &dark, sizeof(dark));
+					say("still flash extinguished (0/1000) after photograph");
+				}
+				s->flash_lit = false;
+				s->still_flash_wanted = false;
+				s->flash_warmup = 0;
+			}
 			say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 		}
 		pthread_mutex_unlock(&s->lock);
@@ -692,6 +795,17 @@ worker(void *context)
 	free(buffer);
 	isp_destroy(&isp);
 	close(device);
+	pthread_mutex_lock(&s->lock);
+	if (s->flash_lit && s->torch >= 0) {
+		uint32_t dark = 0;
+
+		(void)write(s->torch, &dark, sizeof(dark));
+	}
+	s->flash_lit = false;
+	s->still_flash_wanted = false;
+	s->still_redeye_wanted = false;
+	s->flash_warmup = 0;
+	pthread_mutex_unlock(&s->lock);
 	if (s->state == CAM_STREAM_ACTIVE) {
 		s->state = CAM_STREAM_FAULTED;
 	}
@@ -756,6 +870,18 @@ stream_stop(CMBaseObjectRef o)
 		pthread_join(s->worker, NULL);
 		s->worker_started = false;
 	}
+	pthread_mutex_lock(&s->lock);
+	if (s->flash_lit && s->torch >= 0) {
+		uint32_t dark = 0;
+
+		(void)write(s->torch, &dark, sizeof(dark));
+		s->flash_lit = false;
+	}
+	s->still_flash_wanted = false;
+	s->still_redeye_wanted = false;
+	s->stills_wanted = 0;
+	s->flash_warmup = 0;
+	pthread_mutex_unlock(&s->lock);
 	return 0;
 }
 
@@ -909,7 +1035,20 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 		s->min_fps = s->max_fps = profile->fps_milli / 1000.0;
 	}
 	s->formats = build_stream_formats(profile, camera->field_of_view);
-	s->supported = profile != NULL ? supported(stream_props, sizeof(stream_props) / sizeof(stream_props[0])) :
-	    supported(torch_props, sizeof(torch_props) / sizeof(torch_props[0]));
+	if (profile != NULL) {
+		CFMutableDictionaryRef sup = (CFMutableDictionaryRef)supported(stream_props,
+		    sizeof(stream_props) / sizeof(stream_props[0]));
+
+		if (torch_fd >= 0) {
+			CFMutableDictionaryRef tprop = (CFMutableDictionaryRef)new_dict();
+
+			put(tprop, "PropertyType", CFRetain(CFSTR("Number")));
+			put(tprop, "ReadWriteStatus", CFRetain(CFSTR("ReadWrite")));
+			put(sup, "TorchLevel", tprop);
+		}
+		s->supported = sup;
+	} else {
+		s->supported = supported(torch_props, sizeof(torch_props) / sizeof(torch_props[0]));
+	}
 	return o;
 }
