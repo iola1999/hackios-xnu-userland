@@ -5830,10 +5830,13 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
          .maxy = (unsigned)CLAMP((float)(draw->scissor[1] + draw->scissor[3]), 0.0f, (float)h) });
    }
    /* The caller's depth/stencil state, or the pipeline's zeroed one, which is Metal's
-    * behaviour with no MTLDepthStencilState set: no test and no write.
+    * behaviour with no MTLDepthStencilState set: no test and no write. A pass without a
+    * depth/stencil attachment also takes the zeroed one: Metal skips both tests there,
+    * while freedreno's batch_draw_tracking reads pfb->zsbuf.texture whenever the bound
+    * state enables either test (MapKit's snapshot service crashed on that NULL).
     */
    state_objects(device, render->blend,
-                 draw->depth_stencil ? draw->depth_stencil->cso : render->dsa,
+                 draw->depth_stencil && draw->depth ? draw->depth_stencil->cso : render->dsa,
                  draw->scissor != NULL ? render->rast_scissor : render->rast,
                  render->vs_cso, fragment_cso);
 
