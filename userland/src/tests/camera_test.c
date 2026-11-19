@@ -3,11 +3,15 @@
  *
  * usage: camera_test native [OUTPUT]
  *        camera_test native-back [OUTPUT]
+ *        camera_test stream SENSOR [FRAMES LINES GAIN FLL]...
  *        camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]
  *        camera_test cycle [FRAMES]
  *        camera_test noise [SENSOR|all]
  *   native: captures one checked front mode 4 frame and optionally saves its RWFRAME1 header and RAW10 bytes.
  *   native-back: captures one checked back mode 24 frame through the same capture/read checks.
+ *   stream: native frames of sensor 1 (back) or 2 (front) in one session; each group of four numbers asks
+ *   for an exposure (lines, the gain register, the frame's length in lines) and takes FRAMES frames with
+ *   it. The first failed capture ends the run and prints the kernel's capture status.
  *   raw: reads FRAMES frames (default 150) from the kernel's /dev/annibale-camera, with src/camera_isp.c's
  *   exposure (unless noae: the kernel's, boot-args cam_shutter and cam_gain) and white balance working
  *   on them, says what came and how fast, and leaves the last one as a picture for the host (xl
@@ -146,6 +150,65 @@ ticks_ms(uint64_t ticks)
 		mach_timebase_info(&tb);
 	}
 	return (double)ticks * tb.numer / tb.denom / 1e6;
+}
+
+static int
+stream(uint32_t sensor, int count, char **groups)
+{
+	struct annibale_camera_profile profile;
+	struct annibale_camera_capture capture;
+	int device = camera_native_open(sensor, &profile);
+	int result = 0;
+
+	if (device < 0) {
+		perror("camera_test: stream open");
+		return 1;
+	}
+	size_t bytes = sizeof(struct annibale_camera_frame) + (size_t)profile.stride * profile.height;
+	uint8_t *buffer = malloc(bytes);
+
+	if (buffer == NULL) {
+		perror("camera_test: stream buffer");
+		close(device);
+		return 1;
+	}
+	for (int i = 0; i + 3 < count && result == 0; i += 4) {
+		int frames = atoi(groups[i]), got = 0;
+		struct annibale_camera_command c = { .command = ANNIBALE_CAMERA_EXPOSURE, .a = (uint32_t)atoi(groups[i + 1]),
+			.b = (uint32_t)atoi(groups[i + 2]), .c = (uint32_t)atoi(groups[i + 3]) };
+		double slowest = 0;
+
+		if (write(device, &c, sizeof(c)) != (ssize_t)sizeof(c)) {
+			printf("camera_test: stream: exposure %u lines, gain %u, frame %u refused: %s\n", c.a, c.b, c.c, strerror(errno));
+			result = 1;
+			break;
+		}
+		uint64_t start = mach_absolute_time();
+
+		for (; got < frames; got++) {
+			uint64_t asked = mach_absolute_time();
+
+			if (camera_native_frame(device, &profile, buffer, bytes, &capture) < 0) {
+				printf("camera_test: stream: lines %u gain %u frame %u: frame %d of %d failed: %s; state=%u error=%u "
+				    "flags=%#x buf=%#x top=%#x rx=%#x path=%#x consumed=%#x fifo=%u reset=%#x wm=%#x\n", c.a, c.b, c.c,
+				    got + 1, frames, strerror(errno), capture.state, capture.error, capture.flags, capture.buf_done,
+				    capture.top_irq, capture.rx_irq, capture.path_irq, capture.consumed_addr, capture.fifo_count,
+				    capture.reset_status, capture.wm_cfg);
+				result = 1;
+				break;
+			}
+			double took = ms_since(asked);
+
+			slowest = took > slowest ? took : slowest;
+		}
+		double total = ms_since(start);
+
+		printf("camera_test: stream: lines %u gain %u frame %u: %d of %d frames in %.0f ms (%.1f a second, the slowest "
+		    "%.0f ms)\n", c.a, c.b, c.c, got, frames, total, got > 0 ? got * 1000.0 / total : 0.0, slowest);
+	}
+	free(buffer);
+	close(device);
+	return result;
 }
 
 static const char *const sensor_names[4] = { "macro", "wide", "front", "ultra-wide" };
@@ -513,6 +576,9 @@ main(int argc, char **argv)
 	if ((argc == 2 || argc == 3) && strcmp(argv[1], "native-back") == 0) {
 		return native(1u, argc == 3 ? argv[2] : NULL);
 	}
+	if (argc >= 3 && strcmp(argv[1], "stream") == 0) {
+		return stream((uint32_t)atoi(argv[2]), argc - 3, argv + 3);
+	}
 	if (argc >= 2 && strcmp(argv[1], "raw") == 0) {
 		bool ae = true, awb = true, keep_raw = false, full = false;
 		int sensor = -1;
@@ -545,6 +611,6 @@ main(int argc, char **argv)
 	if (argc >= 2 && strcmp(argv[1], "cycle") == 0) {
 		return cycle(argc >= 3 ? atoi(argv[2]) : 30);
 	}
-	fprintf(stderr, "usage: camera_test native [OUTPUT]\n       camera_test native-back [OUTPUT]\n       camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
+	fprintf(stderr, "usage: camera_test native [OUTPUT]\n       camera_test native-back [OUTPUT]\n       camera_test stream SENSOR [FRAMES LINES GAIN FLL]...\n       camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
 	return 2;
 }

@@ -97,6 +97,13 @@ static const struct rwa_pixel_format rwa_pixel_formats[] = {
    ASTC(12, 10, 10), ASTC(13, 12, 10), ASTC(14, 12, 12),
 #undef ASTC
 
+   /* The planes of 'x420'/'xf20' as LumaChromaImage binds them: 10 bits at the top of each
+    * 16-bit sample. The A830 has no X6R10 format, so they are R16/RG16 here: a sample reads
+    * 65472/65535 of its value, and a write keeps the low six bits the shader computed.
+    */
+   { 576, "MTLPixelFormatR10Unorm_X6",     PIPE_FORMAT_R16_UNORM },
+   { 578, "MTLPixelFormatRG10Unorm_X12",   PIPE_FORMAT_R16G16_UNORM },
+
    /* RGB2P renders per-fragment codes here and stores both planes at pass end; 542 renders
     * blendable colour instead. */
    { 540, "MTLPixelFormatRGB8_420_2P",      PIPE_FORMAT_R8G8B8A8_UINT },

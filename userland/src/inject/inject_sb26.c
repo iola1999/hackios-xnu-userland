@@ -141,6 +141,72 @@ wake_screen_for_unlock(void)
 
 static unsigned boot_unlock_wait_appear;
 
+static id
+object_if_responds(id object, const char *name)
+{
+    SEL selector = sel_registerName(name);
+    if (!object || !class_respondsToSelector(object_getClass(object), selector)) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static id
+home_screen_controller(void)
+{
+    Class cls = objc_getClass("SBIconController");
+    SEL shared = sel_registerName("sharedInstanceIfExists");
+    if (!cls || !class_getClassMethod(cls, shared)) return nil;
+    return object_if_responds(((id (*)(Class, SEL))objc_msgSend)(cls, shared), "_mainDisplayHomeScreenController");
+}
+
+/*
+ * SBHomeScreenController holds icons and widgets back while iconOcclusionReasons carries the lock
+ * screen's bit 0x10. Two writers race at boot: the SBLockScreenUIWillDismissNotification handler
+ * clears the bit, and the display layout publisher's observer queues a block to the main queue
+ * with the mask of the layout it was called with, which sets the bit again when that layout still
+ * held com.apple.lock-screen. On an iPhone the first layout is delivered long before anyone can
+ * unlock. The unlock therefore waits until the published layout holds the lock screen's element.
+ * 1: it does; 0: not yet; -1: this build has no such getters.
+ */
+static int
+lock_screen_layout_published(void)
+{
+    id publisher = object_if_responds(object_if_responds(home_screen_controller(), "windowScene"),
+        "displayLayoutPublisher");
+    if (!publisher || !class_respondsToSelector(object_getClass(publisher), sel_registerName("currentLayout")))
+        return -1;
+    id elements = object_if_responds(object_if_responds(publisher, "currentLayout"), "elements");
+    if (!elements || !class_respondsToSelector(object_getClass(elements), sel_registerName("objectAtIndex:")))
+        return 0;
+    unsigned long count = ((unsigned long (*)(id, SEL))objc_msgSend)(elements, sel_registerName("count"));
+    for (unsigned long i = 0; i < count; i++) {
+        id element = ((id (*)(id, SEL, unsigned long))objc_msgSend)(elements, sel_registerName("objectAtIndex:"), i);
+        id identifier = object_if_responds(element, "identifier");
+        const char *text = identifier
+            ? ((const char *(*)(id, SEL))objc_msgSend)(identifier, sel_registerName("UTF8String")) : NULL;
+        if (text && !strcmp(text, "com.apple.lock-screen")) return 1;
+    }
+    return 0;
+}
+
+/* What the race above left behind, a few seconds after the unlock: 0 is the settled home screen. */
+static void
+report_icon_occlusion(void *context)
+{
+    (void)context;
+    id home = home_screen_controller();
+    SEL reasons = sel_registerName("iconOcclusionReasons");
+    if (!home || !class_respondsToSelector(object_getClass(home), reasons)) {
+        fprintf(stderr, "sb26: icons: no home screen controller to read iconOcclusionReasons from\n");
+        return;
+    }
+    fprintf(stderr, "sb26: icons: occlusion reasons %#llx, lock screen element in the layout %d\n",
+        ((unsigned long long (*)(id, SEL))objc_msgSend)(home, reasons), lock_screen_layout_published());
+}
+
+#define LAYOUT_WAITS 20
+static unsigned boot_unlock_wait_layout;
+static int boot_unlock_layout_seen;
+
 static int
 unlock_once(const char *why)
 {
@@ -180,6 +246,22 @@ unlock_once(const char *why)
             why, appear, boot_unlock_wait_appear);
         return 1;
     }
+    int published = lock_screen_layout_published();
+    if (published == 0 && boot_unlock_wait_layout < LAYOUT_WAITS) {
+        boot_unlock_wait_layout++;
+        fprintf(stderr, "sb26: unlock %s: waiting for the lock screen's layout element (wait=%u)\n",
+            why, boot_unlock_wait_layout);
+        return 1;
+    }
+    if (published == 1 && !boot_unlock_layout_seen) {
+        /* The observer's block for this layout is on the main queue behind us: unlock on the next attempt. */
+        boot_unlock_layout_seen = 1;
+        return 1;
+    }
+    if (published != 1) {
+        fprintf(stderr, "sb26: unlock %s: unlocking without the lock screen's layout element (state=%d wait=%u)\n",
+            why, published, boot_unlock_wait_layout);
+    }
     BOOL answer = ((BOOL (*)(id, SEL, long, id))objc_msgSend)(manager, unlock_ui, UNLOCK_SOURCE_COVER_SHEET, nil);
     int locked_after = ((BOOL (*)(id, SEL))objc_msgSend)(manager, locked);
     fprintf(stderr, "sb26: unlock %s: answer=%d locked_after=%d\n", why, answer, locked_after);
@@ -201,6 +283,8 @@ boot_unlock(void *context)
     if (state == 2 || (state == 0 && boot_unlock_seen_locked)) {
         fprintf(stderr, "sb26: boot unlock done after %lu attempts\n", (unsigned long)attempt);
         sb26_on_unlocked();
+        dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL,
+            report_icon_occlusion);
         return;
     }
     if (attempt >= UNLOCK_ATTEMPTS) {
