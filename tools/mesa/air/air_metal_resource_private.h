@@ -6,6 +6,7 @@
 struct rwa_bound_state {
    struct pipe_framebuffer_state fb;
    bool fb_set, viewport_set, stencil_set, scissor_set;
+   bool views_dirty[2];
    struct pipe_viewport_state viewport;
    struct pipe_stencil_ref stencil;
    struct pipe_scissor_state scissor;

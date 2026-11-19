@@ -1,0 +1,1180 @@
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -141,6 +141,8 @@
+       // TODO possibly larger size for streaming bo?
+       fd_ring->ring_bo = fd_bo_new_ring(submit->pipe->dev, SUBALLOC_SIZE);
+       fd_ring->offset = 0;
++      if (!fd_ring->ring_bo)
++         return;
+    } else {
+       fd_ring->ring_bo = fd_bo_ref(suballoc_bo);
+       fd_ring->offset = suballoc_offset;
+@@ -180,8 +182,12 @@
+       fd_ring->ring_bo = fd_bo_new_ring(submit->pipe->dev, size);
+    }
+ 
+-   if (!fd_ringbuffer_sp_init(fd_ring, size, flags))
++   if (!fd_ringbuffer_sp_init(fd_ring, size, flags)) {
++      if (fd_ring->ring_bo)
++         fd_bo_del(fd_ring->ring_bo);
++      slab_free(&fd_submit->ring_pool, fd_ring);
+       return NULL;
++   }
+ 
+    return &fd_ring->base;
+ }
+@@ -815,9 +821,13 @@
+ {
+    struct fd_ringbuffer *ring = &fd_ring->base;
+ 
+-   assert(fd_ring->ring_bo);
++   if (!fd_ring->ring_bo)
++      return NULL;
+ 
+    uint8_t *base = fd_bo_map(fd_ring->ring_bo);
++   if (!base)
++      return NULL;
++
+    ring->start = (void *)(base + fd_ring->offset);
+    ring->end = &(ring->start[size / 4]);
+    ring->cur = ring->start;
+@@ -876,6 +886,13 @@
+       fd_ring->offset = 0;
+    }
+ 
++   if (!dev->suballoc_bo) {
++      dev->suballoc_offset = 0;
++      simple_mtx_unlock(&dev->suballoc_lock);
++      free(fd_ring);
++      return NULL;
++   }
++
+    fd_ring->u.pipe = pipe;
+    fd_ring->ring_bo = fd_bo_ref(dev->suballoc_bo);
+    fd_ring->base.refcnt = 1;
+@@ -885,5 +902,10 @@
+ 
+    simple_mtx_unlock(&dev->suballoc_lock);
+ 
+-   return fd_ringbuffer_sp_init(fd_ring, size, _FD_RINGBUFFER_OBJECT);
++   struct fd_ringbuffer *ret = fd_ringbuffer_sp_init(fd_ring, size, _FD_RINGBUFFER_OBJECT);
++   if (!ret) {
++      fd_bo_del(fd_ring->ring_bo);
++      free(fd_ring);
++   }
++   return ret;
+ }
+--- a/src/freedreno/ir3/ir3_compiler.h
++++ b/src/freedreno/ir3/ir3_compiler.h
+@@ -37,10 +37,11 @@
+    bool disable_cache;
+ 
+    /* If >= 0, this specifies the bindless descriptor set + descriptor to use
+-    * for txf_ms_fb
++    * for txf_ms_fb, and an unused zeroed sampler slot within that set.
+     */
+    int bindless_fb_read_descriptor;
+    int bindless_fb_read_slot;
++   int bindless_fb_read_sampler;
+ 
+    /* True if 16-bit descriptors are available. */
+    bool storage_16bit;
+--- a/src/freedreno/ir3/ir3_compiler_nir.c
++++ b/src/freedreno/ir3/ir3_compiler_nir.c
+@@ -4017,6 +4017,7 @@
+       ctx->so->fb_read = true;
+       if (ctx->compiler->options.bindless_fb_read_descriptor >= 0) {
+          ctx->so->bindless_tex = true;
++         ctx->so->bindless_samp = true;
+          info.flags = IR3_INSTR_B;
+          info.base = ctx->compiler->options.bindless_fb_read_descriptor;
+          struct ir3_instruction *texture, *sampler;
+@@ -4036,7 +4037,9 @@
+                ir3_get_src(ctx, &tex->src[base_index].src)[0];
+             texture = ir3_ADD_U(b, texture, 0, base, 0);
+          }
+-         sampler = create_immed_typed(b, 0, TYPE_U32);
++         int samp_slot = ctx->compiler->options.bindless_fb_read_sampler >= 0 ?
++            ctx->compiler->options.bindless_fb_read_sampler : 0;
++         sampler = create_immed_typed(b, samp_slot, TYPE_U32);
+          info.samp_tex = ir3_collect(b, texture, sampler);
+          info.flags |= IR3_INSTR_S2EN;
+          if (tex->texture_non_uniform) {
+@@ -4050,9 +4053,8 @@
+             ir3_collect(b, create_immed_typed(b, ctx->so->num_samp, TYPE_U16),
+                         create_immed_typed(b, ctx->so->num_samp, TYPE_U16));
+          info.flags = IR3_INSTR_S2EN;
++         ctx->so->num_samp++;
+       }
+-
+-      ctx->so->num_samp++;
+    } else {
+       info = get_tex_samp_tex_src(ctx, tex);
+    }
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2983,6 +2983,7 @@
+          .disable_cache = true,
+          .bindless_fb_read_descriptor = -1,
+          .bindless_fb_read_slot = -1,
++         .bindless_fb_read_sampler = -1,
+          .storage_16bit = physical_device->info->props.storage_16bit,
+          .storage_8bit = physical_device->info->props.storage_8bit,
+          .shared_push_consts = !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
+@@ -38,7 +38,8 @@
+    if ((CHIP >= A7XX) && (flushes & FD6_BLIT_CLEAN_CACHE))
+       fd6_event_write<CHIP>(ctx, cs, FD_CCU_CLEAN_BLIT_CACHE);
+ 
+-   if ((CHIP >= A7XX) && (flushes & FD6_INVALIDATE_CCHE)) {
++   if ((CHIP >= A7XX) && (flushes & FD6_INVALIDATE_CCHE) &&
++       !(flushes & FD6_INVALIDATE_CACHE)) {
+       /* CP_CCHE_INVALIDATE is just a plain register write underneath, so
+        * it needs WFI before it, in order to invalidate at the right point.
+        */
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
+@@ -315,6 +315,13 @@
+    /* also account for UBO addresses: */
+    packets += 1;
+    size += 2 * const_state->num_app_ubos;
++
++   if (fd6_load_shader_consts_via_preamble<CHIP>(v) &&
++       v->type == MESA_SHADER_FRAGMENT &&
++       const_state->driver_params_ubo.idx >= 0) {
++      packets += 1;
++      size += 2;
++   }
+ 
+    unsigned sizedwords = (4 * packets) + size;
+    return sizedwords * 4;
+@@ -323,13 +330,25 @@
+ 
+ template <chip CHIP>
+ static void
+-emit_user_consts(const struct ir3_shader_variant *v, fd_cs &cs,
+-                 struct fd_constbuf_stateobj *constbuf)
++emit_user_consts(struct fd_context *ctx, const struct ir3_shader_variant *v,
++                 fd_cs &cs, struct fd_constbuf_stateobj *constbuf)
+ {
+    fd6_emit_ubos(v, cs, constbuf);
+ 
+-   if (fd6_load_shader_consts_via_preamble<CHIP>(v))
++   if (fd6_load_shader_consts_via_preamble<CHIP>(v)) {
++      const struct ir3_const_state *const_state = ir3_const_state(v);
++      if (v->type == MESA_SHADER_FRAGMENT &&
++          const_state->driver_params_ubo.idx >= 0) {
++         uint32_t subgroup = v->info.subgroup_size
++                                ? v->info.subgroup_size
++                                : (v->info.double_threadsize ? 128u : 64u);
++         uint32_t fs_dp[4] = { subgroup, 0, 0, 0 };
++         fd6_upload_emit_driver_ubo(ctx, cs, v,
++                                    const_state->driver_params_ubo.idx,
++                                    4, fs_dp);
++      }
+       return;
++   }
+ 
+    ir3_emit_user_consts(v, cs, constbuf);
+ }
+@@ -342,19 +361,21 @@
+    unsigned sz = emit->prog->user_consts_cmdstream_size;
+ 
+    fd_cs constobj(ctx->batch->submit, sz);
++   if (!((struct fd_ringbuffer *)constobj))
++      return NULL;
+ 
+-   emit_user_consts<CHIP>(emit->vs, constobj, &ctx->constbuf[MESA_SHADER_VERTEX]);
++   emit_user_consts<CHIP>(ctx, emit->vs, constobj, &ctx->constbuf[MESA_SHADER_VERTEX]);
+ 
+    if (PIPELINE == HAS_TESS_GS) {
+       if (emit->hs) {
+-         emit_user_consts<CHIP>(emit->hs, constobj, &ctx->constbuf[MESA_SHADER_TESS_CTRL]);
+-         emit_user_consts<CHIP>(emit->ds, constobj, &ctx->constbuf[MESA_SHADER_TESS_EVAL]);
++         emit_user_consts<CHIP>(ctx, emit->hs, constobj, &ctx->constbuf[MESA_SHADER_TESS_CTRL]);
++         emit_user_consts<CHIP>(ctx, emit->ds, constobj, &ctx->constbuf[MESA_SHADER_TESS_EVAL]);
+       }
+       if (emit->gs) {
+-         emit_user_consts<CHIP>(emit->gs, constobj, &ctx->constbuf[MESA_SHADER_GEOMETRY]);
++         emit_user_consts<CHIP>(ctx, emit->gs, constobj, &ctx->constbuf[MESA_SHADER_GEOMETRY]);
+       }
+    }
+-   emit_user_consts<CHIP>(emit->fs, constobj, &ctx->constbuf[MESA_SHADER_FRAGMENT]);
++   emit_user_consts<CHIP>(ctx, emit->fs, constobj, &ctx->constbuf[MESA_SHADER_FRAGMENT]);
+ 
+    return constobj;
+ }
+@@ -514,7 +535,7 @@
+ fd6_emit_cs_user_consts(struct fd_context *ctx, fd_cs &cs,
+                         const struct ir3_shader_variant *v)
+ {
+-   emit_user_consts<CHIP>(v, cs, &ctx->constbuf[MESA_SHADER_COMPUTE]);
++   emit_user_consts<CHIP>(ctx, v, cs, &ctx->constbuf[MESA_SHADER_COMPUTE]);
+ }
+ FD_GENX(fd6_emit_cs_user_consts);
+ 
+@@ -524,7 +545,7 @@
+ {
+    const struct ir3_const_state *const_state = ir3_const_state(v);
+ 
+-   if (const_state->consts_ubo.idx >= 0) {
++   if (const_state->consts_ubo.idx >= 0 && v->bo) {
+       int sizedwords = DIV_ROUND_UP(v->constant_data_size, 4);
+ 
+       fd6_emit_driver_ubo(cs, v, const_state->consts_ubo.idx, sizedwords,
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+@@ -57,7 +57,10 @@
+       fd_bo_del(fd6_ctx->vsc_draw_strm);
+    if (fd6_ctx->vsc_prim_strm)
+       fd_bo_del(fd6_ctx->vsc_prim_strm);
+-   fd_bo_del(fd6_ctx->control_mem);
++   if (fd6_ctx->control_mem)
++      fd_bo_del(fd6_ctx->control_mem);
++   if (fd6_ctx->zero_desc_mem)
++      fd_bo_del(fd6_ctx->zero_desc_mem);
+ 
+    fd_context_cleanup_common_vbos(&fd6_ctx->base);
+ 
+@@ -177,17 +180,23 @@
+    fd_context_add_map(ctx, FD_DIRTY_BLEND_COHERENT,
+       BIT(FD6_GROUP_PRIM_MODE_SYSMEM) | BIT(FD6_GROUP_PRIM_MODE_GMEM));
+ 
+-   fd_context_add_shader_map(ctx, MESA_SHADER_VERTEX, FD_DIRTY_SHADER_TEX,
++   fd_context_add_shader_map(ctx, MESA_SHADER_VERTEX,
++                             FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_TEX,
+                              BIT(FD6_GROUP_VS_TEX));
+-   fd_context_add_shader_map(ctx, MESA_SHADER_TESS_CTRL, FD_DIRTY_SHADER_TEX,
++   fd_context_add_shader_map(ctx, MESA_SHADER_TESS_CTRL,
++                             FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_TEX,
+                              BIT(FD6_GROUP_HS_TEX));
+-   fd_context_add_shader_map(ctx, MESA_SHADER_TESS_EVAL, FD_DIRTY_SHADER_TEX,
++   fd_context_add_shader_map(ctx, MESA_SHADER_TESS_EVAL,
++                             FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_TEX,
+                              BIT(FD6_GROUP_DS_TEX));
+-   fd_context_add_shader_map(ctx, MESA_SHADER_GEOMETRY, FD_DIRTY_SHADER_TEX,
++   fd_context_add_shader_map(ctx, MESA_SHADER_GEOMETRY,
++                             FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_TEX,
+                              BIT(FD6_GROUP_GS_TEX));
+-   fd_context_add_shader_map(ctx, MESA_SHADER_FRAGMENT, FD_DIRTY_SHADER_TEX,
++   fd_context_add_shader_map(ctx, MESA_SHADER_FRAGMENT,
++                             FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_TEX,
+                              BIT(FD6_GROUP_FS_TEX));
+-   fd_context_add_shader_map(ctx, MESA_SHADER_COMPUTE, FD_DIRTY_SHADER_TEX,
++   fd_context_add_shader_map(ctx, MESA_SHADER_COMPUTE,
++                             FD_DIRTY_SHADER_PROG | FD_DIRTY_SHADER_TEX,
+                              BIT(FD6_GROUP_CS_TEX));
+ 
+    fd_context_add_shader_map(ctx, MESA_SHADER_VERTEX,
+@@ -300,10 +309,23 @@
+    fd6_ctx->control_mem =
+       fd_bo_new(screen->dev, 0x1000, 0, "control");
+ 
+-   fd_context_add_private_bo(&fd6_ctx->base, fd6_ctx->control_mem);
++   if (fd6_ctx->control_mem) {
++      fd_context_add_private_bo(&fd6_ctx->base, fd6_ctx->control_mem);
+ 
+-   memset(fd_bo_map(fd6_ctx->control_mem), 0, sizeof(struct fd6_control));
++      void *ctrl = fd_bo_map(fd6_ctx->control_mem);
++      if (ctrl)
++         memset(ctrl, 0, sizeof(struct fd6_control));
++   }
+ 
++   fd6_ctx->zero_desc_mem =
++      fd_bo_new(screen->dev, 0x1000, FD_BO_GPUREADONLY, "zero_desc");
++   if (fd6_ctx->zero_desc_mem) {
++      fd_context_add_private_bo(&fd6_ctx->base, fd6_ctx->zero_desc_mem);
++      void *zero_desc = fd_bo_map(fd6_ctx->zero_desc_mem);
++      if (zero_desc)
++         memset(zero_desc, 0, 0x1000);
++   }
++
+    fd_context_setup_common_vbos(&fd6_ctx->base);
+ 
+    fd6_blitter_init<CHIP>(pctx);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.h
+@@ -85,6 +85,7 @@
+     * functions.  See 'struct fd6_control'
+     */
+    struct fd_bo *control_mem;
++   struct fd_bo *zero_desc_mem;
+    uint32_t seqno;
+ 
+    /* pre-baked stateobj for stream-out disable: */
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -510,6 +510,10 @@
+       emit.hs = fd6_emit_get_prog(&emit)->hs;
+       emit.ds = fd6_emit_get_prog(&emit)->ds;
+       emit.gs = fd6_emit_get_prog(&emit)->gs;
++   } else {
++      emit.hs = NULL;
++      emit.ds = NULL;
++      emit.gs = NULL;
+    }
+    emit.fs = fd6_emit_get_prog(&emit)->fs;
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -41,10 +41,11 @@
+ tex_state(struct fd_context *ctx, mesa_shader_stage type)
+    assert_dt
+ {
+-   if (ctx->tex[type].num_textures == 0)
++   struct fd6_texture_state *state = fd6_texture_state<CHIP>(ctx, type);
++   if (!state || !state->stateobj)
+       return NULL;
+ 
+-   return fd_ringbuffer_ref(fd6_texture_state<CHIP>(ctx, type)->stateobj);
++   return fd_ringbuffer_ref(state->stateobj);
+ }
+ 
+ static struct fd_ringbuffer *
+@@ -552,11 +553,33 @@
+    const struct ir3_shader_variant *fs = emit->fs;
+ 
+    /* Special case, we need to re-emit bindless FS state w/ the
+-    * fb-read state appended:
++    * fb-read state appended, and ensure bindless descriptor bases and
++    * all active stage texture descriptors are re-emitted whenever
++    * FD6_GROUP_PROG_CONFIG clears SP_UPDATE_CNTL:
+     */
+-   if ((emit->dirty_groups & BIT(FD6_GROUP_PROG)) && fs->fb_read) {
+-      ctx->batch->gmem_reason |= FD_GMEM_FB_READ;
+-      emit->dirty_groups |= BIT(FD6_GROUP_FS_BINDLESS);
++   if (emit->dirty_groups & BIT(FD6_GROUP_PROG)) {
++      emit->dirty_groups |= BIT(FD6_GROUP_VS_TEX) | BIT(FD6_GROUP_FS_TEX);
++      if (emit->vs->bindless_ibo)
++         emit->dirty_groups |= BIT(FD6_GROUP_VS_BINDLESS);
++      if (PIPELINE == HAS_TESS_GS) {
++         if (emit->hs)
++            emit->dirty_groups |= BIT(FD6_GROUP_HS_TEX);
++         if (emit->hs && emit->hs->bindless_ibo)
++            emit->dirty_groups |= BIT(FD6_GROUP_HS_BINDLESS);
++         if (emit->ds)
++            emit->dirty_groups |= BIT(FD6_GROUP_DS_TEX);
++         if (emit->ds && emit->ds->bindless_ibo)
++            emit->dirty_groups |= BIT(FD6_GROUP_DS_BINDLESS);
++         if (emit->gs)
++            emit->dirty_groups |= BIT(FD6_GROUP_GS_TEX);
++         if (emit->gs && emit->gs->bindless_ibo)
++            emit->dirty_groups |= BIT(FD6_GROUP_GS_BINDLESS);
++      }
++      if (fs->fb_read || fs->bindless_ibo) {
++         if (fs->fb_read)
++            ctx->batch->gmem_reason |= FD_GMEM_FB_READ;
++         emit->dirty_groups |= BIT(FD6_GROUP_FS_BINDLESS);
++      }
+    }
+ 
+    u_foreach_bit (b, emit->dirty_groups) {
+@@ -720,6 +743,9 @@
+    uint32_t gen_dirty = ctx->gen_dirty &
+          (BIT(FD6_GROUP_PROG) | BIT(FD6_GROUP_CS_TEX) | BIT(FD6_GROUP_CS_BINDLESS));
+ 
++   if ((gen_dirty & BIT(FD6_GROUP_PROG)) && cp->v->bindless_ibo)
++      gen_dirty |= BIT(FD6_GROUP_CS_BINDLESS);
++
+    u_foreach_bit (b, gen_dirty) {
+       enum fd6_state_id group = (enum fd6_state_id)b;
+ 
+@@ -939,8 +965,11 @@
+ fd6_emit_static_context_regs(struct fd_context *ctx, fd_cs &cs)
+ {
+    struct fd_screen *screen = ctx->screen;
++   struct fd6_context *fd6_ctx = fd6_context(ctx);
++   struct fd_bo *zero_desc = fd6_ctx->zero_desc_mem;
++   const unsigned num_bindless = CHIP >= A7XX ? 8 : 5;
+ 
+-   fd_crb crb(cs, 84);
++   fd_crb crb(cs, 114 + 4 * num_bindless);
+ 
+    crb.add(SP_GFX_USIZE(CHIP));
+    crb.add(A6XX_TPL1_PS_ROTATION_CNTL());
+@@ -1017,7 +1046,35 @@
+    for (int32_t i = 0; i < 32; i++)
+       crb.add(A6XX_VFD_VERTEX_BUFFER_SIZE(i, 0));
+ 
+-   struct fd6_context *fd6_ctx = fd6_context(ctx);
++   /* Point unbound texture/sampler/bindless bases at zero_desc_mem so a stage
++    * that samples 0 textures never leaves an uninitialized or zero IOVA:
++    */
++   crb.add(A6XX_SP_VS_SAMPLER_BASE(zero_desc));
++   crb.add(A6XX_SP_VS_TEXMEMOBJ_BASE(zero_desc));
++   crb.add(A6XX_SP_VS_TSIZE(0));
++   crb.add(A6XX_SP_HS_SAMPLER_BASE(zero_desc));
++   crb.add(A6XX_SP_HS_TEXMEMOBJ_BASE(zero_desc));
++   crb.add(A6XX_SP_HS_TSIZE(0));
++   crb.add(A6XX_SP_DS_SAMPLER_BASE(zero_desc));
++   crb.add(A6XX_SP_DS_TEXMEMOBJ_BASE(zero_desc));
++   crb.add(A6XX_SP_DS_TSIZE(0));
++   crb.add(A6XX_SP_GS_SAMPLER_BASE(zero_desc));
++   crb.add(A6XX_SP_GS_TEXMEMOBJ_BASE(zero_desc));
++   crb.add(A6XX_SP_GS_TSIZE(0));
++   crb.add(A6XX_SP_PS_SAMPLER_BASE(zero_desc));
++   crb.add(A6XX_SP_PS_TEXMEMOBJ_BASE(zero_desc));
++   crb.add(A6XX_SP_PS_TSIZE(0));
++   crb.add(A6XX_SP_CS_SAMPLER_BASE(zero_desc));
++   crb.add(A6XX_SP_CS_TEXMEMOBJ_BASE(zero_desc));
++   crb.add(A6XX_SP_CS_TSIZE(0));
++
++   for (unsigned i = 0; i < num_bindless; i++) {
++      crb.add(SP_GFX_BINDLESS_BASE_DESCRIPTOR(CHIP, i,
++         .desc_size = BINDLESS_DESCRIPTOR_64B, .bo = zero_desc));
++      crb.add(SP_CS_BINDLESS_BASE_DESCRIPTOR(CHIP, i,
++         .desc_size = BINDLESS_DESCRIPTOR_64B, .bo = zero_desc));
++   }
++
+    struct fd_bo *bcolor_mem = fd6_ctx->bcolor_mem;
+ 
+    crb.add(A6XX_TPL1_GFX_BORDER_COLOR_BASE(.bo = bcolor_mem));
+@@ -1137,7 +1194,14 @@
+          .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,
+       ));
+ 
++   if (CHIP >= A8XX) {
++      fd_pkt4(cs, 1).add(A6XX_SP_CS_BINDLESS_INVALIDATE(.dword = 0xff));
++      fd_pkt4(cs, 1).add(A6XX_SP_GFX_BINDLESS_INVALIDATE(.dword = 0xff));
++   }
++
+    fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
++   if (CHIP >= A8XX)
++      fd_pkt7(cs, CP_WAIT_FOR_ME, 0);
+ 
+    fd6_emit_ib<CHIP>(cs, fd6_context(ctx)->restore);
+    fd6_emit_gmem_cache_cntl<CHIP>(cs, screen, false);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+@@ -2213,6 +2213,9 @@
+                      FD6_FLUSH_CACHE |
+                      FD6_WAIT_FOR_IDLE;
+ 
++   if (CHIP >= A8XX)
++      batch->barrier |= FD6_WAIT_FOR_ME;
++
+    if (!batch->nondraw)
+       batch->barrier |= FD6_FLUSH_CCU_DEPTH | FD6_INVALIDATE_CCU_DEPTH;
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_image.cc
+@@ -139,7 +139,14 @@
+     * shader could use variable indexing into the set of UAVs to
+     * get at them.  See piglit arb_shader_image_load_store-invalid.
+     */
+-   if (!set->descriptor[slot][1])
++   bool nonzero = false;
++   for (unsigned i = 0; i < FDL6_TEX_CONST_DWORDS; i++) {
++      if (set->descriptor[slot][i]) {
++         nonzero = true;
++         break;
++      }
++   }
++   if (!nonzero)
+       return;
+ 
+    fd6_descriptor_set_invalidate(set);
+@@ -189,7 +196,9 @@
+    struct fd_shaderimg_stateobj *imgso = &ctx->shaderimg[shader];
+    struct fd6_descriptor_set *set = descriptor_set(ctx, shader);
+ 
+-   fd_cs cs(ctx->batch->submit, 19 * 4);
++   fd_cs cs(ctx->batch->submit, 24 * 4);
++   if (!((struct fd_ringbuffer *)cs))
++      return NULL;
+ 
+    /* Don't re-use a previous descriptor set if appending the
+     * fb-read descriptor, as that can change across batches.
+@@ -229,9 +238,16 @@
+              */
+             FD_BO_GPUREADONLY | FD_BO_CACHED_COHERENT,
+             "%s bindless", _mesa_shader_stage_to_abbrev(shader));
++      if (!set->bo)
++         return NULL;
+       fd_bo_mark_for_dump(set->bo);
+ 
+       uint32_t *desc_buf = (uint32_t *)fd_bo_map(set->bo);
++      if (!desc_buf) {
++         fd_bo_del(set->bo);
++         set->bo = NULL;
++         return NULL;
++      }
+ 
+       memcpy(desc_buf, set->descriptor, sizeof(set->descriptor));
+ 
+@@ -249,6 +265,9 @@
+             };
+             util_dynarray_append(&ctx->batch->fb_read_patches, patch);
+          }
++         /* Keep dedicated bindless_fb_read_sampler slot (63) valid and zeroed. */
++         memset(&desc_buf[(IR3_BINDLESS_DESC_COUNT - 1) * FDL6_TEX_CONST_DWORDS],
++                0, FDL6_TEX_CONST_DWORDS * sizeof(uint32_t));
+       }
+    }
+ 
+@@ -266,10 +285,12 @@
+    cs.attach_bo(set->bo);
+ 
+    if (shader == MESA_SHADER_COMPUTE) {
+-      with_crb (cs, 5) {
+-         crb.add(SP_UPDATE_CNTL(CHIP,
+-            .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
+-         ));
++      with_crb (cs, 6) {
++         if (CHIP < A8XX) {
++            crb.add(SP_UPDATE_CNTL(CHIP,
++               .cs_bindless = CHIP == A6XX ? 0x1f : 0xff,
++            ));
++         }
+          crb.add(SP_CS_BINDLESS_BASE_DESCRIPTOR(CHIP,
+             idx, .desc_size = BINDLESS_DESCRIPTOR_64B, .bo = set->bo,
+          ));
+@@ -279,6 +300,8 @@
+                idx, .desc_size = BINDLESS_DESCRIPTOR_64B, .bo = set->bo,
+             ));
+          }
++         if (CHIP >= A8XX)
++            crb.add(A6XX_SP_CS_BINDLESS_INVALIDATE(.dword = 0xff));
+       }
+ 
+       if ((CHIP < A8XX) && bufso->enabled_mask) {
+@@ -313,10 +336,12 @@
+             ));
+       }
+    } else {
+-      with_crb (cs, 5) {
+-         crb.add(SP_UPDATE_CNTL(CHIP,
+-            .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,
+-         ));
++      with_crb (cs, 6) {
++         if (CHIP < A8XX) {
++            crb.add(SP_UPDATE_CNTL(CHIP,
++               .gfx_bindless = CHIP == A6XX ? 0x1f : 0xff,
++            ));
++         }
+          crb.add(SP_GFX_BINDLESS_BASE_DESCRIPTOR(CHIP,
+             idx, .desc_size = BINDLESS_DESCRIPTOR_64B, .bo = set->bo,
+          ));
+@@ -325,6 +350,8 @@
+                idx, .desc_size = BINDLESS_DESCRIPTOR_64B, .bo = set->bo,
+             ));
+          }
++         if (CHIP >= A8XX)
++            crb.add(A6XX_SP_GFX_BINDLESS_INVALIDATE(.dword = 0xff));
+       }
+ 
+       if ((CHIP < A8XX) && bufso->enabled_mask) {
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
+@@ -45,6 +45,9 @@
+ static void
+ emit_shader_regs(struct fd_screen *screen, fd_cs &cs, const struct ir3_shader_variant *so)
+ {
++   if (!so->bo)
++      return;
++
+    fd_crb crb(cs, 14);
+ 
+    mesa_shader_stage type = so->type;
+@@ -89,16 +92,28 @@
+    ir3_get_private_mem(screen, so);
+ 
+    auto pvtmem = &screen->pvtmem[so->pvtmem_per_wave];
+-   uint32_t per_sp_size = pvtmem->per_sp_size;
+-   struct fd_bo *pvtmem_bo = NULL;
++   struct fd_bo *pvtmem_bo = (so->pvtmem_size > 0) ? pvtmem->bo : NULL;
++   uint32_t per_fiber_size = pvtmem_bo ? pvtmem->per_fiber_size : 0;
++   uint32_t per_sp_size = pvtmem_bo ? pvtmem->per_sp_size : 0;
+ 
+-   if (so->pvtmem_size > 0) { /* SP_xS_PVT_MEM_ADDR */
+-      pvtmem_bo = pvtmem->bo;
++   if (pvtmem_bo)
+       crb.attach_bo(pvtmem_bo);
+-   }
+ 
+    crb.attach_bo(so->bo);
+ 
++/* Emit private-memory registers only when the shader actually uses scratch/spilling; skipping
++ * zero writes keeps in-flight draws on an earlier shader from racing with SP_*_PVT_MEM_BASE = 0. */
++#define EMIT_PVT_MEM(STAGE) \
++   if (pvtmem_bo) { \
++      crb.add(A6XX_SP_##STAGE##_PVT_MEM_PARAM(.memsizeperitem = per_fiber_size)); \
++      crb.add(A6XX_SP_##STAGE##_PVT_MEM_BASE(pvtmem_bo)); \
++      crb.add(A6XX_SP_##STAGE##_PVT_MEM_SIZE( \
++         .totalpvtmemsize = per_sp_size, \
++         .perwavememlayout = so->pvtmem_per_wave, \
++      )); \
++      crb.add(A6XX_SP_##STAGE##_PVT_MEM_STACK_OFFSET(.offset = per_sp_size)); \
++   }
++
+    switch (type) {
+    case MESA_SHADER_VERTEX:
+       crb.add(A6XX_SP_VS_CNTL_0(
+@@ -111,15 +126,7 @@
+       crb.add(A6XX_SP_VS_INSTR_SIZE(so->instrlen));
+       crb.add(A6XX_SP_VS_PROGRAM_COUNTER_OFFSET());
+       crb.add(A6XX_SP_VS_BASE(so->bo));
+-      crb.add(A6XX_SP_VS_PVT_MEM_PARAM(
+-         .memsizeperitem = pvtmem->per_fiber_size,
+-      ));
+-      crb.add(A6XX_SP_VS_PVT_MEM_BASE(pvtmem_bo));
+-      crb.add(A6XX_SP_VS_PVT_MEM_SIZE(
+-         .totalpvtmemsize = per_sp_size,
+-         .perwavememlayout = so->pvtmem_per_wave,
+-      ));
+-      crb.add(A6XX_SP_VS_PVT_MEM_STACK_OFFSET(.offset = per_sp_size));
++      EMIT_PVT_MEM(VS)
+       if (CHIP >= A7XX)
+          crb.add(SP_VS_VGS_CNTL(CHIP));
+       break;
+@@ -133,15 +140,7 @@
+       crb.add(A6XX_SP_HS_INSTR_SIZE(so->instrlen));
+       crb.add(A6XX_SP_HS_PROGRAM_COUNTER_OFFSET());
+       crb.add(A6XX_SP_HS_BASE(so->bo));
+-      crb.add(A6XX_SP_HS_PVT_MEM_PARAM(
+-         .memsizeperitem = pvtmem->per_fiber_size,
+-      ));
+-      crb.add(A6XX_SP_HS_PVT_MEM_BASE(pvtmem_bo));
+-      crb.add(A6XX_SP_HS_PVT_MEM_SIZE(
+-         .totalpvtmemsize = per_sp_size,
+-         .perwavememlayout = so->pvtmem_per_wave,
+-      ));
+-      crb.add(A6XX_SP_HS_PVT_MEM_STACK_OFFSET(.offset = per_sp_size));
++      EMIT_PVT_MEM(HS)
+       if (CHIP >= A7XX)
+          crb.add(SP_HS_VGS_CNTL(CHIP));
+       break;
+@@ -155,15 +154,7 @@
+       crb.add(A6XX_SP_DS_INSTR_SIZE(so->instrlen));
+       crb.add(A6XX_SP_DS_PROGRAM_COUNTER_OFFSET());
+       crb.add(A6XX_SP_DS_BASE(so->bo));
+-      crb.add(A6XX_SP_DS_PVT_MEM_PARAM(
+-         .memsizeperitem = pvtmem->per_fiber_size,
+-      ));
+-      crb.add(A6XX_SP_DS_PVT_MEM_BASE(pvtmem_bo));
+-      crb.add(A6XX_SP_DS_PVT_MEM_SIZE(
+-         .totalpvtmemsize = per_sp_size,
+-         .perwavememlayout = so->pvtmem_per_wave,
+-      ));
+-      crb.add(A6XX_SP_DS_PVT_MEM_STACK_OFFSET(.offset = per_sp_size));
++      EMIT_PVT_MEM(DS)
+       if (CHIP >= A7XX)
+          crb.add(SP_DS_VGS_CNTL(CHIP));
+       break;
+@@ -177,15 +168,7 @@
+       crb.add(A6XX_SP_GS_INSTR_SIZE(so->instrlen));
+       crb.add(A6XX_SP_GS_PROGRAM_COUNTER_OFFSET());
+       crb.add(A6XX_SP_GS_BASE(so->bo));
+-      crb.add(A6XX_SP_GS_PVT_MEM_PARAM(
+-         .memsizeperitem = pvtmem->per_fiber_size,
+-      ));
+-      crb.add(A6XX_SP_GS_PVT_MEM_BASE(pvtmem_bo));
+-      crb.add(A6XX_SP_GS_PVT_MEM_SIZE(
+-         .totalpvtmemsize = per_sp_size,
+-         .perwavememlayout = so->pvtmem_per_wave,
+-      ));
+-      crb.add(A6XX_SP_GS_PVT_MEM_STACK_OFFSET(.offset = per_sp_size));
++      EMIT_PVT_MEM(GS)
+       if (CHIP >= A7XX)
+          crb.add(SP_GS_VGS_CNTL(CHIP));
+       break;
+@@ -211,15 +194,7 @@
+       crb.add(A6XX_SP_PS_INSTR_SIZE(so->instrlen));
+       crb.add(A6XX_SP_PS_PROGRAM_COUNTER_OFFSET());
+       crb.add(A6XX_SP_PS_BASE(so->bo));
+-      crb.add(A6XX_SP_PS_PVT_MEM_PARAM(
+-         .memsizeperitem = pvtmem->per_fiber_size,
+-      ));
+-      crb.add(A6XX_SP_PS_PVT_MEM_BASE(pvtmem_bo));
+-      crb.add(A6XX_SP_PS_PVT_MEM_SIZE(
+-         .totalpvtmemsize = per_sp_size,
+-         .perwavememlayout = so->pvtmem_per_wave,
+-      ));
+-      crb.add(A6XX_SP_PS_PVT_MEM_STACK_OFFSET(.offset = per_sp_size));
++      EMIT_PVT_MEM(PS)
+       if (CHIP >= A7XX)
+          crb.add(SP_PS_VGS_CNTL(CHIP));
+       break;
+@@ -237,21 +212,14 @@
+       crb.add(A6XX_SP_CS_INSTR_SIZE(so->instrlen));
+       crb.add(A6XX_SP_CS_PROGRAM_COUNTER_OFFSET());
+       crb.add(A6XX_SP_CS_BASE(so->bo));
+-      crb.add(A6XX_SP_CS_PVT_MEM_PARAM(
+-         .memsizeperitem = pvtmem->per_fiber_size,
+-      ));
+-      crb.add(A6XX_SP_CS_PVT_MEM_BASE(pvtmem_bo));
+-      crb.add(A6XX_SP_CS_PVT_MEM_SIZE(
+-         .totalpvtmemsize = per_sp_size,
+-         .perwavememlayout = so->pvtmem_per_wave,
+-      ));
+-      crb.add(A6XX_SP_CS_PVT_MEM_STACK_OFFSET(.offset = per_sp_size));
++      EMIT_PVT_MEM(CS)
+       if (CHIP >= A7XX)
+          crb.add(SP_CS_VGS_CNTL(CHIP));
+       break;
+    default:
+       UNREACHABLE("bad shader stage");
+    }
++#undef EMIT_PVT_MEM
+ 
+    fd_screen_unlock(screen);
+ }
+@@ -260,8 +228,8 @@
+ void
+ fd6_emit_shader(struct fd_screen *screen, fd_cs &cs, const struct ir3_shader_variant *so)
+ {
+-   if (!so) {
+-      /* shader stage disabled */
++   if (!so || !so->bo) {
++      /* shader stage disabled or BO allocation failed */
+       return;
+    }
+ 
+@@ -1314,6 +1282,10 @@
+    emit_linkmap<CHIP>(cs, b);
+ 
+    fd_crb crb(cs, 100);
++   if (b->binning_pass) {
++      crb.add(SP_PS_CONST_CONFIG(CHIP));
++      crb.add(A6XX_SP_PS_CONFIG());
++   }
+ 
+    crb.add(PC_STEREO_RENDERING_CNTL(CHIP));
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
+@@ -262,7 +262,9 @@
+       return NULL;
+ 
+    so->base = *cso;
++   fd_screen_lock(ctx->screen);
+    so->seqno = util_idalloc_alloc(&fd6_context(ctx)->tex_ids);
++   fd_screen_unlock(ctx->screen);
+ 
+    if (cso->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
+       miplinear = true;
+@@ -406,10 +408,10 @@
+       }
+    }
+ 
+-   fd_screen_unlock(ctx->screen);
+-
+    util_idalloc_free(&fd6_ctx->tex_ids, samp->seqno);
+ 
++   fd_screen_unlock(ctx->screen);
++
+    free(hwcso);
+ }
+ 
+@@ -417,14 +419,17 @@
+ fd6_sampler_view_create(struct pipe_context *pctx, struct pipe_resource *prsc,
+                         const struct pipe_sampler_view *cso)
+ {
+-   struct fd6_context *fd6_ctx = fd6_context(fd_context(pctx));
++   struct fd_context *ctx = fd_context(pctx);
++   struct fd6_context *fd6_ctx = fd6_context(ctx);
+    struct fd6_pipe_sampler_view *so = CALLOC_STRUCT(fd6_pipe_sampler_view);
+ 
+    if (!so)
+       return NULL;
+ 
+    so->base = *cso;
++   fd_screen_lock(ctx->screen);
+    so->seqno = util_idalloc_alloc(&fd6_ctx->tex_ids);
++   fd_screen_unlock(ctx->screen);
+    pipe_reference(NULL, &prsc->reference);
+    so->base.texture = prsc;
+    so->base.reference.count = 1;
+@@ -606,7 +611,9 @@
+ 
+    pipe_resource_reference(&view->base.texture, NULL);
+ 
++   fd_screen_lock(ctx->screen);
+    util_idalloc_free(&fd6_context(ctx)->tex_ids, view->seqno);
++   fd_screen_unlock(ctx->screen);
+ 
+    free(view);
+ }
+@@ -648,6 +655,8 @@
+ {
+    struct fd_bo *tex_desc = NULL, *samp_desc = NULL;
+    fd_cs cs(ctx->pipe, 32 * 4);
++   if (!((struct fd_ringbuffer *)cs))
++      return NULL;
+ 
+    unsigned num_samplers = tex->num_samplers;
+    if (num_samplers == 0 && tex->num_textures > 0)
+@@ -657,7 +666,11 @@
+       samp_desc = fd_bo_new(ctx->dev, num_samplers * 4 * 4,
+                             FD_BO_GPUREADONLY | FD_BO_HINT_COMMAND,
+                             "samp desc");
++      if (!samp_desc)
++         goto fail_cs;
+       uint32_t *buf = (uint32_t *)fd_bo_map(samp_desc);
++      if (!buf)
++         goto fail_samp;
+       fd_bo_mark_for_dump(samp_desc);
+ 
+       for (unsigned i = 0; i < num_samplers; i++) {
+@@ -677,7 +690,13 @@
+       tex_desc = fd_bo_new(ctx->dev, tex->num_textures * 16 * 4,
+                            FD_BO_GPUREADONLY | FD_BO_HINT_COMMAND,
+                            "tex desc");
++      if (!tex_desc)
++         goto fail_samp;
+       uint32_t *buf = (uint32_t *)fd_bo_map(tex_desc);
++      if (!buf) {
++         fd_bo_del(tex_desc);
++         goto fail_samp;
++      }
+       fd_bo_mark_for_dump(tex_desc);
+ 
+       for (unsigned i = 0; i < tex->num_textures; i++) {
+@@ -700,40 +719,46 @@
+       cs.attach_bo(tex_desc);
+    }
+ 
+-   with_crb (cs, 5) {
+-      switch (type) {
+-      case MESA_SHADER_VERTEX:
+-         crb.add(A6XX_SP_VS_SAMPLER_BASE(samp_desc));
+-         crb.add(A6XX_SP_VS_TEXMEMOBJ_BASE(tex_desc));
+-         crb.add(A6XX_SP_VS_TSIZE(tex->num_textures));
+-         break;
+-      case MESA_SHADER_TESS_CTRL:
+-         crb.add(A6XX_SP_HS_SAMPLER_BASE(samp_desc));
+-         crb.add(A6XX_SP_HS_TEXMEMOBJ_BASE(tex_desc));
+-         crb.add(A6XX_SP_HS_TSIZE(tex->num_textures));
+-         break;
+-      case MESA_SHADER_TESS_EVAL:
+-         crb.add(A6XX_SP_DS_SAMPLER_BASE(samp_desc));
+-         crb.add(A6XX_SP_DS_TEXMEMOBJ_BASE(tex_desc));
+-         crb.add(A6XX_SP_DS_TSIZE(tex->num_textures));
+-         break;
+-      case MESA_SHADER_GEOMETRY:
+-         crb.add(A6XX_SP_GS_SAMPLER_BASE(samp_desc));
+-         crb.add(A6XX_SP_GS_TEXMEMOBJ_BASE(tex_desc));
+-         crb.add(A6XX_SP_GS_TSIZE(tex->num_textures));
+-         break;
+-      case MESA_SHADER_FRAGMENT:
+-         crb.add(A6XX_SP_PS_SAMPLER_BASE(samp_desc));
+-         crb.add(A6XX_SP_PS_TEXMEMOBJ_BASE(tex_desc));
+-         crb.add(A6XX_SP_PS_TSIZE(tex->num_textures));
+-         break;
+-      case MESA_SHADER_COMPUTE:
+-         crb.add(A6XX_SP_CS_SAMPLER_BASE(samp_desc));
+-         crb.add(A6XX_SP_CS_TEXMEMOBJ_BASE(tex_desc));
+-         crb.add(A6XX_SP_CS_TSIZE(tex->num_textures));
+-         break;
+-      default:
+-         UNREACHABLE("bad state block");
++   {
++      struct fd_bo *zero_desc = fd6_context(ctx)->zero_desc_mem;
++      struct fd_bo *samp_base = samp_desc ? samp_desc : zero_desc;
++      struct fd_bo *tex_base = tex_desc ? tex_desc : zero_desc;
++
++      with_crb (cs, 5) {
++         switch (type) {
++         case MESA_SHADER_VERTEX:
++            crb.add(A6XX_SP_VS_SAMPLER_BASE(samp_base));
++            crb.add(A6XX_SP_VS_TEXMEMOBJ_BASE(tex_base));
++            crb.add(A6XX_SP_VS_TSIZE(tex->num_textures));
++            break;
++         case MESA_SHADER_TESS_CTRL:
++            crb.add(A6XX_SP_HS_SAMPLER_BASE(samp_base));
++            crb.add(A6XX_SP_HS_TEXMEMOBJ_BASE(tex_base));
++            crb.add(A6XX_SP_HS_TSIZE(tex->num_textures));
++            break;
++         case MESA_SHADER_TESS_EVAL:
++            crb.add(A6XX_SP_DS_SAMPLER_BASE(samp_base));
++            crb.add(A6XX_SP_DS_TEXMEMOBJ_BASE(tex_base));
++            crb.add(A6XX_SP_DS_TSIZE(tex->num_textures));
++            break;
++         case MESA_SHADER_GEOMETRY:
++            crb.add(A6XX_SP_GS_SAMPLER_BASE(samp_base));
++            crb.add(A6XX_SP_GS_TEXMEMOBJ_BASE(tex_base));
++            crb.add(A6XX_SP_GS_TSIZE(tex->num_textures));
++            break;
++         case MESA_SHADER_FRAGMENT:
++            crb.add(A6XX_SP_PS_SAMPLER_BASE(samp_base));
++            crb.add(A6XX_SP_PS_TEXMEMOBJ_BASE(tex_base));
++            crb.add(A6XX_SP_PS_TSIZE(tex->num_textures));
++            break;
++         case MESA_SHADER_COMPUTE:
++            crb.add(A6XX_SP_CS_SAMPLER_BASE(samp_base));
++            crb.add(A6XX_SP_CS_TEXMEMOBJ_BASE(tex_base));
++            crb.add(A6XX_SP_CS_TSIZE(tex->num_textures));
++            break;
++         default:
++            UNREACHABLE("bad state block");
++         }
+       }
+    }
+ 
+@@ -764,6 +789,13 @@
+    }
+ 
+    return cs;
++
++fail_samp:
++   if (samp_desc)
++      fd_bo_del(samp_desc);
++fail_cs:
++   fd_ringbuffer_del((struct fd_ringbuffer *)cs);
++   return NULL;
+ }
+ 
+ /**
+@@ -828,6 +860,8 @@
+ 
+       struct fd6_pipe_sampler_view *view =
+          fd6_pipe_sampler_view(tex->textures[i]);
++      if (unlikely(view->rsc_seqno != fd_resource(view->base.texture)->seqno))
++         fd6_sampler_view_update<CHIP>(ctx, view);
+ 
+       key.view_seqno[i] = view->seqno;
+    }
+@@ -853,13 +887,20 @@
+ 
+    if (entry) {
+       state = (struct fd6_texture_state *)entry->data;
++      bool stale = false;
+       for (unsigned i = 0; i < MIN2(tex->num_textures, ARRAY_SIZE(state->view_rsc_seqno)); i++) {
+          uint16_t seqno = tex->textures[i] ?
+                fd_resource(tex->textures[i]->texture)->seqno : 0;
+ 
+-         assert(state->view_rsc_seqno[i] == seqno);
++         if (unlikely(state->view_rsc_seqno[i] != seqno)) {
++            stale = true;
++            break;
++         }
+       }
+-      goto out_unlock;
++      if (!stale)
++         goto out_unlock;
++      remove_tex_entry(fd6_ctx, entry);
++      state = NULL;
+    }
+ 
+    state = CALLOC_STRUCT(fd6_texture_state);
+@@ -877,6 +918,11 @@
+ 
+    state->key = key;
+    state->stateobj = build_texture_state(ctx, type, tex);
++   if (!state->stateobj) {
++      free(state);
++      state = NULL;
++      goto out_unlock;
++   }
+ 
+    /* NOTE: uses copy of key in state obj, because pointer passed by caller
+     * is probably on the stack
+@@ -913,7 +959,8 @@
+       STATIC_ASSERT(ARRAY_SIZE(state->view_rsc_seqno) == ARRAY_SIZE(state->key.view_seqno));
+ 
+       for (unsigned i = 0; i < ARRAY_SIZE(state->view_rsc_seqno); i++) {
+-         if (rsc->seqno == state->view_rsc_seqno[i]) {
++         if (rsc->prev_seqno == state->view_rsc_seqno[i] ||
++             rsc->seqno == state->view_rsc_seqno[i]) {
+             struct fd6_texture_state *tex =
+                   (struct fd6_texture_state *)entry->data;
+             tex->invalidate = true;
+@@ -950,6 +997,10 @@
+ 
+    fd6_ctx->tex_cache = _mesa_hash_table_create(NULL, tex_key_hash, tex_key_equals);
+    util_idalloc_init(&fd6_ctx->tex_ids, 256);
++   /* Reserve id 0 so live view/sampler seqnos never collide with NULL slots in fd6_texture_key. */
++   unsigned zero_id = util_idalloc_alloc(&fd6_ctx->tex_ids);
++   assert(zero_id == 0);
++   (void)zero_id;
+ }
+ FD_GENX(fd6_texture_init);
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_texture.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_texture.h
+@@ -48,7 +48,7 @@
+ struct fd6_sampler_stateobj {
+    struct pipe_sampler_state base;
+    uint32_t descriptor[4];
+-   uint16_t seqno;
++   uint32_t seqno;
+ };
+ 
+ static inline struct fd6_sampler_stateobj *
+@@ -59,7 +59,7 @@
+ 
+ struct fd6_pipe_sampler_view {
+    struct pipe_sampler_view base;
+-   uint16_t seqno;
++   uint32_t seqno;
+ 
+    /* TEX_CONST descriptor */
+    uint32_t descriptor[FDL6_TEX_CONST_DWORDS];
+@@ -90,10 +90,11 @@
+  */
+ 
+ struct fd6_texture_key {
+-   uint16_t view_seqno[16];
+-   uint16_t samp_seqno[16];
++   uint32_t view_seqno[16];
++   uint32_t samp_seqno[16];
+    uint8_t type;
+    uint8_t num_textures;
++   uint16_t pad;
+ };
+ 
+ struct fd6_texture_state {
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -80,14 +80,12 @@
+ 
+    /* per-shader-stage resources: */
+    for (unsigned stage = 0; stage < MESA_SHADER_STAGES; stage++) {
+-      /* Constbufs.. note that constbuf[0] is normal uniforms emitted in
+-       * cmdstream rather than by pointer..
+-       */
++      /* Constbufs (including cb[0], which Metal uniform buffers can back by BO): */
+       if ((rsc->dirty & FD_DIRTY_CONST) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_CONST)) {
++          !(ctx->dirty_shader[stage] & FD_DIRTY_SHADER_CONST)) {
+          struct fd_constbuf_stateobj *cb = &ctx->constbuf[stage];
+          const unsigned num_ubos = util_last_bit(cb->enabled_mask);
+-         for (unsigned i = 1; i < num_ubos; i++) {
++         for (unsigned i = 0; i < num_ubos; i++) {
+             if (cb->cb[i].buffer == prsc) {
+                fd_dirty_shader_resource(ctx, prsc, stage,
+                                         FD_DIRTY_SHADER_CONST, false);
+@@ -98,7 +96,7 @@
+ 
+       /* Textures */
+       if ((rsc->dirty & FD_DIRTY_TEX) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_TEX)) {
++          !(ctx->dirty_shader[stage] & FD_DIRTY_SHADER_TEX)) {
+          struct fd_texture_stateobj *tex = &ctx->tex[stage];
+          for (unsigned i = 0; i < tex->num_textures; i++) {
+             if (tex->textures[i] && (tex->textures[i]->texture == prsc)) {
+@@ -111,7 +109,7 @@
+ 
+       /* Images */
+       if ((rsc->dirty & FD_DIRTY_IMAGE) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_IMAGE)) {
++          !(ctx->dirty_shader[stage] & FD_DIRTY_SHADER_IMAGE)) {
+          struct fd_shaderimg_stateobj *si = &ctx->shaderimg[stage];
+          const unsigned num_images = util_last_bit(si->enabled_mask);
+          for (unsigned i = 0; i < num_images; i++) {
+@@ -126,7 +124,7 @@
+ 
+       /* SSBOs */
+       if ((rsc->dirty & FD_DIRTY_SSBO) &&
+-          !(ctx->dirty_shader[stage] & FD_DIRTY_SSBO)) {
++          !(ctx->dirty_shader[stage] & FD_DIRTY_SHADER_SSBO)) {
+          struct fd_shaderbuf_stateobj *sb = &ctx->shaderbuf[stage];
+          const unsigned num_ssbos = util_last_bit(sb->enabled_mask);
+          for (unsigned i = 0; i < num_ssbos; i++) {
+@@ -162,6 +160,7 @@
+ {
+    struct fd_screen *screen = fd_screen(rsc->b.b.screen);
+ 
++   rsc->prev_seqno = rsc->seqno;
+    rsc->bo = bo;
+    rsc->seqno = seqno_next_u16(&screen->rsc_seqno);
+ }
+@@ -287,6 +286,7 @@
+    fd_resource_tracking_reference(&dst->track, src->track);
+    src->is_replacement = true;
+ 
++   dst->prev_seqno = dst->seqno;
+    dst->seqno = seqno_next_u16(&ctx->screen->rsc_seqno);
+ 
+    fd_screen_unlock(ctx->screen);
+@@ -492,6 +492,7 @@
+    rsc->needs_ubwc_clear = temp;
+ 
+    SWAP(rsc->layout, shadow->layout);
++   rsc->prev_seqno = rsc->seqno;
+    rsc->seqno = seqno_next_u16(&ctx->screen->rsc_seqno);
+ 
+    /* at this point, the newly created shadow buffer is not referenced
+--- a/src/gallium/drivers/freedreno/freedreno_resource.h
++++ b/src/gallium/drivers/freedreno/freedreno_resource.h
+@@ -126,6 +126,7 @@
+ 
+    /* Sequence # incremented each time bo changes: */
+    uint16_t seqno;
++   uint16_t prev_seqno;
+ 
+    /* Is this buffer a replacement created by threaded_context to avoid
+     * a stall in PIPE_MAP_DISCARD_WHOLE_RESOURCE|PIPE_MAP_WRITE case?
+--- a/src/gallium/drivers/freedreno/freedreno_state.c
++++ b/src/gallium/drivers/freedreno/freedreno_state.c
+@@ -137,16 +137,22 @@
+     * passing a NULL cb, or a cb with no buffer:
+     */
+    if (!cb || !(cb->user_buffer || cb->buffer)) {
+-      so->enabled_mask &= ~(1 << index);
++      so->enabled_mask &= ~(1u << index);
++      fd_context_dirty_shader(ctx, shader, FD_DIRTY_SHADER_CONST);
+       return;
+    }
+ 
+    if (cb->user_buffer && ctx->screen->gen >= 6) {
+       upload_user_buffer(pctx, &so->cb[index]);
+       cb = &so->cb[index];
++      if (!cb->buffer) {
++         so->enabled_mask &= ~(1u << index);
++         fd_context_dirty_shader(ctx, shader, FD_DIRTY_SHADER_CONST);
++         return;
++      }
+    }
+ 
+-   so->enabled_mask |= 1 << index;
++   so->enabled_mask |= 1u << index;
+ 
+    fd_context_dirty_shader(ctx, shader, FD_DIRTY_SHADER_CONST);
+    fd_resource_set_usage(cb->buffer, FD_DIRTY_CONST);
+--- a/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
+@@ -179,6 +179,8 @@
+    v->bo =
+       fd_bo_new(compiler->dev, v->info.size, FD_BO_NOMAP,
+                 "%s:%s", ir3_shader_stage(v), v->name);
++   if (!v->bo)
++      return;
+ 
+    /* Always include shaders in kernel crash dumps. */
+    fd_bo_mark_for_dump(v->bo);
+@@ -651,6 +653,7 @@
+          ir3_shader_descriptor_set(MESA_SHADER_FRAGMENT),
+       .bindless_fb_read_slot = IR3_BINDLESS_IMAGE_OFFSET +
+                                IR3_BINDLESS_IMAGE_COUNT - 1 - screen->max_rts,
++      .bindless_fb_read_sampler = IR3_BINDLESS_DESC_COUNT - 1,
+       .dual_color_blend_by_location = screen->driconf.dual_color_blend_by_location,
+       .uche_trap_base = screen->uche_trap_base,
+    };
+@@ -752,16 +755,19 @@
+ 
+    uint32_t per_fiber_size = so->pvtmem_size;
+    if (per_fiber_size > screen->pvtmem[so->pvtmem_per_wave].per_fiber_size) {
+-      if (screen->pvtmem[so->pvtmem_per_wave].bo)
+-         fd_bo_del(screen->pvtmem[so->pvtmem_per_wave].bo);
+-
+       uint32_t per_sp_size = align(per_fiber_size * fibers_per_sp, 1 << 12);
+       uint32_t total_size = per_sp_size * num_sp_cores;
++      struct fd_bo *bo = fd_bo_new(
++         screen->dev, total_size, FD_BO_NOMAP, "pvtmem_%s_%d",
++         so->pvtmem_per_wave ? "per_wave" : "per_fiber", per_fiber_size);
++      if (!bo)
++         return;
+ 
++      if (screen->pvtmem[so->pvtmem_per_wave].bo)
++         fd_bo_del(screen->pvtmem[so->pvtmem_per_wave].bo);
++
+       screen->pvtmem[so->pvtmem_per_wave].per_fiber_size = per_fiber_size;
+       screen->pvtmem[so->pvtmem_per_wave].per_sp_size = per_sp_size;
+-      screen->pvtmem[so->pvtmem_per_wave].bo = fd_bo_new(
+-         screen->dev, total_size, FD_BO_NOMAP, "pvtmem_%s_%d",
+-         so->pvtmem_per_wave ? "per_wave" : "per_fiber", per_fiber_size);
++      screen->pvtmem[so->pvtmem_per_wave].bo = bo;
+    }
+ }

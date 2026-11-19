@@ -58,6 +58,7 @@ state_forget(struct rwa_device *device)
 
    b->blend = b->dsa = b->rast = b->vs = b->fs = b->velem = STATE_UNKNOWN;
    b->viewport_set = b->stencil_set = b->scissor_set = false;
+   b->views_dirty[0] = b->views_dirty[1] = false;
    for (unsigned s = 0; s < 2; s++) {
       if (b->num_samplers[s]) {
          void *none[RWA_MAX_TEXTURES] = { 0 };
@@ -89,6 +90,7 @@ state_framebuffer(struct rwa_device *device, const struct pipe_framebuffer_state
                                             b->num_views[s], NULL);
          b->num_views[s] = 0;
          memset(b->views[s], 0, sizeof(b->views[s]));
+         b->views_dirty[s] = false;
       }
       device->pipe->flush(device->pipe, NULL, 0);
    }
@@ -195,6 +197,23 @@ state_vertex_elements(struct rwa_device *device, void *velem)
       device->pipe->bind_vertex_elements_state(device->pipe, device->bound.velem = velem);
 }
 
+static void
+state_invalidate_view(struct rwa_device *device, const struct pipe_sampler_view *view)
+{
+   struct rwa_bound_state *b = &device->bound;
+
+   if (!view)
+      return;
+   for (unsigned s = 0; s < 2; s++) {
+      for (unsigned i = 0; i < b->num_views[s]; i++) {
+         if (b->views[s][i] == view) {
+            b->views_dirty[s] = true;
+            break;
+         }
+      }
+   }
+}
+
 /* The views of a fragment or vertex draw, from slot 0; slots past `count` that the draw before
  * left bound are unbound with them. */
 static void
@@ -204,13 +223,14 @@ state_views(struct rwa_device *device, mesa_shader_stage stage, unsigned count,
    struct rwa_bound_state *b = &device->bound;
    unsigned s = state_stage(stage), before = b->num_views[s];
 
-   if (count == before && memcmp(b->views[s], views, count * sizeof(*views)) == 0)
+   if (!b->views_dirty[s] && count == before && memcmp(b->views[s], views, count * sizeof(*views)) == 0)
       return;
    state_count.views++;
    device->pipe->set_sampler_views(device->pipe, stage, 0, count,
                                    before > count ? before - count : 0, views);
    memcpy(b->views[s], views, count * sizeof(*views));
    b->num_views[s] = count;
+   b->views_dirty[s] = false;
 }
 
 static void

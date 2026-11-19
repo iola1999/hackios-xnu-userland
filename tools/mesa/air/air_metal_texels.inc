@@ -191,6 +191,10 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
                                           row * util_format_get_nblocksy(texture->res->format,
                                                                          box.height));
    texture_written(texture);
+   if (texture->view)
+      state_invalidate_view(texture->device, texture->view);
+   if (texture->chroma && texture->chroma->view)
+      state_invalidate_view(texture->device, texture->chroma->view);
    return 0;
 }
 
