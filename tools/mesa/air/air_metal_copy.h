@@ -64,6 +64,10 @@ struct rwa_texture *rwa_texture_from_buffer(struct rwa_device *device,
                                             unsigned row_bytes, char *why, size_t why_size);
 void rwa_buffer_textures_refresh(struct rwa_device *device);
 
+/* A buffer backed directly by a shareable IOSurface (kAnnibaleSurface / drmPrimeFDToHandle). */
+struct rwa_buffer *rwa_buffer_from_surface(struct rwa_device *device, int surface_id, size_t size,
+					   char *why, size_t why_size);
+
 /*
  * A function linked into a stage at pipeline time (MTLLinkedFunctions): a call of a function
  * the stage's module only declares, under the name its air.visible_function_reference gives,
@@ -119,6 +123,12 @@ struct rwa_compute_info;
 __attribute__((visibility("default")))
 struct rwa_compute *rwa_compute_create_stitched(struct rwa_device *device,
    const struct rwa_stitched_kernel *kernel, struct rwa_compute_info *info,
+   char *why, size_t why_size);
+__attribute__((visibility("default")))
+struct rwa_compute *rwa_compute_create_deferred(struct rwa_device *device, const void *bitcode,
+   size_t size, const char *entry, struct rwa_compute_info *info, char *why, size_t why_size);
+__attribute__((visibility("default")))
+int rwa_compute_materialize(struct rwa_compute *compute, struct rwa_compute_info *info,
    char *why, size_t why_size);
 
 #ifdef __cplusplus

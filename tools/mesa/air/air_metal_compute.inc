@@ -18,9 +18,9 @@ compute_state_for(struct rwa_compute *compute, const unsigned block[3],
 static struct rwa_compute *
 compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                 const char *entry, const struct rwa_stitched_kernel *kernel,
-                struct rwa_compute_info *info, char *why, size_t why_size)
+                bool deferred, struct rwa_compute_info *info, char *why,
+                size_t why_size)
 {
-   RWA_LOCKED;
    if (!kernel && (!bitcode || size < 4)) {
       say(why, why_size, "%zu bytes is not a shader module", size);
       return NULL;
@@ -161,9 +161,13 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
    }
 
    /* The hardware pipeline reports the limit of the same variable-workgroup
-    * CSO that dispatch will use. Softpipe requires a fixed block at dispatch. */
-   if (!device->software && !compute_state_for(compute, NULL, &compute->yuv, why, why_size))
-      goto fail;
+    * CSO that dispatch will use. Deferred pipelines compile their CSO on first
+    * dispatch or materialization; softpipe always requires a fixed block at dispatch. */
+   if (!device->software && !deferred) {
+      RWA_LOCKED;
+      if (!compute_state_for(compute, NULL, &compute->yuv, why, why_size))
+         goto fail;
+   }
    if (info)
       *info = compute->caps;
    return compute;
@@ -181,7 +185,35 @@ rwa_compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_compute_info *info,
                    char *why, size_t why_size)
 {
-   return compute_create(device, bitcode, size, entry, NULL, info, why, why_size);
+   return compute_create(device, bitcode, size, entry, NULL, false, info, why,
+                         why_size);
+}
+
+struct rwa_compute *
+rwa_compute_create_deferred(struct rwa_device *device, const void *bitcode,
+                            size_t size, const char *entry,
+                            struct rwa_compute_info *info, char *why,
+                            size_t why_size)
+{
+   return compute_create(device, bitcode, size, entry, NULL, true, info, why,
+                         why_size);
+}
+
+int
+rwa_compute_materialize(struct rwa_compute *compute, struct rwa_compute_info *info,
+                        char *why, size_t why_size)
+{
+   RWA_LOCKED;
+   if (!compute) {
+      say(why, why_size, "compute materialize requires a pipeline");
+      return -1;
+   }
+   if (!compute->device->software && !compute->cso &&
+       !compute_state_for(compute, NULL, &compute->yuv, why, why_size))
+      return -1;
+   if (info)
+      *info = compute->caps;
+   return 0;
 }
 
 _Static_assert(sizeof(struct rwa_stitched_kernel) == sizeof(struct air_stitched_kernel) &&
@@ -200,7 +232,8 @@ rwa_compute_create_stitched(struct rwa_device *device,
       say(why, why_size, "missing stitched kernel graph");
       return NULL;
    }
-   return compute_create(device, NULL, 0, NULL, kernel, info, why, why_size);
+   return compute_create(device, NULL, 0, NULL, kernel, false, info, why,
+                         why_size);
 }
 
 int

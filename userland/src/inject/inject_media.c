@@ -28,6 +28,7 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -329,23 +330,29 @@ static void
 time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
 {
 	CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample_buffer);
+	CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sample_buffer);
+	id node = ((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("node"));
 	static uint64_t began;
 	static mach_timebase_info_data_t timebase;
 	id connection, input;
 
-	if (image == NULL || CVPixelBufferGetWidth(image) < 2000) {
-		return;                 /* not a photograph */
-	}
-	if (is_node(((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("node")), "BWPhotoEncoderNode")) {
+	if (is_node(node, "BWPhotoEncoderNode")) {
 		if (began != 0) {
 			if (timebase.denom == 0) {
 				mach_timebase_info(&timebase);
 			}
-			say("annibale: mediaserverd: a photograph of %zux%zu encoded in %.0f ms\n", CVPixelBufferGetWidth(image),
-			    CVPixelBufferGetHeight(image), (double)(mach_absolute_time() - began) * timebase.numer / timebase.denom / 1e6);
+			size_t blk_len = block != NULL ? CMBlockBufferGetDataLength(block) : 0;
+			size_t w = image != NULL ? CVPixelBufferGetWidth(image) : 0;
+			size_t h = image != NULL ? CVPixelBufferGetHeight(image) : 0;
+			say("annibale: mediaserverd: a photograph (%zux%zu, block=%zu B) encoded in %.0f ms\n",
+			    w, h, blk_len,
+			    (double)(mach_absolute_time() - began) * timebase.numer / timebase.denom / 1e6);
 		}
 		began = 0;
 		return;
+	}
+	if (image == NULL || CVPixelBufferGetWidth(image) < 2000) {
+		return;                 /* not a photograph */
 	}
 	connection = ((id (*)(id, SEL))objc_msgSend)(output, sel_registerName("connection"));
 	input = connection != nil ? ((id (*)(id, SEL))objc_msgSend)(connection, sel_registerName("input")) : nil;
@@ -358,6 +365,7 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  * A node's output given no sample buffer at all: drop NULL sample buffers before they reach downstream nodes.
  */
 static IMP original_emit_sample_buffer;
+static IMP original_emit_node_error;
 static IMP original_ms_configure;
 static IMP original_ms_allocate_pools;
 static IMP original_ms_prepare;
@@ -399,6 +407,7 @@ static void
 emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 {
 	static bool said;
+	static unsigned emit_trace_count;
 
 	if (sample_buffer == NULL) {
 		if (!said) {
@@ -407,8 +416,45 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		}
 		return;
 	}
+	if (emit_trace_count < 32) {
+		id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
+		if (is_node(node, "BWStillImageCoordinatorNode") ||
+		    is_node(node, "BWPhotonicEngineNode") ||
+		    is_node(node, "BWPhotoEncoderNode")) {
+			emit_trace_count++;
+			CVImageBufferRef img = CMSampleBufferGetImageBuffer(sample_buffer);
+			CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sample_buffer);
+			say("annibale: media: emit %s img=%zux%zu blk=%zu\n",
+			    object_getClassName(node),
+			    img != NULL ? CVPixelBufferGetWidth(img) : 0,
+			    img != NULL ? CVPixelBufferGetHeight(img) : 0,
+			    bb != NULL ? CMBlockBufferGetDataLength(bb) : 0);
+		}
+	}
 	time_photo_encoder(self, sample_buffer);
 	((void (*)(id, SEL, CMSampleBufferRef))original_emit_sample_buffer)(self, selector, sample_buffer);
+}
+
+static void
+emit_node_error(id self, __unused SEL selector, id nodeError)
+{
+	static unsigned err_trace_count;
+
+	if (err_trace_count < 32) {
+		err_trace_count++;
+		id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
+		int code = 0;
+		if (nodeError != nil &&
+		    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(nodeError, sel_registerName("respondsToSelector:"),
+		        sel_registerName("errorCode"))) {
+			code = ((int (*)(id, SEL))objc_msgSend)(nodeError, sel_registerName("errorCode"));
+		}
+		say("annibale: media: emitNodeError node=%s code=%d\n",
+		    node != nil ? object_getClassName(node) : "nil", code);
+	}
+	if (original_emit_node_error != NULL) {
+		((void (*)(id, SEL, id))original_emit_node_error)(self, selector, nodeError);
+	}
 }
 
 /*
@@ -506,6 +552,7 @@ static struct replacement {
 	  (IMP)quality_prioritization, &original_quality_prioritization, true, false },
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
+	{ "BWNodeOutput", "emitNodeError:", 0UL, (IMP)emit_node_error, &original_emit_node_error, true, false },
 	{ "BWMultiStreamCameraSourceNode", "configure:", 0UL, (IMP)ms_configure, &original_ms_configure, true, false },
 	{ "BWMultiStreamCameraSourceNode", "allocateOrReuseBufferPoolsFromSourceNode:", 0UL, (IMP)ms_allocate_pools,
 	  &original_ms_allocate_pools, true, false },
@@ -616,6 +663,61 @@ image_added(__unused const struct mach_header *header, __unused intptr_t image_s
 	}
 }
 
+/*
+ * CoreVideo registers Apple universal/HTPC compressed pixel formats only when the
+ * hardware DeviceTree advertises buffer-compression, whereas CMCapture hardcodes
+ * FigCapturePlatformSupports*Compression() to 1 for the V57 platform ID. When
+ * CoreVideo has no compressed pixel format descriptions, align CMCapture's
+ * platform capability flags to 0 so BWPixelBufferPool negotiates uncompressed
+ * formats instead of failing with kCVReturnInvalidPixelFormat (-6680).
+ */
+static int
+clear_cmcapture_compression_flag(const char *sym)
+{
+	typedef uint8_t (*cap_fn_t)(void);
+	void *raw = dlsym(RTLD_DEFAULT, sym);
+	if (raw == NULL) {
+		return -1;
+	}
+	cap_fn_t fn = (cap_fn_t)raw;
+	if (fn() == 0) {
+		return 0;
+	}
+	uintptr_t pc = STRIP_FN(raw) + 0x10u;
+	const uint32_t *insns = (const uint32_t *)pc;
+	uint32_t i_adrp = insns[0];
+	uint32_t i_ldrb = insns[1];
+	uint32_t i_ret = insns[2];
+	if ((i_adrp & 0x9f00001fu) != 0x90000008u ||
+	    (i_ldrb & 0xffc003ffu) != 0x39400100u ||
+	    i_ret != 0xd65f03c0u) {
+		return -2;
+	}
+	int64_t imm21 = (int64_t)(((i_adrp >> 5) & 0x7ffffu) << 2 | ((i_adrp >> 29) & 0x3u));
+	imm21 = (imm21 << 43) >> 43;
+	uint32_t imm12 = (i_ldrb >> 10) & 0xfffu;
+	uintptr_t addr = (pc & ~(uintptr_t)0xfffu) + (uintptr_t)((uint64_t)imm21 << 12) + imm12;
+	*(volatile uint8_t *)addr = 0;
+	return fn() == 0 ? 1 : -3;
+}
+
+static void
+align_cmcapture_compression_caps(void)
+{
+	CFDictionaryRef d10 = CVPixelFormatDescriptionCreateWithPixelFormatType(
+	    kCFAllocatorDefault, 0x26786632u /* '&xf2' */);
+	if (d10 != NULL) {
+		CFRelease(d10);
+		return;
+	}
+	int r_univ = clear_cmcapture_compression_flag("FigCapturePlatformSupportsUniversalCompression");
+	int r_lossy = clear_cmcapture_compression_flag("FigCapturePlatformSupportsUniversalLossyCompression");
+	int r_h16 = clear_cmcapture_compression_flag("FigCapturePlatformSupportsHTPC16x8Compression");
+	int r_h32 = clear_cmcapture_compression_flag("FigCapturePlatformSupportsHTPC32x4Compression");
+	say("annibale: media: aligned CMCapture compression caps (univ=%d lossy=%d htpc16=%d htpc32=%d)\n",
+	    r_univ, r_lossy, r_h16, r_h32);
+}
+
 __attribute__((constructor))
 static void
 annibale_media_init(void)
@@ -623,7 +725,17 @@ annibale_media_init(void)
 	const char *name = getprogname();
 	size_t length = 0;
 
-	if (name == NULL || (strcmp(name, "mediaserverd") != 0 && strcmp(name, "cameracaptured") != 0)) {
+	if (name == NULL || (strcmp(name, "mediaserverd") != 0 &&
+	    strcmp(name, "cameracaptured") != 0 &&
+	    strcmp(name, "deferredmediad") != 0)) {
+		return;
+	}
+	if (strcmp(name, "deferredmediad") == 0) {
+		register_hevc_encoder();
+		(void)dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY | RTLD_GLOBAL);
+		align_cmcapture_compression_caps();
+		sysctlbyname("kern.annibale.say", NULL, NULL,
+		    "media: loaded in deferredmediad\n", sizeof("media: loaded in deferredmediad\n"));
 		return;
 	}
 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
@@ -662,6 +774,7 @@ annibale_media_init(void)
 		    CFSTR("com.apple.coremedia"));
 		CFPreferencesAppSynchronize(CFSTR("com.apple.coremedia"));
 		(void)dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY | RTLD_GLOBAL);
+		align_cmcapture_compression_caps();
 	}
 	{
 		Dl_info info;

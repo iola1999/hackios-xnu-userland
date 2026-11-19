@@ -900,6 +900,7 @@ rwa_device_close(struct rwa_device *device)
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    pipe_resource_reference(&device->null_ssbo, NULL);
+   pipe_resource_reference(&device->quad_vbuf, NULL);
    /* Before the pipe goes: a fence outlives the context that made it, and one nobody
     * waited for is still the screen's to release. */
    if (device->pending)
@@ -3357,7 +3358,6 @@ rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t size,
                     const char *entry, struct rwa_texture_decl *out, unsigned max,
                     unsigned *count, char *why, size_t why_size)
 {
-   RWA_LOCKED;
    if (count)
       *count = 0;
    if (!device) {
@@ -3505,7 +3505,6 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
                    const char *entry, struct rwa_argbuf_layout *out, unsigned max,
                    unsigned *count, char *why, size_t why_size)
 {
-   RWA_LOCKED;
    if (count)
       *count = 0;
    if (!device) {
@@ -4116,29 +4115,8 @@ static void *
 make_stage_cso(struct rwa_device *device, nir_shader *nir, const struct air_shader_info *info,
                const struct rwa_yuv_key *yuv, char *why, size_t why_size)
 {
-   nir_shader *clone = nir_shader_clone(NULL, nir);
-   if (!clone) {
-      say(why, why_size, "out of memory compiling a shader stage");
-      return NULL;
-   }
-   if ((yuv && (!lower_yuv(clone, yuv, why, why_size) ||
-                !lower_rgb2p_samples(clone, info, yuv, why, why_size))) ||
-       !lower_half_for_backend(clone, device, info, why, why_size)) {
-      ralloc_free(clone);
-      return NULL;
-   }
-   finalize_for_gallium(clone, device->screen);
-
-   struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
-   struct pipe_context *pipe = device->pipe;
-   void *cso = nir->info.stage == MESA_SHADER_VERTEX
-                  ? pipe->create_vs_state(pipe, &templ)
-                  : pipe->create_fs_state(pipe, &templ);
-   if (!cso)
-      say(why, why_size, "%s would not compile the %s stage",
-          device->screen->get_name(device->screen),
-          nir->info.stage == MESA_SHADER_VERTEX ? "vertex" : "fragment");
-   return cso;
+   nir_shader *clone = prepare_stage_nir(device, nir, info, yuv, why, why_size);
+   return clone ? create_stage_cso(device, clone, nir->info.stage, why, why_size) : NULL;
 }
 
 /* Whether a vertex shader reads vertex attributes, which used to be the one thing the
@@ -4662,7 +4640,6 @@ rwa_render_create_linked(struct rwa_device *device,
                          const struct rwa_render_shape *shape,
                          struct rwa_render_info *info, char *why, size_t why_size)
 {
-   RWA_LOCKED;
    if (!shape) {
       say(why, why_size, "a render pipeline with no attachment description");
       return NULL;
@@ -4760,8 +4737,9 @@ rwa_render_create_linked(struct rwa_device *device,
          return NULL;
       }
       unsigned q = samples > 1 ? samples : 0;
-      if (!device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D,
-                                               q, q, PIPE_BIND_DEPTH_STENCIL)) {
+      bool supported;
+      { RWA_LOCKED; supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_DEPTH_STENCIL); }
+      if (!supported) {
          char ms[48] = "";
          if (q)
             snprintf(ms, sizeof(ms), " of %u samples per pixel", q);
@@ -4799,9 +4777,9 @@ rwa_render_create_linked(struct rwa_device *device,
          return NULL;
       }
       unsigned q = samples > 1 ? samples : 0;
-      if (!device->screen->is_format_supported(device->screen, fmt->pipe,
-                                               PIPE_TEXTURE_2D, q, q,
-                                               PIPE_BIND_RENDER_TARGET)) {
+      bool supported;
+      { RWA_LOCKED; supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_RENDER_TARGET); }
+      if (!supported) {
          char ms[48] = "";
          if (q)
             snprintf(ms, sizeof(ms), " of %u samples per pixel", q);
@@ -4907,26 +4885,21 @@ rwa_render_create_linked(struct rwa_device *device,
          say(why, why_size, "%zu bytes is not a vertex shader module", vertex_size);
          goto fail;
       }
-      struct rwa_vertex_cso_entry *vcso_cached =
-         rwa_vertex_cso_lookup(device, vertex_bitcode, vertex_size, vertex_entry);
-      if (vcso_cached) {
-         render->cached_vcso_entry = vcso_cached;
-         render->vs_cso = vcso_cached->vs_cso;
-         render->vinfo = vcso_cached->vinfo;
-         memcpy(render->vert_slots, vcso_cached->vert_slots, sizeof(render->vert_slots));
-         memcpy(render->vert_compare_sampler, vcso_cached->vert_compare_sampler,
-                sizeof(render->vert_compare_sampler));
-         const char *vn = render->vinfo.entry_point ? render->vinfo.entry_point
-                                                    : "the vertex shader";
-         if (vcso_cached->fetched_count &&
-             !build_vertex_state(&render->vinfo, shape, vn, device->screen, &render->vstate,
-                                 why, why_size))
-            goto fail;
-         unsigned vtex = 0, vsamp = 0;
-         count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
-         render->generated_vertex = false;
-         out.generated_vertex_stage = 0;
-      } else {
+      struct rwa_vertex_cso_entry *vcso_cached;
+      {
+         RWA_LOCKED;
+         vcso_cached = rwa_vertex_cso_lookup(device, vertex_bitcode, vertex_size, vertex_entry);
+         if (vcso_cached) {
+            render->cached_vcso_entry = vcso_cached;
+            render->vs_cso = vcso_cached->vs_cso;
+            render->vinfo = vcso_cached->vinfo;
+            memcpy(render->vert_slots, vcso_cached->vert_slots, sizeof(render->vert_slots));
+            memcpy(render->vert_compare_sampler, vcso_cached->vert_compare_sampler,
+                   sizeof(render->vert_compare_sampler));
+            fetched = vcso_cached->fetched_count;
+         }
+      }
+      if (!vcso_cached) {
          struct air_constant_value *vfc;
          unsigned num_vfc =
             air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
@@ -4959,16 +4932,12 @@ rwa_render_create_linked(struct rwa_device *device,
                 fetched == 1 ? "" : "s");
             goto fail;
          }
-         if (fetched &&
-             !build_vertex_state(&render->vinfo, shape, vn, device->screen, &render->vstate,
-                                 why, why_size))
-            goto fail;
          slot_shapes(vs, render->vert_slots, render->vert_compare_sampler);
-         unsigned vtex = 0, vsamp = 0;
-         count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
-         render->generated_vertex = false;
-         out.generated_vertex_stage = 0;
       }
+      unsigned vtex = 0, vsamp = 0;
+      count_resources(&render->vinfo, render->vert_slots, &out.vertex_buffers, &vtex, &vsamp);
+      render->generated_vertex = false;
+      out.generated_vertex_stage = 0;
    } else {
       /* A vertex descriptor with no vertex function is refused rather than ignored. The
        * generated stage draws this library's own quad out of this library's own buffer
@@ -5001,18 +4970,36 @@ rwa_render_create_linked(struct rwa_device *device,
       out.generated_vertex_stage = 1;
    }
 
-   /* Compile both stages now. A failure here is a creation failure and says so; the
-    * stages are linked later, at the draw.
-    */
-   if (!lower_rgb2p_outputs(fs, shape, why, why_size)) goto fail;
-   render->fragment_nir = fs;
-   render->fs_cso = make_stage_cso(device, fs, &render->finfo, NULL, why, why_size);
-   if (!render->fs_cso)
+   /* Prepare NIR lowering lock-free before acquiring rwa_lock for Gallium CSO creation. */
+   if (!lower_rgb2p_outputs(fs, shape, why, why_size)) {
+      if (render->generated_vertex) ralloc_free(vs);
       goto fail;
+   }
+   render->fragment_nir = fs;
+   nir_shader *fs_prep = prepare_stage_nir(device, fs, &render->finfo, NULL, why, why_size);
+   nir_shader *vs_prep = fs_prep && !render->vs_cso
+      ? prepare_stage_nir(device, vs, &render->vinfo, NULL, why, why_size) : NULL;
+   if (render->generated_vertex) ralloc_free(vs);
+   if (!fs_prep || (!render->vs_cso && !vs_prep)) {
+      ralloc_free(fs_prep); ralloc_free(vs_prep);
+      goto fail;
+   }
+   {
+   RWA_LOCKED;
+   if (fetched) {
+      const char *vn = render->vinfo.entry_point ? render->vinfo.entry_point : "the vertex shader";
+      if (!build_vertex_state(&render->vinfo, shape, vn, device->screen, &render->vstate, why, why_size)) {
+         ralloc_free(fs_prep); ralloc_free(vs_prep);
+         goto fail;
+      }
+   }
+   render->fs_cso = create_stage_cso(device, fs_prep, MESA_SHADER_FRAGMENT, why, why_size);
+   if (!render->fs_cso) {
+      ralloc_free(vs_prep);
+      goto fail;
+   }
    if (!render->vs_cso) {
-      render->vs_cso = make_stage_cso(device, vs, &render->vinfo, NULL, why, why_size);
-      if (render->generated_vertex)
-         ralloc_free(vs);
+      render->vs_cso = create_stage_cso(device, vs_prep, MESA_SHADER_VERTEX, why, why_size);
       if (!render->vs_cso)
          goto fail;
       if (!render->generated_vertex && vertex_bitcode) {
@@ -5153,15 +5140,12 @@ rwa_render_create_linked(struct rwa_device *device,
            &(struct pipe_vertex_element){
               .src_offset = 0, .src_stride = 16, .vertex_buffer_index = 0,
               .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT });
-   render->vbuf = pipe_buffer_create(device->screen, PIPE_BIND_VERTEX_BUFFER,
-                                     PIPE_USAGE_DEFAULT, sizeof(rwa_quad_verts));
+   render->vbuf = rwa_quad_vbuf_ref(device, rwa_quad_verts, sizeof(rwa_quad_verts));
    if (!render->velem || !render->vbuf) {
       say(why, why_size, "%s would not make the quad a draw covers the attachment with",
           rwa_device_name(device));
       goto fail;
    }
-   pipe_buffer_write(device->pipe, render->vbuf, 0, sizeof(rwa_quad_verts),
-                     rwa_quad_verts);
 
    /* What the layout became, for a driver that has to fill the stream slots and for a
     * caller that wants to compare the mapping with the shader's own interface rather
@@ -5202,6 +5186,7 @@ rwa_render_create_linked(struct rwa_device *device,
    if (info)
       *info = out;
    return render;
+   }
 
 fail:
    rwa_render_destroy(render);

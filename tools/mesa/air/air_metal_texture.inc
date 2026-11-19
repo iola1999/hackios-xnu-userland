@@ -97,6 +97,45 @@ struct annibale_memory_request {
 
 struct rwa_buffer *rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size,
                                           char *why, size_t why_size);
+struct rwa_buffer *rwa_buffer_from_surface(struct rwa_device *device, int surface_id, size_t size,
+                                           char *why, size_t why_size);
+
+static struct rwa_buffer *
+buffer_import_handle(struct rwa_device *device, const struct winsys_handle *whandle,
+                     size_t size, bool close_kms_on_fail, const char *what, char *why,
+                     size_t why_size)
+{
+   struct pipe_resource templ = {
+      .target = PIPE_BUFFER, .format = PIPE_FORMAT_R8_UNORM, .usage = PIPE_USAGE_STAGING,
+      .bind = PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_INDEX_BUFFER |
+              PIPE_BIND_SHARED,
+      .width0 = (unsigned)size, .height0 = 1, .depth0 = 1, .array_size = 1,
+   };
+   struct rwa_buffer *buffer = calloc(1, sizeof(*buffer));
+
+   if (buffer)
+      buffer->res = device->screen->resource_from_handle(device->screen, &templ,
+                                                         (struct winsys_handle *)whandle,
+                                                         PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
+   if (buffer && buffer->res)
+      buffer->map = pipe_buffer_map(device->pipe, buffer->res, PIPE_MAP_READ | PIPE_MAP_WRITE,
+                                    &buffer->xfer);
+   if (!buffer || !buffer->map) {
+      say(why, why_size, "%s over %zu bytes could not be %s", what, size,
+          buffer && buffer->res ? "mapped" : "imported");
+      if (buffer && buffer->res)
+         pipe_resource_reference(&buffer->res, NULL);   /* the import closes the handle */
+      else if (close_kms_on_fail) {
+         struct { uint32_t handle, pad; } close = { whandle->handle, 0 };
+         drmIoctl(-1, _IOW('d', 0x09, close), &close);  /* DRM_IOCTL_GEM_CLOSE */
+      }
+      free(buffer);
+      return NULL;
+   }
+   buffer->device = device;
+   buffer->size = size;
+   return buffer;
+}
 
 struct rwa_buffer *
 rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char *why,
@@ -104,15 +143,8 @@ rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char
 {
    RWA_LOCKED;
    struct annibale_memory_request request = { (uint64_t)(uintptr_t)bytes, size, 0, 0 };
-   struct pipe_resource templ = {
-      .target = PIPE_BUFFER, .format = PIPE_FORMAT_R8_UNORM, .usage = PIPE_USAGE_STAGING,
-      .bind = PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER | PIPE_BIND_INDEX_BUFFER |
-              PIPE_BIND_SHARED,
-      .width0 = (unsigned)size, .height0 = 1, .depth0 = 1, .array_size = 1,
-   };
    struct winsys_handle whandle = { .type = WINSYS_HANDLE_TYPE_KMS, .stride = (unsigned)size,
                                     .size = size };
-   struct rwa_buffer *buffer;
 
    if (!device || device->software || !device->screen->resource_from_handle) {
       say(why, why_size, "this device imports no memory");
@@ -140,28 +172,36 @@ rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char
       return NULL;
    }
    whandle.handle = request.handle;
-   buffer = calloc(1, sizeof(*buffer));
-   if (buffer)
-      buffer->res = device->screen->resource_from_handle(device->screen, &templ, &whandle,
-                                                         PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
-   if (buffer && buffer->res)
-      buffer->map = pipe_buffer_map(device->pipe, buffer->res, PIPE_MAP_READ | PIPE_MAP_WRITE,
-                                    &buffer->xfer);
-   if (!buffer || !buffer->map) {
-      struct { uint32_t handle, pad; } close = { request.handle, 0 };
+   char what[64];
+   snprintf(what, sizeof(what), "buffer %u at %p", request.handle, bytes);
+   return buffer_import_handle(device, &whandle, size, true, what, why, why_size);
+}
 
-      say(why, why_size, "buffer %u over %zu bytes at %p could not be %s", request.handle, size,
-          bytes, buffer && buffer->res ? "mapped" : "imported");
-      if (buffer && buffer->res)
-         pipe_resource_reference(&buffer->res, NULL);   /* the import closes the handle */
-      else
-         drmIoctl(-1, _IOW('d', 0x09, close), &close);  /* DRM_IOCTL_GEM_CLOSE */
-      free(buffer);
+struct rwa_buffer *
+rwa_buffer_from_surface(struct rwa_device *device, int surface_id, size_t size, char *why,
+                        size_t why_size)
+{
+   RWA_LOCKED;
+   if (!device || device->software || !device->screen->resource_from_handle) {
+      say(why, why_size, "this device imports no memory");
       return NULL;
    }
-   buffer->device = device;
-   buffer->size = size;
-   return buffer;
+   if (surface_id <= 0) {
+      say(why, why_size, "IOSurface %d is not shareable", surface_id);
+      return NULL;
+   }
+   if (size == 0 || size > UINT32_MAX) {
+      say(why, why_size, "IOSurface %d size %zu is outside Gallium buffer bounds",
+          surface_id, size);
+      return NULL;
+   }
+   const struct winsys_handle whandle = {
+      .type = WINSYS_HANDLE_TYPE_FD, .handle = (unsigned)surface_id,
+      .stride = (unsigned)size, .size = size,
+   };
+   char what[64];
+   snprintf(what, sizeof(what), "IOSurface %d", surface_id);
+   return buffer_import_handle(device, &whandle, size, false, what, why, why_size);
 }
 
 /* Where the texture's rows lie in the buffer, or NULL when they do not fit in it. */
@@ -228,7 +268,7 @@ buffer_texture_upload(struct rwa_buffer_texture *backing, char *why, size_t why_
                          why_size) != 0)
       return -1;
    upload_count.uploads++;
-   backing->written = false;   /* the texture now holds the buffer's bytes */
+   buffer_texture_clear_written(backing->texture->device, backing);   /* the texture now holds the buffer's bytes */
    backing->hashed = true;
    backing->hash = h;
    return 0;
@@ -265,7 +305,7 @@ buffer_texture_download(struct rwa_buffer_texture *backing, char *why, size_t wh
              backing->texture->res->height0, backing->texture->format_name, backing->row_bytes,
              backing->offset, (void *)backing->source, backing->source->mirror, nonzero, span);
    }
-   backing->written = false;
+   buffer_texture_clear_written(backing->texture->device, backing);
    return 0;
 }
 
@@ -363,6 +403,7 @@ rwa_texture_from_buffer(struct rwa_device *device, const struct rwa_texture_shap
    backing->next = device->buffer_textures;
    device->buffer_textures = backing;
    texture->backing = backing;
+   __atomic_fetch_add(&device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
 
    buffer_mirror_pull(source);
    if (buffer_texture_upload(backing, why, why_size) != 0) {
@@ -486,6 +527,8 @@ buffer_textures_forget(struct rwa_buffer *buffer)
       *at = backing->next;
       if (backing->texture)
          backing->texture->backing = NULL;
+      buffer_texture_clear_written(buffer->device, backing);
+      __atomic_fetch_sub(&buffer->device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
       free(backing);
    }
 }
@@ -493,7 +536,11 @@ buffer_textures_forget(struct rwa_buffer *buffer)
 void
 rwa_buffer_textures_refresh(struct rwa_device *device)
 {
+   if (!device || __atomic_load_n(&device->buffer_textures_count, __ATOMIC_ACQUIRE) == 0)
+      return;
    RWA_LOCKED;
+   if (__atomic_load_n(&device->buffer_textures_count, __ATOMIC_RELAXED) == 0)
+      return;
    for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
       if (b->source)
          buffer_mirror_pull(b->source);
@@ -526,7 +573,11 @@ rwa_buffer_textures_refresh(struct rwa_device *device)
 void
 rwa_buffer_textures_writeback(struct rwa_device *device)
 {
+   if (!device || __atomic_load_n(&device->written_buffer_textures, __ATOMIC_ACQUIRE) == 0)
+      return;
    RWA_LOCKED;
+   if (__atomic_load_n(&device->written_buffer_textures, __ATOMIC_RELAXED) == 0)
+      return;
    for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
       char why[256] = { 0 };
 
@@ -580,6 +631,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
          at = &(*at)->next;
       if (*at) {
          *at = texture->backing->next;
+         buffer_texture_clear_written(texture->device, texture->backing);
+         __atomic_fetch_sub(&texture->device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
          free(texture->backing);
       }
       texture->backing = NULL;

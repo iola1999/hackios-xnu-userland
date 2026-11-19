@@ -1097,6 +1097,10 @@ annibale_camera_device_create(CFAllocatorRef allocator, CFDictionaryRef options,
 		struct annibale_camera_profile profile;
 		int torch_fd = cameras[i].sensor == 1 ? open("/dev/annibale-torch", O_RDWR) : -1;
 		int fd = camera_native_open(cameras[i].sensor, &profile);
+		for (int attempt = 0; fd < 0 && errno == EBUSY && attempt < 10; attempt++) {
+			usleep(100000);
+			fd = camera_native_open(cameras[i].sensor, &profile);
+		}
 
 		if (fd < 0 && torch_fd < 0) {
 			continue;

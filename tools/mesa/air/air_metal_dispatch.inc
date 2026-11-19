@@ -104,6 +104,14 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
    void *cso = compute_state_for_ib(compute, group_size, &yuv, ib_dim, why, why_size);
    if (!cso)
       return -1;
+   /* Re-check threadgroup limit once a deferred CSO materializes with compiled register pressure. */
+   if (!device->software && compute->caps.max_threads_per_group &&
+       threads > compute->caps.max_threads_per_group) {
+      say(why, why_size, "%ux%ux%u is %u threads in one threadgroup and this GPU takes "
+                         "at most %u", group_size[0], group_size[1], group_size[2],
+          threads, compute->caps.max_threads_per_group);
+      return -1;
+   }
 
    /* The binding is bind_stage's, shared with the fragment stage of a draw. On a
     * failure mid-bind nothing has been set yet (the set_* calls are at its end), so

@@ -84,25 +84,25 @@ native(uint32_t sensor, const char *output)
 				break;
 			}
 		}
-		/* raw window starts at +256 inside the physical page, so ci=0 is phys bit8=1 */
+		/* Page-aligned DMA starts at dma_address[8]==0, so even ci maps to addr[8]==0 and odd ci to addr[8]==1. */
 		if ((ci & 1u) == 0) {
-			odd_total++;
-			if (any_nz) {
-				odd_nz++;
-			}
-		} else {
 			even_total++;
 			if (any_nz) {
 				even_nz++;
+			}
+		} else {
+			odd_total++;
+			if (any_nz) {
+				odd_nz++;
 			}
 		}
 	}
 	isp_measure(NULL, frame, raw_bytes, &stats);
 	printf("camera_test: native frame=%llu time=%llu %ux%u stride=%u bayer=%u bytes=%zd "
-	    "R=%.1f G=%.1f B=%.1f above black chunks256=%zu phys_bit8_1=%zu/%zu phys_bit8_0=%zu/%zu\n",
+	    "R=%.1f G=%.1f B=%.1f above black chunks256=%zu addr_bit8_0=%zu/%zu addr_bit8_1=%zu/%zu\n",
 	    frame->sequence, frame->time, frame->width, frame->height,
 	    frame->stride, frame->bayer, got, stats.mean[0], stats.mean[1], stats.mean[2],
-	    n_chunks, odd_nz, odd_total, even_nz, even_total);
+	    n_chunks, even_nz, even_total, odd_nz, odd_total);
 	if (output != NULL) {
 		FILE *file = fopen(output, "wb");
 

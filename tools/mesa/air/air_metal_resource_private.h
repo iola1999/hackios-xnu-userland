@@ -42,7 +42,7 @@ struct rwa_device {
     * sampler, but softpipe dereferences the state of every unit a shader touches.
     */
    void *default_sampler;
-   struct pipe_resource *null_ssbo;
+   struct pipe_resource *null_ssbo, *quad_vbuf;
 
    /* Whether this is the rasterizer in plain C rather than the Adreno. Kept because one
     * refusal has to name it: a software screen HAS a resource_from_handle, and it is the
@@ -80,6 +80,8 @@ struct rwa_device {
     * has to happen again before every batch of work that reads them.
     */
    struct rwa_buffer_texture *buffer_textures;
+   /* Atomic counts so refresh and writeback fast-paths skip rwa_lock when empty/unwritten. */
+   unsigned written_buffer_textures, buffer_textures_count;
 
    void *rgb2p_csos[4][3];
    uint64_t submit_seq;
@@ -215,6 +217,15 @@ struct rwa_texture {
    uint8_t swizzle_r, swizzle_g, swizzle_b, swizzle_a;
 };
 
+static inline void
+buffer_texture_clear_written(struct rwa_device *device, struct rwa_buffer_texture *backing)
+{
+   if (backing && backing->written) {
+      backing->written = false;
+      __atomic_fetch_sub(&device->written_buffer_textures, 1u, __ATOMIC_RELEASE);
+   }
+}
+
 /* Writes through a view update the original texture's buffer writeback record.
  * storage_owner always names the original texture, including for nested views. */
 static void
@@ -227,8 +238,10 @@ texture_written(struct rwa_texture *t)
    if (t->storage_owner)
       t = t->storage_owner;
    t->write_seq++;
-   if (t->backing)
+   if (t->backing && !t->backing->written) {
       t->backing->written = true;
+      __atomic_fetch_add(&t->device->written_buffer_textures, 1u, __ATOMIC_RELEASE);
+   }
 }
 
 /*

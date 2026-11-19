@@ -121,18 +121,6 @@
           .storage_16bit = physical_device->info->props.storage_16bit,
           .storage_8bit = physical_device->info->props.storage_8bit,
           .shared_push_consts = !TU_DEBUG(PUSH_CONSTS_PER_STAGE),
---- a/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
-+++ b/src/gallium/drivers/freedreno/a6xx/fd6_barrier.cc
-@@ -38,7 +38,8 @@
-    if ((CHIP >= A7XX) && (flushes & FD6_BLIT_CLEAN_CACHE))
-       fd6_event_write<CHIP>(ctx, cs, FD_CCU_CLEAN_BLIT_CACHE);
- 
--   if ((CHIP >= A7XX) && (flushes & FD6_INVALIDATE_CCHE)) {
-+   if ((CHIP >= A7XX) && (flushes & FD6_INVALIDATE_CCHE) &&
-+       !(flushes & FD6_INVALIDATE_CACHE)) {
-       /* CP_CCHE_INVALIDATE is just a plain register write underneath, so
-        * it needs WFI before it, in order to invalidate at the right point.
-        */
 --- a/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
 +++ b/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
 @@ -315,6 +315,13 @@

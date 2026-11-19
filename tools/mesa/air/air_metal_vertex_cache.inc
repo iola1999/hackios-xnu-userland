@@ -165,4 +165,54 @@ rwa_vertex_cso_cache_destroy(struct rwa_device *device)
    device->vertex_cso_cache = NULL;
 }
 
+static nir_shader *
+prepare_stage_nir(struct rwa_device *device, nir_shader *nir, const struct air_shader_info *info,
+                  const struct rwa_yuv_key *yuv, char *why, size_t why_size)
+{
+   nir_shader *clone = nir_shader_clone(NULL, nir);
+   if (!clone) {
+      say(why, why_size, "out of memory compiling a shader stage");
+      return NULL;
+   }
+   if ((yuv && (!lower_yuv(clone, yuv, why, why_size) ||
+                !lower_rgb2p_samples(clone, info, yuv, why, why_size))) ||
+       !lower_half_for_backend(clone, device, info, why, why_size)) {
+      ralloc_free(clone);
+      return NULL;
+   }
+   finalize_for_gallium(clone, device->screen);
+   return clone;
+}
+
+static void *
+create_stage_cso(struct rwa_device *device, nir_shader *clone, mesa_shader_stage stage,
+                 char *why, size_t why_size)
+{
+   struct pipe_shader_state templ = { .type = PIPE_SHADER_IR_NIR, .ir.nir = clone };
+   struct pipe_context *pipe = device->pipe;
+   void *cso = stage == MESA_SHADER_VERTEX
+                  ? pipe->create_vs_state(pipe, &templ)
+                  : pipe->create_fs_state(pipe, &templ);
+   if (!cso)
+      say(why, why_size, "%s would not compile the %s stage",
+          device->screen->get_name(device->screen),
+          stage == MESA_SHADER_VERTEX ? "vertex" : "fragment");
+   return cso;
+}
+
+static struct pipe_resource *
+rwa_quad_vbuf_ref(struct rwa_device *device, const void *verts, size_t size)
+{
+   if (!device->quad_vbuf) {
+      device->quad_vbuf = pipe_buffer_create(device->screen, PIPE_BIND_VERTEX_BUFFER,
+                                             PIPE_USAGE_DEFAULT, size);
+      if (device->quad_vbuf)
+         pipe_buffer_write(device->pipe, device->quad_vbuf, 0, size, verts);
+   }
+   struct pipe_resource *ref = NULL;
+   if (device->quad_vbuf)
+      pipe_resource_reference(&ref, device->quad_vbuf);
+   return ref;
+}
+
 #endif /* AIR_METAL_VERTEX_CACHE_INC */
