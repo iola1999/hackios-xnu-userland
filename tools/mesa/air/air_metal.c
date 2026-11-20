@@ -900,6 +900,7 @@ rwa_device_close(struct rwa_device *device)
    if (device->default_sampler)
       device->pipe->delete_sampler_state(device->pipe, device->default_sampler);
    pipe_resource_reference(&device->null_ssbo, NULL);
+   pipe_resource_reference(&device->null_ubo, NULL);
    pipe_resource_reference(&device->quad_vbuf, NULL);
    /* Before the pipe goes: a fence outlives the context that made it, and one nobody
     * waited for is still the screen's to release. */
@@ -2535,10 +2536,17 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
          struct rwa_buffer *b = mbuffer;
 
          if (!member) {
-            if (!member && r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->nullable &&
-                (r->index >= bindings->buffer_count || !bindings->buffers[r->index]))
+            bool unbound = r->index >= bindings->buffer_count || !bindings->buffers[r->index];
+
+            if (unbound && r->kind == AIR_RESOURCE_DEVICE_BUFFER && r->nullable)
                break;
-            if (r->index >= bindings->buffer_count || !bindings->buffers[r->index]) {
+            /* Metal lets a pointer argument go unbound where the shader does not read through
+             * it: Tungsten's fragment_main walks `const float4 *shaderP` only for sprites with
+             * shader opcodes, and Photos binds nothing there for the grid. A reference argument
+             * carries air.buffer_size and must be bound. */
+            if (unbound && r->kind == AIR_RESOURCE_CONSTANT_BUFFER && r->size == 0)
+               break;
+            if (unbound) {
                say(why, why_size, "%s reads buffer %u and %u buffer%s bound", name,
                    r->index, bindings->buffer_count,
                    bindings->buffer_count == 1 ? " was" : "s were");
@@ -2863,6 +2871,26 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
                                "Gallium has slots for", name, r->index,
                 (unsigned)PIPE_MAX_CONSTANT_BUFFERS);
             return -1;
+         }
+         if (!b) {   /* an unbound pointer argument (check_bindings): a page of zeros */
+            if (!device->null_ubo) {
+               static const uint8_t zeros[4096];
+
+               device->null_ubo = pipe_buffer_create_with_data(pipe, PIPE_BIND_CONSTANT_BUFFER,
+                                                               PIPE_USAGE_IMMUTABLE, sizeof(zeros),
+                                                               zeros);
+               if (!device->null_ubo) {
+                  say(why, why_size, "%s could not allocate placeholder constant buffer", name);
+                  return -1;
+               }
+            }
+            struct pipe_constant_buffer none = {
+               .buffer = device->null_ubo,
+               .buffer_size = 4096,
+            };
+
+            pipe->set_constant_buffer(pipe, stage, r->index, &none);
+            break;
          }
          size_t left = b->size - MIN2(b->size, boffset);
          /*

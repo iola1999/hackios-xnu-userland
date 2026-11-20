@@ -42,7 +42,7 @@ struct rwa_device {
     * sampler, but softpipe dereferences the state of every unit a shader touches.
     */
    void *default_sampler;
-   struct pipe_resource *null_ssbo, *quad_vbuf;
+   struct pipe_resource *null_ssbo, *null_ubo, *quad_vbuf;
 
    /* Whether this is the rasterizer in plain C rather than the Adreno. Kept because one
     * refusal has to name it: a software screen HAS a resource_from_handle, and it is the
