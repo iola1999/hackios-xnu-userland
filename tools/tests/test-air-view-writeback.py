@@ -57,7 +57,7 @@ struct pipe_context { struct pipe_sampler_view *(*create_sampler_view)(struct pi
 struct rwa_texture_shape { unsigned pixel_format,type,width,height,depth,array_length,mip_levels,sample_count,usage; };
 struct rwa_pixel_format { enum pipe_format pipe; const char *name; };
 struct pipe_screen { bool (*is_format_supported)(struct pipe_screen *,enum pipe_format,unsigned,unsigned,unsigned,unsigned); };
-struct rwa_device { struct pipe_screen *screen; struct pipe_context *pipe; struct rwa_buffer_texture *buffer_textures; };
+struct rwa_device { struct pipe_screen *screen; struct pipe_context *pipe; struct rwa_buffer_texture *buffer_textures; unsigned written_buffer_textures, buffer_textures_count; };
 struct rwa_buffer { struct rwa_device *device; void *map,*mirror; size_t size; bool mirror_hashed; };
 '''
 pre = r'''
@@ -147,7 +147,7 @@ int main(int argc,char **argv) {
 def build(label, texts):
     alltext='\n'.join(texts)
     structs=structure(alltext,'rwa_texture')+structure(alltext,'rwa_buffer_texture')
-    body='\n'.join(function(alltext,n) for n in ['rgb2p_format','texture_format','texture_levels','texture_written'])
+    body='\n'.join(function(alltext,n) for n in ['buffer_texture_clear_written','rgb2p_format','texture_format','texture_levels','texture_written'])
     later='\n'.join(function(alltext,n) for n in ['buffer_texture_bytes','rows_hash','buffer_texture_download','rwa_texture_view','rwa_texture_set_swizzle','buffer_textures_forget','rwa_buffer_textures_writeback','texture_ensure_sampler_view','rwa_texture_destroy'])
     init='t->references = 1;' if 'unsigned references;' in structs else ''
     lock_start = alltext.index('static pthread_mutex_t rwa_lock =')
