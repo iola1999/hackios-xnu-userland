@@ -94,7 +94,7 @@ fail:
 	return -1;
 }
 
-/* A failed or HELD capture ends the worker; pixels are read only after all stop checks pass. */
+/* A failed or HELD capture ends the worker; pixels are read only from a frame the kernel says is whole. */
 static ssize_t
 camera_native_frame(int device, const struct annibale_camera_profile *profile, void *buffer, size_t bytes,
     struct annibale_camera_capture *capture)
@@ -103,8 +103,7 @@ camera_native_frame(int device, const struct annibale_camera_profile *profile, v
 	if (ioctl(device, CAMIOC_CAPTURE, capture) != 0) {
 		return -1;
 	}
-	if (capture->error != 0 || capture->state != ANNIBALE_CAM_CAPTURE_STOPPED ||
-	    (capture->flags & ANNIBALE_CAM_CAPTURE_COMPLETE) != ANNIBALE_CAM_CAPTURE_COMPLETE) {
+	if (!ANNIBALE_CAM_CAPTURE_HAS_FRAME(capture)) {
 		errno = capture->error != 0 ? (int)capture->error : EIO;
 		return -1;
 	}
