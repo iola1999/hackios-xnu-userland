@@ -1,0 +1,16 @@
+--- a/src/freedreno/ir3/ir3_ra.c
++++ b/src/freedreno/ir3/ir3_ra.c
+@@ -2780,8 +2780,12 @@
+       .shared_half = RA_SHARED_HALF_SIZE,
+    };
+ 
++   /* A workgroup of a known size has to fit on the SP whether or not it waits
++    * at a barrier: fd6_get_compute_state_info reports the threads the registers
++    * leave room for, and a dispatch of more than that cannot run.
++    */
+    if (mesa_shader_stage_is_compute(v->type) &&
+-       v->shader->nir->info.uses_control_barrier) {
++       (v->shader->nir->info.uses_control_barrier || !v->local_size_variable)) {
+       calc_limit_pressure_for_cs_with_barrier(v, &limit_pressure);
+    }
+ 

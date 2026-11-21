@@ -91,11 +91,14 @@ rwa_unlock_scope(int *unused)
 #include "util/u_math.h" /* CLAMP(), for the scissor rectangle */
 #include "util/u_gen_mipmap.h" /* util_gen_mipmap(), for -generateMipmapsForTexture: */
 
-/* Two seconds, the same wait air_run uses, and for the same reason: a dispatch nobody
- * waited for is not a result, and on this GPU one timeout wedges the core for the rest
- * of the boot, so every later dispatch would be vacuous too (docs/air.md section 5).
+/* Whether the GPU is hung is the kernel's to say, as Metal leaves it to the GPU driver: a hang
+ * the GMU reports ends the wait at once, and a completed timestamp that has not moved for 30 s
+ * is reported as no answer (AnnibaleGPU gpuWait, kernel db010097). Work that runs long is not
+ * hung: the camera's noise reduction and fusion is one submission of 0.4 to 5.8 s at the GPU's
+ * low clocks, and a two-second wait here failed its command buffer and left the photograph
+ * black. This only bounds a wait the kernel never answers.
  */
-#define RWA_FENCE_TIMEOUT_NS 2000000000ull
+#define RWA_FENCE_TIMEOUT_NS 60000000000ull
 
 /* How many texture slots a dispatch fills, and the bound is not Gallium's 32: sixteen
  * is where air_run stops, by name, and that refusal is what keeps freedreno's own
@@ -197,9 +200,13 @@ struct rwa_compute {
     */
    bool compare_sampler[RWA_MAX_TEXTURES];
 
-   /* Hardware reuses one variable-workgroup state. Software recompiles its one
-    * fixed-block state when cso_block changes. */
+   /* Hardware reuses one variable-workgroup state, unless a dispatch's threadgroup is
+    * larger than that state's registers let in (variable_max): then one compiled for that
+    * threadgroup, which ir3 keeps to the registers that let it in (rebase-26 0022).
+    * Software recompiles its one fixed-block state when cso_block changes. */
    void *cso;
+   bool cso_fixed;
+   unsigned variable_max;
    unsigned cso_block[3];
    unsigned cso_ib_dim[2];
    struct rwa_yuv_key yuv;
@@ -2200,7 +2207,7 @@ finish_or_say_why(struct rwa_device *device, bool required, const char *what,
                                             RWA_FENCE_TIMEOUT_NS);
    device->screen->fence_reference(device->screen, &device->pending, NULL);
    if (!done) {
-      say(why, why_size, "the GPU did not finish the %s within two seconds. Anything in "
+      say(why, why_size, "the GPU did not finish the %s in time. Anything in "
                          "the buffers is what was put there, not what the shader "
                          "computed. The likeliest reason is the shader's input: a "
                          "kernel whose buffers carry counts, indices or sentinels, "
@@ -2873,6 +2880,23 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             return -1;
          }
          if (!b) {   /* an unbound pointer argument (check_bindings): a page of zeros */
+            /* (once a shader and index: a shader that does read it computes with zeros) */
+            static char said[16][96];
+            char line[160], key[96];
+
+            snprintf(key, sizeof key, "%s %u", name, r->index);
+            for (unsigned i = 0; i < 16; i++) {
+               if (!strcmp(said[i], key))
+                  break;
+               if (!said[i][0]) {
+                  snprintf(said[i], sizeof said[i], "%s", key);
+                  int n = snprintf(line, sizeof line, "air: %s: constant buffer %u unbound, zeros given\n",
+                                   name, r->index);
+                  if (n > 0)
+                     (void) write(STDOUT_FILENO, line, MIN2(n, (int)sizeof line - 1));
+                  break;
+               }
+            }
             if (!device->null_ubo) {
                static const uint8_t zeros[4096];
 

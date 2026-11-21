@@ -327,9 +327,20 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
       }
    }
 
+   /* (the variable state first: what its registers let in decides whether this threadgroup
+    * needs a state of its own) */
+   if (!device->software && block && !compute->variable_max &&
+       !compute_state_for_ib(compute, NULL, yuv, ib_dim, why, why_size))
+      return NULL;
+
+   unsigned threads = block ? block[0] * block[1] * block[2] : 0;
+   bool fixed = device->software ||
+                (block && compute->variable_max && threads > compute->variable_max);
+
    if (compute->cso && memcmp(&compute->yuv, yuv, sizeof(*yuv)) == 0 &&
        compute->cso_ib_dim[0] == eff_ib[0] && compute->cso_ib_dim[1] == eff_ib[1] &&
-       (!device->software ||
+       compute->cso_fixed == fixed &&
+       (!fixed ||
         (compute->cso_block[0] == block[0] && compute->cso_block[1] == block[1] &&
          compute->cso_block[2] == block[2])))
       return compute->cso;
@@ -371,7 +382,7 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
       say(why, why_size, "out of memory compiling the shader");
       return NULL;
    }
-   if (device->software) {
+   if (fixed) {
       cs->info.workgroup_size[0] = block[0];
       cs->info.workgroup_size[1] = block[1];
       cs->info.workgroup_size[2] = block[2];
@@ -410,8 +421,17 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
          delete_compute_state(device, cso);
          return NULL;
       }
-      compute->caps.max_threads_per_group = MIN2(compute->caps.max_threads_per_group,
-                                                 si.max_threads);
+      if (fixed && threads > si.max_threads) {
+         say(why, why_size, "%s: compiled for %ux%ux%u threads in a threadgroup, the shader "
+                            "still takes at most %u", compute->info.entry_point ?
+                            compute->info.entry_point : "the shader", block[0], block[1],
+             block[2], si.max_threads);
+         delete_compute_state(device, cso);
+         return NULL;
+      }
+      if (!fixed)
+         compute->variable_max = si.max_threads;
+      compute->caps.max_threads_per_group = MIN2(device->max_threads_per_group, si.max_threads);
       if (si.preferred_simd_size)
          compute->caps.thread_execution_width = si.preferred_simd_size;
    } else if (si.max_threads && block[0] * block[1] * block[2] > si.max_threads) {
@@ -424,10 +444,11 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
    }
 
    compute->cso = cso;
+   compute->cso_fixed = fixed;
    compute->yuv = *yuv;
    compute->cso_ib_dim[0] = eff_ib[0];
    compute->cso_ib_dim[1] = eff_ib[1];
-   if (device->software) {
+   if (fixed) {
       compute->cso_block[0] = block[0];
       compute->cso_block[1] = block[1];
       compute->cso_block[2] = block[2];

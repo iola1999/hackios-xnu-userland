@@ -62,12 +62,15 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
       }
    }
 
+   /* (the hardware's own limit here; what the compiled shader takes is checked once the
+    * state for this threadgroup is made, below) */
    unsigned threads = group_size[0] * group_size[1] * group_size[2];
-   if (compute->caps.max_threads_per_group &&
-       threads > compute->caps.max_threads_per_group) {
-      say(why, why_size, "%ux%ux%u is %u threads in one threadgroup and this GPU takes "
-                         "at most %u", group_size[0], group_size[1], group_size[2],
-          threads, compute->caps.max_threads_per_group);
+   unsigned limit = device->software ? compute->caps.max_threads_per_group
+                                     : device->max_threads_per_group;
+   if (limit && threads > limit) {
+      say(why, why_size, "%s: %ux%ux%u is %u threads in one threadgroup and this GPU takes "
+                         "at most %u", name, group_size[0], group_size[1], group_size[2],
+          threads, limit);
       return -1;
    }
 
@@ -107,8 +110,8 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
    /* Re-check threadgroup limit once a deferred CSO materializes with compiled register pressure. */
    if (!device->software && compute->caps.max_threads_per_group &&
        threads > compute->caps.max_threads_per_group) {
-      say(why, why_size, "%ux%ux%u is %u threads in one threadgroup and this GPU takes "
-                         "at most %u", group_size[0], group_size[1], group_size[2],
+      say(why, why_size, "%s: %ux%ux%u is %u threads in one threadgroup and this GPU takes "
+                         "at most %u", name, group_size[0], group_size[1], group_size[2],
           threads, compute->caps.max_threads_per_group);
       return -1;
    }
@@ -139,7 +142,19 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
     * be named, and because the buffers stay mapped: a caller reading them before the
     * fence reads what it wrote. rwa_dispatch_nowait leaves the batch to the next flush.
     */
+   uint64_t began = wait ? device_us() : 0;
    int rc = wait ? finish_or_say_why(device, true, "dispatch", why, why_size) : 0;
+
+   /* (waited for, a dispatch the GPU spends a tenth of a second on is named: the slow one of
+    * a command buffer that holds dozens) */
+   if (wait && device_us() - began > 100000) {
+      char line[200];
+      int n = snprintf(line, sizeof line, "air: %s: %ux%ux%u threadgroups of %ux%ux%u took %llu ms\n",
+                       name, groups[0], groups[1], groups[2], group_size[0], group_size[1],
+                       group_size[2], (unsigned long long)(device_us() - began) / 1000);
+      if (n > 0)
+         (void) write(STDOUT_FILENO, line, MIN2(n, (int)sizeof line - 1));
+   }
    unbind_stage(device, MESA_SHADER_COMPUTE, &bound);
    return rc;
 }

@@ -25,6 +25,8 @@
 21. `0019-fd6-zero-unbound-texture-slots.patch`：`fd_set_sampler_views` 保留调用方显式传入槽位范围中的尾部空视图槽位，并在 `fd6_texture_key` 中记录 `num_textures`，使 `CP_LOAD_STATE6_0` 对未绑定的可空纹理槽位写入全零硬件描述符（`dummy_view`）；同时在 `fd_launch_grid` 恢复已保存的 3D `ctx->batch` 时调用 `fd_context_all_dirty`，防止计算核分发末尾 `fd_context_all_clean` 清空 3D 脏位导致后续绘制漏发常量与采样状态。
 22. `0021-fd6-zero-unbound-ubo-slots.patch`：这一代 GPU 上 freedreno 用着色器前导码装载常量（`fd6_load_shader_consts_via_preamble`），前导码按着色器用到的范围读每个 UBO 槽，不看主程序的分支。`fd6_emit_ubos` 给未绑定的槽写地址 0，而 Metal 允许运行时不访问的缓冲参数不绑定，前导码读地址 0 时发生 SMMU 翻译故障，内核随即关闭 GPU 提交。补丁给每个上下文分配一块 64 KiB 全零、GPU 只读的 BO（`zero_ubo_mem`），未绑定的槽指向它，并把 `fd_context` 的私有 BO 表从 3 项扩到 4 项。分析与验收见[11-21 真机体验问题 §5](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/progress/2026-11-21-user-test-issues.md#5-地图触发的-gpu-停转与整屏闪烁s21)。
 
+23. `0022-ir3-fixed-workgroup-fits.patch`：ir3 对线程组大小固定的计算着色器，不论是否用到 barrier，都把寄存器用量限制在整个线程组能同时驻留的范围内，超出的部分溢出到私有内存。此前只对带 barrier 的着色器这样做，`fd6_get_compute_state_info` 按寄存器用量报告的线程上限可能小于派发要求的线程组。AIR 在派发的线程组超过可变大小编译的上限时，按实际大小另编一份（`tools/mesa/air/air_metal_compute.inc`）。相机拍照处理的 `kernelRec709DownsampleYFilterOrder2`（18×18 线程组）由 47 个寄存器降到 31 个、1536 字节私有内存，派发不再被拒绝，见顶层 `docs/progress/2026-11-21-user-test-issues.md` §16.3。
+
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，修改的文件互不重叠。应用这一层补丁后的源码树，加上 `tools/mesa/annibale-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只执行到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 
 `smoke-osmesa.c` / `smoke-osmesa-es.c` 是构建后冒烟测试，在 macOS 主机上编译运行，见顶层 `docs/analysis/mesa-rebase-2026-10.md` 第 3 节。
