@@ -357,11 +357,15 @@ for camera_sensor in front wide; do
 			camera_module=../fw-camera/com.qti.sensormodule.annibale_sunny_ov20b40_front_i.bin
 			camera_mode=4
 			camera_output=camera-ov20b-front-mode4.tab
+			camera_tuned=../fw-camera/com.qti.tuned.annibale_sunny_ov20b40_front_i.bin
+			camera_isp=camera-ov20b40.isp
 			;;
 		wide)
 			camera_module=../fw-camera/com.qti.sensormodule.annibale_aac_ovx8000_wide_i.bin
 			camera_mode=24
 			camera_output=camera-ovx8000-wide-mode24.tab
+			camera_tuned=../fw-camera/com.qti.tuned.annibale_aac_ovx8000_wide_i.bin
+			camera_isp=camera-ovx8000.isp
 			;;
 	esac
 	if [ ! -f "$camera_module" ]; then
@@ -369,23 +373,14 @@ for camera_sensor in front wide; do
 		exit 1
 	fi
 	python3 "$camera_tools/camsensor.py" --profile "$camera_module" "$camera_mode" "root/fw/$camera_output" >/dev/null
-done
-unset camera_module camera_tools camera_sensor camera_mode camera_output
-python3 ./mkcameraresources.py "$IOS/rootfs/System/Library/PrivateFrameworks/CMCapture.framework/V57" \
-	root/lib/CMCaptureResources/V57
-
-for tuned in ../fw-camera/com.qti.tuned.annibale_*.bin; do
-	[ -f "$tuned" ] || continue
-	sensor=$(basename "$tuned" .bin | sed 's/^com\.qti\.tuned\.annibale_[a-z]*_\([a-z0-9]*\)_.*/\1/')
-	mkdir -p root/fw
-	CAMTUNING=""
-	for _ct in ../tools/camtuning.py ../../hackios-xnu-kernel/tools/camtuning.py ../../tools/camtuning.py; do
-		if [ -f "$_ct" ]; then CAMTUNING="$_ct"; break; fi
-	done
-	if [ -n "$CAMTUNING" ]; then
-		python3 "$CAMTUNING" "$tuned" "root/fw/camera-$sensor.isp" >/dev/null
+	# The tuning's lens shading is laid over the part of the sensor this mode reads.
+	if [ -f "$camera_tuned" ]; then
+		python3 "$camera_tools/camtuning.py" "$camera_tuned" "root/fw/$camera_isp" "$camera_module" "$camera_mode" >/dev/null
 	fi
 done
+unset camera_module camera_tools camera_sensor camera_mode camera_output camera_tuned camera_isp
+python3 ./mkcameraresources.py "$IOS/rootfs/System/Library/PrivateFrameworks/CMCapture.framework/V57" \
+	root/lib/CMCaptureResources/V57
 
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw

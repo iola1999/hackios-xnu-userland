@@ -3,8 +3,9 @@
  * cell, the nearest cell for each pixel of the picture (previews), or every pixel by bilinear
  * demosaic (stills); per pixel, in this order: the black level off, lens shading (a grid of gains per
  * colour, when there is one), the white balance's and AE's gains, the colour matrix (identity until
- * one is set), sRGB's curve. Grey-world white balance; no noise reduction yet. The colour matrix and
- * the lens shading can come from the camera's own tuning (isp_load_tuning(), isp_tune()).
+ * one is set), AE's tone curve, sRGB's curve. Grey-world white balance; no noise reduction yet. The
+ * colour matrix and the lens shading can come from the camera's own tuning (isp_load_tuning(),
+ * isp_tune()).
  */
 #include <fcntl.h>
 #include <math.h>
@@ -17,6 +18,23 @@
 #define WHITE           1023
 #define LUT_WHITE       (WHITE * 4)
 
+/*
+ * The gamma table for a tone curve of gain drc at black: drc * v / (1 + (drc - 1) * v) on the linear
+ * value (white staying white, what is near it compressed), then sRGB's curve.
+ */
+static void
+tone(struct isp *isp, float drc)
+{
+	for (int i = 0; i < 4096; i++) {
+		double v = i >= LUT_WHITE ? 1 : (double)i / LUT_WHITE;
+
+		v = drc * v / (1 + (drc - 1) * v);
+		v = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055;
+		isp->gamma[i] = (uint8_t)(v * 255 + 0.5);
+	}
+	isp->drc = drc;
+}
+
 void
 isp_init(struct isp *isp)
 {
@@ -27,12 +45,7 @@ isp_init(struct isp *isp)
 	for (int i = 0; i < 3; i++) {
 		isp->ccm[i][i] = 1;
 	}
-	for (int i = 0; i < 4096; i++) {
-		double v = i >= LUT_WHITE ? 1 : (double)i / LUT_WHITE;
-
-		v = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055;
-		isp->gamma[i] = (uint8_t)(v * 255 + 0.5);
-	}
+	tone(isp, 1);
 }
 
 /* where red and blue are in a cell (0 top left, 1 top right, 2 bottom left, 3 bottom right) */
@@ -126,7 +139,7 @@ void
 isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, struct isp_stats *s)
 {
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
-	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 };
+	double sum[3] = { 0, 0, 0 }, grey[2] = { 0, 0 }, neutral[2] = { 0, 0 }, logs = 0;
 	float gains[3] = { 1, 1, 1 };
 	int r, b;
 
@@ -149,23 +162,27 @@ isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const 
 			sum[1] += g;
 			sum[2] += v[b];
 			/*
+			 * As the picture will have it: the lens shading raises the corners several times, and
+			 * the light there counts for that much more than in the frame as it comes.
+			 */
+			float cr = (float)v[r], cg = (float)g, cb = (float)v[b];
+
+			if (isp != NULL && isp->lsc.on) {
+				lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
+				cr *= gains[0];
+				cg *= gains[1];
+				cb *= gains[2];
+			}
+			/* (a cell near black counts as the near black below: there it is noise more than light) */
+			logs += logf(cg > 24 ? cg : 24);
+			/* the brightest colour, white balanced: a bluish screen reaches white in blue first */
+			float top = isp != NULL ? fmaxf(cg, fmaxf(cr * isp->wb[0], cb * isp->wb[2])) : fmaxf(cg, fmaxf(cr, cb));
+			/*
 			 * The white balance leaves out a cell with a colour near white -- a lamp, a screen:
 			 * green, the most sensitive, stops there first and the cell would count as magenta --
 			 * and one near black, where noise cut off at the black level is all there is.
 			 */
 			if (top_v < (int)(WHITE - f->black) * 9 / 10 && g >= 24) {
-				float cr = (float)v[r], cg = (float)g, cb = (float)v[b];
-
-				/*
-				 * As the picture will have it: the lens shading raises the corners several times, and
-				 * the light there counts for that much more than in the frame as it comes.
-				 */
-				if (isp != NULL && isp->lsc.on) {
-					lsc_at(isp, cells_w > 1 ? (float)cx / (cells_w - 1) : 0, v_pos, gains);
-					cr *= gains[0];
-					cg *= gains[1];
-					cb *= gains[2];
-				}
 				/*
 				 * Each cell's colour, not its light: summed, a lamp or a screen in the picture -- tens of
 				 * times brighter than the room it is in -- would have the white balance to itself, and
@@ -189,13 +206,14 @@ isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const 
 					}
 				}
 			}
-			s->hist[g >> 4 > 63 ? 63 : g >> 4]++;
+			s->hist[top >= 1008 ? 63 : (int)top >> 4]++;
 			s->cells++;
 		}
 	}
 	for (int c = 0; c < 3; c++) {
 		s->mean[c] = s->cells ? sum[c] / s->cells : 0;
 	}
+	s->key = s->cells ? exp(logs / s->cells) : 0;
 	for (int c = 0; c < 2; c++) {
 		s->grey[c] = s->grey_cells ? grey[c] / s->grey_cells : 0;
 		s->neutral[c] = s->neutral_cells ? neutral[c] / s->neutral_cells : 0;
@@ -210,9 +228,13 @@ isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const 
 }
 
 /*
- * Green's mean towards 15 % of white, unless that would put 1 % of the picture into white. The
- * exposure, longest first: the frame's lines at the shortest frame, then gain to 16x, then frames up
- * to max_frame_lines, then gain to the most; beyond that, digital gain (up to 4x).
+ * The picture's middle grey (the key: green's log average, lens-shaded) towards 18 % of white, unless
+ * that would put 1 % of the picture into white (then down to half of it, the tone curve's drc making
+ * up for it). 18 %: a grey card's, which ISO 12232's standard output sensitivity puts at 118 of 255 in
+ * sRGB, as the gamma here does. The log average: the scene in stops as exposure counts them, so that a
+ * lamp or a window in it does not darken the rest as it would a mean's. The exposure, longest first:
+ * the frame's lines at the shortest frame, then gain to 16x, then frames up to max_frame_lines, then
+ * gain to the most; beyond that, digital gain (up to 4x).
  */
 bool
 isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_stats *s, struct annibale_camera_command *c)
@@ -222,12 +244,22 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 		return false;
 	}
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double white = WHITE - f->black, target = 0.15 * white, mean = s->mean[1] * isp->digital > 0.5 ? s->mean[1] * isp->digital : 0.5;
+	double white = WHITE - f->black, target = 0.18 * white, mean = s->key * isp->digital > 0.5 ? s->key * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;
-	double digital = 1;
+	double digital = 1, drc;
 
+	/*
+	 * As Qualcomm's ADRC does, on this frame's picture: where the highlights keep the exposure short of
+	 * what the key wants (to half of it at most, below), the tone curve raises the rest by what is
+	 * missing and compresses the highlights under white instead of cutting them.
+	 */
+	drc = target / mean * (bright > 0.9 * white ? 1 : bright / (0.9 * white));
+	drc = drc < 1 ? 1 : drc > 2 ? 2 : drc;
+	if (fabs(drc - isp->drc) > 0.005 * isp->drc) {
+		tone(isp, (float)drc);
+	}
 	if (isp->ae_wait > 0 && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
 		isp->ae_wait--;
 		return false;                   /* (the last change not in the frames yet) */

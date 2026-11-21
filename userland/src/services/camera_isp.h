@@ -16,8 +16,10 @@
 
 struct isp_stats {
 	double          mean[3];        /* R, G, B above black, in 10-bit steps */
-	double          bright;         /* the level of green that 1 % of the cells are above */
-	uint32_t        hist[64];       /* green above black, 16 steps a bin */
+	/* lens-shaded, as the picture will have it: */
+	double          key;            /* green's log average, a cell near black counted as near black (24) */
+	double          bright;         /* the level that 1 % of the cells' brightest colour (white balanced) is above */
+	uint32_t        hist[64];       /* of the brightest colours, 16 steps a bin */
 	uint32_t        cells;
 	/*
 	 * Red over green and blue over green, lens-shaded, each cell's counted once however bright it is:
@@ -75,7 +77,8 @@ struct isp {
 	bool            turned;         /* the picture turned half round (a sensor mounted the other way up) */
 	float           ccm[3][3];      /* the colour matrix, camera RGB (white balanced) to linear sRGB; rows sum to 1 */
 	struct isp_lsc  lsc;
-	uint8_t         gamma[4096];    /* linear 0..4092 to 8 bits, sRGB's curve */
+	float           drc;            /* the tone curve's gain at black (isp_ae(): 1 to 2) */
+	uint8_t         gamma[4096];    /* linear 0..4092 to 8 bits: the tone curve, then sRGB's curve */
 	uint32_t        asked_lines, asked_gain, asked_frame_lines;     /* what AE asked for last */
 	uint32_t        ae_wait;        /* frames left to wait for the sensor to apply asked_lines/asked_gain */
 	uint32_t        max_frame_lines;        /* the longest frame AE may ask for (0: twice the shortest) */
