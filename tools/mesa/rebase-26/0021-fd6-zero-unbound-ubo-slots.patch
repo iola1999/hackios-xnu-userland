@@ -1,0 +1,100 @@
+--- a/src/gallium/drivers/freedreno/freedreno_context.h
++++ b/src/gallium/drivers/freedreno/freedreno_context.h
+@@ -439,7 +439,7 @@
+     * In particular, these are driver internal buffers which do not
+     * participate in batch resource tracking.
+     */
+-   struct fd_bo *private_bos[3];
++   struct fd_bo *private_bos[4];   /* HackiOS: a6xx adds zero_ubo_mem as a fourth */
+    unsigned num_private_bos;
+ 
+    /* Maps generic gallium oriented fd_dirty_3d_state bits to generation
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.h
+@@ -67,6 +67,8 @@
+    set->bo = NULL;
+ }
+ 
++#define FD6_ZERO_UBO_SIZE 0x10000
++
+ struct fd6_context {
+    struct fd_context base;
+ 
+@@ -86,6 +88,8 @@
+     */
+    struct fd_bo *control_mem;
+    struct fd_bo *zero_desc_mem;
++   /* HackiOS: what an unbound UBO slot points at (fd6_emit_ubos), FD6_ZERO_UBO_SIZE bytes */
++   struct fd_bo *zero_ubo_mem;
+    uint32_t seqno;
+ 
+    /* pre-baked stateobj for stream-out disable: */
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+@@ -61,6 +61,8 @@
+       fd_bo_del(fd6_ctx->control_mem);
+    if (fd6_ctx->zero_desc_mem)
+       fd_bo_del(fd6_ctx->zero_desc_mem);
++   if (fd6_ctx->zero_ubo_mem)
++      fd_bo_del(fd6_ctx->zero_ubo_mem);
+ 
+    fd_context_cleanup_common_vbos(&fd6_ctx->base);
+ 
+@@ -324,6 +326,16 @@
+       void *zero_desc = fd_bo_map(fd6_ctx->zero_desc_mem);
+       if (zero_desc)
+          memset(zero_desc, 0, 0x1000);
++   }
++
++   /* HackiOS: one UBO's worth of zeros (PIPE_CAP max constant buffer size), see fd6_emit_ubos */
++   fd6_ctx->zero_ubo_mem =
++      fd_bo_new(screen->dev, FD6_ZERO_UBO_SIZE, FD_BO_GPUREADONLY, "zero_ubo");
++   if (fd6_ctx->zero_ubo_mem) {
++      fd_context_add_private_bo(&fd6_ctx->base, fd6_ctx->zero_ubo_mem);
++      void *zero_ubo = fd_bo_map(fd6_ctx->zero_ubo_mem);
++      if (zero_ubo)
++         memset(zero_ubo, 0, FD6_ZERO_UBO_SIZE);
+    }
+ 
+    fd_context_setup_common_vbos(&fd6_ctx->base);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_const.cc
+@@ -260,9 +260,19 @@
+ FD_GENX(fd6_build_tess_consts);
+ 
+ static void
+-fd6_emit_ubos(const struct ir3_shader_variant *v, fd_cs &cs,
++fd6_emit_ubos(struct fd_context *ctx, const struct ir3_shader_variant *v, fd_cs &cs,
+               struct fd_constbuf_stateobj *constbuf)
+ {
++   /*
++    * HackiOS: an unbound slot points at a page of zeros rather than at address 0. Where
++    * constants are loaded by the shader preamble, the preamble reads every UBO range the
++    * shader uses, before and whatever its branches decide. Metal leaves a buffer argument
++    * unbound when the shader does not reach it at run time, and that read of address 0
++    * stopped the GPU with an SMMU fault at 0, 0x40 or 0x80 (Maps, the location prompt and
++    * MapKit's snapshot service: docs/progress/2026-11-21-user-test-issues.md).
++    */
++   struct fd_bo *zero_ubo = fd6_context(ctx)->zero_ubo_mem;
++
+    const struct ir3_const_state *const_state = ir3_const_state(v);
+    int num_ubos = const_state->num_app_ubos;
+ 
+@@ -287,6 +297,8 @@
+          struct fd_bo *bo = fd_resource(cb->buffer)->bo;
+          int size_vec4s = DIV_ROUND_UP(cb->buffer_size, 16);
+          pkt.add(A6XX_UBO_DESC(i, bo, cb->buffer_offset, size_vec4s));
++      } else if (zero_ubo) {
++         pkt.add(A6XX_UBO_DESC(i, zero_ubo, 0, FD6_ZERO_UBO_SIZE / 16));
+       } else {
+          pkt.add(A6XX_UBO_DESC(i, NULL, 0, 0));
+       }
+@@ -333,7 +345,7 @@
+ emit_user_consts(struct fd_context *ctx, const struct ir3_shader_variant *v,
+                  fd_cs &cs, struct fd_constbuf_stateobj *constbuf)
+ {
+-   fd6_emit_ubos(v, cs, constbuf);
++   fd6_emit_ubos(ctx, v, cs, constbuf);
+ 
+    if (fd6_load_shader_consts_via_preamble<CHIP>(v)) {
+       const struct ir3_const_state *const_state = ir3_const_state(v);

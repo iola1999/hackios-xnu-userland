@@ -23,6 +23,7 @@
 19. `0017-nir-yuv-explicit-lod.patch`：YUV 平面采样接受 `nir_texop_tex`、`nir_texop_txl`、`nir_texop_txb` 与 `nir_texop_txd`，生成平面纹理指令时保留原操作，支持显式 LOD、bias 和导数采样。
 20. `0018-ir3-alias-relative-and-fsat.patch`：移植上游 `8511f446` 与 `5a9db0be`，相对常量输出保留原 MOV，`fsat` 仅合入浮点 cat2/cat3 指令的饱和标记。实际 ir3 回归测试在旧版复现 3 项失败，修复后 16 项通过；隔离 iOS arm64e 目标库已链接，GPU 像素待验。运行方法与范围见 [ir3 输出优化测试](../tests/README.md)。
 21. `0019-fd6-zero-unbound-texture-slots.patch`：`fd_set_sampler_views` 保留调用方显式传入槽位范围中的尾部空视图槽位，并在 `fd6_texture_key` 中记录 `num_textures`，使 `CP_LOAD_STATE6_0` 对未绑定的可空纹理槽位写入全零硬件描述符（`dummy_view`）；同时在 `fd_launch_grid` 恢复已保存的 3D `ctx->batch` 时调用 `fd_context_all_dirty`，防止计算核分发末尾 `fd_context_all_clean` 清空 3D 脏位导致后续绘制漏发常量与采样状态。
+22. `0021-fd6-zero-unbound-ubo-slots.patch`：这一代 GPU 上 freedreno 用着色器前导码装载常量（`fd6_load_shader_consts_via_preamble`），前导码按着色器用到的范围读每个 UBO 槽，不看主程序的分支。`fd6_emit_ubos` 给未绑定的槽写地址 0，而 Metal 允许运行时不访问的缓冲参数不绑定，前导码读地址 0 时发生 SMMU 翻译故障，内核随即关闭 GPU 提交。补丁给每个上下文分配一块 64 KiB 全零、GPU 只读的 BO（`zero_ubo_mem`），未绑定的槽指向它，并把 `fd_context` 的私有 BO 表从 3 项扩到 4 项。分析与验收见[11-21 真机体验问题 §5](https://github.com/iola1999/hackios-redmi-k90-annibale/blob/main/docs/progress/2026-11-21-user-test-issues.md#5-地图触发的-gpu-停转与整屏闪烁s21)。
 
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，修改的文件互不重叠。应用这一层补丁后的源码树，加上 `tools/mesa/annibale-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只执行到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 
