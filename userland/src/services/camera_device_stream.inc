@@ -429,6 +429,7 @@ struct af {
 	bool            sweep;          /* ... and the whole travel measured */
 	float           sum_sharpness, sum_level;
 	unsigned        measured;
+	unsigned        lag;            /* frames not yet taken where the lens was told to go */
 };
 
 static void
@@ -467,6 +468,12 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 		af_go(device, af, af->target);          /* (the next step of a longer way) */
 		return;
 	}
+	/* A frame reports the lens position it was taken at: measure the ones taken where it was told. */
+	if (f->focus != af->at && af->lag < 4) {
+		af->lag++;
+		return;
+	}
+	af->lag = 0;
 	sharpness = isp_sharpness(f, raw, window[0], window[1], window[2], window[3], &level);
 	af->sum_sharpness += sharpness;
 	af->sum_level += level;
