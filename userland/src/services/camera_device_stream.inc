@@ -256,6 +256,27 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	uint64_t began = mach_absolute_time();
 
 	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	double still_y = 0, still_cb = 0, still_cr = 0;
+
+	if (job.still) {
+		/* (the picture as made, 8 bits a value, every 16th pixel each way: what the photograph starts from) */
+		const uint8_t *yp = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *cp = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
+		size_t ys = CVPixelBufferGetBytesPerRowOfPlane(pb, 0), cs = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
+		unsigned n = 0;
+
+		for (uint32_t y = 0; y + 1 < height; y += 16) {
+			for (uint32_t x = 0; x + 1 < width; x += 16, n++) {
+				still_y += yp[(size_t)y * ys + x];
+				still_cb += cp[(size_t)(y / 2) * cs + (x & ~1u)];
+				still_cr += cp[(size_t)(y / 2) * cs + (x & ~1u) + 1];
+			}
+		}
+		if (n > 0) {
+			still_y /= n;
+			still_cb /= n;
+			still_cr /= n;
+		}
+	}
 	if (pf == PF_X420 || pf == PF_X422 || pf == PF_XF20) {
 		uint8_t *y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
 		size_t y_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
@@ -296,8 +317,10 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 		if (tb.denom == 0) {
 			mach_timebase_info(&tb);
 		}
-		say("%s: %ux%u made of every pixel in %.0f ms", out->name, width, height,
-		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6);
+		say("%s: %ux%u %c%c%c%c made of every pixel in %.0f ms; Y %.0f Cb %.0f Cr %.0f; exposure %u lines gain %.2fx, AE's tone curve %.2f",
+		    out->name, width, height, pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255,
+		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6, still_y, still_cb, still_cr,
+		    f->exposure_lines, f->gain_unity ? (double)f->gain / f->gain_unity : 0, isp->drc);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
 	CVBufferSetAttachments(pb, colour_attachments(), kCVAttachmentMode_ShouldPropagate);
@@ -405,31 +428,31 @@ colour_temperature(const struct isp *isp)
 /*
  * Focus, where the camera has a lens motor (the frames' focus is a position, not ANNIBALE_CAMERA_NO_FOCUS:
  * the wide camera's): by contrast, as there is nothing else to go by -- the sensor's phase-detection
- * pixels are not read.
+ * pixels are not read. A search goes through CMCapture's search positions (AFSearchPositions, 0 to 255
+ * over the lens's travel), from the end nearer the lens, and stops early as AFEarlyOutParams say; the
+ * lens then goes to the peak of a parabola through the sharpest position and its two neighbours
+ * (AFPeakPredictionEnabled). Each position is measured on the first frame taken there: the lens moves
+ * while the frame before it is exposed.
  */
-enum { AF_WATCH, AF_STEADY, AF_CLIMB, AF_SWEEP, AF_FINE_SEARCH, AF_SETTLE };
+enum { AF_WATCH, AF_STEADY, AF_SEARCH, AF_SETTLE };
 #define AF_NEAR         16              /* (off the stop at 0) */
 #define AF_FAR          768             /* (its module file's actuator region goes to 700) */
-#define AF_STEP         48
-#define AF_FINE         12
 
 struct af {
 	int             state;
-	uint32_t        at, target;     /* where the lens was told to go; where it is going a step at a time */
-	unsigned        wait;           /* frames before the next measurement */
-	int             way;            /* +1 nearer, -1 further */
-	bool            turned;
-	unsigned        worse;          /* steps in a row less sharp than the sharpest */
-	uint32_t        start, best, fine_to;
-	float           best_sharpness;
+	uint32_t        at;             /* where the lens was told to go */
+	struct af_search search;        /* the stream's, as it was when this search began */
+	uint32_t        pos[AF_POSITIONS];      /* the search's lens positions, in the order taken */
+	float           sharp[AF_POSITIONS];
+	unsigned        next, best, below;      /* the position being measured; the sharpest; how many since below it */
 	float           sharpness, level;       /* in focus: the middle's, to watch */
 	float           last_sharpness, last_level;
 	unsigned        unlike, steady, steps;
 	bool            now;            /* asked for: no waiting for the picture to keep still */
-	bool            sweep;          /* ... and the whole travel measured */
 	float           sum_sharpness, sum_level;
 	unsigned        measured;
 	unsigned        lag;            /* frames not yet taken where the lens was told to go */
+	uint64_t        began;          /* when the search began (mach_absolute_time) */
 };
 
 static void
@@ -437,15 +460,53 @@ af_go(int device, struct af *af, uint32_t target)
 {
 	struct annibale_camera_command c = { .command = ANNIBALE_CAMERA_FOCUS };
 
-	af->target = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
-	c.a = af->at < af->target ? (af->target - af->at > AF_STEP ? af->at + AF_STEP : af->target) :
-	    (af->at - af->target > AF_STEP ? af->at - AF_STEP : af->target);
-	af->at = c.a;
-	af->wait = af->at == af->target ? 1 : 0;
+	af->at = c.a = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
 	af->steps++;
+	af->lag = 0;
 	af->sum_sharpness = af->sum_level = 0;
 	af->measured = 0;
 	(void)write(device, &c, sizeof(c));
+}
+
+static void
+af_search(int device, struct af *af)
+{
+	const struct af_search *p = &af->search;
+	uint32_t first = AF_NEAR + p->position[0] * (AF_FAR - AF_NEAR) / 255,
+	    last = AF_NEAR + p->position[p->count - 1] * (AF_FAR - AF_NEAR) / 255;
+	bool backwards = (af->at > first ? af->at - first : first - af->at) > (af->at > last ? af->at - last : last - af->at);
+
+	for (unsigned i = 0; i < p->count; i++) {
+		af->pos[i] = AF_NEAR + p->position[backwards ? p->count - 1 - i : i] * (AF_FAR - AF_NEAR) / 255;
+	}
+	af->state = AF_SEARCH;
+	af->next = af->best = af->below = 0;
+	af->steps = 0;
+	af->began = mach_absolute_time();
+	af_go(device, af, af->pos[0]);
+}
+
+/* the sharpest position, or the peak of the parabola through it and its neighbours */
+static uint32_t
+af_peak(const struct af *af)
+{
+	unsigned b = af->best;
+
+	if (!af->search.peak_prediction || b == 0 || b >= af->next) {
+		return af->pos[b];
+	}
+	double x0 = af->pos[b - 1], x1 = af->pos[b], x2 = af->pos[b + 1];
+	double y0 = af->sharp[b - 1], y1 = af->sharp[b], y2 = af->sharp[b + 1];
+	double d = (x0 - x1) * (x0 - x2) * (x1 - x2);
+	double a = (x2 * (y1 - y0) + x1 * (y0 - y2) + x0 * (y2 - y1)) / d;
+	double bb = (x2 * x2 * (y0 - y1) + x1 * x1 * (y2 - y0) + x0 * x0 * (y1 - y2)) / d;
+
+	if (a >= 0) {
+		return af->pos[b];
+	}
+	double peak = -bb / (2 * a), lo = x0 < x2 ? x0 : x2, hi = x0 < x2 ? x2 : x0;
+
+	return (uint32_t)(peak < lo ? lo : peak > hi ? hi : peak + 0.5);
 }
 
 static void
@@ -457,16 +518,8 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 	if (f->focus == ANNIBALE_CAMERA_NO_FOCUS) {
 		return;
 	}
-	if (af->at == 0 && af->target == 0) {
-		af->at = af->target = f->focus;         /* (where the kernel put it) */
-	}
-	if (af->wait > 0) {
-		af->wait--;
-		return;
-	}
-	if (af->at != af->target) {
-		af_go(device, af, af->target);          /* (the next step of a longer way) */
-		return;
+	if (af->at == 0) {
+		af->at = f->focus;              /* (where the kernel put it) */
 	}
 	/* A frame reports the lens position it was taken at: measure the ones taken where it was told. */
 	if (f->focus != af->at && af->lag < 4) {
@@ -511,90 +564,41 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 			return;
 		}
 		af->now = false;
-		if (af->sweep) {
-			af->sweep = false;
-			af->state = AF_SWEEP;
-			af->best_sharpness = -1;
-			af->worse = 0;
-			af->steps = 0;
-			af->way = af->at - AF_NEAR < AF_FAR - af->at ? 1 : -1;
-			af_go(device, af, af->way > 0 ? AF_NEAR : AF_FAR);     /* (walked there a step at a time) */
-			return;
-		}
-		af->state = AF_CLIMB;
-		af->best = af->start = af->at;
-		af->best_sharpness = sharpness;
-		af->way = af->at + AF_STEP > AF_FAR ? -1 : 1;
-		af->turned = false;
-		af->worse = 0;
-		af->steps = 0;
-		af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
+		af_search(device, af);
 		return;
-	case AF_CLIMB: {
-		int next = (int)af->at + af->way * AF_STEP;
-		bool end = next < AF_NEAR || next > AF_FAR;
+	case AF_SEARCH: {
+		const struct af_search *p = &af->search;
 
-		if (sharpness > af->best_sharpness * 1.02f) {
-			af->best = af->at;
-			af->best_sharpness = sharpness;
-			af->worse = 0;
-		} else {
-			af->worse++;
+		af->sharp[af->next] = sharpness;
+		if (sharpness > af->sharp[af->best]) {
+			af->best = af->next;
+			af->below = 0;
+		} else if (sharpness < af->sharp[af->best] * (1 - p->early_out_drop) && (af->best > 0 || p->early_out_at_start)) {
+			af->below++;
 		}
-		if (af->worse < 2 && !end) {
-			af_go(device, af, (uint32_t)next);
-			return;
-		}
-		next = (int)af->best - af->way * AF_STEP;
-		if (!af->turned && af->best == af->start && next >= AF_NEAR && next <= AF_FAR) {
-			/* not sharper that way at all: the other way, from where it started */
-			af->turned = true;
-			af->way = -af->way;
-			af->worse = 0;
-			af_go(device, af, (uint32_t)next);
-			return;
-		}
-		af->state = AF_FINE_SEARCH;
-		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
-		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
-		return;
-	}
-	case AF_SWEEP:
-		say("focus: sweep: %u %.4f", af->at, sharpness);
-		if (sharpness > af->best_sharpness) {
-			af->best = af->at;
-			af->best_sharpness = sharpness;
-			af->worse = 0;
-		} else if (sharpness < af->best_sharpness * 0.85f) {
-			af->worse++;
-		}
-		if (af->worse < 2 && (int)af->at + af->way * AF_STEP >= AF_NEAR && (int)af->at + af->way * AF_STEP <= AF_FAR) {
-			af_go(device, af, (uint32_t)((int)af->at + af->way * AF_STEP));
-			return;
-		}
-		af->state = AF_FINE_SEARCH;
-		af->fine_to = af->best + 2 * AF_FINE > AF_FAR ? AF_FAR : af->best + 2 * AF_FINE;
-		af_go(device, af, af->best > 2 * AF_FINE + AF_NEAR ? af->best - 2 * AF_FINE : AF_NEAR);
-		return;
-	case AF_FINE_SEARCH:
-		if (sharpness > af->best_sharpness) {
-			af->best = af->at;
-			af->best_sharpness = sharpness;
-		}
-		if (af->at + AF_FINE <= af->fine_to) {
-			af_go(device, af, af->at + AF_FINE);
+		if (af->next + 1 < p->count && !(p->early_out && af->below >= p->early_out_count)) {
+			af_go(device, af, af->pos[++af->next]);
 			return;
 		}
 		af->state = AF_SETTLE;
-		af_go(device, af, af->best);
+		af_go(device, af, af_peak(af));
 		return;
-	case AF_SETTLE:
+	}
+	case AF_SETTLE: {
+		static mach_timebase_info_data_t tb;
+
+		if (tb.denom == 0) {
+			mach_timebase_info(&tb);
+		}
 		af->state = AF_WATCH;
 		af->sharpness = sharpness;
 		af->level = level;
 		af->unlike = 0;
-		say("focus: the lens at %u after %u moves (sharpness %.3f)", af->at, af->steps, sharpness);
+		say("focus: the lens at %u after %u moves in %.0f ms (sharpness %.3f, the best searched %.3f at %u)", af->at,
+		    af->steps, (double)(mach_absolute_time() - af->began) * tb.numer / tb.denom / 1e6, sharpness,
+		    af->sharp[af->best], af->pos[af->best]);
 		return;
+	}
 	}
 }
 
@@ -650,8 +654,16 @@ worker(void *context)
 		return NULL;
 	}
 	unsigned consecutive_failures = 0;
+	/* the pace over the last 300 frames: how long between frames at most, how long each took here */
+	mach_timebase_info_data_t tb;
+	uint64_t got = 0, pace_from = 0, longest = 0, work = 0, rendering = 0;
+	uint32_t pace_frames = 0, skipped = 0, last_sequence = 0;
+
+	mach_timebase_info(&tb);
 	isp_init(&isp);
 	while (s->state == CAM_STREAM_ACTIVE) {
+		uint64_t asked = mach_absolute_time();
+
 		if (camera_native_frame(device, &profile, buffer, bytes, &capture) < 0) {
 			if (capture.state == ANNIBALE_CAM_CAPTURE_FAILED && ++consecutive_failures <= 3) {
 				say("transient capture error (%u/3): state %u flags %#x error %u (%s)",
@@ -665,11 +677,32 @@ worker(void *context)
 		consecutive_failures = 0;
 
 		const struct annibale_camera_frame *f = (const void *)buffer;
+		uint64_t now = mach_absolute_time();
+
+		if (got != 0 && now - got > longest) {
+			longest = now - got;
+		}
+		if (got != 0 && (now - got) * tb.numer / tb.denom > 200000000ull) {
+			/* (which side the time went to: the kernel's wait for the frame, or this loop's work) */
+			say("frame %llu came %.0f ms after the one before: %.0f ms of it waiting for it", f->sequence,
+			    (now - got) * (double)tb.numer / tb.denom / 1e6, (now - asked) * (double)tb.numer / tb.denom / 1e6);
+		}
+		if (last_sequence != 0 && f->sequence > last_sequence + 1) {
+			skipped += f->sequence - last_sequence - 1;
+		}
+		last_sequence = (uint32_t)f->sequence;
+		got = now;
+		if (pace_from == 0) {
+			pace_from = now;
+		}
 		const uint8_t *raw = buffer + f->header_bytes;
 		struct annibale_camera_command c;
 
+		uint64_t mark[5];
+
 		isp_measure(&isp, f, raw, &st);
 		isp_awb(&isp, &st);
+		mark[0] = mach_absolute_time();
 		if (f->sensor != tuned_for) {
 			tuned_for = f->sensor;
 			load_tuning(&isp, f->sensor);
@@ -688,12 +721,20 @@ worker(void *context)
 		}
 		isp.zoom = s->zoom;
 		isp.turned = s->camera->turned;
+		pthread_mutex_lock(&s->lock);
+		isp.bias = s->exposure_bias / 256.0f;
+		pthread_mutex_unlock(&s->lock);
+		mark[1] = mach_absolute_time();
 		if (isp_ae(&isp, f, &st, &c)) {
 			(void)write(device, &c, sizeof(c));
 		}
+		mark[2] = mach_absolute_time();
 		bool af_now, af_locked;
 		float af_win[4];
 		pthread_mutex_lock(&s->lock);
+		if (af.state != AF_SEARCH && af.state != AF_SETTLE) {
+			af.search = s->af_search;
+		}
 		s->last_lux = lux;
 		s->last_cct = cct;
 		af_now = s->af_now;
@@ -704,12 +745,10 @@ worker(void *context)
 		if (af_now) {
 			/* (whatever it was doing: at once, from the next frame) */
 			af.state = AF_STEADY;
-			af.target = af.at;
-			af.wait = 0;
 			af.now = true;
-			af.sweep = true;
 		}
 		af_frame(device, &af, f, raw, af_win, af_locked);
+		mark[3] = mach_absolute_time();
 		s->frames++;
 
 		CFDictionaryRef metadata = frame_metadata(&isp, f, s->port);
@@ -750,6 +789,8 @@ worker(void *context)
 			}
 		}
 		bool gave_still = false;
+		uint64_t render_from = mach_absolute_time();
+
 		for (int i = 0; s->state == CAM_STREAM_ACTIVE && i < OUTPUTS; i++) {
 			struct output *out = &s->out[i];
 
@@ -774,6 +815,8 @@ worker(void *context)
 				gave_still = true;
 			}
 		}
+		mark[4] = mach_absolute_time();
+		rendering += mark[4] - render_from;
 		if (gave_still && s->stills_wanted > 0) {
 			s->stills_wanted--;
 			s->still_redeye_wanted = false;
@@ -793,6 +836,24 @@ worker(void *context)
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {
 			CFRelease(metadata);
+		}
+		work += mach_absolute_time() - got;
+		if ((mach_absolute_time() - got) * tb.numer / tb.denom > 150000000ull) {
+			double ms = (double)tb.numer / tb.denom / 1e6;
+
+			say("frame %llu took %.0f ms here: measuring %.0f, tuning %.0f, AE %.0f, focus %.0f, giving pictures %.0f",
+			    f->sequence, (mach_absolute_time() - got) * ms, (mark[0] - got) * ms, (mark[1] - mark[0]) * ms,
+			    (mark[2] - mark[1]) * ms, (mark[3] - mark[2]) * ms, (mark[4] - render_from) * ms);
+		}
+		if (++pace_frames == 300) {
+			double ms = (double)tb.numer / tb.denom / 1e6;
+
+			say("pace: %u frames in %.1f s, %u of the sensor's skipped; at most %.0f ms between two; %.1f ms each here (%.1f giving pictures)",
+			    pace_frames, (got - pace_from) * ms / 1000, skipped, longest * ms, work * ms / pace_frames,
+			    rendering * ms / pace_frames);
+			pace_frames = skipped = 0;
+			pace_from = got;
+			longest = work = rendering = 0;
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
 			say("frame %llu: %ux%u RAW10, green %.0f above black; white balance R %.2f B %.2f",
@@ -1029,6 +1090,10 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	pthread_mutex_init(&s->metadata_lock, NULL);
 	s->torch = torch_fd;
 	s->zoom = 1;
+	s->exposure_bias = s->said_bias = 256;
+	/* (CMCapture's for the wide camera, until it sends them) */
+	s->af_search = (struct af_search){ 13, { 13, 31, 48, 66, 86, 107, 128, 149, 171, 192, 213, 234, 255 }, true, 2, 56 / 256.0f,
+		true, true };
 	s->af_window[0] = s->af_window[1] = 0.3f;
 	s->af_window[2] = s->af_window[3] = 0.7f;
 	s->camera = camera;

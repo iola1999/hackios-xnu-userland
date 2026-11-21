@@ -73,6 +73,7 @@ struct isp_tuning {
 struct isp {
 	float           wb[3];          /* the white balance's gains, green 1 */
 	float           digital;        /* more gain, for what AE cannot reach with the sensor's */
+	float           bias;           /* AE's target times this: the exposure bias asked for (2^EV) */
 	float           zoom;           /* the picture is the middle 1/zoom of the sensor each way (1: the whole of it) */
 	bool            turned;         /* the picture turned half round (a sensor mounted the other way up) */
 	float           ccm[3][3];      /* the colour matrix, camera RGB (white balanced) to linear sRGB; rows sum to 1 */

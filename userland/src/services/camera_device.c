@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
@@ -53,7 +54,8 @@ annibale_camera_say(const char *format, ...)
 {
 	char line[400];
 	va_list ap;
-	int n = snprintf(line, sizeof(line), "annibale: camera: ");
+	/* (seconds since boot: the time between two lines is what a step took) */
+	int n = snprintf(line, sizeof(line), "annibale: camera: %.3f ", clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1e9);
 
 	va_start(ap, format);
 	n += vsnprintf(line + n, sizeof(line) - (size_t)n, format, ap);
@@ -206,7 +208,8 @@ say_value(const char *what, CFStringRef key, CFTypeRef value)
 	say("%s %s%s%s", what, name, value ? " = " : "", text);
 }
 
-static void
+/* true the first time (the value said), false after */
+static bool
 say_once(const char *what, CFStringRef key, CFTypeRef value)
 {
 	CFStringRef tag = CFStringCreateWithFormat(NULL, NULL, CFSTR("%s %@"), what, key);
@@ -223,6 +226,7 @@ say_once(const char *what, CFStringRef key, CFTypeRef value)
 	if (first) {
 		say_value(what, key, value);
 	}
+	return first;
 }
 
 /* ---- numbers and dictionaries ---------------------------------------------------------------------- */
@@ -401,6 +405,19 @@ enum camera_stream_state {
 	CAM_STREAM_FAULTED = 3,
 };
 
+/* how a focus search goes, as CMCapture asks (AFSearchPositions, AFEarlyOutParams, AFPeakPredictionEnabled) */
+#define AF_POSITIONS    16
+struct af_search {
+	unsigned        count;
+	uint8_t         position[AF_POSITIONS];         /* 0 to 255 over the lens's travel, ascending */
+	bool            early_out;      /* stop once ... */
+	unsigned        early_out_count;        /* ... this many positions in a row are ... */
+	float           early_out_drop;         /* ... this much less sharp than the sharpest (AFEarlyOutDecrementAmount
+	                                         * read as 256ths: an assumption, its unit not traced in CMCapture) */
+	bool            early_out_at_start;     /* ... even when the sharpest is the first */
+	bool            peak_prediction;
+};
+
 struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
@@ -412,6 +429,12 @@ struct stream {
 	int             format_index;
 	double          min_fps, max_fps;
 	float           zoom;           /* ZoomFactor: the picture is the middle 1/zoom of the sensor each way */
+	/*
+	 * ExposureBias: the exposure the user asked for over AE's, 2^EV in 1/256ths, 1 to 65535 -- as
+	 * CMCapture's sender (0x1aea2eb08) makes it of the EV, llroundf(exp2f(EV) * 256): 256 none.
+	 */
+	uint32_t        exposure_bias, said_bias;
+	struct af_search af_search;
 	const struct camera *camera;
 	struct annibale_camera_profile profile;
 	CFStringRef     port;
@@ -503,7 +526,9 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 		}
 		value = number_f(level / 1000.0);
 	} else if (key_is(key, "ExposureBias")) {
-		value = number_f(0);
+		pthread_mutex_lock(&s->lock);
+		value = number_i32((int32_t)s->exposure_bias);
+		pthread_mutex_unlock(&s->lock);
 	} else if (key_is(key, "VideoOutputConfigurations") || key_is(key, "VideoOutputsEnabled")) {
 		bool configs = key_is(key, "VideoOutputConfigurations");
 		CFMutableDictionaryRef d = (CFMutableDictionaryRef)new_dict();
@@ -683,41 +708,7 @@ dict_number(CFDictionaryRef d, const char *name, double otherwise)
 	return n;
 }
 
-/* AFWindowParams: the first window, as fractions of the frame; none (or not one) is the middle */
-static void
-af_window(struct stream *s, CFTypeRef value)
-{
-	CFDictionaryRef w = NULL;
-	double x0, y0, width, height;
-
-	if (value != NULL && CFGetTypeID(value) == CFArrayGetTypeID() && CFArrayGetCount(value) > 0) {
-		w = CFArrayGetValueAtIndex(value, 0);
-	}
-	if (w == NULL || CFGetTypeID(w) != CFDictionaryGetTypeID() || (width = dict_number(w, "width", 0)) <= 0 ||
-	    (height = dict_number(w, "height", 0)) <= 0) {
-		s->af_window[0] = s->af_window[1] = 0.3f;
-		s->af_window[2] = s->af_window[3] = 0.7f;
-		return;
-	}
-	x0 = dict_number(w, "hStart", 0) / 1000;
-	y0 = dict_number(w, "vStart", 0) / 1000;
-	width /= 1000;
-	height /= 1000;
-	if (width < 0.1) {
-		x0 -= (0.1 - width) / 2;
-		width = 0.1;
-	}
-	if (height < 0.1) {
-		y0 -= (0.1 - height) / 2;
-		height = 0.1;
-	}
-	x0 = x0 < 0 ? 0 : x0 + width > 1 ? 1 - width : x0;
-	y0 = y0 < 0 ? 0 : y0 + height > 1 ? 1 - height : y0;
-	s->af_window[0] = (float)x0;
-	s->af_window[1] = (float)y0;
-	s->af_window[2] = (float)(x0 + width);
-	s->af_window[3] = (float)(y0 + height);
-}
+#include "camera_device_focus.inc"
 
 static OSStatus
 stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
@@ -858,6 +849,30 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
+	if (key_is(key, "AFSearchPositions") || key_is(key, "AFEarlyOutParams") || key_is(key, "AFPeakPredictionEnabled")) {
+		af_search_set(s, key, value);
+		return 0;
+	}
+	if (key_is(key, "ExposureBias")) {
+		/* a number, or with the command it answers to: { ExposureBias, CommandID } */
+		CFTypeRef v = value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID() ?
+		    CFDictionaryGetValue(value, CFSTR("ExposureBias")) : value;
+		int32_t bias;
+
+		if (v == NULL || CFGetTypeID(v) != CFNumberGetTypeID() || !CFNumberGetValue(v, kCFNumberSInt32Type, &bias)) {
+			return ERR_PARAM;
+		}
+		bias = bias < 1 ? 1 : bias > 65535 ? 65535 : bias;
+		pthread_mutex_lock(&s->lock);
+		s->exposure_bias = (uint32_t)bias;
+		pthread_mutex_unlock(&s->lock);
+		/* (a drag of the slider sends one for each step) */
+		if (fabs(log2((double)bias / s->said_bias)) >= 0.5 || bias == 256) {
+			say("stream: exposure bias %+.2f EV", log2(bias / 256.0));
+			s->said_bias = (uint32_t)bias;
+		}
+		return 0;
+	}
 	if (key_is(key, "FlashMode")) {
 		int fm = parse_flash_mode(value, -1);
 
@@ -926,7 +941,10 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		pthread_mutex_unlock(&s->lock);
 		return 0;
 	}
-	say_once("stream: set (not used)", key, value);
+	if (!say_once("stream: set (not used)", key, value)) {
+		/* (the name only: the order of what comes, a tap's for one) */
+		say_value("stream: set (not used) again:", key, NULL);
+	}
 	return 0;
 }
 

@@ -41,6 +41,7 @@ isp_init(struct isp *isp)
 	memset(isp, 0, sizeof(*isp));
 	isp->wb[0] = isp->wb[1] = isp->wb[2] = 1;
 	isp->digital = 1;
+	isp->bias = 1;
 	isp->zoom = 1;
 	for (int i = 0; i < 3; i++) {
 		isp->ccm[i][i] = 1;
@@ -228,7 +229,8 @@ isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const 
 }
 
 /*
- * The picture's middle grey (the key: green's log average, lens-shaded) towards 18 % of white, unless
+ * The picture's middle grey (the key: green's log average, lens-shaded) towards 18 % of white (times
+ * the exposure bias asked for), unless
  * that would put 1 % of the picture into white (then down to half of it, the tone curve's drc making
  * up for it). 18 %: a grey card's, which ISO 12232's standard output sensitivity puts at 118 of 255 in
  * sRGB, as the gamma here does. The log average: the scene in stops as exposure counts them, so that a
@@ -244,7 +246,7 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 		return false;
 	}
 	double now = (double)f->exposure_lines * f->gain / f->gain_unity * isp->digital, ratio, want;
-	double white = WHITE - f->black, target = 0.18 * white, mean = s->key * isp->digital > 0.5 ? s->key * isp->digital : 0.5;
+	double white = WHITE - f->black, target = 0.18 * white * isp->bias, mean = s->key * isp->digital > 0.5 ? s->key * isp->digital : 0.5;
 	double bright = s->bright * isp->digital;
 	uint32_t fast = f->frame_lines_min - f->margin, longest = isp->max_frame_lines ? isp->max_frame_lines : 2 * f->frame_lines_min;
 	uint32_t lines, gain, frame_lines = 0;
@@ -481,10 +483,80 @@ lsc_at(const struct isp *isp, float u, float v, float g[3])
 	}
 }
 
-/* one line of the picture as 8-bit R, G, B */
+/*
+ * A line of cells (cy) as R, G, B above black, lens-shaded: what the magnified picture is made of,
+ * each line made once for the two or three lines of the picture between it and the next.
+ */
+struct cell_lines {
+	int32_t         cy[2];          /* which line each holds (-1: none) */
+	float           *rgb[2];        /* 3 floats a cell */
+	uint32_t        cells;          /* room in each */
+};
+
+static void
+cell_line(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, uint32_t cy, int r, int b,
+    float *out)
+{
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
+	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
+	float row[3][LSC_W];
+
+	if (isp->lsc.on) {
+		/* (the grid's line here, once: across the line only x changes) */
+		float gy = cells_h > 1 ? (float)cy / (cells_h - 1) * (LSC_H - 1) : 0;
+		int y = (int)gy > LSC_H - 2 ? LSC_H - 2 : (int)gy;
+		float fy = gy - y;
+
+		for (int c = 0; c < 3; c++) {
+			for (int x = 0; x < LSC_W; x++) {
+				row[c][x] = isp->lsc.gain[c][y][x] * (1 - fy) + isp->lsc.gain[c][y + 1][x] * fy;
+			}
+		}
+	}
+	for (uint32_t cx = 0; cx < cells_w; cx++) {
+		int v[4], g = 0;
+		float gains[3] = { 1, 1, 1 };
+
+		cell(top, f->stride, cx, f->black, v);
+		for (int j = 0; j < 4; j++) {
+			g += j != r && j != b ? v[j] : 0;
+		}
+		if (isp->lsc.on) {
+			float gx = cells_w > 1 ? (float)cx / (cells_w - 1) * (LSC_W - 1) : 0;
+			int x = (int)gx > LSC_W - 2 ? LSC_W - 2 : (int)gx;
+			float fx = gx - x;
+
+			for (int c = 0; c < 3; c++) {
+				gains[c] = row[c][x] + (row[c][x + 1] - row[c][x]) * fx;
+			}
+		}
+		out[3 * cx] = v[r] * gains[0];
+		out[3 * cx + 1] = g * 0.5f * gains[1];
+		out[3 * cx + 2] = v[b] * gains[2];
+	}
+}
+
+/* the cells of line cy, made into one of the two slots unless one has them (keeping `keep''s) */
+static const float *
+cells_of(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, uint32_t cy, int r, int b,
+    struct cell_lines *lines, int32_t keep)
+{
+	for (int i = 0; i < 2; i++) {
+		if (lines->cy[i] == (int32_t)cy) {
+			return lines->rgb[i];
+		}
+	}
+	int slot = lines->cy[0] == keep ? 1 : 0;
+
+	cell_line(isp, f, raw, cy, r, b, lines->rgb[slot]);
+	lines->cy[slot] = (int32_t)cy;
+	return lines->rgb[slot];
+}
+
+/* one line of the picture as 8-bit R, G, B (lines: the cells made for the line before, kept) */
 static void
 render_line(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, uint32_t width, uint32_t height,
-    uint32_t row, uint8_t *rgb)
+    uint32_t row, uint8_t *rgb, struct cell_lines *lines)
 {
 	uint32_t x0, y0, cw, ch, cells_w = f->width / 2, cells_h = f->height / 2;
 	int r, b;
@@ -496,44 +568,35 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 	if (isp->turned) {
 		row = height - 1 - row;         /* (and each line from its end, below) */
 	}
-	if (cw < width && ch < height) {
+	if (cw < width && ch < height && lines->cells >= cells_w) {
 		/*
 		 * Magnified (the zoom): each pixel between the four cells around it. The nearest cell blown up
 		 * to a square of pixels showed every cell's own colour, its noise and the colours a 2x2 cell
 		 * gets wrong at an edge, as coloured dots.
 		 */
-		float fy = y0 + (row + 0.5f) * ch / height - 0.5f, ty, v_at;
+		float fy = y0 + (row + 0.5f) * ch / height - 0.5f, ty;
 		uint32_t cy0 = fy < 0 ? 0 : (uint32_t)fy, cy1;
 
 		cy0 = cy0 > cells_h - 1 ? cells_h - 1 : cy0;
 		cy1 = cy0 + 1 > cells_h - 1 ? cells_h - 1 : cy0 + 1;
 		ty = fy < (float)cy0 ? 0 : fy - cy0;
-		v_at = cells_h > 1 ? (float)cy0 / (cells_h - 1) : 0;
-		const uint8_t *t0 = raw + (size_t)cy0 * 2 * f->stride, *t1 = raw + (size_t)cy1 * 2 * f->stride;
-		float gains[3] = { 1, 1, 1 };
+		const float *a = cells_of(isp, f, raw, cy0, r, b, lines, -1);
+		const float *c1 = cells_of(isp, f, raw, cy1, r, b, lines, (int32_t)cy0);
 
 		for (uint32_t x = 0; x < width; x++) {
-			float fx = x0 + (x + 0.5f) * cw / width - 0.5f, tx, c[3] = { 0, 0, 0 };
+			float fx = x0 + (x + 0.5f) * cw / width - 0.5f, tx, c[3];
 			uint32_t cx0 = fx < 0 ? 0 : (uint32_t)fx, cx1;
 
 			cx0 = cx0 > cells_w - 1 ? cells_w - 1 : cx0;
 			cx1 = cx0 + 1 > cells_w - 1 ? cells_w - 1 : cx0 + 1;
 			tx = fx < (float)cx0 ? 0 : fx - cx0;
-			for (int k = 0; k < 4; k++) {
-				int v[4];
-				float w = (k & 1 ? tx : 1 - tx) * (k & 2 ? ty : 1 - ty);
+			for (int k = 0; k < 3; k++) {
+				float top = a[3 * cx0 + k] + (a[3 * cx1 + k] - a[3 * cx0 + k]) * tx;
+				float bottom = c1[3 * cx0 + k] + (c1[3 * cx1 + k] - c1[3 * cx0 + k]) * tx;
 
-				cell(k & 2 ? t1 : t0, f->stride, k & 1 ? cx1 : cx0, f->black, v);
-				c[0] += w * v[r];
-				c[2] += w * v[b];
-				for (int j = 0; j < 4; j++) {
-					c[1] += j != r && j != b ? w * v[j] * 0.5f : 0;
-				}
+				c[k] = top + (bottom - top) * ty;
 			}
-			if (isp->lsc.on) {
-				lsc_at(isp, cells_w > 1 ? (float)cx0 / (cells_w - 1) : 0, v_at, gains);
-			}
-			pixel(isp, &p, c[0] * gains[0], c[1] * gains[1], c[2] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+			pixel(isp, &p, c[0], c[1], c[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
 		}
 		return;
 	}
@@ -555,6 +618,29 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 		}
 		pixel(isp, &p, v[r] * gains[0], g * 0.5f * gains[1], v[b] * gains[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
 	}
+}
+
+/* this thread's two lines of cells, room for a frame cells_w cells wide (cells 0 when there is none) */
+static struct cell_lines
+thread_cell_lines(uint32_t cells_w)
+{
+	static __thread float *rgb[2];
+	static __thread uint32_t have;
+	struct cell_lines lines = { { -1, -1 }, { NULL, NULL }, 0 };
+
+	if (cells_w > have) {
+		for (int i = 0; i < 2; i++) {
+			free(rgb[i]);
+			rgb[i] = malloc(3 * sizeof(float) * cells_w);
+		}
+		have = rgb[0] != NULL && rgb[1] != NULL ? cells_w : 0;
+	}
+	if (have >= cells_w) {
+		lines.rgb[0] = rgb[0];
+		lines.rgb[1] = rgb[1];
+		lines.cells = have;
+	}
+	return lines;
 }
 
 /*
@@ -603,6 +689,7 @@ isp_render_nv12(const struct isp *isp, const struct annibale_camera_frame *f, co
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
 {
 	uint8_t line[2][3 * 8192];
+	struct cell_lines lines = thread_cell_lines(f->width / 2);
 
 	if (width > 8192) {
 		return;
@@ -610,8 +697,8 @@ isp_render_nv12(const struct isp *isp, const struct annibale_camera_frame *f, co
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
 		bool second = row + 1 < height;
 
-		render_line(isp, f, raw, width, height, row, line[0]);
-		render_line(isp, f, raw, width, height, second ? row + 1 : row, line[1]);
+		render_line(isp, f, raw, width, height, row, line[0], &lines);
+		render_line(isp, f, raw, width, height, second ? row + 1 : row, line[1], &lines);
 		nv12_pair(line[0], line[1], width, y + (size_t)row * y_stride, second ? y + (size_t)(row + 1) * y_stride : NULL,
 		    uv + (size_t)(row / 2) * uv_stride, video_range);
 	}
@@ -622,6 +709,7 @@ isp_render_bgra(const struct isp *isp, const struct annibale_camera_frame *f, co
     uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
 {
 	uint8_t line[3 * 8192];
+	struct cell_lines lines = thread_cell_lines(f->width / 2);
 
 	if (width > 8192) {
 		return;
@@ -629,7 +717,7 @@ isp_render_bgra(const struct isp *isp, const struct annibale_camera_frame *f, co
 	for (uint32_t row = first_row; row < end_row && row < height; row++) {
 		uint8_t *o = out + (size_t)row * stride;
 
-		render_line(isp, f, raw, width, height, row, line);
+		render_line(isp, f, raw, width, height, row, line, &lines);
 		for (uint32_t x = 0; x < width; x++) {
 			o[4 * x] = line[3 * x + 2];
 			o[4 * x + 1] = line[3 * x + 1];
