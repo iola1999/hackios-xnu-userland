@@ -210,6 +210,72 @@ var_is_apfs(void)
 	return is ? 1 : -1;
 }
 
+/*
+ * Before the cryptexes were grafted, lsd dropped the OS cryptex's WebKit extensions from its
+ * database at the boot after the one that built it ("Marking container at
+ * /private/preboot/Cryptexes/OS/ for removal"), and nothing registers them again in a database it
+ * keeps: Safari then starts no WebKit process.  On the first boot with the OS cryptex grafted the
+ * database is removed once, and lsd builds a new one when it starts, as after an iOS update.
+ */
+static int os_cryptex_grafted;          /* this boot: set by mount_cryptex */
+
+static void
+launchservices_rebuild_once(void)
+{
+	static const char marker[] = "/private/var/db/.annibale-cryptex-grafted";
+	static const char daemons[] = "/private/var/mobile/Containers/Data/InternalDaemon/";
+	static char outer[4096], inner[4096];
+	char caches[160], file[320];
+	off_t at_outer = 0;
+	ssize_t n, m;
+	struct stat st;
+	int fd, removed = 0;
+
+	if (!os_cryptex_grafted || lstat(marker, &st) == 0) {
+		return;
+	}
+	fd = open(daemons, O_RDONLY | O_DIRECTORY, 0);
+	while (fd >= 0 && (n = getdirentries(fd, outer, sizeof(outer), &at_outer)) > 0) {
+		for (ssize_t i = 0; i < n; i += ((struct dirent *)(outer + i))->d_reclen) {
+			const char *container = ((struct dirent *)(outer + i))->d_name;
+			off_t at_inner = 0;
+			int cfd;
+
+			if (container[0] == '.' ||
+			    strlen(daemons) + strlen(container) + sizeof("/Library/Caches/") > sizeof(caches)) {
+				continue;
+			}
+			strcpy(caches, join(daemons, container, "/Library/Caches/"));
+			cfd = open(caches, O_RDONLY | O_DIRECTORY, 0);
+			while (cfd >= 0 && (m = getdirentries(cfd, inner, sizeof(inner), &at_inner)) > 0) {
+				for (ssize_t k = 0; k < m; k += ((struct dirent *)(inner + k))->d_reclen) {
+					const char *name = ((struct dirent *)(inner + k))->d_name;
+					size_t len = strlen(name);
+					const char *store = strncmp(name, "SystemDataOnly-", 15) == 0 ? name + 15 : name;
+
+					if (strncmp(store, "com.apple.LaunchServices-", 25) != 0 || len < 8 ||
+					    strcmp(name + len - 8, ".csstore") != 0 || strlen(caches) + len >= sizeof(file)) {
+						continue;
+					}
+					strcpy(file, join(caches, name, ""));
+					removed += unlink(file) == 0;
+				}
+			}
+			if (cfd >= 0) {
+				close(cfd);
+			}
+		}
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	fd = open(marker, O_WRONLY | O_CREAT, 0644);
+	if (fd >= 0) {
+		close(fd);
+	}
+	printf("  first boot with the OS cryptex grafted: %d LaunchServices database files removed for lsd to rebuild\n", removed);
+}
+
 static int
 mount_writable(void)
 {
@@ -297,6 +363,7 @@ mount_writable(void)
 	/* Clear cached camera source backings so mounted V57 changes take effect on every boot. */
 	(void)unlink("/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist");
 	(void)unlink("/private/var/root/Library/Preferences/com.apple.cameracapture.volatile.plist");
+	launchservices_rebuild_once();
 
 	/*
 	 * and the package manager's prefix, when the image was built with one (tools/mk-jb.sh): /jb of
@@ -451,26 +518,60 @@ restore_var(void)
 }
 
 /*
- * Mount a cryptex on /private/preboot/Cryptexes/NAME: container C (",c=N") of md0, or, when md0 has
- * no such container (EINVAL: the RAM part of the boot is the boot volume alone), the same container
- * of the device the iOS volume came from.  Neither: said, and a check fails.
+ * The cryptexes go into the Preboot volume the way iOS grafts them (graftdmg): their files
+ * become Preboot's, inode numbers and all, which LaunchServices needs to keep the WebKit
+ * extensions in the OS cryptex registered (bsd/miscfs/apfs/apfs_graft.inc).  The request names
+ * the volume the way mount(2)'s data does.  A kernel without grafts answers ENOTTY, and the
+ * cryptex is then mounted on the directory instead.
+ */
+struct apfs_graft_req {
+	char spec[128];
+};
+#define APFS_IOC_GRAFT 0x80804AFAUL     /* _IOW('J', 250, struct apfs_graft_req) */
+#ifndef ENOTTY
+#define ENOTTY 25
+#endif
+
+static int
+attach_cryptex(const char *at, const char *spec, const char **how)
+{
+	struct apfs_graft_req req;
+
+	memset(&req, 0, sizeof(req));
+	strcpy(req.spec, spec);
+	*how = "grafted";
+	if (fsctl(at, APFS_IOC_GRAFT, &req, 0) == 0) {
+		return 0;
+	}
+	if (errno != ENOTTY) {
+		return -1;
+	}
+	*how = "mounted";
+	return mount("apfs", at, MNT_RDONLY, (void *)spec);
+}
+
+/*
+ * A cryptex onto /private/preboot/Cryptexes/NAME: container C (",c=N") of md0, or, when md0 has
+ * no such container (EINVAL: the RAM part of the boot is the boot volume alone), the same
+ * container of the device the iOS volume came from.  Neither: said, and a check fails.
  */
 static void
 mount_cryptex(const char *name, const char *container, const char *flashdev)
 {
 	char at[64], spec[128], what[200];
+	const char *how = "";
 	struct stat st;
 	int err;
 
 	strcpy(at, join("/private/preboot/Cryptexes/", name, ""));
 	strcpy(spec, join("/dev/md0", container, ""));
-	if (mount("apfs", at, MNT_RDONLY, (void *)spec) != 0) {
+	if (attach_cryptex(at, spec, &how) != 0) {
 		err = errno;
 		if (err != EINVAL) {
 			printf("  the %s cryptex from %s: %s\n", name, spec, strerror(err));
 		}
 		strcpy(spec, join(flashdev, container, ""));
-		if (mount("apfs", at, MNT_RDONLY, (void *)spec) != 0) {
+		if (attach_cryptex(at, spec, &how) != 0) {
 			if (lstat(join("/System/Cryptexes/", name, ""), &st) == 0 &&
 			    (st.st_mode & S_IFMT) == S_IFDIR) {
 				strcpy(what, join("the ", name, " cryptex is in /System/Cryptexes"));
@@ -483,8 +584,10 @@ mount_cryptex(const char *name, const char *container, const char *flashdev)
 			return;
 		}
 	}
+	os_cryptex_grafted |= strcmp(name, "OS") == 0 && strcmp(how, "grafted") == 0;
 	strcpy(what, join("the ", name, " cryptex ("));
-	strcpy(what, join(what, spec, ") on "));
+	strcpy(what, join(what, spec, ") "));
+	strcpy(what, join(what, how, " on "));
 	strcpy(what, join(what, at, ""));
 	check(1, what);
 }

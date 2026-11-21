@@ -26,7 +26,7 @@ enum {
 	SYS_select = 93, SYS_fsync = 95, SYS_setpriority = 96, SYS_socket = 97, SYS_bind = 104, SYS_gettimeofday = 116,
 	SYS_rename = 128, SYS_mkdir = 136, SYS_rmdir = 137, SYS_utimes = 138, SYS_pread = 153, SYS_pwrite = 154,
 	SYS_mount = 167, SYS_mmap = 197, SYS_lseek = 199, SYS_ftruncate = 201, SYS_getxattr = 234,
-	SYS_setxattr = 236, SYS_listxattr = 240, SYS_sysctlbyname = 274, SYS_stat64 = 338, SYS_fstat64 = 339,
+	SYS_setxattr = 236, SYS_listxattr = 240, SYS_fsctl = 242, SYS_sysctlbyname = 274, SYS_stat64 = 338, SYS_fstat64 = 339,
 	SYS_lstat64 = 340, SYS_getdirentries64 = 344, SYS_lchown = 364,
 };
 
@@ -156,6 +156,7 @@ int     usleep(unsigned microseconds);
 int     sysctlbyname(const char *name, void *oldp, size_t *oldlenp, const void *newp, size_t newlen);
 int     reboot(int howto);
 int     mount(const char *type, const char *dir, int flags, void *data);
+int     fsctl(const char *path, unsigned long cmd, void *data, unsigned int options);
 int     mkdir(const char *path, int mode);
 int     rmdir(const char *path);
 int     unlink(const char *path);

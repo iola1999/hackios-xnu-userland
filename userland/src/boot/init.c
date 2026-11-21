@@ -134,7 +134,7 @@ mount_dir(const char *path)
  * cache, HAL plug-ins and Metal bundle over its system paths. Staged applications get synthetic
  * names in /Applications before /private/var is mounted. No system-volume data is written.
  * After switching the root, the boot volume moves to /private/preboot, md1 is rebound on /annibale,
- * and OS/App cryptexes mount beneath /private/preboot/Cryptexes. The kernel uses the OS shared cache.
+ * and the OS/App cryptexes are grafted into /private/preboot/Cryptexes. The kernel uses the OS shared cache.
  * The boot-args name the RAM disk root with rootdev=md0 alone, so launchd runs its real-device boot tasks.
  */
 #ifndef EINVAL
