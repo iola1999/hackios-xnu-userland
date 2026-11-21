@@ -7,7 +7,8 @@
  * message the process emits; each goes to kern.annibale.say as "oslog TYPE: TEXT". At most
  * OSLOG_LINES are forwarded per process, so a chatty process does not push the rest of the kernel's
  * log out. package.py inserts this library into the programs OSLOG names and sets OSLOG_LINES from
- * its own OSLOG_LINES.
+ * its own OSLOG_LINES; with OSLOG_MATCH ("WORD|WORD...") only messages containing one of the words
+ * are forwarded, for a chatty process such as SpringBoard.
  */
 #include <os/log.h>
 #include <stdatomic.h>
@@ -48,20 +49,46 @@ type_name(os_log_type_t type)
 	}
 }
 
+static int
+wanted(const char *text)
+{
+#ifdef OSLOG_MATCH
+	for (const char *word = OSLOG_MATCH; *word != '\0';) {
+		size_t len = strcspn(word, "|");
+
+		for (const char *at = text; (at = strchr(at, word[0])) != NULL; at++) {
+			if (len != 0 && strncmp(at, word, len) == 0)
+				return 1;
+		}
+		word += len + (word[len] == '|');
+	}
+	return 0;
+#else
+	(void)text;
+	return 1;
+#endif
+}
+
 static void
 forward(os_log_type_t type, os_log_message_t message)
 {
-	unsigned n = atomic_fetch_add(&said, 1);
 	char line[256], *text;
+	unsigned n;
 
-	if (n >= OSLOG_LINES) {
-		if (n == OSLOG_LINES)
-			say("oslog: line limit reached, later messages are not forwarded");
-		return;
-	}
 	text = os_log_copy_message_string(message);
 	if (text == NULL)
 		return;
+	if (!wanted(text)) {
+		free(text);
+		return;
+	}
+	n = atomic_fetch_add(&said, 1);
+	if (n >= OSLOG_LINES) {
+		if (n == OSLOG_LINES)
+			say("oslog: line limit reached, later messages are not forwarded");
+		free(text);
+		return;
+	}
 	/* one kernel log line per message: say cuts a line at its end of line */
 	for (char *c = text; *c != '\0'; c++) {
 		if (*c == '\n' || *c == '\r')
