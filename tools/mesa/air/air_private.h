@@ -167,6 +167,7 @@ struct air_ctx {
    struct hash_table *phi_regs;
    /* pointers stored into locals, keyed on the local's byte offset plus one (store_pointer) */
    struct hash_table_u64 *ptr_slots;
+   struct air_val *ptr_slot_last;   /* the last pointer stored into a local (see unwritten_pointer) */
    /* Where this function's constants are built: the top of its entry block,
     * which dominates every use of them. air_get caches a constant the first
     * time it is asked for, so the def has to be somewhere every later block

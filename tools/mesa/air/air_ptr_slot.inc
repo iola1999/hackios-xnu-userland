@@ -33,7 +33,26 @@ air_store_pointer_slot(struct air_ctx *c, const struct air_val *at, struct air_v
        !(had->kind == AIR_VAL_PTR && v->kind == AIR_VAL_PTR && same_ptr(&had->ptr, &v->ptr)))
       return air_error(c, "instruction: a second, different pointer stored into one local");
    _mesa_hash_table_u64_insert(c->ptr_slots, ptr_slot_key(&at->ptr), v);
+   c->ptr_slot_last = v;
    return true;
+}
+
+/*
+ * A pointer loaded from a local at a constant offset that nothing was stored into: memory never
+ * written, whose load LLVM defines as undef, so any pointer is a correct value for it. Such a load
+ * sits on a path the stores make unreachable: Deep Fusion's
+ * RawDFSyntheticReferenceCRG::kernelRawDFDeepShadowRecovery fills a BandSampler's second texture
+ * only for the samplers whose flag says they have one, and the inlined samplePixel reads it under
+ * that flag (kernel-12377-lens2-w18). The last pointer stored into a local stands in, so the
+ * translation goes on; with none stored at all the load is refused as before.
+ */
+static struct air_val *
+unwritten_pointer(struct air_ctx *c, const struct air_val *at)
+{
+   if (!c->ptr_slots || !ptr_slot_place(at) ||
+       _mesa_hash_table_u64_search(c->ptr_slots, ptr_slot_key(&at->ptr)))
+      return NULL;
+   return c->ptr_slot_last;
 }
 
 /* The pointer stored at the place a load reads, or NULL where none was: such a load is

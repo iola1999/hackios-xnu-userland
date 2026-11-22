@@ -9,8 +9,16 @@
  *   shm_test [share]       the test (share: the memory entry made as WebKit's SharedMemory makes it, with
  *                          MAP_MEM_VM_SHARE); starts itself again as the second process
  *   shm_test child         (internal) the second process: its ports come through mach_ports_register()
+ *   shm_test posix [NAME]  POSIX shared memory as AttentionAwareness's PersistentDataManager makes it in
+ *                          backboardd: shm_open(O_RDWR | O_CREAT, 0600), ftruncate, mmap(MAP_SHARED); a second
+ *                          process opens the same name and reads what the first wrote. NAME alone opens an
+ *                          existing object read-only and prints its size and first words.
  */
+#include <errno.h>
+#include <fcntl.h>
 #include <mach/mach.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <spawn.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -64,6 +72,45 @@ child(void)
 	return 0;
 }
 
+static int
+posix_shm(int argc, char **argv)
+{
+	const char *name = argc >= 3 ? argv[2] : "com.annibale.shm_test";
+	bool child = strcmp(argv[1], "posixchild") == 0, existing = argc >= 3 && !child;
+	int fd = shm_open(name, child || existing ? O_RDONLY : O_RDWR | O_CREAT, 0600);
+	struct stat st = { 0 };
+
+	if (fd < 0) {
+		printf("shm_test %s: shm_open(%s) failed: %d %s\n", argv[1], name, errno, strerror(errno));
+		return 1;
+	}
+	if (!child && !existing && ftruncate(fd, 16384) != 0)
+		printf("shm_test posix: ftruncate failed: %d %s\n", errno, strerror(errno));
+	fstat(fd, &st);
+	volatile uint32_t *words = mmap(NULL, 16384, child || existing ? PROT_READ : PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (words == MAP_FAILED) {
+		printf("shm_test %s: mmap failed: %d %s (size %lld)\n", argv[1], errno, strerror(errno), (long long)st.st_size);
+		return 1;
+	}
+	if (child || existing) {
+		printf("shm_test %s: %s size %lld, words %#x %#x %#x %#x\n", argv[1], name, (long long)st.st_size, words[0], words[1],
+		    words[2], words[3]);
+		return child && words[0] != 0x5a5a1234;
+	}
+	words[0] = 0x5a5a1234;
+	char *args[] = { argv[0], "posixchild", (char *)name, NULL };
+	pid_t pid;
+	int status = 0;
+	if (posix_spawn(&pid, argv[0], NULL, NULL, args, environ) != 0 || waitpid(pid, &status, 0) < 0) {
+		printf("shm_test posix: the second process did not run\n");
+		return 1;
+	}
+	printf("shm_test posix: size %lld, the second process %s\n", (long long)st.st_size,
+	    WIFEXITED(status) && WEXITSTATUS(status) == 0 ? "read what this one wrote" : "DID NOT read it");
+	shm_unlink(name);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -80,6 +127,9 @@ main(int argc, char **argv)
 
 	if (argc == 2 && strcmp(argv[1], "child") == 0) {
 		return child();
+	}
+	if (argc >= 2 && (strcmp(argv[1], "posix") == 0 || strcmp(argv[1], "posixchild") == 0)) {
+		return posix_shm(argc, argv);
 	}
 	printf("shm_test: the memory entry made %s\n", share ? "with MAP_MEM_VM_SHARE | VM_PROT_IS_MASK, as WebKit's SharedMemory "
 	    "makes it" : "plainly");

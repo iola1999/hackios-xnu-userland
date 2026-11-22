@@ -215,6 +215,7 @@ struct rwa_compute {
       void *cso;
       struct rwa_grid_split split;
       unsigned block[3];
+      unsigned ib_dim[2];
       struct rwa_yuv_key yuv;
    } split_states[8];
    unsigned split_next;
@@ -5147,6 +5148,7 @@ rwa_render_create_linked(struct rwa_device *device,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+         .clip_plane_enable = BITFIELD_MASK(render->vinfo.clip_distances),
          .multisample = samples > 1, .line_width = 1.0f });
    /* The same state with the clip rectangle turned on. Scissor enable is part of this
     * state and not a call of its own in Gallium, and the rectangle itself is encoder
@@ -5156,6 +5158,7 @@ rwa_render_create_linked(struct rwa_device *device,
       &(struct pipe_rasterizer_state){
          .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
          .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+         .clip_plane_enable = BITFIELD_MASK(render->vinfo.clip_distances),
          .multisample = samples > 1, .line_width = 1.0f, .scissor = 1 });
    if (!render->blend || !render->dsa || !render->rast || !render->rast_scissor) {
       say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));

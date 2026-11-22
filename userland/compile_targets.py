@@ -159,6 +159,13 @@ TARGETS = [
         "entitlements": "src/tests/keychain_test.entitlements",
     },
     {
+        "name": "attn_test",
+        "type": "exe",
+        "sources": ["src/tests/attn_test.c"],
+        "flags": ["-O1", "-framework", "CoreFoundation"],
+        "entitlements": "src/tests/attn_test.entitlements",
+    },
+    {
         "name": "wifipw_test",
         "type": "exe",
         "sources": ["src/tests/wifipw_test.c"],

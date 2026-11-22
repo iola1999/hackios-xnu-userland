@@ -179,7 +179,7 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 	for t in hello_dyn svc_test surf_test drawable_test anntouch annsh annsig framewatch lsprobe mg_test \
 		cpu_test cow_test cg_test metal_dev metal_stubdev metal_drv_test metal_caps metal_props \
 		shm_test apfs_mmap_test vol_ls snap_test font_test metal_test net_test store_test \
-		battery_test keychain_test wifipw_test sound_test torch_test camera_test camera_avtest \
+		battery_test keychain_test attn_test wifipw_test sound_test torch_test camera_test camera_avtest \
 		record_test video_decode_test video_player_test video_combined_test; do
 		[ -f obj/$t ] && cp obj/$t root/bin/
 	done

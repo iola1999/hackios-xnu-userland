@@ -342,6 +342,10 @@ struct air_shader_info {
     */
    bool group_free;
 
+   /* A vertex function's clip distances (`air.clip_distance`, an array of float): how many.
+    * The render state enables that many clip planes. */
+   unsigned clip_distances;
+
    /* Complete API argument metadata, retained independently of translation's
     * active resource list. An unsupported declaration records its reason here
     * so that a pipeline can still be used without requesting reflection.

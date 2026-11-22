@@ -137,6 +137,13 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
       .variable_shared_mem = var_shared,
    };
    pipe->launch_grid(pipe, &grid);
+   /* Metal runs the dispatches of a serial compute encoder in order, each one seeing what the ones
+    * before it wrote. freedreno puts a cache flush and a wait between two grids of one batch only
+    * when memory_barrier asks for it (fd6_barrier.cc add_flushes); without one the Deep Fusion
+    * chain read its own intermediate textures before they were written, and the photograph came
+    * out dark green unless every dispatch was waited for (kernel-12377-lens2-w24 against w25). */
+   pipe->memory_barrier(pipe, PIPE_BARRIER_SHADER_BUFFER | PIPE_BARRIER_CONSTANT_BUFFER |
+                              PIPE_BARRIER_IMAGE | PIPE_BARRIER_TEXTURE);
 
    /* The waiting entry points wait here, where a dispatch that does not come back can
     * be named, and because the buffers stay mapped: a caller reading them before the
@@ -194,9 +201,9 @@ int
 rwa_dispatch_split(struct rwa_compute *compute, const struct rwa_bindings *bindings,
                    const struct rwa_buffer_bind *table, unsigned table_count,
                    const unsigned groups[3], const unsigned group_size[3],
-                   unsigned threadgroup_bytes, const struct rwa_grid_split *split, bool wait,
-                   char *why, size_t why_size)
+                   unsigned threadgroup_bytes, const unsigned imageblock_size[2],
+                   const struct rwa_grid_split *split, bool wait, char *why, size_t why_size)
 {
    return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
-                        threadgroup_bytes, NULL, split, wait, why, why_size);
+                        threadgroup_bytes, imageblock_size, split, wait, why, why_size);
 }

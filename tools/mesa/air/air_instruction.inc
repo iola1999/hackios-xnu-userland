@@ -309,6 +309,8 @@ translate_instruction(struct air_ctx *c, const struct air_inst *in)
          (in->base.type->kind == AIR_TYPE_POINTER ||
           (in->base.type->kind == AIR_TYPE_INT && in->base.type->bits == 64))
          ? stored_pointer(c, p) : NULL;
+      if (!stored && in->base.type && in->base.type->kind == AIR_TYPE_POINTER)
+         stored = unwritten_pointer(c, p);
       if (stored) {
          struct air_val *value = val_in_current_impl(c, stored);
          if (!value)

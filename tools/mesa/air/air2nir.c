@@ -36,6 +36,16 @@
 #include "air_module.h"
 #include "util/ralloc.h"
 
+/* util_copy_rect calls the device library's copy guard (rebase-26 0012-fd-shadow-guard-probes);
+ * this host tool links libmesa_util without air_metal.c, and has no shadow buffers to guard. */
+void rwa_copy_rect_guard(const void *src, long stride, unsigned rows, unsigned len);
+
+__attribute__((weak)) void
+rwa_copy_rect_guard(const void *src, long stride, unsigned rows, unsigned len)
+{
+   (void)src; (void)stride; (void)rows; (void)len;
+}
+
 /* --library: translate an air.visible library function inside a generated
  * entry point (nir_air.h). Off by default, because a wrapped function is not
  * an entry point of the corpus and must not be counted as one.

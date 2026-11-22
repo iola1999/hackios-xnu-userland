@@ -1689,28 +1689,30 @@ translate_output(struct air_ctx *c, const struct air_md *node, unsigned field,
       return air_error(c, "interface: an output with no key this translator knows");
    }
 
-   /* An output whose type is not a number has no varying here, and until this
-    * was checked it got one anyway: an `air.clip_distance` output arrives as
-    * an ARRAY of float, and air_type_scalar has no answer for an array, so the
-    * varying was declared with whatever air_nir_bit_size made of that. NIR's
-    * own form is an output of several slots, which this frontend does not
-    * build, so it is refused by name instead.
-    *
-    * The length is in the message because it decides how much work closing
-    * this is, and the measured length is not the one the general case
-    * suggests: over all 86 of Resident Evil 4's modules that stop here --
-    * every one a vertex shader -- the member is `[1 x float]`, an array of
-    * exactly ONE, and Metal's own `air.arg_type_name` on the node says
-    * `float`. So there is no module in reach that declares two clip planes,
-    * and the shape that is actually in the way is an array of one, which is a
-    * scalar wearing a bracket. Closing that is two things and not one: this
-    * declaration would take the element type, and emit_return would have to
-    * store elems[0] of a one-element aggregate instead of skipping a field
-    * that is not an AIR_VAL_SSA -- which is what silently drops the plane
-    * today. It is left refused rather than half built, because a clip distance
-    * that is written to nothing is a shader that draws without the clipping it
-    * asked for, and nothing in this tree can check a vertex clip distance
-    * numerically.
+   /* `air.clip_distance` arrives as an ARRAY of float: one element in Resident Evil 4's
+    * vertex shaders, two in MapKit's DaVinci::elevated* (kernel-12377-lens2-w19), whose
+    * buildings were left black while the pipeline was refused. NIR's form is a compact
+    * float array at VARYING_SLOT_CLIP_DIST0; emit_return stores it element by element.
+    */
+   if (location == VARYING_SLOT_CLIP_DIST0 && t->kind == AIR_TYPE_ARRAY && t->count >= 1 &&
+       t->count <= 8 && t->elem && air_type_is_float(t->elem) && air_nir_bit_size(c, t->elem) == 32) {
+      nir_variable *var = nir_variable_create(c->nir, nir_var_shader_out,
+                                              glsl_array_type(glsl_float_type(), t->count, 0),
+                                              name ? name : "clip_distance");
+      var->data.location = location;
+      var->data.compact = true;
+      var->data.driver_location = c->nir->num_outputs++;
+      c->nir->info.clip_distance_array_size = t->count;
+      c->info->clip_distances = t->count;
+      c->outputs[field].location = location;
+      c->outputs[field].index = 0;
+      c->outputs[field].var = var;
+      return true;
+   }
+
+   /* Any other output whose type is not a number has no varying here, and NIR's own form
+    * for it is an output of several slots, which this frontend does not build, so it is
+    * refused by name.
     */
    if (t->kind == AIR_TYPE_ARRAY || t->kind == AIR_TYPE_STRUCT) {
       const char *tn = md_key_str(node, "air.arg_type_name");
@@ -2112,6 +2114,20 @@ emit_return(struct air_ctx *c, const struct air_inst *in)
       for (unsigned i = 0; i < v->num_elems; i++) {
          if (!c->outputs[i].var)
             return air_error(c, "interface: field %u of the result has no output", i);
+         if (c->outputs[i].var->data.compact) {
+            const struct air_val *a = v->elems[i];
+            for (unsigned e = 0; a && a->kind == AIR_VAL_AGG && e < a->num_elems; e++)
+               if (a->elems[e] && a->elems[e]->kind == AIR_VAL_SSA)
+                  nir_store_deref(&c->b, nir_build_deref_array_imm(&c->b,
+                                  nir_build_deref_var(&c->b, c->outputs[i].var), e),
+                                  a->elems[e]->def, 1);
+            if (a && a->kind == AIR_VAL_SSA)
+               for (unsigned e = 0; e < a->def->num_components; e++)
+                  nir_store_deref(&c->b, nir_build_deref_array_imm(&c->b,
+                                  nir_build_deref_var(&c->b, c->outputs[i].var), e),
+                                  nir_channel(&c->b, a->def, e), 1);
+            continue;
+         }
          if (!v->elems[i] || v->elems[i]->kind != AIR_VAL_SSA)
             continue; /* a field left undef is a target nothing writes */
          nir_store_var(&c->b, c->outputs[i].var, v->elems[i]->def,

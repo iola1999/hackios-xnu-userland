@@ -595,7 +595,8 @@ int rwa_dispatch_nowait(struct rwa_compute *compute, const struct rwa_bindings *
  * One part of a -dispatchThreads: whose threadgroup size does not divide the grid
  * (struct air_grid_split in nir_air.h has what the fields mean): `groups` and `group_size`
  * are this part's, and the kernel sees its threads where they sit in the whole grid.
- * `wait` as rwa_dispatch_threadgroup (true) or rwa_dispatch_nowait (false).
+ * `imageblock_size` as rwa_dispatch_nowait_imageblock (NULL or {0, 0}: none set); `wait` as
+ * rwa_dispatch_threadgroup (true) or rwa_dispatch_nowait (false).
  */
 struct rwa_grid_split {
 	unsigned base_group[3], nominal[3], grid_threads[3], grid_groups[3];
@@ -603,8 +604,8 @@ struct rwa_grid_split {
 int rwa_dispatch_split(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 		       const struct rwa_buffer_bind *table, unsigned table_count,
 		       const unsigned groups[3], const unsigned group_size[3],
-		       unsigned threadgroup_bytes, const struct rwa_grid_split *split, bool wait,
-		       char *why, size_t why_size);
+		       unsigned threadgroup_bytes, const unsigned imageblock_size[2],
+		       const struct rwa_grid_split *split, bool wait, char *why, size_t why_size);
 
 /* Wait for everything dispatched so far, with a real fence. 0, or -1 and a sentence. */
 int rwa_finish(struct rwa_device *device, char *why, size_t why_size);

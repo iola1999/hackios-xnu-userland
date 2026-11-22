@@ -255,11 +255,22 @@ static int
 buffer_texture_upload(struct rwa_buffer_texture *backing, char *why, size_t why_size)
 {
    const char *bytes = buffer_texture_bytes(backing, why, why_size);
+   size_t span = (size_t)backing->row_bytes * backing->texture->res->height0;
+   struct pipe_context *pipe = backing->texture->device->pipe;
+   struct pipe_transfer *transfer = NULL;
    uint64_t h;
 
    if (!bytes)
       return -1;
-   h = rows_hash(bytes, (size_t)backing->row_bytes * backing->texture->res->height0);
+   /* The rows are read through the buffer's persistent mapping, which does not wait for the
+    * GPU, and a command buffer still running may be writing them as a buffer: in Metal the
+    * texture and the buffer are one memory. A read mapping of the range waits for those
+    * writes first. Deep Fusion's second photograph of kernel-12377-lens2-w29 came out dark
+    * green from rows uploaded before its previous command buffer had written them. */
+   if (backing->source->res &&
+       pipe_buffer_map_range(pipe, backing->source->res, backing->offset, span, PIPE_MAP_READ, &transfer))
+      pipe_buffer_unmap(pipe, transfer);
+   h = rows_hash(bytes, span);
    if (backing->hashed && backing->hash == h) {
       upload_count.unchanged++;
       return 0;

@@ -343,6 +343,7 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
          if (compute->split_states[i].cso &&
              memcmp(&compute->split_states[i].split, split, sizeof(*split)) == 0 &&
              memcmp(compute->split_states[i].block, block, sizeof(compute->split_states[i].block)) == 0 &&
+             compute->split_states[i].ib_dim[0] == eff_ib[0] && compute->split_states[i].ib_dim[1] == eff_ib[1] &&
              memcmp(&compute->split_states[i].yuv, yuv, sizeof(*yuv)) == 0)
             return compute->split_states[i].cso;
    }
@@ -476,6 +477,8 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
       compute->split_states[i].cso = cso;
       compute->split_states[i].split = *split;
       memcpy(compute->split_states[i].block, block, sizeof(compute->split_states[i].block));
+      compute->split_states[i].ib_dim[0] = eff_ib[0];
+      compute->split_states[i].ib_dim[1] = eff_ib[1];
       compute->split_states[i].yuv = *yuv;
       return cso;
    }
