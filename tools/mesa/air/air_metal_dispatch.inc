@@ -33,7 +33,7 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
               const struct rwa_buffer_bind *table, unsigned table_count,
               const unsigned groups[3], const unsigned group_size[3],
               unsigned threadgroup_bytes, const unsigned ib_dim[2],
-              bool wait, char *why, size_t why_size)
+              const struct rwa_grid_split *split, bool wait, char *why, size_t why_size)
 {
    RWA_LOCKED;
    struct rwa_device *device = compute->device;
@@ -104,7 +104,7 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
    struct rwa_yuv_key yuv;
    if (!yuv_key_for(&compute->info, bindings, table, table_count, &yuv, why, why_size))
       return -1;
-   void *cso = compute_state_for_ib(compute, group_size, &yuv, ib_dim, why, why_size);
+   void *cso = compute_state_for_ib(compute, group_size, &yuv, ib_dim, split, why, why_size);
    if (!cso)
       return -1;
    /* Re-check threadgroup limit once a deferred CSO materializes with compiled register pressure. */
@@ -166,7 +166,7 @@ rwa_dispatch_threadgroup(struct rwa_compute *compute, const struct rwa_bindings 
                          unsigned threadgroup_bytes, char *why, size_t why_size)
 {
    return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
-                        threadgroup_bytes, NULL, true, why, why_size);
+                        threadgroup_bytes, NULL, NULL, true, why, why_size);
 }
 
 int
@@ -176,7 +176,7 @@ rwa_dispatch_nowait(struct rwa_compute *compute, const struct rwa_bindings *bind
                     unsigned threadgroup_bytes, char *why, size_t why_size)
 {
    return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
-                        threadgroup_bytes, NULL, false, why, why_size);
+                        threadgroup_bytes, NULL, NULL, false, why, why_size);
 }
 
 int
@@ -187,5 +187,16 @@ rwa_dispatch_nowait_imageblock(struct rwa_compute *compute, const struct rwa_bin
                                char *why, size_t why_size)
 {
    return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
-                        threadgroup_bytes, imageblock_size, false, why, why_size);
+                        threadgroup_bytes, imageblock_size, NULL, false, why, why_size);
+}
+
+int
+rwa_dispatch_split(struct rwa_compute *compute, const struct rwa_bindings *bindings,
+                   const struct rwa_buffer_bind *table, unsigned table_count,
+                   const unsigned groups[3], const unsigned group_size[3],
+                   unsigned threadgroup_bytes, const struct rwa_grid_split *split, bool wait,
+                   char *why, size_t why_size)
+{
+   return dispatch_grid(compute, bindings, table, table_count, groups, group_size,
+                        threadgroup_bytes, NULL, split, wait, why, why_size);
 }

@@ -6,13 +6,13 @@
 
 static void *compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
                                   const struct rwa_yuv_key *yuv, const unsigned ib_dim[2],
-                                  char *why, size_t why_size);
+                                  const struct rwa_grid_split *split, char *why, size_t why_size);
 
 static void *
 compute_state_for(struct rwa_compute *compute, const unsigned block[3],
                   const struct rwa_yuv_key *yuv, char *why, size_t why_size)
 {
-   return compute_state_for_ib(compute, block, yuv, NULL, why, why_size);
+   return compute_state_for_ib(compute, block, yuv, NULL, NULL, why, why_size);
 }
 
 static struct rwa_compute *
@@ -151,7 +151,9 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
                       &compute->caps.argbuf_mask, why, why_size) != 0)
       goto fail;
 
-   if (compute->info.imageblock_data_size > 0 && bitcode && size >= 4) {
+   /* (kept for a translation of its own: an imageblock size, or a part of a split grid,
+    * which only a kernel that reads its threadgroup needs) */
+   if ((compute->info.imageblock_data_size > 0 || !compute->info.group_free) && bitcode && size >= 4) {
       compute->bitcode_copy = malloc(size);
       if (compute->bitcode_copy) {
          memcpy(compute->bitcode_copy, bitcode, size);
@@ -289,6 +291,9 @@ rwa_compute_destroy(struct rwa_compute *compute)
       return;
    if (compute->cso)
       delete_compute_state(compute->device, compute->cso);
+   for (unsigned i = 0; i < ARRAY_SIZE(compute->split_states); i++)
+      if (compute->split_states[i].cso)
+         delete_compute_state(compute->device, compute->split_states[i].cso);
    /* and the states built for the samplers the shader declared itself. Nothing is
     * unbound first, for the reason rwa_sampler_destroy gives: a dispatch leaves
     * nothing of its own bound.
@@ -309,7 +314,7 @@ rwa_compute_destroy(struct rwa_compute *compute)
 static void *
 compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
                      const struct rwa_yuv_key *yuv, const unsigned ib_dim[2],
-                     char *why, size_t why_size)
+                     const struct rwa_grid_split *split, char *why, size_t why_size)
 {
    struct rwa_device *device = compute->device;
    if (device->software && yuv->mask) {
@@ -330,14 +335,23 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
    /* (the variable state first: what its registers let in decides whether this threadgroup
     * needs a state of its own) */
    if (!device->software && block && !compute->variable_max &&
-       !compute_state_for_ib(compute, NULL, yuv, ib_dim, why, why_size))
+       !compute_state_for_ib(compute, NULL, yuv, ib_dim, NULL, why, why_size))
       return NULL;
 
+   if (split) {
+      for (unsigned i = 0; i < ARRAY_SIZE(compute->split_states); i++)
+         if (compute->split_states[i].cso &&
+             memcmp(&compute->split_states[i].split, split, sizeof(*split)) == 0 &&
+             memcmp(compute->split_states[i].block, block, sizeof(compute->split_states[i].block)) == 0 &&
+             memcmp(&compute->split_states[i].yuv, yuv, sizeof(*yuv)) == 0)
+            return compute->split_states[i].cso;
+   }
+
    unsigned threads = block ? block[0] * block[1] * block[2] : 0;
-   bool fixed = device->software ||
+   bool fixed = split || device->software ||
                 (block && compute->variable_max && threads > compute->variable_max);
 
-   if (compute->cso && memcmp(&compute->yuv, yuv, sizeof(*yuv)) == 0 &&
+   if (!split && compute->cso && memcmp(&compute->yuv, yuv, sizeof(*yuv)) == 0 &&
        compute->cso_ib_dim[0] == eff_ib[0] && compute->cso_ib_dim[1] == eff_ib[1] &&
        compute->cso_fixed == fixed &&
        (!fixed ||
@@ -345,23 +359,32 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
          compute->cso_block[2] == block[2])))
       return compute->cso;
 
-   if (compute->cso) {
+   if (!split && compute->cso) {
       delete_compute_state(device, compute->cso);
       compute->cso = NULL;
    }
 
    nir_shader *cs = NULL;
-   if ((eff_ib[0] || eff_ib[1]) && compute->bitcode_copy) {
+   if (split && !compute->bitcode_copy) {
+      say(why, why_size, "%s: no copy of the kernel's bitcode to translate a part of a split grid with",
+          compute->info.entry_point ? compute->info.entry_point : "the shader");
+      return NULL;
+   }
+   if ((eff_ib[0] || eff_ib[1] || split) && compute->bitcode_copy) {
+      struct air_grid_split air_split;
       void *tmp_ctx = ralloc_context(NULL);
       struct air_constant_value *constants = NULL;
       unsigned num_constants =
          air_module_function_constants(tmp_ctx, compute->bitcode_copy,
                                        compute->bitcode_size, &constants);
+      if (split)
+         memcpy(&air_split, split, sizeof(air_split));
       const struct air_to_nir_options ib_opts = {
          .constants = constants,
          .num_constants = num_constants,
          .imageblock_width = eff_ib[0],
          .imageblock_height = eff_ib[1],
+         .split = split ? &air_split : NULL,
       };
       struct air_shader_info ib_info;
       const char *ib_err = NULL;
@@ -431,9 +454,11 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
       }
       if (!fixed)
          compute->variable_max = si.max_threads;
-      compute->caps.max_threads_per_group = MIN2(device->max_threads_per_group, si.max_threads);
-      if (si.preferred_simd_size)
-         compute->caps.thread_execution_width = si.preferred_simd_size;
+      if (!split) {
+         compute->caps.max_threads_per_group = MIN2(device->max_threads_per_group, si.max_threads);
+         if (si.preferred_simd_size)
+            compute->caps.thread_execution_width = si.preferred_simd_size;
+      }
    } else if (si.max_threads && block[0] * block[1] * block[2] > si.max_threads) {
       say(why, why_size, "this dispatch asks for %u threads in a threadgroup and the "
                          "compiled shader takes at most %u: it uses too many "
@@ -443,6 +468,17 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
       return NULL;
    }
 
+   if (split) {
+      unsigned i = compute->split_next++ % ARRAY_SIZE(compute->split_states);
+
+      if (compute->split_states[i].cso)
+         delete_compute_state(device, compute->split_states[i].cso);
+      compute->split_states[i].cso = cso;
+      compute->split_states[i].split = *split;
+      memcpy(compute->split_states[i].block, block, sizeof(compute->split_states[i].block));
+      compute->split_states[i].yuv = *yuv;
+      return cso;
+   }
    compute->cso = cso;
    compute->cso_fixed = fixed;
    compute->yuv = *yuv;

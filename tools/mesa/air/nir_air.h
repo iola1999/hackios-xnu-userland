@@ -415,6 +415,18 @@ struct air_stitched_kernel {
    unsigned num_inputs;
    const struct air_stitch_input *inputs;
 };
+/*
+ * One part of a -dispatchThreads: whose threadgroup size does not divide the grid, as
+ * Metal's partial threadgroups run it on a GPU that has none: the grid is cut into at most
+ * eight dispatches of whole threadgroups each (the groups that fit in every dimension, and
+ * those of the rest), and each is translated with where its groups sit in the grid. Counts
+ * per dimension: the first threadgroup's position in the grid, the threadgroup size the
+ * application asked for, and the grid's threads and threadgroups (the last ones partial).
+ */
+struct air_grid_split {
+   unsigned base_group[3], nominal[3], grid_threads[3], grid_groups[3];
+};
+
 struct air_to_nir_options {
    const struct air_constant_value *constants;
    unsigned num_constants;
@@ -435,6 +447,7 @@ struct air_to_nir_options {
    const struct air_stitched_kernel *kernel;
    unsigned imageblock_width;
    unsigned imageblock_height;
+   const struct air_grid_split *split;
 };
 
 /* Translates one AIR module (one function of a .metallib). entry_point may

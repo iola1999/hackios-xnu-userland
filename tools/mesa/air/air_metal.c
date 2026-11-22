@@ -210,6 +210,14 @@ struct rwa_compute {
    unsigned cso_block[3];
    unsigned cso_ib_dim[2];
    struct rwa_yuv_key yuv;
+   /* the states of the parts of split grids (rwa_dispatch_split), the last few kept */
+   struct {
+      void *cso;
+      struct rwa_grid_split split;
+      unsigned block[3];
+      struct rwa_yuv_key yuv;
+   } split_states[8];
+   unsigned split_next;
    void *bitcode_copy;
    size_t bitcode_size;
    char *entry_copy;

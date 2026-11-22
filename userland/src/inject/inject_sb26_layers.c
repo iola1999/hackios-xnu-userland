@@ -796,9 +796,73 @@ resolve(void *context)
     }
 }
 
+/*
+ * Boot-arg idlelog=1: every idle timer the coordinator applies, every behavior a provider proposes
+ * and every disable assertion taken, with their descriptions, to tell why the screen never
+ * dims and locks by itself.
+ */
+int sb26_boot_arg_present(const char *wanted);      /* inject_sb26.c */
+
+static const char *
+described(id object, char *text, size_t size)
+{
+    id d = object ? send(object, "description") : nil;
+    const char *c = d ? ((const char *(*)(id, SEL))objc_msgSend)(d, sel_registerName("UTF8String")) : NULL;
+    snprintf(text, size, "%s", c ? c : "(nil)");
+    for (char *p = text; *p; p++)
+        if (*p == '\n') *p = ' ';
+    return text;
+}
+
+static void (*idle_set_original)(id, SEL, id, id);
+static void
+idle_set(id self, SEL cmd, id descriptor, id reason)
+{
+    char a[600], b[160];
+    out("sb26 idletimer: apply %s for %s\n", described(descriptor, a, sizeof(a)), described(reason, b, sizeof(b)));
+    idle_set_original(self, cmd, descriptor, reason);
+}
+
+static void (*idle_propose_original)(id, SEL, id, id, id);
+static void
+idle_propose(id self, SEL cmd, id provider, id behavior, id reason)
+{
+    char a[200], b[400], c[160];
+    out("sb26 idletimer: %s proposes %s for %s\n", described(provider, a, sizeof(a)), described(behavior, b, sizeof(b)),
+        described(reason, c, sizeof(c)));
+    idle_propose_original(self, cmd, provider, behavior, reason);
+}
+
+static id (*idle_disable_original)(id, SEL, id);
+static id
+idle_disable(id self, SEL cmd, id reason)
+{
+    char a[160];
+    out("sb26 idletimer: disable assertion for %s\n", described(reason, a, sizeof(a)));
+    return idle_disable_original(self, cmd, reason);
+}
+
+static void
+install_idle_log(void)
+{
+    Class coordinator = objc_getClass("SBIdleTimerGlobalCoordinator");
+    Method m;
+
+    if (!sb26_boot_arg_present("idlelog=1") || !coordinator) return;
+    if ((m = class_getInstanceMethod(coordinator, sel_registerName("_setIdleTimerWithDescriptor:forReason:"))))
+        idle_set_original = (void (*)(id, SEL, id, id))method_setImplementation(m, (IMP)idle_set);
+    if ((m = class_getInstanceMethod(coordinator, sel_registerName("idleTimerProvider:didProposeBehavior:forReason:"))))
+        idle_propose_original = (void (*)(id, SEL, id, id, id))method_setImplementation(m, (IMP)idle_propose);
+    if ((m = class_getInstanceMethod(coordinator, sel_registerName("acquireIdleTimerDisableAssertionForReason:"))))
+        idle_disable_original = (id (*)(id, SEL, id))method_setImplementation(m, (IMP)idle_disable);
+    out("sb26 idletimer: logged (apply %d, propose %d, disable %d)\n", idle_set_original != NULL,
+        idle_propose_original != NULL, idle_disable_original != NULL);
+}
+
 void
 sb26_install_layer_dump(void)
 {
+    install_idle_log();
     static const char *filters[] = { "all", "Icon", "Wallpaper", "Poster", "StatusBar", "Battery", "Widget",
                                      "DateView", "Time", "SDF", "animated" };
     for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {

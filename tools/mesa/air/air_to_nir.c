@@ -903,13 +903,41 @@ load_sysval(struct air_ctx *c, enum air_sysval sv)
    case AIR_SV_SAMPLE_ID: return nir_load_sample_id(&c->b);
    case AIR_SV_SAMPLE_MASK_IN: return nir_load_sample_mask_in(&c->b);
    case AIR_SV_POINT_COORD: return nir_load_point_coord(&c->b);
-   case AIR_SV_THREAD_POS_GRID: return nir_load_global_invocation_id(&c->b, 32);
+   case AIR_SV_THREAD_POS_GRID:
+      if (c->options && c->options->split) {
+         const struct air_grid_split *s = c->options->split;
+         nir_def *group = nir_iadd(&c->b, nir_load_workgroup_id(&c->b),
+                                   nir_imm_ivec3(&c->b, s->base_group[0], s->base_group[1], s->base_group[2]));
+
+         return nir_iadd(&c->b, nir_imul(&c->b, group, nir_imm_ivec3(&c->b, s->nominal[0], s->nominal[1], s->nominal[2])),
+                         nir_load_local_invocation_id(&c->b));
+      }
+      return nir_load_global_invocation_id(&c->b, 32);
    case AIR_SV_THREAD_POS_TG: return nir_load_local_invocation_id(&c->b);
-   case AIR_SV_TG_POS_GRID: return nir_load_workgroup_id(&c->b);
+   case AIR_SV_TG_POS_GRID:
+      if (c->options && c->options->split) {
+         const struct air_grid_split *s = c->options->split;
+
+         return nir_iadd(&c->b, nir_load_workgroup_id(&c->b),
+                         nir_imm_ivec3(&c->b, s->base_group[0], s->base_group[1], s->base_group[2]));
+      }
+      return nir_load_workgroup_id(&c->b);
+   /* (in a part of a split grid this is the part's own size: Metal's partial threadgroup) */
    case AIR_SV_THREADS_PER_TG: return nir_load_workgroup_size(&c->b);
-   case AIR_SV_TGS_PER_GRID: return nir_load_num_workgroups(&c->b);
+   case AIR_SV_TGS_PER_GRID:
+      if (c->options && c->options->split) {
+         const struct air_grid_split *s = c->options->split;
+
+         return nir_imm_ivec3(&c->b, s->grid_groups[0], s->grid_groups[1], s->grid_groups[2]);
+      }
+      return nir_load_num_workgroups(&c->b);
    case AIR_SV_THREAD_INDEX_TG: return nir_load_local_invocation_index(&c->b);
    case AIR_SV_THREADS_PER_GRID:
+      if (c->options && c->options->split) {
+         const struct air_grid_split *s = c->options->split;
+
+         return nir_imm_ivec3(&c->b, s->grid_threads[0], s->grid_threads[1], s->grid_threads[2]);
+      }
       return nir_imul(&c->b, nir_load_num_workgroups(&c->b), nir_load_workgroup_size(&c->b));
    case AIR_SV_SIMD_LANE: return nir_load_subgroup_invocation(&c->b);
    case AIR_SV_SIMD_INDEX: return nir_load_subgroup_id(&c->b);
