@@ -2,6 +2,7 @@
  * camera_test: the wide camera's frames as a program gets them (cam=5).
  *
  * usage: camera_test native [OUTPUT]
+ *        camera_test focus [STEP] [FRAMES]
  *        camera_test native-back [OUTPUT]
  *        camera_test stream SENSOR [FRAMES LINES GAIN FLL]...
  *        camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]
@@ -566,6 +567,72 @@ raw(int frames, bool ae, bool awb, bool keep_raw, bool full, int sensor)
 	return 0;
 }
 
+/*
+ * camera_test focus [STEP] [FRAMES]: the back lens from 16 up to 768 and back down by STEP (16), FRAMES (4)
+ * frames at each position, exposure and white balance settled first and then held. One line per frame:
+ * the direction, the position asked for, the one the frame reports, its sequence, and the sharpness and
+ * level of the middle (isp_sharpness over 0.3..0.7, the stream's window without one from CMCapture).
+ */
+static int
+focus_sweep(int step, int frames)
+{
+	struct annibale_camera_profile profile;
+	struct annibale_camera_capture capture;
+	struct isp isp;
+	struct isp_stats s;
+	int device = camera_native_open(1u, &profile), result = 1;
+
+	if (device < 0) {
+		perror("camera_test: focus open");
+		return 1;
+	}
+	size_t bytes = sizeof(struct annibale_camera_frame) + (size_t)profile.stride * profile.height;
+	uint8_t *buffer = malloc(bytes);
+	const struct annibale_camera_frame *f = (const void *)buffer;
+
+	isp_init(&isp);
+	for (int i = 0; i < 60; i++) {
+		struct annibale_camera_command c;
+
+		if (camera_native_frame(device, &profile, buffer, bytes, &capture) < 0) {
+			perror("camera_test: focus: a frame while exposure settles");
+			goto done;
+		}
+		isp_measure(&isp, f, buffer + f->header_bytes, &s);
+		isp_awb(&isp, &s);
+		if (isp_ae(&isp, f, &s, &c) && write(device, &c, sizeof(c)) != (ssize_t)sizeof(c)) {
+			perror("camera_test: focus: exposure");
+		}
+	}
+	printf("camera_test: focus: exposure %u lines, gain %u (%u is 1x)\n", f->exposure_lines, f->gain, f->gain_unity);
+	for (int down = 0; down < 2; down++) {
+		for (int pos = down ? 768 : 16; down ? pos >= 16 : pos <= 768; pos += down ? -step : step) {
+			struct annibale_camera_command c = { .command = ANNIBALE_CAMERA_FOCUS, .a = (uint32_t)pos };
+
+			if (write(device, &c, sizeof(c)) != (ssize_t)sizeof(c)) {
+				perror("camera_test: focus: the lens");
+				goto done;
+			}
+			for (int n = 0; n < frames; n++) {
+				float level, sharpness;
+
+				if (camera_native_frame(device, &profile, buffer, bytes, &capture) < 0) {
+					perror("camera_test: focus: a frame");
+					goto done;
+				}
+				sharpness = isp_sharpness(f, buffer + f->header_bytes, 0.3f, 0.3f, 0.7f, 0.7f, &level);
+				printf("camera_test: focus %s %d frame %d reports %d seq %llu sharpness %.4f level %.1f\n", down ? "down" : "up",
+				    pos, n, f->focus == ANNIBALE_CAMERA_NO_FOCUS ? -1 : (int)f->focus, f->sequence, sharpness, level);
+			}
+		}
+	}
+	result = 0;
+done:
+	free(buffer);
+	close(device);
+	return result;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -608,9 +675,12 @@ main(int argc, char **argv)
 	if (argc >= 2 && strcmp(argv[1], "noise") == 0) {
 		return noise(argc >= 3 ? argv[2] : "all");
 	}
+	if (argc >= 2 && strcmp(argv[1], "focus") == 0) {
+		return focus_sweep(argc >= 3 ? atoi(argv[2]) : 16, argc >= 4 ? atoi(argv[3]) : 4);
+	}
 	if (argc >= 2 && strcmp(argv[1], "cycle") == 0) {
 		return cycle(argc >= 3 ? atoi(argv[2]) : 30);
 	}
-	fprintf(stderr, "usage: camera_test native [OUTPUT]\n       camera_test native-back [OUTPUT]\n       camera_test stream SENSOR [FRAMES LINES GAIN FLL]...\n       camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
+	fprintf(stderr, "usage: camera_test native [OUTPUT]\n       camera_test native-back [OUTPUT]\n       camera_test focus [STEP] [FRAMES]\n       camera_test stream SENSOR [FRAMES LINES GAIN FLL]...\n       camera_test raw [FRAMES] [noae] [noawb] [keepraw|full] [ccm M] [sensor N]\n       camera_test cycle [FRAMES]\n       camera_test noise [SENSOR|all]\n");
 	return 2;
 }

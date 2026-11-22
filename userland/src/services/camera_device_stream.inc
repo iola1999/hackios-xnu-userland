@@ -438,6 +438,8 @@ enum { AF_WATCH, AF_STEADY, AF_SEARCH, AF_SETTLE };
 #define AF_NEAR         16              /* (off the stop at 0) */
 #define AF_FAR          768             /* (its module file's actuator region goes to 700) */
 
+#define AF_LONG_MOVE    100             /* lens positions: a move this long takes a frame more to settle */
+
 struct af {
 	int             state;
 	uint32_t        at;             /* where the lens was told to go */
@@ -452,6 +454,7 @@ struct af {
 	float           sum_sharpness, sum_level;
 	unsigned        measured;
 	unsigned        lag;            /* frames not yet taken where the lens was told to go */
+	unsigned        skip;           /* frames taken there to pass over before measuring */
 	uint64_t        began;          /* when the search began (mach_absolute_time) */
 };
 
@@ -459,10 +462,18 @@ static void
 af_go(int device, struct af *af, uint32_t target)
 {
 	struct annibale_camera_command c = { .command = ANNIBALE_CAMERA_FOCUS };
+	uint32_t from = af->at;
 
 	af->at = c.a = target < AF_NEAR ? AF_NEAR : target > AF_FAR ? AF_FAR : target;
 	af->steps++;
 	af->lag = 0;
+	/*
+	 * The frame after a move of a search step (62 positions) already has the new position's sharpness;
+	 * after a longer one the lens is still moving there: the first frame after the move back to the
+	 * peak (130 positions) read 0.011 against 0.025 searched beside it, and one at the start of a
+	 * search (330 positions) read as sharp as the place it left (kernel-12377-af1-w9, -w10).
+	 */
+	af->skip = (from > af->at ? from - af->at : af->at - from) > AF_LONG_MOVE ? 1 : 0;
 	af->sum_sharpness = af->sum_level = 0;
 	af->measured = 0;
 	(void)write(device, &c, sizeof(c));
@@ -527,6 +538,10 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 		return;
 	}
 	af->lag = 0;
+	if (af->skip > 0) {
+		af->skip--;
+		return;
+	}
 	sharpness = isp_sharpness(f, raw, window[0], window[1], window[2], window[3], &level);
 	af->sum_sharpness += sharpness;
 	af->sum_level += level;
@@ -569,6 +584,7 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 	case AF_SEARCH: {
 		const struct af_search *p = &af->search;
 
+		say("focus: searched %u: sharpness %.4f level %.1f frame %llu", af->at, sharpness, level, f->sequence);
 		af->sharp[af->next] = sharpness;
 		if (sharpness > af->sharp[af->best]) {
 			af->best = af->next;

@@ -50,38 +50,51 @@ af_search_set(struct stream *s, CFStringRef key, CFTypeRef value)
 	pthread_mutex_unlock(&s->lock);
 }
 
-/* AFWindowParams: the first window, as fractions of the frame; none (or not one) is the middle */
+/*
+ * AFWindowParams: the windows, in thousandths of the frame. With AutoFocusModeMatrix CMCapture sends
+ * a grid of them (15 cells of 105 x 147 over 237..762 x 280..721 on 23G90) and a tap sends one; the
+ * sharpness is measured over the box around every window with a weight. None is the middle.
+ */
 static void
 af_window(struct stream *s, CFTypeRef value)
 {
-	CFDictionaryRef w = NULL;
-	double x0, y0, width, height;
+	double x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+	CFIndex count = value != NULL && CFGetTypeID(value) == CFArrayGetTypeID() ? CFArrayGetCount(value) : 0;
 
-	if (value != NULL && CFGetTypeID(value) == CFArrayGetTypeID() && CFArrayGetCount(value) > 0) {
-		w = CFArrayGetValueAtIndex(value, 0);
+	for (CFIndex i = 0; i < count; i++) {
+		CFDictionaryRef w = CFArrayGetValueAtIndex(value, i);
+		double width, height, h, v;
+
+		if (w == NULL || CFGetTypeID(w) != CFDictionaryGetTypeID() || (width = dict_number(w, "width", 0)) <= 0 ||
+		    (height = dict_number(w, "height", 0)) <= 0 || dict_number(w, "weight", 1) <= 0) {
+			continue;
+		}
+		h = dict_number(w, "hStart", 0) / 1000;
+		v = dict_number(w, "vStart", 0) / 1000;
+		x0 = h < x0 ? h : x0;
+		y0 = v < y0 ? v : y0;
+		x1 = h + width / 1000 > x1 ? h + width / 1000 : x1;
+		y1 = v + height / 1000 > y1 ? v + height / 1000 : y1;
 	}
-	if (w == NULL || CFGetTypeID(w) != CFDictionaryGetTypeID() || (width = dict_number(w, "width", 0)) <= 0 ||
-	    (height = dict_number(w, "height", 0)) <= 0) {
+	if (x1 <= x0 || y1 <= y0) {
 		s->af_window[0] = s->af_window[1] = 0.3f;
 		s->af_window[2] = s->af_window[3] = 0.7f;
 		return;
 	}
-	x0 = dict_number(w, "hStart", 0) / 1000;
-	y0 = dict_number(w, "vStart", 0) / 1000;
-	width /= 1000;
-	height /= 1000;
-	if (width < 0.1) {
-		x0 -= (0.1 - width) / 2;
-		width = 0.1;
+	if (x1 - x0 < 0.1) {
+		x0 -= (0.1 - (x1 - x0)) / 2;
+		x1 = x0 + 0.1;
 	}
-	if (height < 0.1) {
-		y0 -= (0.1 - height) / 2;
-		height = 0.1;
+	if (y1 - y0 < 0.1) {
+		y0 -= (0.1 - (y1 - y0)) / 2;
+		y1 = y0 + 0.1;
 	}
-	x0 = x0 < 0 ? 0 : x0 + width > 1 ? 1 - width : x0;
-	y0 = y0 < 0 ? 0 : y0 + height > 1 ? 1 - height : y0;
+	x0 = x0 < 0 ? 0 : x1 > 1 ? x0 - (x1 - 1) : x0;
+	y0 = y0 < 0 ? 0 : y1 > 1 ? y0 - (y1 - 1) : y0;
+	x1 = x1 > 1 ? 1 : x1;
+	y1 = y1 > 1 ? 1 : y1;
 	s->af_window[0] = (float)x0;
 	s->af_window[1] = (float)y0;
-	s->af_window[2] = (float)(x0 + width);
-	s->af_window[3] = (float)(y0 + height);
+	s->af_window[2] = (float)x1;
+	s->af_window[3] = (float)y1;
 }
