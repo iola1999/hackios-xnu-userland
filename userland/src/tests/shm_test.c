@@ -77,6 +77,8 @@ posix_shm(int argc, char **argv)
 {
 	const char *name = argc >= 3 ? argv[2] : "com.annibale.shm_test";
 	bool child = strcmp(argv[1], "posixchild") == 0, existing = argc >= 3 && !child;
+	if (strcmp(argv[1], "posix2") == 0)
+		existing = false;
 	int fd = shm_open(name, child || existing ? O_RDONLY : O_RDWR | O_CREAT, 0600);
 	struct stat st = { 0 };
 
@@ -92,10 +94,41 @@ posix_shm(int argc, char **argv)
 		printf("shm_test %s: mmap failed: %d %s (size %lld)\n", argv[1], errno, strerror(errno), (long long)st.st_size);
 		return 1;
 	}
+	if (child && argc >= 4) {
+		/* posix2: mapped before the first process writes; a byte on fd 3 when mapped, then reads */
+		char go = 1;
+		write(3, &go, 1);
+		for (int tenths = 0; tenths < 30 && words[1] != 0x77777777; tenths++)
+			usleep(100000);
+		printf("shm_test posixchild: after mapping first, word 1 is %#x\n", words[1]);
+		return words[1] != 0x77777777;
+	}
 	if (child || existing) {
 		printf("shm_test %s: %s size %lld, words %#x %#x %#x %#x\n", argv[1], name, (long long)st.st_size, words[0], words[1],
 		    words[2], words[3]);
 		return child && words[0] != 0x5a5a1234;
+	}
+	if (strcmp(argv[1], "posix2") == 0) {
+		int fds[2];
+		pipe(fds);
+		posix_spawn_file_actions_t fa;
+		posix_spawn_file_actions_init(&fa);
+		posix_spawn_file_actions_adddup2(&fa, fds[1], 3);
+		char *args2[] = { argv[0], "posixchild", (char *)name, "after", NULL };
+		pid_t pid2;
+		int status2 = 0;
+		if (posix_spawn(&pid2, argv[0], &fa, NULL, args2, environ) != 0) {
+			printf("shm_test posix2: the second process did not run\n");
+			return 1;
+		}
+		char go;
+		read(fds[0], &go, 1);
+		words[1] = 0x77777777;
+		waitpid(pid2, &status2, 0);
+		printf("shm_test posix2: a write after both mapped %s\n",
+		    WIFEXITED(status2) && WEXITSTATUS(status2) == 0 ? "reached the other process" : "DID NOT reach the other process");
+		shm_unlink(name);
+		return 0;
 	}
 	words[0] = 0x5a5a1234;
 	char *args[] = { argv[0], "posixchild", (char *)name, NULL };
@@ -128,7 +161,7 @@ main(int argc, char **argv)
 	if (argc == 2 && strcmp(argv[1], "child") == 0) {
 		return child();
 	}
-	if (argc >= 2 && (strcmp(argv[1], "posix") == 0 || strcmp(argv[1], "posixchild") == 0)) {
+	if (argc >= 2 && (strcmp(argv[1], "posix") == 0 || strcmp(argv[1], "posix2") == 0 || strcmp(argv[1], "posixchild") == 0)) {
 		return posix_shm(argc, argv);
 	}
 	printf("shm_test: the memory entry made %s\n", share ? "with MAP_MEM_VM_SHARE | VM_PROT_IS_MASK, as WebKit's SharedMemory "

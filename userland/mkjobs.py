@@ -59,67 +59,14 @@ import sys
 # It needs no hardware we have not got, and it serves its clients whether or not it reaches a push courier,
 # which it never will: the courier wants a device identity rooted in the Secure Enclave this phone has not
 # got (apsd -> mobileactivationd, "Device is probably unactivated"), so the push itself stays out of reach.)
-# CommCenter stays, and this is what it cost to find out. Shipping both of its plists is the stock
-# arrangement -- they carry the same label and launchd picks by the device tree, so with no "baseband" node
-# it takes com.apple.CommCenter-noncellular, the variant iOS has for a device with no modem -- and it does
-# pick it. It then gets a long way: it answers com.apple.commcenter.xpc and .coretelephony.xpc (85 and 18
-# failed lookups in a session become none), serves geod its policy, loads the network-extension
-# configurations. And then it dies, every time, on one of two IOKit drivers of the cellular path that this
-# kernel has not got, and each has its own signal. With CommCenter's own log on, the split is clean over
-# 20 crashes: 11 SIGSEGV every one of them right after "Could not find AppleIPAppender service" (matched
-# by name; user client ApplePDPHelperInterface -- PDP contexts, traffic-class flows, dedicated bearers),
-# and 9 SIGABRT every one of them right after "Unable to communicate with AppleBaseband driver"
-# (com.apple.driver.AppleBasebandPCI). That answers the obvious question before anyone spends a week on
-# it: stubbing AppleIPAppender alone would remove the SIGSEGV half and leave the SIGABRT half, so it is
-# not enough on its own -- and AppleBasebandPCI is an Apple modem on PCIe, which this phone has not got.
-# It respawns and does it again: 18 crashes in a seven-minute session where the same image without it has
-# none. The boot is not held up -- it reaches the same 118 processes against 119 -- so the trade is 103
-# failed lookups a session against a process dying every fifteen seconds for ever, which is a bad one.
-# Stubbing the first driver is the kind of work AnnibaleBattery already is, but the second is an Apple
-# baseband on PCIe, and this phone's modem is on the SoC and speaks QMI to a Qualcomm subsystem -- so what
-# is behind the driver is missing too, not just the driver.
-# cloudd and appstored are IN, and getting there was the most instructive thing in this file.
-# They looked like daemons that cost the home screen: with them the boot reached 76-78 processes against
-# 119 and not one widget or poster started, and on the phone it was worse still -- 42 processes against
-# 128, no home screen, the scenario's applications never opening. The cause was neither of them. cloudd
-# was retrying com.apple.nsurlsessiond without ever stopping -- 2351 times in that phone session -- because
-# nsurlsessiond was itself in this tuple. With nsurlsessiond shipped, the phone run with both of them in
-# reaches 130 processes and 20 widget and poster processes with no crash, against the baseline's 128 and 19:
-# better than the image without them. Zero nsurlsessiond retries.
-# What each one is actually shown to do, which is less than "it works":
-#   appstored -- confirmed. It spawns, and com.apple.appstored.xpc.request, the one service the App Store
-#     could not find when it was opened by hand, is answered: 0 failed lookups against 1.
-#   cloudd -- the harm is gone, the use is not shown. In that phone session nothing asked for it at all
-#     (0 requestor lines against 2352 when it was spinning), so all that is proved is that shipping it no
-#     longer costs the boot. In QEMU it does start and behaves: 0 retries, 100 processes, 12 widgets.
-# Taking 'cloudd' out of the tuple also lets com.apple.itunescloudd through, which has never been asked
-# for in any session measured here.
-# The App Store: itunesstored and installcoordinationd are in, and this is exactly how far it gets.
-# appstored asks for both the moment the store is opened, and with them it runs clean -- 135 processes,
-# 17 widget and poster processes, no crash. The App Store opens and shows its own LOADING spinner and
-# stays there. It is NOT the FairPlay wall and NOT a sign-in: the store stack never opens a TCP
-# connection at all (trustd, mDNSResponder, geod, nsurlsessiond all do; appstored, itunesstored and
-# AppStore do not), so it stops before the network. appstored says why, in one line:
-#   [bag] AMSBagActiveAccountProvider: The local account doesn't have a storefront.
-#         localAccount = <ACAccount type = iTunesStore | username = local | storefront = (null)>
-#   [bag] AMSBagNetworkDataSource: Could not fetch initial cached storefront
-#   [Bag] Error creating snapshot of bag: Timed out while waiting for snapshot bag to load
-# CAUTION, this paragraph's conclusion was wrong and is left here only so the mistake is not repeated.
-# There IS a third route to a storefront and it is the one a SIM-less, never-signed-in iPhone uses: the
-# bag server sets it over HTTP. AppleMediaServices holds "X-Set-Apple-Store-Front" and the line
-# "Attempting to load the bag again because the response had a x-set-apple-store-front header", plus
-# https://bag.itunes.apple.com/bag.xml; AMS fetches the bag with no storefront, the server picks one from
-# the request's address, and AMSBagDataSource _setStorefrontFromURLResponse:bagData: writes it onto the
-# local account. "The local account doesn't have a storefront" is a fallback message, not a wall, and
-# there is no activation gate anywhere in the store stack.
-# AND THE MEASUREMENT UNDER IT CANNOT CARRY A NEGATIVE AT ALL, which is the lesson worth keeping:
-# /dev/console on the phone DROPS LINES, and every "it never appears in the log" above rests on that
-# channel. In the same run the scenario's steps demonstrably ran -- init echoed the command line, the
-# step after them printed -- and net_test's own output for resolve, reach and two fetches is simply
-# absent, while launchd's "Last log repeated 2312 times" of failed lookups fills the window. So the
-# store's missing bag strings are not evidence that no bag was fetched; they are evidence of nothing.
-# What the console did carry, and what is therefore true, is the opposite of what was written here:
-# THE PHONE'S NETWORK WORKS. en0 has an IPv4 address, mDNSResponder resolves over TCP port 53
+# CommCenter runs, as com.apple.CommCenter-noncellular: launchd picks that variant by the device tree (no
+# "baseband" node), and the cellular plist is skipped below. Without it nothing answers
+# com.apple.commcenter.coretelephony.xpc, SpringBoard's SBTelephonyManager takes its call-control failure
+# path once a second and resets the idle timer each time ("TelephonyManager:UpdateSB"), so the screen
+# never dimmed or locked by itself (kernel-12377-lens2-w55..w59). On kernel-12377-lens2-w60 it ran for
+# minutes without a restart and auto-lock fired at 40, 42 and 60 s. It once crash-looped every fifteen
+# seconds on the missing AppleIPAppender and AppleBasebandPCI drivers; if that comes back, those two are
+# where it dies.
 # (four queries, answers of 159, 842, 200 and 107 bytes), and trustd, geod, maild, gamed, cloudd,
 # StocksWidget and nsurlsessiond all open TLS to Apple and Akamai (17.248.214.x, 17.253.39.x,
 # 2.16.56.93, 23.11.40.157, 95.100.176.233). "net_test: en0: flags 0x8802" was read 0.1 s into user
@@ -148,8 +95,8 @@ import sys
 # connection and its AMSDCookieService.getCookies transactions), so the account layer answers at
 # least that much.
 # The two services below are still the ones appstored cannot find, but they are no longer the story:
-#   com.apple.commcenter.coretelephony.xpc -- the SIM's country, through CommCenter, which crash-loops
-#     here (see above);
+#   com.apple.commcenter.coretelephony.xpc -- the SIM's country, through CommCenter, which runs here
+#     without a SIM or a modem and so has no country to give (see above);
 #   com.apple.mobileactivationd -- the activation record's region. That binary carries RegionCode,
 #     RegionInfo and subscriberCountryCodeDidChange:, and it is rooted in a Secure Enclave this phone
 #     has not got.
@@ -206,7 +153,7 @@ import sys
 # for ever, see «Sileo» in README.md.)
 # (mediaserverd is not among them, for all that there is neither sound nor a camera:
 # it is where VideoToolbox decodes for every other process, a HEIC picture included; see src/inject_media.c.)
-DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'softwareupdate',
+DENY = ('watchdog', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'softwareupdate',
         'datamigrator', 'backupd', 'thermalmonitord', 'keybagd', 'nfcd', 'biometrickitd', 'pearld',
         'obliterat', 'storage_mounter', 'com.apple.fud', 'sepd', 'seputil', 'ReportCrash',
         'lockdown', 'audio', 'jetsamproperties',
@@ -398,8 +345,8 @@ if rest:
         label = name[:-len('.plist')]
         if not name.endswith('.plist') or label in labels or any(word in label for word in DENY):
             continue
-        # If CommCenter is unlocked via ALLOW="CommCenter", skip the AppleBasebandPCI cellular plist
-        # so it does not collide with com.apple.CommCenter-noncellular.plist or crash-loop on PCIe baseband.
+        # The AppleBasebandPCI cellular plist carries CommCenter's label too; the noncellular one is the
+        # job for a device with no modem.
         if label == 'com.apple.CommCenter':
             continue
         with open(f'{directory}/{name}', 'rb') as f:

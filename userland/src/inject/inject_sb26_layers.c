@@ -842,6 +842,235 @@ idle_disable(id self, SEL cmd, id reason)
     return idle_disable_original(self, cmd, reason);
 }
 
+static void (*idle_event_original)(id, SEL, id);
+static void
+idle_event(id self, SEL cmd, id event)
+{
+    char a[400], b[100];
+    double timeout = -1;
+    id object = nil;
+
+    if (event && class_respondsToSelector(object_getClass(event), sel_registerName("attentionLostTimeout")))
+        timeout = ((double (*)(id, SEL))objc_msgSend)(event, sel_registerName("attentionLostTimeout"));
+    if (event && class_respondsToSelector(object_getClass(event), sel_registerName("associatedObject")))
+        object = send(event, "associatedObject");
+    out("sb26 idletimer: %s handles %s; timeout %.17g, associatedObject %s\n", described(self, b, sizeof(b)),
+        described(event, a, sizeof(a)), timeout, object ? described(object, b, sizeof(b)) : "(nil)");
+    idle_event_original(self, cmd, event);
+}
+
+static BOOL (*aw_resume_original)(id, SEL, id *);
+static BOOL (*aw_suspend_original)(id, SEL, id *);
+static BOOL (*aw_configure_original)(id, SEL, id, BOOL, id *);
+
+static const char *
+aw_identifier(id client, char *text, size_t size)
+{
+    id config = client ? send(client, "configuration") : nil;
+    id ident = config ? send(config, "identifier") : nil;
+    return described(ident, text, size);
+}
+
+static void
+aw_dump_ivars(id client, const char *when)
+{
+    unsigned n = 0;
+    Ivar *list = class_copyIvarList(object_getClass(client), &n);
+    char line[1200];
+    size_t at = (size_t)snprintf(line, sizeof(line), "sb26 idletimer: AW ivars %s:", when);
+    for (unsigned i = 0; i < n && at < sizeof(line) - 80; i++) {
+        const char *type = ivar_getTypeEncoding(list[i]);
+        ptrdiff_t off = ivar_getOffset(list[i]);
+        long long v = 0;
+        if (type && (type[0] == 'i' || type[0] == 'I'))
+            v = *(int *)((char *)client + off);
+        else if (type && (type[0] == 'B' || type[0] == 'c' || type[0] == 'C'))
+            v = *(unsigned char *)((char *)client + off);
+        else if (type && (type[0] == 'q' || type[0] == 'Q' || type[0] == '@' || type[0] == '^'))
+            v = *(long long *)((char *)client + off);
+        at += (size_t)snprintf(line + at, sizeof(line) - at, " %s(%s)=%#llx", ivar_getName(list[i]), type ? type : "?", v);
+    }
+    free(list);
+    out("%s\n", line);
+}
+
+static BOOL
+aw_resume(id self, SEL cmd, id *error)
+{
+    char a[120], b[200];
+    BOOL ok = aw_resume_original(self, cmd, error);
+    out("sb26 idletimer: AW resume %s -> %d %s\n", aw_identifier(self, a, sizeof(a)), ok,
+        error && *error ? described(*error, b, sizeof(b)) : "");
+    if (strstr(a, "GlobalBacklight"))
+        aw_dump_ivars(self, "after resume");
+    return ok;
+}
+
+static BOOL
+aw_suspend(id self, SEL cmd, id *error)
+{
+    char a[120], b[200];
+    BOOL ok = aw_suspend_original(self, cmd, error);
+    out("sb26 idletimer: AW suspend %s -> %d %s\n", aw_identifier(self, a, sizeof(a)), ok,
+        error && *error ? described(*error, b, sizeof(b)) : "");
+    return ok;
+}
+
+static BOOL
+aw_configure(id self, SEL cmd, id config, BOOL reset, id *error)
+{
+    char a[120], b[200];
+    id ident0 = config ? send(config, "identifier") : nil;
+    out("sb26 idletimer: AW configure begin %s reset %d\n", described(ident0, a, sizeof(a)), reset);
+    BOOL ok = aw_configure_original(self, cmd, config, reset, error);
+    id ident = config ? send(config, "identifier") : nil;
+    out("sb26 idletimer: AW configure %s reset %d -> %d %s\n", described(ident, a, sizeof(a)), reset, ok,
+        error && *error ? described(*error, b, sizeof(b)) : "");
+    return ok;
+}
+
+static void (*aw_configure2_original)(id, SEL, id, BOOL);
+static void (*aw_configure1_original)(id, SEL, id);
+
+static void
+aw_configure2(id self, SEL cmd, id config, BOOL reset)
+{
+    char a[120], b[400];
+    id ident = config ? send(config, "identifier") : nil;
+    id timeouts = config ? send(config, "attentionLostTimeoutDictionary") : nil;
+    out("sb26 idletimer: AW configure2 %s reset %d timeouts %s\n", described(ident, a, sizeof(a)), reset,
+        described(timeouts, b, sizeof(b)));
+    aw_configure2_original(self, cmd, config, reset);
+    if (strstr(a, "GlobalBacklight"))
+        aw_dump_ivars(self, "after configure2");
+}
+
+static void
+aw_configure1(id self, SEL cmd, id config)
+{
+    char a[120];
+    id ident = config ? send(config, "identifier") : nil;
+    out("sb26 idletimer: AW configure1 %s\n", described(ident, a, sizeof(a)));
+    aw_configure1_original(self, cmd, config);
+}
+
+static void (*idle_reset_original)(id, SEL, id);
+static void (*idle_update_original)(id, SEL, id);
+static unsigned idle_reset_seen, idle_update_seen;
+
+static const char *
+caller_name(void *caller, char *text, size_t size)
+{
+    Dl_info info;
+    size_t length = 0;
+    extern const void *_dyld_get_shared_cache_range(size_t *);
+    uintptr_t slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - 0x180000000ul;
+    if (dladdr(caller, &info) && info.dli_sname)
+        snprintf(text, size, "%s+%#lx (%#lx)", info.dli_sname, (unsigned long)((char *)caller - (char *)info.dli_saddr),
+                 (unsigned long)((uintptr_t)caller - slide));
+    else
+        snprintf(text, size, "%#lx", (unsigned long)((uintptr_t)caller - slide));
+    return text;
+}
+
+static void
+idle_reset(id self, SEL cmd, id reason)
+{
+    char a[160], b[160];
+    if (idle_reset_seen++ < 30)
+        out("sb26 idletimer: reset for %s from %s\n", described(reason, a, sizeof(a)),
+            caller_name(__builtin_return_address(0), b, sizeof(b)));
+    idle_reset_original(self, cmd, reason);
+}
+
+static void
+idle_update(id self, SEL cmd, id reason)
+{
+    char a[160], b[160];
+    if (idle_update_seen++ < 60)
+        out("sb26 idletimer: update for %s from %s\n", described(reason, a, sizeof(a)),
+            caller_name(__builtin_return_address(0), b, sizeof(b)));
+    idle_update_original(self, cmd, reason);
+}
+
+static IMP telephony_update_original;
+static unsigned telephony_update_seen;
+
+static void
+telephony_update(id self, SEL cmd)
+{
+    char a[160];
+    if (telephony_update_seen++ < 12)
+        out("sb26 idletimer: -[SBTelephonyManager %s] from %s\n", sel_getName(cmd),
+            caller_name(__builtin_return_address(0), a, sizeof(a)));
+    ((void (*)(id, SEL))telephony_update_original)(self, cmd);
+}
+
+static IMP telephony_calls_original;
+static unsigned telephony_calls_seen;
+
+static void
+telephony_calls(id self, SEL cmd)
+{
+    char a[160], b[160];
+    if (telephony_calls_seen++ < 12)
+    {
+        /* two frames up, through the frame pointer chain (x29) */
+        void **fp = (void **)__builtin_frame_address(0);
+        void **up = fp ? (void **)fp[0] : NULL;
+        out("sb26 idletimer: -[SBTelephonyManager updateCalls] from %s, %s\n",
+            caller_name(__builtin_return_address(0), a, sizeof(a)),
+            caller_name(up ? __builtin_extract_return_addr(up[1]) : NULL, b, sizeof(b)));
+    }
+    ((void (*)(id, SEL))telephony_calls_original)(self, cmd);
+}
+
+static IMP telephony_status_original;
+static unsigned telephony_status_seen;
+
+static void
+telephony_status(id self, SEL cmd, id argument)
+{
+    char a[160], b[300];
+    if (telephony_status_seen++ < 12)
+        out("sb26 idletimer: -[SBTelephonyManager %s] %s from %s\n", sel_getName(cmd), described(argument, b, sizeof(b)),
+            caller_name(__builtin_return_address(0), a, sizeof(a)));
+    ((void (*)(id, SEL, id))telephony_status_original)(self, cmd, argument);
+}
+
+/* SBTelephonyManager's methods at their shared cache addresses (dsc.py), and a hook on the one at
+ * 0x22438214c: the "TelephonyManager:UpdateSB" idle timer reset */
+static void
+install_telephony_log(void)
+{
+    Class t = objc_getClass("SBTelephonyManager");
+    Dl_info info;
+    if (!t || !dladdr((void *)t, &info)) return;
+    size_t length = 0;
+    extern const void *_dyld_get_shared_cache_range(size_t *);
+    uintptr_t slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - 0x180000000ul;
+    unsigned n = 0;
+    Method *list = class_copyMethodList(t, &n);
+    for (unsigned i = 0; i < n; i++) {
+        uintptr_t at = (uintptr_t)method_getImplementation(list[i]) - slide;
+        if (at >= 0x22445c700ul && at <= 0x22445c9d4ul)
+            out("sb26 idletimer: SBTelephonyManager %s at %#lx (args %u) contains the caller\n",
+                sel_getName(method_getName(list[i])), (unsigned long)at, method_getNumberOfArguments(list[i]));
+        if (at >= 0x22445c700ul && at <= 0x22445c9d4ul && method_getNumberOfArguments(list[i]) == 3) {
+            telephony_status_original = method_setImplementation(list[i], (IMP)telephony_status);
+        }
+        if (at == 0x22445c770ul && method_getNumberOfArguments(list[i]) == 2) {
+            telephony_calls_original = method_setImplementation(list[i], (IMP)telephony_calls);
+            out("sb26 idletimer: SBTelephonyManager updateCalls hooked\n");
+        }
+        if (at == 0x22438214cul && method_getNumberOfArguments(list[i]) == 2) {
+            telephony_update_original = method_setImplementation(list[i], (IMP)telephony_update);
+            out("sb26 idletimer: SBTelephonyManager %s is the UpdateSB reset; hooked\n", sel_getName(method_getName(list[i])));
+        }
+    }
+    free(list);
+}
+
 static void
 install_idle_log(void)
 {
@@ -855,6 +1084,26 @@ install_idle_log(void)
         idle_propose_original = (void (*)(id, SEL, id, id, id))method_setImplementation(m, (IMP)idle_propose);
     if ((m = class_getInstanceMethod(coordinator, sel_registerName("acquireIdleTimerDisableAssertionForReason:"))))
         idle_disable_original = (id (*)(id, SEL, id))method_setImplementation(m, (IMP)idle_disable);
+    if ((m = class_getInstanceMethod(coordinator, sel_registerName("resetIdleTimerForReason:"))))
+        idle_reset_original = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)idle_reset);
+    if ((m = class_getInstanceMethod(coordinator, sel_registerName("_updateIdleTimerForReason:"))))
+        idle_update_original = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)idle_update);
+    install_telephony_log();
+    Class attention = objc_getClass("ITAttentionAwarenessClient");
+    if (attention && (m = class_getInstanceMethod(attention, sel_registerName("_handleAttentionAwarenessEvent:"))))
+        idle_event_original = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)idle_event);
+    Class aw = objc_getClass("AWAttentionAwarenessClient");
+    if (aw && (m = class_getInstanceMethod(aw, sel_registerName("resumeWithError:"))))
+        aw_resume_original = (BOOL (*)(id, SEL, id *))method_setImplementation(m, (IMP)aw_resume);
+    if (aw && (m = class_getInstanceMethod(aw, sel_registerName("suspendWithError:"))))
+        aw_suspend_original = (BOOL (*)(id, SEL, id *))method_setImplementation(m, (IMP)aw_suspend);
+    if (aw && (m = class_getInstanceMethod(aw, sel_registerName("setConfiguration:shouldReset:error:"))))
+        aw_configure_original = (BOOL (*)(id, SEL, id, BOOL, id *))method_setImplementation(m, (IMP)aw_configure);
+    if (aw && (m = class_getInstanceMethod(aw, sel_registerName("setConfiguration:shouldReset:"))))
+        aw_configure2_original = (void (*)(id, SEL, id, BOOL))method_setImplementation(m, (IMP)aw_configure2);
+    if (aw && (m = class_getInstanceMethod(aw, sel_registerName("setConfiguration:"))))
+        aw_configure1_original = (void (*)(id, SEL, id))method_setImplementation(m, (IMP)aw_configure1);
+    out("sb26 idletimer: attention events %s\n", idle_event_original ? "logged" : "not found");
     out("sb26 idletimer: logged (apply %d, propose %d, disable %d)\n", idle_set_original != NULL,
         idle_propose_original != NULL, idle_disable_original != NULL);
 }
