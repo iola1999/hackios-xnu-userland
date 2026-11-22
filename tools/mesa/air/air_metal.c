@@ -2922,7 +2922,7 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
                .buffer_size = 4096,
             };
 
-            pipe->set_constant_buffer(pipe, stage, r->index, &none);
+            pipe->set_constant_buffer(pipe, stage, r->slot, &none);
             break;
          }
          size_t left = b->size - MIN2(b->size, boffset);
@@ -2952,7 +2952,7 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
          }
          uint64_t cb_mark = draw_mark();
 
-         pipe->set_constant_buffer(pipe, stage, r->index, &cb);
+         pipe->set_constant_buffer(pipe, stage, r->slot, &cb);
          bind_phase_add(BIND_PHASE_CONSTANT, cb_mark);
          break;
       }

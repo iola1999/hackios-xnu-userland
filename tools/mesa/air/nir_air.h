@@ -47,6 +47,9 @@ const char *air_metallib_type_name(int type);
 
 /* -- what the translated shader expects of the runtime ---------------------- */
 
+/* the constant buffers freedreno gives ir3 (freedreno_screen.c, max_const_buffers) */
+#define AIR_UBO_SLOTS 16
+
 enum air_resource_kind {
    AIR_RESOURCE_CONSTANT_BUFFER,    /* UBO at .index */
    AIR_RESOURCE_DEVICE_BUFFER,      /* SSBO at .index */
@@ -117,6 +120,9 @@ struct air_resource {
                       * EXCEPT for an argument-buffer member, where it is the
                       * index this frontend allocated: see argbuf_set below */
    unsigned size;    /* air.buffer_size when given, else 0 */
+   unsigned slot;    /* a constant buffer's Gallium slot and NIR block: .index, or its rank
+                      * among the shader's constant buffers when an index is past the
+                      * sixteen freedreno gives ir3 (air_entry.inc) */
    bool read, write;
    unsigned param;   /* the entry point's parameter; ~0u for an inline sampler */
    const char *name; /* air.arg_name */

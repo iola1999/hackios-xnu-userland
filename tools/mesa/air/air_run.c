@@ -976,7 +976,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
          struct pipe_resource *b = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
                                                       PIPE_USAGE_DEFAULT, bytes);
          pipe_buffer_write(pipe, b, 0, bytes, bits);
-         pipe->set_constant_buffer(pipe, MESA_SHADER_COMPUTE, r->index,
+         pipe->set_constant_buffer(pipe, MESA_SHADER_COMPUTE, r->slot,
                                    &(struct pipe_constant_buffer){
                                       .buffer = b, .buffer_size = bytes });
       } else if (r->kind == AIR_RESOURCE_DEVICE_BUFFER) {
@@ -1773,7 +1773,7 @@ main(int argc, char **argv)
       struct pipe_resource *buf = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
                                                      PIPE_USAGE_DEFAULT, bytes);
       pipe_buffer_write(pipe, buf, 0, bytes, bits);
-      pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, r->index,
+      pipe->set_constant_buffer(pipe, MESA_SHADER_FRAGMENT, r->slot,
                                 &(struct pipe_constant_buffer){
                                    .buffer = buf, .buffer_size = bytes,
                                 });

@@ -117,6 +117,7 @@ TARGETS = [
         "flags": ["-O1", "-fno-objc-arc", "-framework", "Foundation", "-framework", "IOKit", "-framework", "Metal", "-lobjc"],
     },
     {"name": "metal_drv_test", "type": "exe", "sources": ["src/tests/metal_drv_test.m"], "flags": ["-O1", "-framework", "Foundation", "-framework", "IOKit", "-framework", "Metal", "-lobjc"]},
+    {"name": "ubo_test", "type": "exe", "sources": ["src/tests/ubo_test.m"], "flags": ["-O1", "-framework", "Foundation", "-framework", "Metal", "-lobjc"]},
     {
         "name": "AnnibaleTriangle",
         "type": "exe",

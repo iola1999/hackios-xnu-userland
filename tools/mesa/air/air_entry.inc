@@ -237,6 +237,72 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       }
 
    }
+   /* freedreno gives ir3 sixteen constant buffers (freedreno_screen.c, max_const_buffers),
+    * and a UBO block past them reads zeros: in kernel-12377-lens2-w75 a kernel read its
+    * setBytes: at buffer(3) and buffer(5) and zeros at buffer(21) and buffer(22). Metal's
+    * indices go to 30 -- MapKit binds DaVinci::ground_fragment's styleColor at 21, and every
+    * building came out transparent, then black. When an index is past the sixteen, the
+    * shader's constant buffers are numbered in order of index from 0, in the NIR's load_ubo
+    * and in the binding (air_resource.slot); the buffer is still looked up by its index.
+    * Past sixteen of them (the camera's LTM kernel has seventeen) the rest keep their index
+    * and still read zeros, as before this renumbering: read as storage buffers instead, they
+    * left the photographs dark green (kernel-12377-lens2-w77), for a reason not found yet.
+    * A shader that picks a constant buffer at run time keeps every index as it is.
+    */
+   if (!c.error[0]) {
+      unsigned indices[32], count = 0, top = 0;
+      for (unsigned i = 0; i < c.info->num_resources; i++) {
+         struct air_resource *r = &c.info->resources[i];
+         if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
+            continue;
+         r->slot = r->index;
+         top = MAX2(top, r->index + 1);
+         bool seen = false;
+         for (unsigned k = 0; k < count; k++)
+            seen = seen || indices[k] == r->index;
+         if (!seen && count < ARRAY_SIZE(indices))
+            indices[count++] = r->index;
+      }
+#define AIR_UBO_RANK(index, rank) \
+   do { rank = 0; for (unsigned k = 0; k < count; k++) rank += indices[k] < (index); } while (0)
+      bool dynamic = false;
+      nir_foreach_function_impl(impl, c.nir) {
+         /* the translation's CFG is not structured yet */
+         nir_foreach_block_unstructured(block, impl) {
+            nir_foreach_instr(instr, block) {
+               dynamic = dynamic || (instr->type == nir_instr_type_intrinsic &&
+                                     nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_ubo &&
+                                     !nir_src_is_const(nir_instr_as_intrinsic(instr)->src[0]));
+            }
+         }
+      }
+      if (top > AIR_UBO_SLOTS && !dynamic) {
+         for (unsigned i = 0; i < c.info->num_resources; i++) {
+            struct air_resource *r = &c.info->resources[i];
+            if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
+               continue;
+            AIR_UBO_RANK(r->index, r->slot);
+            if (r->slot >= AIR_UBO_SLOTS)
+               r->slot = r->index;
+         }
+         nir_foreach_function_impl(impl, c.nir) {
+            nir_foreach_block_unstructured(block, impl) {
+               nir_foreach_instr(instr, block) {
+                  if (instr->type != nir_instr_type_intrinsic ||
+                      nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_load_ubo)
+                     continue;
+                  nir_intrinsic_instr *load = nir_instr_as_intrinsic(instr);
+                  unsigned index = nir_src_as_uint(load->src[0]), slot;
+                  AIR_UBO_RANK(index, slot);
+                  nir_builder b = nir_builder_at(nir_before_instr(instr));
+                  if (slot < AIR_UBO_SLOTS)
+                     nir_src_rewrite(&load->src[0], nir_imm_int(&b, slot));
+               }
+            }
+         }
+      }
+#undef AIR_UBO_RANK
+   }
    if (c.error[0]) {
       if (error)
          *error = ralloc_strdup(mem_ctx, c.error);
@@ -253,7 +319,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       const struct air_resource *r = &c.info->resources[i];
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
-         c.nir->info.num_ubos = MAX2(c.nir->info.num_ubos, r->index + 1);
+         c.nir->info.num_ubos = MAX2(c.nir->info.num_ubos, r->slot + 1);
          break;
       case AIR_RESOURCE_DEVICE_BUFFER:
          c.nir->info.num_ssbos = MAX2(c.nir->info.num_ssbos, r->index + 1);
