@@ -6,7 +6,8 @@
  * `notify com.annibale.layers.<filter>` prints, to stderr and so to the console, every layer whose
  * own class or whose view's class contains <filter> (case sensitive), at any depth, with the layers
  * below it up to LAYER_BELOW levels. `com.annibale.layers.all` prints the whole tree.
- * `com.annibale.layers.full` prints the full subtree without truncation and exports layer visual
+ * `com.annibale.layers.animated` prints every layer with animations attached (key, class, timing, frame
+ * rate range). `com.annibale.layers.full` prints the full subtree without truncation and exports layer visual
  * styling (background, border, corner, masks, and filter parameters) to /private/var/tmp/layers-dump.txt.
  * Each line contains depth, layer class, view class, bounds and position, hidden/opacity, visual styles,
  * contents (CGImage/IOSurface with dimensions, mean colour and black ratio) and effects/filters.
@@ -537,6 +538,29 @@ describe_sdf(id layer, unsigned depth)
     }
 }
 
+/* `animated`: every layer with animations attached, each animation's key, class, timing and frame rate range */
+static void
+describe_animations(id layer, unsigned depth)
+{
+    id keys = send(layer, "animationKeys");
+    unsigned long count = keys ? ((unsigned long (*)(id, SEL))objc_msgSend)(keys, sel_registerName("count")) : 0;
+    for (unsigned long i = 0; i < count; i++) {
+        id key = ((id (*)(id, SEL, unsigned long))objc_msgSend)(keys, sel_registerName("objectAtIndex:"), i);
+        id animation = ((id (*)(id, SEL, id))objc_msgSend)(layer, sel_registerName("animationForKey:"), key);
+        const char *text = ((const char *(*)(id, SEL))objc_msgSend)(key, sel_registerName("UTF8String"));
+        struct { float minimum, maximum, preferred; } range = { 0, 0, 0 };
+        SEL range_getter = checked_getter(animation, "preferredFrameRateRange", "{CAFrameRateRange=fff}16@0:8");
+        if (range_getter)
+            range = ((__typeof__(range) (*)(id, SEL))objc_msgSend)(animation, range_getter);
+        out("sb26 layer %2u animated %s view=%s key=%.80s %s duration=%.3g repeat=%.3g rate=%.0f..%.0f@%.0f\n",
+            depth, name_of(layer), name_of(send(layer, "delegate")), text ? text : "?", name_of(animation),
+            ((double (*)(id, SEL))objc_msgSend)(animation, sel_registerName("duration")),
+            (double)((float (*)(id, SEL))objc_msgSend)(animation, sel_registerName("repeatCount")),
+            range.minimum, range.maximum, range.preferred);
+        lines++;
+    }
+}
+
 static int
 matches(id layer, const char *filter)
 {
@@ -549,6 +573,7 @@ walk(id layer, unsigned depth, const char *filter, int below, int below_limit, i
 {
     unsigned max_lines = full ? LAYER_LINES_FULL : LAYER_LINES;
     if (!layer || lines >= max_lines || depth > LAYER_DEPTH) return;
+    if (filter && strcmp(filter, "animated") == 0) describe_animations(layer, depth);
     if (below < 0 && matches(layer, filter)) below = below_limit;
     if (below >= 0 || full) {
         struct rect bounds = ((struct rect (*)(id, SEL))objc_msgSend)(layer, sel_registerName("bounds"));
@@ -775,7 +800,7 @@ void
 sb26_install_layer_dump(void)
 {
     static const char *filters[] = { "all", "Icon", "Wallpaper", "Poster", "StatusBar", "Battery", "Widget",
-                                     "DateView", "Time", "SDF" };
+                                     "DateView", "Time", "SDF", "animated" };
     for (size_t i = 0; i < sizeof(filters) / sizeof(filters[0]); i++) {
         char name[64];
         int token;
