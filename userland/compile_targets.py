@@ -173,6 +173,13 @@ TARGETS = [
         "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "Security"],
         "entitlements": "src/tests/wifipw_test.entitlements",
     },
+    {
+        "name": "a80211_test",
+        "type": "exe",
+        "sources": ["src/tests/a80211_test.c"],
+        "flags": ["-O1", "-framework", "CoreFoundation"],
+        "entitlements": "src/tests/a80211_test.entitlements",
+    },
 
     # 3. Dynamic libraries & bundles
     {
