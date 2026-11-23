@@ -945,6 +945,7 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
    bool tex_used[MAX_IMG] = { false };
    unsigned num_tex = 0;
    unsigned num_ssbo = 0, num_written = 0;
+   void *const_win = NULL;
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
       unsigned bytes = r->size ? r->size : 4096;
@@ -973,12 +974,20 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
             printf("air_run: constant buffer %u is a %s, so it holds the identity and "
                    "not the fill\n", r->index, r->type_name);
          }
-         struct pipe_resource *b = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
-                                                      PIPE_USAGE_DEFAULT, bytes);
-         pipe_buffer_write(pipe, b, 0, bytes, bits);
-         pipe->set_constant_buffer(pipe, MESA_SHADER_COMPUTE, r->slot,
-                                   &(struct pipe_constant_buffer){
-                                      .buffer = b, .buffer_size = bytes });
+         if (r->const_win) {   /* folded past the sixteen slots into the window (bind below) */
+            if (!const_win)
+               const_win = calloc(1, info->const_win_size);
+            if (const_win)
+               memcpy((char *)const_win + r->win_base, bits,
+                      MIN2((size_t)r->size, (size_t)bytes));
+         } else {
+            struct pipe_resource *b = pipe_buffer_create(screen, PIPE_BIND_CONSTANT_BUFFER,
+                                                         PIPE_USAGE_DEFAULT, bytes);
+            pipe_buffer_write(pipe, b, 0, bytes, bits);
+            pipe->set_constant_buffer(pipe, MESA_SHADER_COMPUTE, r->slot,
+                                      &(struct pipe_constant_buffer){
+                                         .buffer = b, .buffer_size = bytes });
+         }
       } else if (r->kind == AIR_RESOURCE_DEVICE_BUFFER) {
          bufs[r->index] = pipe_buffer_create(screen, PIPE_BIND_SHADER_BUFFER,
                                              PIPE_USAGE_STAGING, bytes);
@@ -1193,6 +1202,11 @@ dispatch_kernel(struct pipe_screen *screen, const struct air_shader_info *info,
       return 1;
    }
    pipe->bind_compute_state(pipe, cso);
+   if (const_win)
+      pipe->set_constant_buffer(pipe, MESA_SHADER_COMPUTE, AIR_UBO_SLOTS - 1,
+                                &(struct pipe_constant_buffer){
+                                   .user_buffer = const_win,
+                                   .buffer_size = info->const_win_size });
 
    /* more than one thread, and the whole grid, so that a wrong index shows */
    struct pipe_grid_info grid = {

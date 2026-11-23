@@ -244,10 +244,14 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     * building came out transparent, then black. When an index is past the sixteen, the
     * shader's constant buffers are numbered in order of index from 0, in the NIR's load_ubo
     * and in the binding (air_resource.slot); the buffer is still looked up by its index.
-    * Past sixteen of them (the camera's LTM kernel has seventeen) the rest keep their index
-    * and still read zeros, as before this renumbering: read as storage buffers instead, they
-    * left the photographs dark green (kernel-12377-lens2-w77), for a reason not found yet.
-    * A shader that picks a constant buffer at run time keeps every index as it is.
+    * Past sixteen of them (the camera's LTM kernel has seventeen) the first fifteen get
+    * direct slots and the rest share the last slot: their declared bytes are packed into
+    * one window bound there and each load is rewritten to that slot at the window's base
+    * plus its own offset, which keeps UBO read semantics exactly (reading the overflow as
+    * storage buffers instead left the photographs dark green in kernel-12377-lens2-w77).
+    * A folded buffer that declares no air.buffer_size cannot be copied and keeps its
+    * index, reading zeros as before. A shader that picks a constant buffer at run time
+    * keeps every index as it is.
     */
    if (!c.error[0]) {
       unsigned indices[32], count = 0, top = 0;
@@ -277,14 +281,28 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
          }
       }
       if (top > AIR_UBO_SLOTS && !dynamic) {
+         const unsigned win_slot = AIR_UBO_SLOTS - 1;
+         const bool fold = count > AIR_UBO_SLOTS;
+         unsigned win_base[32] = { 0 }, win_size = 0;
+         bool folded[32] = { false };
+
          for (unsigned i = 0; i < c.info->num_resources; i++) {
             struct air_resource *r = &c.info->resources[i];
             if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
                continue;
             AIR_UBO_RANK(r->index, r->slot);
-            if (r->slot >= AIR_UBO_SLOTS)
+            if (fold && r->slot >= win_slot && r->size &&
+                r->index < ARRAY_SIZE(folded)) {
+               folded[r->index] = true;
+               win_base[r->index] = win_size;
+               win_size += ALIGN_POT(r->size, 16);
+               r->const_win = true;
+               r->win_base = win_base[r->index];
+               r->slot = win_slot;
+            } else if (r->slot >= AIR_UBO_SLOTS)
                r->slot = r->index;
          }
+         c.info->const_win_size = win_size;
          nir_foreach_function_impl(impl, c.nir) {
             nir_foreach_block_unstructured(block, impl) {
                nir_foreach_instr(instr, block) {
@@ -295,7 +313,12 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
                   unsigned index = nir_src_as_uint(load->src[0]), slot;
                   AIR_UBO_RANK(index, slot);
                   nir_builder b = nir_builder_at(nir_before_instr(instr));
-                  if (slot < AIR_UBO_SLOTS)
+                  if (index < ARRAY_SIZE(folded) && folded[index]) {
+                     nir_src_rewrite(&load->src[0], nir_imm_int(&b, win_slot));
+                     nir_src_rewrite(&load->src[1],
+                                     nir_iadd(&b, load->src[1].ssa,
+                                              nir_imm_int(&b, win_base[index])));
+                  } else if (slot < AIR_UBO_SLOTS)
                      nir_src_rewrite(&load->src[0], nir_imm_int(&b, slot));
                }
             }

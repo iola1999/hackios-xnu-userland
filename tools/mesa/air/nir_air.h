@@ -123,6 +123,13 @@ struct air_resource {
    unsigned slot;    /* a constant buffer's Gallium slot and NIR block: .index, or its rank
                       * among the shader's constant buffers when an index is past the
                       * sixteen freedreno gives ir3 (air_entry.inc) */
+   /* Constant buffers past the sixteen are packed into one bound window at the last
+    * slot: the shader reads slot 15 at win_base + its own offset, and the runtime
+    * copies each folded buffer's bytes there at bind time. A folded buffer without
+    * air.buffer_size cannot be copied and keeps its index, reading zeros as before.
+    */
+   bool const_win;
+   unsigned win_base;
    bool read, write;
    unsigned param;   /* the entry point's parameter; ~0u for an inline sampler */
    const char *name; /* air.arg_name */
@@ -277,6 +284,9 @@ struct air_shader_info {
    const char *entry_point;
    unsigned num_resources;
    struct air_resource *resources;
+   /* Bytes of the folded constant window (air_resource.const_win): bound once at the
+    * last UBO slot when constant buffers outnumber the sixteen ir3 takes. */
+   unsigned const_win_size;
    unsigned num_varyings;     /* vertex outputs or fragment inputs */
    struct air_varying *varyings;
 

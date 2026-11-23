@@ -2699,6 +2699,9 @@ draw_mark(void)
  */
 struct rwa_bound {
    unsigned num_ssbo, num_views, num_images, num_samplers;
+   /* Bytes for the folded constant buffers bound at the last UBO slot (air_entry.inc);
+    * user_buffer uploads happen at the draw, so it lives until unbind_stage. */
+   void *const_win;
 };
 
 /*
@@ -2779,6 +2782,17 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
 {
    struct pipe_context *pipe = device->pipe;
    uint64_t entry = draw_mark();
+
+   /* The folded-constants window has to exist before the loop copies each folded
+    * buffer's bytes into it; it is bound once after the loop. */
+   if (info->const_win_size) {
+      bound->const_win = calloc(1, info->const_win_size);
+      if (!bound->const_win) {
+         say(why, why_size, "%s could not allocate %u bytes of folded constants", name,
+             info->const_win_size);
+         return -1;
+      }
+   }
 
    /* Each buffer bound as whatever the shader declared the index to be. Metal has one
     * [[buffer(n)]] index space and Gallium has two, so a `constant` parameter is a UBO
@@ -2887,6 +2901,15 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
                                "Gallium has slots for", name, r->index,
                 (unsigned)PIPE_MAX_CONSTANT_BUFFERS);
             return -1;
+         }
+         if (r->const_win) {
+            /* Folded past the sixteen UBO slots (air_entry.inc): its bytes go into the
+             * window bound once below at the last slot; an unbound or unmapped buffer
+             * leaves the zeros calloc wrote, which is what it read before. */
+            if (b && b->map && bound->const_win)
+               memcpy((char *)bound->const_win + r->win_base, (const char *)b->map + boffset,
+                      MIN2((size_t)r->size, b->size - MIN2(b->size, boffset)));
+            break;
          }
          if (!b) {   /* an unbound pointer argument (check_bindings): a page of zeros */
             /* (once a shader and index: a shader that does read it computes with zeros) */
@@ -3138,6 +3161,22 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
    bind_phase_add(BIND_PHASE_SAMPLERS, mark);
    bind_phase_done(entry);
 
+   if (bound->const_win) {
+      pipe->set_constant_buffer(pipe, stage, AIR_UBO_SLOTS - 1,
+                                &(struct pipe_constant_buffer){
+                                   .user_buffer = bound->const_win,
+                                   .buffer_size = info->const_win_size });
+      static unsigned win_said;
+      if (win_said++ < 16) {
+         char line[160];
+         int n = snprintf(line, sizeof line,
+                          "air: %s: %u bytes of folded constants at UBO slot %u\n", name,
+                          info->const_win_size, AIR_UBO_SLOTS - 1);
+         if (n > 0)
+            (void) write(STDOUT_FILENO, line, MIN2(n, (int)sizeof line - 1));
+      }
+   }
+
    bound->num_ssbo = num_ssbo;
    bound->num_views = num_views;
    bound->num_images = num_images;
@@ -3156,6 +3195,7 @@ unbind_stage(struct rwa_device *device, mesa_shader_stage stage,
              const struct rwa_bound *bound)
 {
    struct pipe_context *pipe = device->pipe;
+   free(bound->const_win);
    if (bound->num_views)
       pipe->set_sampler_views(pipe, stage, 0, 0, bound->num_views, NULL);
    if (bound->num_images)
