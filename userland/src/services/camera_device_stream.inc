@@ -197,7 +197,8 @@ md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 
 /* the frame's metadata, as H10ISP's stream gives them (see md_names) */
 static CFDictionaryRef
-frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, CFStringRef port)
+frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, CFStringRef port, int af_status,
+    bool af_locked, unsigned focus_pos, int64_t focus_cmdid)
 {
 	CFMutableDictionaryRef m;
 	if (md_attachment == NULL) {
@@ -222,6 +223,16 @@ frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, CFS
 	 * and would make up the rest of what was asked for itself; without it, a zoomed preview stood still.
 	 */
 	md_put(m, MD_ZOOM, number_f(isp->zoom));
+	/* the AF state CMCapture watches to drive adjustingFocus and the still-image focus wait:
+	   1 while a search is moving the lens, 2 once settled (FigCapture afStatus) */
+	if (af_status >= 0) {
+		md_put(m, MD_AFSTATUS, number_i(af_status));
+		md_put(m, MD_AFLOCKED, af_locked ? kCFBooleanTrue : kCFBooleanFalse);
+		md_put(m, MD_FOCUSPOS, number_i((int64_t)focus_pos));
+		if (focus_cmdid != 0) {
+			md_put(m, MD_FOCUSCMDID, number_i(focus_cmdid));
+		}
+	}
 	return m;
 }
 
@@ -767,7 +778,13 @@ worker(void *context)
 		mark[3] = mach_absolute_time();
 		s->frames++;
 
-		CFDictionaryRef metadata = frame_metadata(&isp, f, s->port);
+		int64_t focus_cmdid;
+		pthread_mutex_lock(&s->lock);
+		focus_cmdid = s->focus_cmdid;
+		pthread_mutex_unlock(&s->lock);
+		int af_status = f->focus == ANNIBALE_CAMERA_NO_FOCUS ? -1 :
+		    (af.state == AF_SEARCH || af.state == AF_SETTLE ? 1 : 2);
+		CFDictionaryRef metadata = frame_metadata(&isp, f, s->port, af_status, af_locked, af.at, focus_cmdid);
 
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer

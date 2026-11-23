@@ -127,11 +127,14 @@ static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera
  * AddAttachmentsToSampleBuffer when the graph defers it), and what the capture device keeps its frame
  * statistics of.
  */
-enum { MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_FRAME_RATE, MD_ZOOM, MD_KEYS };
+enum { MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_FRAME_RATE, MD_ZOOM, MD_AFSTATUS, MD_AFLOCKED,
+    MD_FOCUSPOS, MD_FOCUSCMDID, MD_KEYS };
 static const char *const md_names[MD_KEYS] = {
 	"kFigCaptureStreamMetadata_PortType", "kFigCaptureSampleBufferAttachmentKey_OriginalPresentationTimeStamp",
 	"kFigCaptureStreamMetadata_ExposureTime", "kFigCaptureStreamMetadata_AGC", "kFigCaptureStreamMetadata_ispDGain",
 	"kFigCaptureStreamMetadata_CurrentFrameRate", "kFigCaptureStreamMetadata_ZoomFactor",
+	"kFigCaptureStreamMetadata_AFStatus", "kFigCaptureStreamMetadata_AFLocked",
+	"kFigCaptureStreamMetadata_CurrentFocusPosition", "kFigCaptureStreamMetadata_FocusNowCommandID",
 };
 static CFStringRef md_key[MD_KEYS];
 static CFStringRef md_attachment;       /* kFigCaptureSampleBufferAttachmentKey_MetadataDictionary */
@@ -440,6 +443,7 @@ struct stream {
 	CFStringRef     port;
 	bool            af_now;         /* a focus asked for (AutoFocusNow and the like): a search at the next frame */
 	bool            af_locked;      /* LockAFNow: no search but one asked for */
+	int64_t         focus_cmdid;    /* the command id a FocusNow collection carried, echoed back in frame metadata */
 	float           af_window[4];   /* AFWindowParams: where to focus, as fractions of the frame (x0, y0, x1, y1) */
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
@@ -937,6 +941,14 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		    key_is(key, "PeakTrackingFocusNow")) {
 			s->af_locked = false;
 			s->af_now = true;
+			if (value != NULL && CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+				CFTypeRef id = CFDictionaryGetValue((CFDictionaryRef)value, CFSTR("CommandID"));
+				int64_t n = 0;
+				if (id != NULL && CFGetTypeID(id) == CFNumberGetTypeID() &&
+				    CFNumberGetValue(id, kCFNumberSInt64Type, &n)) {
+					s->focus_cmdid = n;
+				}
+			}
 		}
 		pthread_mutex_unlock(&s->lock);
 		return 0;

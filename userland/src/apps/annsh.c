@@ -20,7 +20,8 @@
  *   dump PID                   kern.annibale.thread_dump: one kernel log line per thread of PID
  *   kill SIGNAL PID            kill(2)
  *   notify NAME                notify_post(3)
- *   sysctl NAME                the value as a string, or as integers when it is not printable
+ *   sysctl NAME                the value as a string, or as integers when it is not printable;
+ *                              a node name ("sysctl kern") prints every leaf under it
  *   sysctl NAME=NUMBER         set an integer sysctl
  *   setenv WORD...             kern.annibale.env becomes the words, each PROCESS:NAME=VALUE or
  *                              PROCESS:-NAME; libannibalemetal applies its process's words when the
@@ -290,29 +291,15 @@ do_threads(int pid)
 	return 0;
 }
 
-static int
-do_sysctl(char *name)
+static unsigned char sysctl_value[128 * 1024];      /* kern.annibale.prof prints up to 96 KB */
+
+/* SIZE bytes of a sysctl value as "NAME = STRING" when it is printable, one integer or a byte
+ * count when it is not. */
+static void
+out_sysctl_value(const char *name, unsigned char *value, size_t size)
 {
-	static unsigned char value[128 * 1024];         /* kern.annibale.prof prints up to 96 KB */
-	size_t size = sizeof(value) - 1;
 	size_t printable = 0;
-	char *equals = strchr(name, '=');
 
-	if (equals != NULL) {
-		int number = atoi(equals + 1);
-
-		*equals = '\0';
-		if (sysctlbyname(name, NULL, NULL, &number, sizeof(number)) != 0) {
-			out("sysctl %s=%d: %s", name, number, strerror(errno));
-			return 1;
-		}
-		out("%s = %d", name, number);
-		return 0;
-	}
-	if (sysctlbyname(name, value, &size, NULL, 0) != 0) {
-		out("sysctl %s: %s", name, strerror(errno));
-		return 1;
-	}
 	while (printable < size && (value[printable] >= 0x20 || value[printable] == '\n' || value[printable] == '\t'))
 		printable++;
 	if (size > 0 && (printable == size || (printable == size - 1 && value[printable] == 0))) {
@@ -330,7 +317,90 @@ do_sysctl(char *name)
 	} else {
 		out("%s: %zu bytes", name, size);
 	}
-	return 0;
+}
+
+/*
+ * NAME is a sysctl node rather than a leaf: print every leaf in its subtree, the way
+ * "sysctl -a" prints a whole tree. The kernel keeps the stock sysctl tree
+ * (bsd/kern/kern_newsysctl.c): {0,3} resolves a name to an OID, {0,2} gives the OID that
+ * follows one in tree order and {0,1} gives an OID's dotted name. Returns the number of
+ * leaves found; 0 also means NAME does not resolve at all.
+ */
+static int
+do_sysctl_walk(char *name)
+{
+	int mib[CTL_MAXNAME + 2], prefix[CTL_MAXNAME], oid[CTL_MAXNAME], here[CTL_MAXNAME];
+	size_t size;
+	unsigned plen, hlen;
+	int found = 0;
+
+	mib[0] = 0;
+	mib[1] = 3;
+	size = sizeof(prefix);
+	if (sysctl(mib, 2, prefix, &size, name, strlen(name)) != 0)
+		return 0;
+	plen = size / sizeof(int);
+	memcpy(here, prefix, plen * sizeof(int));
+	hlen = plen;
+	for (;;) {
+		char oname[512];
+		size_t osize = sizeof(oid), nsize = sizeof(oname), vsize;
+		unsigned nlen;
+
+		mib[0] = 0;
+		mib[1] = 2;
+		memcpy(mib + 2, here, hlen * sizeof(int));
+		if (sysctl(mib, hlen + 2, oid, &osize, NULL, 0) != 0)
+			break;                                  /* ENOENT: the end of the tree */
+		nlen = osize / sizeof(int);
+		if (nlen > CTL_MAXNAME || nlen < plen || memcmp(oid, prefix, plen * sizeof(int)) != 0)
+			break;                                  /* left the NAME subtree */
+		mib[1] = 1;
+		memcpy(mib + 2, oid, nlen * sizeof(int));
+		if (sysctl(mib, nlen + 2, oname, &nsize, NULL, 0) != 0) {
+			out("sysctl: oid %d has no name: %s", oid[nlen - 1], strerror(errno));
+		} else {
+			vsize = sizeof(sysctl_value) - 1;
+			if (sysctl(oid, nlen, sysctl_value, &vsize, NULL, 0) == 0)
+				out_sysctl_value(oname, sysctl_value, vsize);
+			else
+				out("%s: %s", oname, strerror(errno));
+			found++;
+		}
+		memcpy(here, oid, nlen * sizeof(int));
+		hlen = nlen;
+	}
+	return found;
+}
+
+static int
+do_sysctl(char *name)
+{
+	size_t size = sizeof(sysctl_value) - 1;
+	char *equals = strchr(name, '=');
+	int error;
+
+	if (equals != NULL) {
+		int number = atoi(equals + 1);
+
+		*equals = '\0';
+		if (sysctlbyname(name, NULL, NULL, &number, sizeof(number)) != 0) {
+			out("sysctl %s=%d: %s", name, number, strerror(errno));
+			return 1;
+		}
+		out("%s = %d", name, number);
+		return 0;
+	}
+	errno = 0;
+	if (sysctlbyname(name, sysctl_value, &size, NULL, 0) == 0) {
+		out_sysctl_value(name, sysctl_value, size);
+		return 0;
+	}
+	error = errno;
+	if (do_sysctl_walk(name) > 0)
+		return 0;
+	out("sysctl %s: %s", name, strerror(error));
+	return 1;
 }
 
 /* A program's stdout and stderr, line by line, until it exits or its time is up. */
