@@ -112,9 +112,20 @@ mwsj_scan_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
 		}
 	}
 	if (picked != NULL && !mwsj_sent && mwsj_assoc != NULL) {
+		void *mw2 = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi",
+		    RTLD_NOW);
+		int (*disassoc)(CFTypeRef) = mw2 ? dlsym(mw2, "WiFiDeviceClientDisassociate") : NULL;
 		int (*assoc)(CFTypeRef, CFTypeRef, CFDictionaryRef, void *) = (void *)mwsj_assoc;
 
 		mwsj_sent = 1;
+		/* the kernel's standing rejoin leaves wifid "currently associated",
+		   which short-circuits its forced-association path before any scan */
+		if (disassoc != NULL) {
+			int d = disassoc(mwsj_device);
+
+			fprintf(stderr, "a80211_test: WiFiDeviceClientDisassociate -> %d\n", d);
+			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 3, false);
+		}
 		int error = assoc(mwsj_device, picked, NULL, mwsj_assoc_cb);
 		fprintf(stderr, "a80211_test: WiFiDeviceClientAssociateAsync(scan-result %p) -> %d\n",
 		    picked, error);
