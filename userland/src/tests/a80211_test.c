@@ -65,6 +65,149 @@ power(int on)
 	return a80211_set(handle, 19, NULL, &asked, sizeof(asked));
 }
 
+/* mwscanjoin: the associate wifid accepts needs a network record of the scan-result
+   shape (WiFiDeviceManagerUserForcedAssociation CFEquals it against results[0]),
+   so this joins with the record WiFiDeviceClientScanAsync hands back. */
+static CFTypeRef mwsj_assoc;            /* WiFiDeviceClientAssociateAsync */
+static CFTypeRef mwsj_device;           /* devices[0] */
+static char mwsj_ssid[33];              /* the network to join */
+static int mwsj_sent;
+
+static void
+mwsj_assoc_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
+{
+	fprintf(stderr, "a80211_test: assoc callback: %p %p %p %p\n", client, a2, a3, a4);
+	if (a2 != NULL) {
+		show("assoc a2", a2);
+	}
+}
+
+static void
+mwsj_scan_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
+{
+	fprintf(stderr, "a80211_test: scan callback: client %p a2 %p a3 %p a4 %p\n", client, a2, a3, a4);
+	if (a2 == NULL || CFGetTypeID(a2) != CFArrayGetTypeID()) {
+		if (a2 != NULL) {
+			show("scan a2", a2);
+		}
+		return;
+	}
+	CFArrayRef results = (CFArrayRef)a2;
+	void *mw = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_NOW);
+	CFTypeRef (*net_prop)(CFTypeRef, CFStringRef) = mw ? dlsym(mw, "WiFiNetworkGetProperty") : NULL;
+	CFTypeRef picked = NULL;
+
+	fprintf(stderr, "a80211_test: scan results %ld\n", CFArrayGetCount(results));
+	for (CFIndex i = 0; i < CFArrayGetCount(results); i++) {
+		CFTypeRef item = (CFTypeRef)CFArrayGetValueAtIndex(results, i);
+		CFTypeRef name = net_prop != NULL ? net_prop(item, CFSTR("SSID_STR")) : NULL;
+		char got[64] = { 0 };
+
+		if (name != NULL && CFGetTypeID(name) == CFStringGetTypeID()) {
+			CFStringGetCString((CFStringRef)name, got, sizeof(got), kCFStringEncodingUTF8);
+		}
+		fprintf(stderr, "a80211_test: scan result %ld ssid '%s' item %p\n", (long)i, got, item);
+		if (picked == NULL && strcmp(got, mwsj_ssid) == 0) {
+			picked = item;
+		}
+	}
+	if (picked != NULL && !mwsj_sent && mwsj_assoc != NULL) {
+		int (*assoc)(CFTypeRef, CFTypeRef, CFDictionaryRef, void *) = (void *)mwsj_assoc;
+
+		mwsj_sent = 1;
+		int error = assoc(mwsj_device, picked, NULL, mwsj_assoc_cb);
+		fprintf(stderr, "a80211_test: WiFiDeviceClientAssociateAsync(scan-result %p) -> %d\n",
+		    picked, error);
+	} else if (picked == NULL) {
+		fprintf(stderr, "a80211_test: %s not in this scan\n", mwsj_ssid);
+	}
+}
+
+static int
+mwscanjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t *passphrase,
+    unsigned passphrase_len, const uint8_t pmk[32])
+{
+	void *mw = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_NOW);
+	CFTypeRef (*client_create)(CFAllocatorRef, int) =
+	    mw ? dlsym(mw, "WiFiManagerClientCreate") : NULL;
+	CFArrayRef (*copy_devices)(CFTypeRef) = mw ? dlsym(mw, "WiFiManagerClientCopyDevices") : NULL;
+	CFTypeRef (*net_ssid)(CFStringRef) = mw ? dlsym(mw, "WiFiNetworkCreateWithSsid") : NULL;
+	void (*net_set)(CFTypeRef, CFStringRef, CFTypeRef) =
+	    mw ? dlsym(mw, "WiFiNetworkSetProperty") : NULL;
+	int (*net_pass)(CFTypeRef, CFStringRef) = mw ? dlsym(mw, "WiFiNetworkSetPassword") : NULL;
+	void (*net_wpa)(CFTypeRef, int) = mw ? dlsym(mw, "WiFiNetworkSetWPA") : NULL;
+	int (*add_net)(CFTypeRef, CFTypeRef) = mw ? dlsym(mw, "WiFiManagerClientAddNetwork") : NULL;
+	int (*scan)(CFTypeRef, CFDictionaryRef, void *, void *) =
+	    mw ? dlsym(mw, "WiFiDeviceClientScanAsync") : NULL;
+	void (*schedule)(CFTypeRef, CFRunLoopRef, CFStringRef) =
+	    mw ? dlsym(mw, "WiFiManagerClientScheduleWithRunLoop") : NULL;
+	mwsj_assoc = mw ? dlsym(mw, "WiFiDeviceClientAssociateAsync") : NULL;
+	char pass[65] = { 0 };
+
+	if (mw == NULL || client_create == NULL || copy_devices == NULL || net_ssid == NULL ||
+	    add_net == NULL || scan == NULL || mwsj_assoc == NULL) {
+		fprintf(stderr, "a80211_test: mwxjoin: missing pieces: mw %p create %p devices %p "
+		    "ssid %p add %p scan %p assoc %p\n", mw, client_create, copy_devices, net_ssid,
+		    add_net, scan, mwsj_assoc);
+		return 1;
+	}
+	memcpy(mwsj_ssid, ssid, ssid_len);
+	if (passphrase_len != 0) {
+		memcpy(pass, passphrase, passphrase_len < 64 ? passphrase_len : 64);
+	} else {
+		static const char hex[] = "0123456789abcdef";
+		for (unsigned i = 0; i < 32; i++) {
+			pass[i * 2] = hex[pmk[i] >> 4];
+			pass[i * 2 + 1] = hex[pmk[i] & 15];
+		}
+	}
+	CFTypeRef client = client_create(kCFAllocatorDefault, 0);
+	/* the client's XPC replies ride this runloop; without scheduling, async
+	   callbacks (scan results, association events) never reach us */
+	if (schedule != NULL && client != NULL) {
+		schedule(client, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+	}
+	CFStringRef s = CFStringCreateWithCString(kCFAllocatorDefault, mwsj_ssid,
+	    kCFStringEncodingUTF8);
+	CFTypeRef net = net_ssid ? net_ssid(s) : NULL;
+
+	if (net != NULL && pass[0] != '\0') {
+		CFStringRef secret = CFStringCreateWithCString(kCFAllocatorDefault, pass,
+		    kCFStringEncodingUTF8);
+
+		if (net_set != NULL) {
+			net_set(net, CFSTR("isWPA"), kCFBooleanTrue);
+			net_set(net, CFSTR("password"), secret);
+		}
+		if (net_wpa != NULL) {
+			net_wpa(net, 1);
+		}
+		if (net_pass != NULL) {
+			fprintf(stderr, "a80211_test: WiFiNetworkSetPassword -> %d\n",
+			    net_pass(net, secret));
+		}
+	}
+	if (net != NULL) {
+		fprintf(stderr, "a80211_test: WiFiManagerClientAddNetwork -> %d\n",
+		    add_net(client, net));
+	}
+	CFArrayRef devices = copy_devices(client);
+	if (devices == NULL || CFArrayGetCount(devices) == 0) {
+		fprintf(stderr, "a80211_test: mwxjoin: no devices\n");
+		return 1;
+	}
+	mwsj_device = CFArrayGetValueAtIndex(devices, 0);
+	CFDictionaryRef params = CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	int error = scan(mwsj_device, params, mwsj_scan_cb, NULL);
+	fprintf(stderr, "a80211_test: WiFiDeviceClientScanAsync -> %d\n", error);
+	/* MobileWiFi delivers client callbacks on the runloop; sleeping here would
+	   drop them, and the session dies with this client anyway */
+	CFRunLoopRunInMode(kCFRunLoopDefaultMode, 40, false);
+	fprintf(stderr, "a80211_test: mwxjoin done, assoc sent %d\n", mwsj_sent);
+	return 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -180,7 +323,7 @@ main(int argc, char **argv)
 		}
 		return 0;
 	}
-	if (argc >= 2 && strcmp(argv[1], "mwjoin") == 0) {
+	if (argc >= 2 && (strcmp(argv[1], "mwjoin") == 0 || strcmp(argv[1], "mwxjoin") == 0)) {
 		/* registers the standing network with wifid the way a join in Settings
 		   does: WiFiManagerClientAddNetwork puts it on the known list (and its
 		   passphrase in the keychain), WiFiDeviceClientAssociateAsync has wifid
@@ -201,6 +344,10 @@ main(int argc, char **argv)
 		    got, got > 0 ? saved.ssid_length : 0, got > 0 ? saved.passphrase_length : 0);
 		if (got < (ssize_t)sizeof(saved) || saved.ssid_length == 0 || saved.ssid_length > 32) {
 			return 1;
+		}
+		if (strcmp(argv[1], "mwxjoin") == 0) {
+			return mwscanjoin(saved.ssid, saved.ssid_length, saved.passphrase,
+			    saved.passphrase_length, saved.pmk);
 		}
 		void *mw = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_NOW);
 		CFTypeRef (*client_create)(CFAllocatorRef, int) =
