@@ -8,6 +8,7 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,6 +177,123 @@ main(int argc, char **argv)
 					}
 				}
 			}
+		}
+		return 0;
+	}
+	if (argc >= 2 && strcmp(argv[1], "mwjoin") == 0) {
+		/* registers the standing network with wifid the way a join in Settings
+		   does: WiFiManagerClientAddNetwork puts it on the known list (and its
+		   passphrase in the keychain), WiFiDeviceClientAssociateAsync has wifid
+		   associate itself so its own association state - what SpringBoard's
+		   icon reads - reflects the link */
+		struct {
+			uint8_t ssid[32], ssid_length, bssid[6];
+			int security;
+			uint8_t pmk[32], passphrase[64], passphrase_length;
+		} saved;
+		int fd = open("/private/var/db/wifi.standing", O_RDONLY);
+		ssize_t got = fd < 0 ? -1 : read(fd, &saved, sizeof(saved));
+
+		if (fd >= 0) {
+			close(fd);
+		}
+		fprintf(stderr, "a80211_test: standing read %zd ssid_length %u passphrase_length %u\n",
+		    got, got > 0 ? saved.ssid_length : 0, got > 0 ? saved.passphrase_length : 0);
+		if (got < (ssize_t)sizeof(saved) || saved.ssid_length == 0 || saved.ssid_length > 32) {
+			return 1;
+		}
+		void *mw = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_NOW);
+		CFTypeRef (*client_create)(CFAllocatorRef, int) =
+		    mw ? dlsym(mw, "WiFiManagerClientCreate") : NULL;
+		CFArrayRef (*copy_devices)(CFTypeRef) = mw ? dlsym(mw, "WiFiManagerClientCopyDevices") : NULL;
+		CFTypeRef (*net_ssid)(CFStringRef) = mw ? dlsym(mw, "WiFiNetworkCreateWithSsid") : NULL;
+		void (*net_set)(CFTypeRef, CFStringRef, CFTypeRef) =
+		    mw ? dlsym(mw, "WiFiNetworkSetProperty") : NULL;
+		int (*net_pass)(CFTypeRef, CFStringRef) = mw ? dlsym(mw, "WiFiNetworkSetPassword") : NULL;
+		void (*net_wpa)(CFTypeRef, int) = mw ? dlsym(mw, "WiFiNetworkSetWPA") : NULL;
+		int (*add_net)(CFTypeRef, CFTypeRef) = mw ? dlsym(mw, "WiFiManagerClientAddNetwork") : NULL;
+		int (*assoc)(CFTypeRef, CFTypeRef, CFDictionaryRef, void *) =
+		    mw ? dlsym(mw, "WiFiDeviceClientAssociateAsync") : NULL;
+		CFArrayRef (*copy_nets)(CFTypeRef) = mw ? dlsym(mw, "WiFiManagerClientCopyMutableNetworks") : NULL;
+		CFTypeRef client = NULL, net = NULL;
+		CFArrayRef devices = NULL;
+		char ssid[33] = { 0 }, pass[65] = { 0 };
+
+		fprintf(stderr, "a80211_test: create %p devices %p net_ssid %p set %p add %p assoc %p\n",
+		    client_create, copy_devices, net_ssid, net_set, add_net, assoc);
+		memcpy(ssid, saved.ssid, saved.ssid_length);
+		if (saved.passphrase_length != 0) {
+			memcpy(pass, saved.passphrase,
+			    saved.passphrase_length < 64 ? saved.passphrase_length : 64);
+		} else {
+			static const char hex[] = "0123456789abcdef";
+			for (unsigned i = 0; i < sizeof(saved.pmk); i++) {
+				pass[i * 2] = hex[saved.pmk[i] >> 4];
+				pass[i * 2 + 1] = hex[saved.pmk[i] & 15];
+			}
+			/* a 64-digit key reaches the driver as the PMK itself (cipher 6), not
+			   the passphrase it would come from */
+		}
+		if (client_create != NULL) {
+			client = client_create(kCFAllocatorDefault, 0);
+		}
+		if (client != NULL && net_ssid != NULL) {
+			net = net_ssid(CFStringCreateWithCString(kCFAllocatorDefault, ssid,
+			    kCFStringEncodingUTF8));
+			fprintf(stderr, "a80211_test: network %p ssid %s\n", net, ssid);
+		}
+		if (net != NULL && net_set != NULL && pass[0] != '\0') {
+			CFStringRef secret =
+			    CFStringCreateWithCString(kCFAllocatorDefault, pass, kCFStringEncodingUTF8);
+
+			net_set(net, CFSTR("isWPA"), kCFBooleanTrue);
+			net_set(net, CFSTR("password"), secret);
+			if (net_wpa != NULL) {
+				net_wpa(net, 1);
+			}
+			if (net_pass != NULL) {
+				error = net_pass(net, secret);
+				fprintf(stderr, "a80211_test: WiFiNetworkSetPassword -> %d\n", error);
+			}
+		}
+		if (net != NULL && add_net != NULL) {
+			error = add_net(client, net);
+			fprintf(stderr, "a80211_test: WiFiManagerClientAddNetwork -> %d (%#x)\n", error, error);
+		}
+		if (copy_nets != NULL && client != NULL) {
+			CFArrayRef nets = copy_nets(client);
+
+			fprintf(stderr, "a80211_test: mutable networks %p count %ld\n", nets,
+			    nets ? CFArrayGetCount(nets) : -1L);
+			if (nets != NULL) {
+				for (CFIndex i = 0; i < CFArrayGetCount(nets); i++) {
+					show("known", CFArrayGetValueAtIndex(nets, i));
+				}
+				CFRelease(nets);
+			}
+		}
+		if (client != NULL && copy_devices != NULL) {
+			devices = copy_devices(client);
+		}
+		CFArrayRef nets2 = copy_nets != NULL && client != NULL ? copy_nets(client) : NULL;
+		CFTypeRef stored = nets2 != NULL && CFArrayGetCount(nets2) > 0 ?
+		    CFArrayGetValueAtIndex(nets2, 0) : net;
+		if (assoc != NULL && devices != NULL && CFArrayGetCount(devices) > 0 && stored != NULL) {
+			const void *k[] = { CFSTR("password") };
+			const void *v[] = { CFStringCreateWithCString(kCFAllocatorDefault, pass,
+			    kCFStringEncodingUTF8) };
+			CFDictionaryRef opts = CFDictionaryCreate(kCFAllocatorDefault, k, v, 1,
+			    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+			error = assoc((CFTypeRef)CFArrayGetValueAtIndex(devices, 0), stored, opts, NULL);
+			fprintf(stderr, "a80211_test: WiFiDeviceClientAssociateAsync(stored %p) -> %d\n",
+			    stored, error);
+			/* the associate is async and dies with this client: stay around
+			   so wifid can finish scanning and issue the join */
+			for (int i = 0; i < 30; i++) {
+				sleep(1);
+			}
+			fprintf(stderr, "a80211_test: mwjoin done\n");
 		}
 		return 0;
 	}
