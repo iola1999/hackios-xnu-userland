@@ -18,6 +18,7 @@
 #include <CoreMedia/CoreMedia.h>
 #include <CoreVideo/CoreVideo.h>
 #include <dlfcn.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
@@ -38,6 +39,146 @@
 #else
 #define STRIP_FN(p) ((uintptr_t)(p))
 #endif
+
+extern uint32_t IOSurfaceGetID(IOSurfaceRef buffer);
+extern int IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
+extern void *IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
+extern void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef buffer, size_t plane);
+
+/* ---- CPU reads of an IOSurface wait for pending GPU writes ---------------------------------------
+ *
+ * A processor lock or base-address lookup on a surface must stand on the far side of the GPU
+ * commit that last wrote it; on unified memory that ordering is the driver's contract. The still
+ * pipeline's encoder reads the fusion output surface on the CPU, and when the still commits queue
+ * behind cold-start work the read landed before the write (first photo black; see
+ * kernel-12377-say16-ubo12). libAnnibaleMetal records, per surface, the newest commit touching it
+ * and exports annibale_surface_writes_wait; processes without the driver resolve nothing and run
+ * unchanged. */
+
+static void say(const char *format, ...);
+static void (*pending_writes_wait)(uint32_t sid);
+static unsigned pwrite_log_count;
+
+/* Name the frame that called the interposed function: first frame outside this dylib. */
+static const char *
+pwrite_caller(void)
+{
+	static char name[160];
+	void *pcs[8];
+	int n = backtrace(pcs, 8);
+
+	if (n <= 0) {
+		return "?";
+	}
+	const void *self = NULL;
+	{
+		Dl_info info;
+		if (dladdr((const void *)&pwrite_log_count, &info)) {
+			self = info.dli_fbase;
+		}
+	}
+	for (int i = 1; i < n; i++) {
+		Dl_info info;
+		if (!dladdr(pcs[i], &info) || info.dli_fbase == self) {
+			continue;
+		}
+		if (info.dli_sname != NULL) {
+			snprintf(name, sizeof(name), "%s", info.dli_sname);
+		} else if (info.dli_fname != NULL) {
+			snprintf(name, sizeof(name), "%s+%#lx", info.dli_fname,
+			    (uintptr_t)pcs[i] - (uintptr_t)info.dli_fbase);
+		}
+		return name;
+	}
+	return "?";
+}
+
+static void
+wait_pending_writes(IOSurfaceRef sf, const char *how)
+{
+	if (sf == NULL) {
+		return;
+	}
+	uint32_t sid = IOSurfaceGetID(sf);
+	BOOL is_emit = how != NULL && how[0] == 'e';
+	if (is_emit || pwrite_log_count < 32) {
+		pwrite_log_count++;
+		say("annibale: media: pwrite call %s surf=%u by %s\n", how, sid, pwrite_caller());
+	}
+	if (pending_writes_wait == NULL) {
+		/* The driver may load after the first lock; retry until it answers. */
+		pending_writes_wait = dlsym(RTLD_DEFAULT, "annibale_surface_writes_wait");
+		if (pending_writes_wait == NULL) {
+			return;
+		}
+	}
+	uint64_t start = mach_absolute_time();
+	pending_writes_wait(sid);
+	uint64_t waited = mach_absolute_time() - start;
+	if (waited > 0) {
+		static mach_timebase_info_data_t tb;
+		if (tb.denom == 0) {
+			mach_timebase_info(&tb);
+		}
+		unsigned us = (unsigned)(waited * tb.numer / tb.denom / 1000);
+		if (us > 100) {
+			say("annibale: media: pwrite surf=%u wait=%uus\n", sid, us);
+		}
+	}
+}
+
+static CVReturn
+watched_CVPixelBufferLockBaseAddress(CVPixelBufferRef pixelBuffer, CVOptionFlags lockFlags)
+{
+	wait_pending_writes(CVPixelBufferGetIOSurface(pixelBuffer), "cvpb-lock");
+	return CVPixelBufferLockBaseAddress(pixelBuffer, lockFlags);
+}
+
+static void *
+watched_CVPixelBufferGetBaseAddress(CVPixelBufferRef pixelBuffer)
+{
+	wait_pending_writes(CVPixelBufferGetIOSurface(pixelBuffer), "cvpb-base");
+	return CVPixelBufferGetBaseAddress(pixelBuffer);
+}
+
+static void *
+watched_CVPixelBufferGetBaseAddressOfPlane(CVPixelBufferRef pixelBuffer, size_t planeIndex)
+{
+	wait_pending_writes(CVPixelBufferGetIOSurface(pixelBuffer), "cvpb-plane");
+	return CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, planeIndex);
+}
+
+static int
+watched_IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed)
+{
+	wait_pending_writes(buffer, "surf-lock");
+	return IOSurfaceLock(buffer, options, seed);
+}
+
+static void *
+watched_IOSurfaceGetBaseAddress(IOSurfaceRef buffer)
+{
+	wait_pending_writes(buffer, "surf-base");
+	return IOSurfaceGetBaseAddress(buffer);
+}
+
+static void *
+watched_IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef buffer, size_t plane)
+{
+	wait_pending_writes(buffer, "surf-plane");
+	return IOSurfaceGetBaseAddressOfPlane(buffer, plane);
+}
+
+__attribute__((used)) static const struct {
+	const void *ours, *theirs;
+} lock_interpose[] __attribute__((section("__DATA,__interpose"))) = {
+	{ watched_CVPixelBufferLockBaseAddress, CVPixelBufferLockBaseAddress },
+	{ watched_CVPixelBufferGetBaseAddress, CVPixelBufferGetBaseAddress },
+	{ watched_CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBaseAddressOfPlane },
+	{ watched_IOSurfaceLock, IOSurfaceLock },
+	{ watched_IOSurfaceGetBaseAddress, IOSurfaceGetBaseAddress },
+	{ watched_IOSurfaceGetBaseAddressOfPlane, IOSurfaceGetBaseAddressOfPlane },
+};
 
 static void
 say(const char *format, ...)
@@ -416,19 +557,84 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 		}
 		return;
 	}
+	id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
+	BOOL still = is_node(node, "BWStillImageCoordinatorNode") ||
+	    is_node(node, "BWPhotonicEngineNode") || is_node(node, "BWPhotoEncoderNode");
+	CVImageBufferRef img = CMSampleBufferGetImageBuffer(sample_buffer);
+	/* The still graph's own contract: a node emits a buffer whose contents are complete.
+	 * On our driver the engine's GPU write can still be in flight here (first shot dark),
+	 * so wait for that surface's pending write before the handoff. */
+	if (still && img != NULL) {
+		wait_pending_writes(CVPixelBufferGetIOSurface(img), "emit");
+	}
 	if (emit_trace_count < 32) {
-		id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
-		if (is_node(node, "BWStillImageCoordinatorNode") ||
-		    is_node(node, "BWPhotonicEngineNode") ||
-		    is_node(node, "BWPhotoEncoderNode")) {
+		if (still) {
 			emit_trace_count++;
-			CVImageBufferRef img = CMSampleBufferGetImageBuffer(sample_buffer);
 			CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sample_buffer);
-			say("annibale: media: emit %s img=%zux%zu blk=%zu\n",
+			/* Still-capture triage: every tap delivers an auxiliary (RedEyeAuxiliaryImage
+			 * in the metadata attachment) plus the photo; the first capture of each
+			 * session saves dark. The flag on each emit shows which frame went where. */
+			int redeye = -1;
+			CFDictionaryRef atts = img != NULL ?
+			    CVBufferCopyAttachments(img, kCVAttachmentMode_ShouldPropagate) : NULL;
+			if (atts != NULL) {
+				redeye = 0;
+				CFIndex count = CFDictionaryGetCount(atts);
+				const void **vals = count > 0 ? malloc((size_t)count * sizeof(void *)) : NULL;
+				if (vals != NULL) {
+					CFDictionaryGetKeysAndValues(atts, NULL, vals);
+					for (CFIndex i = 0; i < count; i++) {
+						if (vals[i] == NULL || CFGetTypeID(vals[i]) != CFDictionaryGetTypeID()) {
+							continue;
+						}
+						if (CFDictionaryGetValue((CFDictionaryRef)vals[i],
+						        CFSTR("RedEyeAuxiliaryImage")) != NULL) {
+							redeye = 1;
+							break;
+						}
+					}
+					free(vals);
+				}
+				CFRelease(atts);
+			}
+			/* CPU-readable probe of the image's centre: stills arrive as Y~10 (aux) or
+			 * Y~150 (photo). A dark emit here splits coordinator/engine/encoder. */
+			unsigned surf = 0;
+			IOSurfaceRef sf = img != NULL ? CVPixelBufferGetIOSurface(img) : NULL;
+			if (sf != NULL) {
+				surf = IOSurfaceGetID(sf);
+			}
+			unsigned lum = 0;
+			int lum_ok = -1;
+			if (img != NULL && CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess) {
+				size_t w = CVPixelBufferGetWidth(img), h = CVPixelBufferGetHeight(img);
+				size_t stride = CVPixelBufferGetBytesPerRow(img);
+				const uint8_t *base = (const uint8_t *)CVPixelBufferGetBaseAddress(img);
+				uint32_t fmt = CVPixelBufferGetPixelFormatType(img);
+				if (base != NULL && stride > 0) {
+					size_t y0 = h / 4, x0 = w / 4;
+					const uint8_t *px = base + y0 * stride + x0;
+					if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+					    fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+						for (unsigned i = 0; i < 64; i++)
+							lum += px[(i % 8) * 97 + (i / 8) * stride];
+						lum /= 64;
+						lum_ok = 1;
+					} else {  /* treat as 4 bytes per pixel (BGRA-ish) */
+						for (unsigned i = 0; i < 64; i++)
+							lum += px[((i % 8) * 97 + (i / 8) * stride) * 4 + 1];
+						lum /= 64;
+						lum_ok = 2;
+					}
+				}
+				CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
+			}
+			say("annibale: media: emit %s img=%zux%zu@%p blk=%zu redeye=%d lum=%d:%u surf=%u seq=%u\n",
 			    object_getClassName(node),
 			    img != NULL ? CVPixelBufferGetWidth(img) : 0,
-			    img != NULL ? CVPixelBufferGetHeight(img) : 0,
-			    bb != NULL ? CMBlockBufferGetDataLength(bb) : 0);
+			    img != NULL ? CVPixelBufferGetHeight(img) : 0, img,
+			    bb != NULL ? CMBlockBufferGetDataLength(bb) : 0,
+			    redeye, lum_ok, lum, surf, emit_trace_count);
 		}
 	}
 	time_photo_encoder(self, sample_buffer);
