@@ -163,26 +163,39 @@ lower_half_txf(nir_builder *b, nir_instr *instr, void *data)
 /* TGSI I/O and IR3's VS user-varying export use float32 registers. Preserve
  * half rounding at loads and numerically widen stores before changing variable
  * types. Raw half bits must never be passed to the rasterizer as float32. */
+/* Which stage-interface variables to widen to float32. IR3's VPC moves user
+ * varyings as full registers, so the side of the link that faces hardware has
+ * to carry float32 even when the AIR declares float16_t. */
+#define WIDEN_VS_USER_OUT 1u /* vertex outputs at VARYING_SLOT_VAR0..31 */
+#define WIDEN_FS_USER_IN 2u /* fragment inputs at VARYING_SLOT_VAR0..31 */
+#define WIDEN_ALL_IO 4u /* every shader_in/shader_out variable (software paths) */
+
 static bool
-half_io_variable(const nir_variable *var, bool vertex_outputs_only)
+half_io_variable(const nir_variable *var, unsigned widen_mask)
 {
    if (!(var->data.mode & (nir_var_shader_in | nir_var_shader_out)) ||
        !glsl_type_is_vector_or_scalar(var->type) ||
        glsl_get_base_type(var->type) != GLSL_TYPE_FLOAT16)
       return false;
-   return !vertex_outputs_only ||
-          (var->data.mode == nir_var_shader_out &&
-           var->data.location >= VARYING_SLOT_VAR0 && var->data.location <= VARYING_SLOT_VAR31);
+   if (widen_mask & WIDEN_ALL_IO)
+      return true;
+   if ((widen_mask & WIDEN_VS_USER_OUT) && var->data.mode == nir_var_shader_out &&
+       var->data.location >= VARYING_SLOT_VAR0 && var->data.location <= VARYING_SLOT_VAR31)
+      return true;
+   return (widen_mask & WIDEN_FS_USER_IN) && var->data.mode == nir_var_shader_in &&
+          var->data.location >= VARYING_SLOT_VAR0 && var->data.location <= VARYING_SLOT_VAR31;
 }
 static bool
-widen_half_stage_io(nir_shader *nir, bool vertex_outputs_only, char *why, size_t why_size)
+widen_half_stage_io(nir_shader *nir, unsigned widen_mask, char *why, size_t why_size)
 {
-   if (vertex_outputs_only) {
-      nir_foreach_variable_with_modes(var, nir, nir_var_shader_out) {
+   if (widen_mask & (WIDEN_VS_USER_OUT | WIDEN_FS_USER_IN)) {
+      nir_foreach_variable_with_modes(var, nir,
+          (widen_mask & WIDEN_VS_USER_OUT) ? nir_var_shader_out : nir_var_shader_in) {
          if (var->data.location >= VARYING_SLOT_VAR0 && var->data.location <= VARYING_SLOT_VAR31 &&
              glsl_get_base_type(glsl_without_array(var->type)) == GLSL_TYPE_FLOAT16 &&
              !glsl_type_is_vector_or_scalar(var->type)) {
-            say(why, why_size, "half VS user-varying exports require scalar/vector types");
+            say(why, why_size, "half user-varying %s requires scalar/vector types",
+                var->data.mode == nir_var_shader_out ? "exports" : "imports");
             return false;
          }
       }
@@ -194,7 +207,7 @@ widen_half_stage_io(nir_shader *nir, bool vertex_outputs_only, char *why, size_t
                continue;
             nir_deref_instr *deref = nir_instr_as_deref(instr);
             if (deref->deref_type != nir_deref_type_var ||
-                !half_io_variable(deref->var, vertex_outputs_only))
+                !half_io_variable(deref->var, widen_mask))
                continue;
             nir_foreach_use(src, &deref->def) {
                nir_instr *use = nir_src_is_if(src) ? NULL : nir_src_use_instr(src);
@@ -219,7 +232,7 @@ widen_half_stage_io(nir_shader *nir, bool vertex_outputs_only, char *why, size_t
                continue;
             nir_deref_instr *deref = nir_src_as_deref(in->src[0]);
             if (!deref || deref->deref_type != nir_deref_type_var ||
-                !half_io_variable(deref->var, vertex_outputs_only))
+                !half_io_variable(deref->var, widen_mask))
                continue;
             if (in->intrinsic == nir_intrinsic_load_deref) {
                in->def.bit_size = 32;
@@ -231,7 +244,7 @@ widen_half_stage_io(nir_shader *nir, bool vertex_outputs_only, char *why, size_t
                nir_def *wide = nir_f2f32(&b, in->src[1].ssa);
                /* This export consumes an already-rounded half value. Keep its
                 * intermediate rounding through algebraic optimization. */
-               if (vertex_outputs_only)
+               if (widen_mask & WIDEN_VS_USER_OUT)
                   nir_def_as_alu(wide)->fp_math_ctrl |= nir_fp_no_transform;
                nir_src_rewrite(&in->src[1], wide);
             }
@@ -243,14 +256,14 @@ widen_half_stage_io(nir_shader *nir, bool vertex_outputs_only, char *why, size_t
                continue;
             nir_deref_instr *deref = nir_instr_as_deref(instr);
             if (deref->deref_type == nir_deref_type_var &&
-                half_io_variable(deref->var, vertex_outputs_only))
+                half_io_variable(deref->var, widen_mask))
                deref->type = glsl_vector_type(GLSL_TYPE_FLOAT, glsl_get_vector_elements(deref->type));
          }
       }
       nir_progress(true, impl, nir_metadata_control_flow);
    }
    nir_foreach_variable_with_modes(var, nir, nir_var_shader_in | nir_var_shader_out) {
-      if (half_io_variable(var, vertex_outputs_only))
+      if (half_io_variable(var, widen_mask))
          var->type = glsl_vector_type(GLSL_TYPE_FLOAT, glsl_get_vector_elements(var->type));
    }
    return true;
@@ -261,16 +274,22 @@ lower_half_for_backend(nir_shader *nir, struct rwa_device *device,
                         const struct air_shader_info *info, char *why, size_t why_size)
 {
    if (!device->software) {
-      /* IR3's VPC output register mapping has no half-register selector. Keep
-       * half computations intact, but export VS user varyings numerically. */
+      /* IR3's VPC output register mapping has no half-register selector, so the
+       * link between stages is always full registers on hardware. A vertex
+       * shader without fp16 exports its user varyings widened to float32; the
+       * fragment inputs at those slots then have to be read back at float32
+       * width, or the f16 read lands in the low half of the f32 bits and comes
+       * out near zero. */
       if (nir->info.stage == MESA_SHADER_VERTEX && !device->screen->shader_caps[MESA_SHADER_VERTEX].fp16)
-         return widen_half_stage_io(nir, true, why, why_size);
+         return widen_half_stage_io(nir, WIDEN_VS_USER_OUT, why, why_size);
+      if (nir->info.stage == MESA_SHADER_FRAGMENT && !device->screen->shader_caps[MESA_SHADER_VERTEX].fp16)
+         return widen_half_stage_io(nir, WIDEN_FS_USER_IN, why, why_size);
       return true;
    }
    if (strcmp(device->screen->get_name(device->screen), "softpipe") ||
        device->screen->shader_caps[nir->info.stage].fp16)
       return true;
-   if (!widen_half_stage_io(nir, false, why, why_size))
+   if (!widen_half_stage_io(nir, WIDEN_ALL_IO, why, why_size))
       return false;
    NIR_PASS(_, nir, nir_shader_instructions_pass, lower_half_txf,
             nir_metadata_control_flow, NULL);
