@@ -98,6 +98,13 @@ TARGETS = [
         "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "AVFoundation", "-lobjc"],
         "entitlements": "src/tests/record_test.entitlements",
     },
+    {
+        "name": "micloop_test",
+        "type": "exe",
+        "sources": ["src/tests/micloop_test.c"],
+        "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "AudioToolbox", "-framework", "AVFoundation", "-lobjc"],
+        "entitlements": "src/tests/record_test.entitlements",
+    },
     {"name": "cpu_test", "type": "exe", "sources": ["src/tests/cpu_test.c"], "flags": ["-O1"]},
     {"name": "cow_test", "type": "exe", "sources": ["src/tests/cow_test.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "IOSurface"]},
     {"name": "cg_test", "type": "exe", "sources": ["src/tests/cg_test.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "CoreGraphics", "-framework", "IOSurface"]},
@@ -177,7 +184,7 @@ TARGETS = [
         "name": "a80211_test",
         "type": "exe",
         "sources": ["src/tests/a80211_test.c"],
-        "flags": ["-O1", "-framework", "CoreFoundation"],
+        "flags": ["-O1", "-fblocks", "-framework", "CoreFoundation"],
         "entitlements": "src/tests/a80211_test.entitlements",
     },
 
