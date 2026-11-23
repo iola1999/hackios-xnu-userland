@@ -40,6 +40,8 @@
  *                              as many lines as fit, then "cat end SIZE next AT" (fetch.py on the host)
  *   ls PATH                    the directory's entries: type, size, name
  *   rm PATH                    unlink(2)
+ *   mkdir [-p] PATH            mkdir(2), with -p each missing parent too
+ *   chmod MODE PATH            chmod(2), MODE in octal
  * Anything else is a program: posix_spawnp with stdout and stderr read back, killed after
  * ANNSH_LIMIT_SECONDS.
  */
@@ -867,6 +869,40 @@ run(char *text)
 	if (strcmp(argv[0], "rm") == 0 && argc == 2) {
 		if (unlink(argv[1]) != 0) {
 			out("rm %s: %s", argv[1], strerror(errno));
+			return 1;
+		}
+		return 0;
+	}
+	if (strcmp(argv[0], "mkdir") == 0 && (argc == 2 || (argc == 3 && strcmp(argv[1], "-p") == 0))) {
+		const char *path = argv[argc - 1];
+		if (argc == 3) {
+			char partial[1024];
+			for (const char *p = path + 1; ; p++) {
+				if (*p != '/' && *p != '\0')
+					continue;
+				if (p - path >= (long)sizeof(partial) - 1)
+					break;
+				memcpy(partial, path, p - path);
+				partial[p - path] = '\0';
+				if (partial[0] != '\0' && mkdir(partial, 0755) != 0 && errno != EEXIST) {
+					out("mkdir %s: %s", partial, strerror(errno));
+					return 1;
+				}
+				if (*p == '\0')
+					return 0;
+			}
+			out("mkdir: %s: path too long", path);
+			return 1;
+		}
+		if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+			out("mkdir %s: %s", path, strerror(errno));
+			return 1;
+		}
+		return 0;
+	}
+	if (strcmp(argv[0], "chmod") == 0 && argc == 3) {
+		if (chmod(argv[2], (mode_t)strtol(argv[1], NULL, 8)) != 0) {
+			out("chmod %s %s: %s", argv[1], argv[2], strerror(errno));
 			return 1;
 		}
 		return 0;
