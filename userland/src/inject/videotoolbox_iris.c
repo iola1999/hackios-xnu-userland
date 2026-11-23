@@ -1,7 +1,8 @@
 /*
  * iOS 26 VideoToolbox hardware decoder plugin for SM8750 Iris VPU v3.5 (/dev/annibale-iris).
- * Probes IRIS_IOC_GET_INFO at load time and registers 'avc1', 'hvc1', and 'hev1' only when
- * IRIS_INFO_HW_READY is set; otherwise leaves Apple's software decoders untouched.
+ * Probes IRIS_IOC_GET_INFO at load time and registers 'avc1', 'hvc1', and 'hev1' when the
+ * firmware is present; otherwise leaves Apple's software decoders untouched. The VPU powers
+ * up on the first OPEN_SESSION, so probing no longer keeps PAS 9 alive all run.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -977,8 +978,9 @@ iris_register_once(void)
 	memset(&info, 0, sizeof(info));
 	int rc = iris_sys_ioctl(fd, IRIS_IOC_GET_INFO, &info);
 	(void)iris_sys_close(fd);
-	if (rc != 0 || (info.flags & IRIS_INFO_HW_READY) == 0) {
-		iris_plugin_log("iris_vt: VPU not ready (rc=%d flags=0x%x); keeping software VideoToolbox decoders\n",
+	if (rc != 0 || (info.flags & (IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT)) !=
+	    (IRIS_INFO_DEV_PRESENT | IRIS_INFO_FW_PRESENT)) {
+		iris_plugin_log("iris_vt: VPU firmware absent (rc=%d flags=0x%x); keeping software VideoToolbox decoders\n",
 		    rc, info.flags);
 		return;
 	}
