@@ -391,6 +391,9 @@ int
 rwa_texture_thumbnail(struct rwa_texture *texture, unsigned w, unsigned h, uint8_t *rgba)
 {
    RWA_LOCKED;
+   /* A combined YCbCr texture (rwa_texture_combine_yuv) is sampled through its luma plane. */
+   if (texture && texture->chroma && texture->storage_owner)
+      texture = texture->storage_owner;
    enum pipe_format format = texture ? texture_format(texture) : PIPE_FORMAT_NONE;
    unsigned level = 0;
    char why[64];
