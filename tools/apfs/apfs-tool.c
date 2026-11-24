@@ -76,6 +76,9 @@ main(int argc, char **argv)
 	if (strcmp(argv[1], "cat") == 0 && argc > 3) {
 		return cmd_cat(argv[2], argv[3]);
 	}
+	if (strcmp(argv[1], "piece") == 0 && argc > 4) {
+		return cmd_piece(argv[2], argv[3], argv[4]);
+	}
 	if (strcmp(argv[1], "census") == 0) {
 		return cmd_census(argv[2], (argc > 3 && argv[3][0] == '/') ? argv[3] : NULL,
 		    (argc > 3 && strcmp(argv[argc - 1], "--meta") == 0));

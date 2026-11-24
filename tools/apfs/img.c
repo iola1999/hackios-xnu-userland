@@ -197,6 +197,11 @@ open_image(const char *path, struct apfs_nx *nx, struct apfs_vol *vol)
 	memset(&dev, 0, sizeof(dev));
 	dev.ctx = (void *)(intptr_t)fd;
 	dev.size = (uint64_t)lseek(fd, 0, SEEK_END);
+	if ((int64_t)dev.size <= 0) {
+		dev.size = getenv("APFS_DEV_SIZE") ? strtoull(getenv("APFS_DEV_SIZE"), NULL, 0) : 0;
+		if (dev.size == 0)
+			dev.size = 17179869184ULL; /* darwin is carved out at 16 GiB */
+	}
 	dev.read = file_read;
 	dev.read_data = file_read;      /* pread is as good without a lock as with one */
 	if (want_write) {

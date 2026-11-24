@@ -4,6 +4,7 @@
  */
 
 #include "apfs_tool.h"
+#include <zlib.h>
 
 /* ---- info ---- */
 
@@ -236,6 +237,108 @@ cmd_cat(const char *path, const char *where)
 	}
 	apfs_cfile_fini(&cf);
 	free(buf);
+	apfs_nx_close(&nx);
+	return 0;
+}
+
+/*
+ * One compressed piece, in detail: the table entry, the extent it resolves to,
+ * the stored bytes (hash + dump) and a plain zlib inflate of them.
+ */
+int
+cmd_piece(const char *path, const char *where, const char *which)
+{
+	struct apfs_nx nx;
+	struct apfs_vol vol;
+	struct apfs_inode ino;
+	struct apfs_cfile cf;
+	struct apfs_extent ext;
+	uint64_t id, n, poff;
+	uint8_t dt;
+	uint8_t *buf;
+	size_t got = 0, i;
+	int error;
+
+	n = strtoull(which, NULL, 0);
+	if (open_image(path, &nx, &vol) != 0) {
+		return 1;
+	}
+	error = apfs_path_lookup(&vol, where, &id, &dt);
+	if (error == 0) {
+		error = apfs_inode_get(&vol, id, &ino);
+	}
+	if (error) {
+		fprintf(stderr, "apfs-tool: %s: %s\n", where, strerror(error));
+		return 1;
+	}
+	memset(&cf, 0, sizeof(cf));
+	cf.held = APFS_NO_PIECE;
+	error = apfs_cfile_init(&vol, &ino, &cf);
+	if (error) {
+		fprintf(stderr, "apfs-tool: cfile_init: %s\n", strerror(error));
+		return 1;
+	}
+	printf("type %u size %llu rsrc_id %llu rsrc_size %llu table_base %llu count %u\n",
+	    cf.type, (unsigned long long)cf.size, (unsigned long long)cf.rsrc_id,
+	    (unsigned long long)cf.rsrc_size, (unsigned long long)cf.table_base,
+	    cf.piece_count);
+	if (n >= cf.piece_count) {
+		fprintf(stderr, "apfs-tool: piece %llu past %u\n", (unsigned long long)n,
+		    cf.piece_count);
+		return 1;
+	}
+	poff = cf.table_base + cf.piece_off[n];
+	printf("piece %llu off %u len %u poff %llu want %u\n", (unsigned long long)n,
+	    cf.piece_off[n], cf.piece_len[n], (unsigned long long)poff,
+	    (unsigned)((n + 1) * 65536 <= cf.size ? 65536 :
+	    (unsigned)(cf.size - n * 65536)));
+	error = apfs_extent_at(&vol, cf.rsrc_id, poff, &ext);
+	if (error) {
+		printf("extent_at: %s\n", strerror(error));
+	} else {
+		printf("extent logical %llu len %llu phys %llu -> dev byte %llu\n",
+		    (unsigned long long)ext.logical, (unsigned long long)ext.length,
+		    (unsigned long long)ext.phys,
+		    (unsigned long long)(ext.phys * 4096 + (poff - ext.logical)));
+	}
+	buf = malloc(cf.piece_len[n]);
+	error = apfs_read_stream(&vol, cf.rsrc_id, cf.rsrc_size, poff, buf,
+	    cf.piece_len[n], &got);
+	printf("read err %d got %zu fnv %016llx\n", error, got,
+	    (unsigned long long)fnv1a(buf, got, FNV_INIT));
+	printf("bytes:");
+	for (i = 0; i < got && i < 40; i++) {
+		printf(" %02x", buf[i]);
+	}
+	printf("\nPIECE-DATA %zu\n", got);
+	{
+		static const char b64[] =
+		    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+		size_t bi;
+		for (bi = 0; bi + 3 <= got; bi += 3) {
+			uint32_t v = (buf[bi] << 16) | (buf[bi+1] << 8) | buf[bi+2];
+			putchar(b64[v >> 18]); putchar(b64[(v >> 12) & 63]);
+			putchar(b64[(v >> 6) & 63]); putchar(b64[v & 63]);
+		}
+		if (bi < got) {
+			uint32_t v = buf[bi] << 16 | (bi + 1 < got ? buf[bi+1] << 8 : 0);
+			putchar(b64[v >> 18]); putchar(b64[(v >> 12) & 63]);
+			putchar(bi + 1 < got ? b64[(v >> 6) & 63] : '=');
+			putchar('=');
+		}
+	}
+	printf("\nPIECE-END\n");
+	{
+		uLongf dlen = 1u << 20;
+		uint8_t *d = malloc(dlen);
+		int z = uncompress(d, &dlen, buf, (uLong)got);
+		printf("zlib uncompress: z=%d dlen=%lu fnv %016llx\n", z,
+		    (unsigned long)dlen,
+		    (unsigned long long)fnv1a(d, dlen, FNV_INIT));
+		free(d);
+	}
+	free(buf);
+	apfs_cfile_fini(&cf);
 	apfs_nx_close(&nx);
 	return 0;
 }

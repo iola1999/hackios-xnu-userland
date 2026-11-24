@@ -45,6 +45,7 @@ int cmd_info(const char *path);
 int cmd_ls(const char *path, const char *where);
 int cmd_stat(const char *path, const char *where);
 int cmd_cat(const char *path, const char *where);
+int cmd_piece(const char *path, const char *where, const char *which);
 int cmd_census(const char *path, const char *where, bool meta_only);
 int cmd_cfrace(const char *path, int n, int rounds);
 int cmd_namehash(const char *path, const char *out);

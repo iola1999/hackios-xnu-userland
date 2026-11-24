@@ -9,6 +9,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -115,11 +116,18 @@ mwsj_scan_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
 		void *mw2 = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi",
 		    RTLD_NOW);
 		int (*disassoc)(CFTypeRef) = mw2 ? dlsym(mw2, "WiFiDeviceClientDisassociate") : NULL;
+		int (*cancel)(CFTypeRef) = mw2 ? dlsym(mw2, "WiFiDeviceClientAssociateCancel") : NULL;
 		int (*assoc)(CFTypeRef, CFTypeRef, CFDictionaryRef, void *) = (void *)mwsj_assoc;
 
 		mwsj_sent = 1;
-		/* the kernel's standing rejoin leaves wifid "currently associated",
-		   which short-circuits its forced-association path before any scan */
+		/* an earlier AssociateAsync that never completed can leave a stale
+		   in-flight command in front of this one: cancel, then disassociate
+		   (the kernel's standing rejoin leaves wifid "currently associated",
+		   which short-circuits its forced-association path before any scan) */
+		if (cancel != NULL) {
+			fprintf(stderr, "a80211_test: WiFiDeviceClientAssociateCancel -> %d\n",
+			    cancel(mwsj_device));
+		}
 		if (disassoc != NULL) {
 			int d = disassoc(mwsj_device);
 
@@ -219,6 +227,178 @@ mwscanjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t *passphrase,
 	return 0;
 }
 
+/* cwjoin: the join Settings makes goes through CoreWiFi's CWFInterface - it
+   carries the CWFScanResult whose scanRecord wifid's __associate XPC handler
+   requires, which MobileWiFi's queued AssociateAsync never produces. */
+struct cwf_job {
+	const uint8_t *ssid;
+	unsigned ssid_len;
+	const uint8_t *pmk;
+};
+
+static void *cwf_run(void *arg);
+
+static int
+cwjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t pmk[32])
+{
+	void *objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_NOW);
+	void *cw = dlopen("/System/Library/PrivateFrameworks/CoreWiFi.framework/CoreWiFi", RTLD_NOW);
+	static struct cwf_job job = { 0 };
+	pthread_t worker;
+
+	fprintf(stderr, "a80211_test: cwjoin: objc %p cw %p\n", objc, cw);
+	if (cw == NULL || objc == NULL) {
+		return 1;
+	}
+	job.ssid = ssid;
+	job.ssid_len = ssid_len;
+	job.pmk = pmk;
+	/* the CoreWiFi XPC answers ride a runloop the way MobileWiFi's do, so the
+	   calls go on a worker while this thread pumps the default loop */
+	if (pthread_create(&worker, NULL, cwf_run, &job) != 0) {
+		fprintf(stderr, "a80211_test: cwjoin: no thread\n");
+		return 1;
+	}
+	CFRunLoopRunInMode(kCFRunLoopDefaultMode, 45, false);
+	return 0;
+}
+
+static void *cwf_msg, *cwf_iface, *cwf_getclass, *cwf_regname;
+static char cwf_name[33], cwf_pass[65];
+
+static void *
+cwf_sel(const char *name)
+{
+	return ((void *(*)(const char *))cwf_regname)(name);
+}
+
+#define MSG0(o, s) ((void *(*)(void *, void *))cwf_msg)((o), cwf_sel(s))
+#define MSG1(o, s, a) ((void *(*)(void *, void *, void *))cwf_msg)((o), cwf_sel(s), (void *)(a))
+#define MSG2(o, s, a, b) \
+	((void *(*)(void *, void *, void *, void *))cwf_msg)((o), cwf_sel(s), (void *)(a), (void *)(b))
+
+static void
+cwf_assoc(void *picked)
+{
+	void *ap = MSG0(MSG0(((void *(*)(const char *))cwf_getclass)("CWFAssocParameters"), "alloc"),
+	    "init");
+
+	if (ap == NULL) {
+		fprintf(stderr, "a80211_test: cwjoin: no CWFAssocParameters\n");
+		return;
+	}
+	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("initWithScanResult:"))) {
+		ap = MSG1(ap, "initWithScanResult:", picked);
+	} else if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setScanResult:"))) {
+		MSG1(ap, "setScanResult:", picked);
+	}
+	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setPassword:"))) {
+		MSG1(ap, "setPassword:", CFStringCreateWithCString(kCFAllocatorDefault, cwf_pass,
+		    kCFStringEncodingUTF8));
+	}
+	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setUserInitiated:"))) {
+		MSG1(ap, "setUserInitiated:", 1);
+	}
+	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setRememberedNetwork:"))) {
+		MSG1(ap, "setRememberedNetwork:", 1);
+	}
+	MSG2(cwf_iface, "associateWithParameters:reply:", ap, ^(void *result, void *err) {
+		fprintf(stderr, "a80211_test: cwjoin: associate reply result %p err %p\n", result, err);
+		show("cwjoin assoc result", result);
+		if (err != NULL) {
+			show("cwjoin assoc error", MSG0(err, "localizedDescription"));
+		}
+	});
+}
+
+static void
+cwf_scan_reply(void *results, void *err)
+{
+	void *arr, *picked = NULL;
+	unsigned long count;
+
+	fprintf(stderr, "a80211_test: cwjoin: scan reply %p err %p\n", results, err);
+	if (err != NULL) {
+		show("cwjoin scan error", MSG0(err, "localizedDescription"));
+	}
+	if (results == NULL) {
+		return;
+	}
+	arr = (long)MSG1(results, "respondsToSelector:", cwf_sel("allObjects")) ?
+	    MSG0(results, "allObjects") : results;
+	count = (unsigned long)MSG0(arr, "count");
+	fprintf(stderr, "a80211_test: cwjoin: %lu scan results\n", count);
+	for (unsigned long i = 0; i < count; i++) {
+		void *item = MSG1(arr, "objectAtIndex:", i);
+		void *nm = MSG0(item, "ssid");
+		char got[64] = { 0 };
+
+		if (nm == NULL) {
+			nm = MSG0(item, "networkName");
+		}
+		if (nm != NULL) {
+			CFStringGetCString((CFStringRef)nm, got, sizeof(got), kCFStringEncodingUTF8);
+		}
+		fprintf(stderr, "a80211_test: cwjoin: result %lu ssid '%s' %p\n", i, got, item);
+		if (picked == NULL && strcmp(got, cwf_name) == 0) {
+			picked = item;
+		}
+	}
+	if (picked == NULL) {
+		fprintf(stderr, "a80211_test: cwjoin: %s not in scan results\n", cwf_name);
+		return;
+	}
+	cwf_assoc(picked);
+}
+
+static void *
+cwf_run(void *arg)
+{
+	struct cwf_job *job = arg;
+	void *objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_NOW);
+	static const char hex[] = "0123456789abcdef";
+
+	cwf_regname = dlsym(objc, "sel_registerName");
+	cwf_msg = dlsym(objc, "objc_msgSend");
+	cwf_getclass = dlsym(objc, "objc_getClass");
+	memcpy(cwf_name, job->ssid, job->ssid_len < 32 ? job->ssid_len : 32);
+	for (unsigned i = 0; i < 32; i++) {
+		cwf_pass[i * 2] = hex[job->pmk[i] >> 4];
+		cwf_pass[i * 2 + 1] = hex[job->pmk[i] & 15];
+	}
+	cwf_iface = MSG0(((void *(*)(const char *))cwf_getclass)("CWFInterface"), "alloc");
+	if ((long)MSG1(cwf_iface, "respondsToSelector:", cwf_sel("initWithInterfaceName:"))) {
+		cwf_iface = MSG1(cwf_iface, "initWithInterfaceName:", (void *)CFSTR("en0"));
+	} else {
+		cwf_iface = MSG0(cwf_iface, "init");
+	}
+	fprintf(stderr, "a80211_test: cwjoin: CWFInterface %p\n", cwf_iface);
+	if (cwf_iface == NULL) {
+		return NULL;
+	}
+	void *sp = MSG0(MSG0(((void *(*)(const char *))cwf_getclass)("CWFScanParameters"), "alloc"),
+	    "init");
+	CFStringRef want = CFStringCreateWithCString(kCFAllocatorDefault, cwf_name,
+	    kCFStringEncodingUTF8);
+
+	if (sp != NULL) {
+		if ((long)MSG1(sp, "respondsToSelector:", cwf_sel("setNetworkName:"))) {
+			MSG1(sp, "setNetworkName:", want);
+		}
+		if ((long)MSG1(sp, "respondsToSelector:", cwf_sel("setSsid:"))) {
+			MSG1(sp, "setSsid:", want);
+		}
+		if ((long)MSG1(sp, "respondsToSelector:", cwf_sel("setSSID:"))) {
+			MSG1(sp, "setSSID:", want);
+		}
+	}
+	MSG2(cwf_iface, "performScanWithParameters:reply:", sp, ^(void *results, void *err) {
+		cwf_scan_reply(results, err);
+	});
+	fprintf(stderr, "a80211_test: cwjoin: scan request sent\n");
+	return NULL;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -247,7 +427,19 @@ main(int argc, char **argv)
 		    CFSTR("com.apple.wifid"), kCFPreferencesAnyUser, kCFPreferencesAnyHost);
 		CFPreferencesSetValue(CFSTR("LoggingEnabled"), kCFBooleanTrue,
 		    CFSTR("com.apple.wifid"), kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-		printf("a80211_test: com.apple.wifid written: %s\n",
+		/* WFLog level-3 messages (Enqueuing command, forced association
+		   scan, scan-result comparisons) only reach os_log when the
+		   logger's level covers them */
+		int loud = argc >= 3 && strcmp(argv[2], "v") == 0;
+		if (loud) {
+			int level = 8;
+			CFNumberRef n = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &level);
+
+			CFPreferencesSetValue(CFSTR("LoggingLoggerLevel"), n,
+			    CFSTR("com.apple.wifid"), kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+			CFRelease(n);
+		}
+		printf("a80211_test: com.apple.wifid written%s: %s\n", loud ? " (level 8)" : "",
 		    CFPreferencesAppSynchronize(CFSTR("com.apple.wifid")) ? "synced" : "NOT synced");
 		return 0;
 	}
@@ -256,6 +448,8 @@ main(int argc, char **argv)
 		CFTypeRef (*client_create)(CFAllocatorRef, int) =
 		    mw ? dlsym(mw, "WiFiManagerClientCreate") : NULL;
 		int (*client_power)(CFTypeRef, int) = mw ? dlsym(mw, "WiFiManagerClientSetPower") : NULL;
+		void (*schedule)(CFTypeRef, CFRunLoopRef, CFStringRef) =
+		    mw ? dlsym(mw, "WiFiManagerClientScheduleWithRunLoop") : NULL;
 		CFTypeRef client = NULL;
 
 		fprintf(stderr, "a80211_test: MobileWiFi %p create %p power %p\n", mw, client_create, client_power);
@@ -263,9 +457,15 @@ main(int argc, char **argv)
 			client = client_create(kCFAllocatorDefault, 0);
 			fprintf(stderr, "a80211_test: client %p\n", client);
 		}
+		/* an unscheduled client's XPC sends stay in its connection: the call
+		   returns success while wifid never sees the request */
+		if (client != NULL && schedule != NULL) {
+			schedule(client, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+		}
 		if (client != NULL && client_power != NULL) {
 			error = client_power(client, atoi(argv[2]) != 0);
 			fprintf(stderr, "a80211_test: WiFiManagerClientSetPower %s -> %d\n", argv[2], error);
+			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 5, false);
 		}
 		return 0;
 	}
@@ -334,7 +534,8 @@ main(int argc, char **argv)
 		}
 		return 0;
 	}
-	if (argc >= 2 && (strcmp(argv[1], "mwjoin") == 0 || strcmp(argv[1], "mwxjoin") == 0)) {
+	if (argc >= 2 && (strcmp(argv[1], "mwjoin") == 0 || strcmp(argv[1], "mwxjoin") == 0 ||
+	    strcmp(argv[1], "cwjoin") == 0 || strcmp(argv[1], "ajoin") == 0)) {
 		/* registers the standing network with wifid the way a join in Settings
 		   does: WiFiManagerClientAddNetwork puts it on the known list (and its
 		   passphrase in the keychain), WiFiDeviceClientAssociateAsync has wifid
@@ -359,6 +560,71 @@ main(int argc, char **argv)
 		if (strcmp(argv[1], "mwxjoin") == 0) {
 			return mwscanjoin(saved.ssid, saved.ssid_length, saved.passphrase,
 			    saved.passphrase_length, saved.pmk);
+		}
+		if (strcmp(argv[1], "cwjoin") == 0) {
+			return cwjoin(saved.ssid, saved.ssid_length, saved.pmk);
+		}
+		if (strcmp(argv[1], "ajoin") == 0) {
+			/* the join wifid is asked to issue is a plain Apple80211Set 20:
+			   send it ourselves - the kernel does the association and posts
+			   the link/SSID events every listener gets */
+			struct {
+				uint32_t version;
+				uint16_t mode, unused_0;
+				uint32_t auth_lower, auth_upper;
+				uint32_t ssid_length;
+				uint8_t ssid[32];
+				uint8_t bssid[6], unused_1[2];
+				uint32_t key_version, key_length, key_cipher;
+				uint16_t key_flags, key_index;
+				uint8_t key[64];
+				uint8_t rest[0x38c - 0x8c];
+			} req = { 0 };
+			uint8_t state[4] = { 0 };
+
+			req.ssid_length = saved.ssid_length;
+			memcpy(req.ssid, saved.ssid, saved.ssid_length);
+			memcpy(req.bssid, saved.bssid, sizeof(req.bssid));
+			if (saved.passphrase_length != 0) {
+				req.key_cipher = 10;
+				req.key_length = saved.passphrase_length;
+				memcpy(req.key, saved.passphrase, saved.passphrase_length);
+			} else {
+				req.key_cipher = 6;
+				req.key_length = sizeof(saved.pmk);
+				memcpy(req.key, saved.pmk, sizeof(saved.pmk));
+			}
+			error = a80211_open(&handle);
+			fprintf(stderr, "a80211_test: ajoin open -> %d\n", error);
+			if (error == 0) {
+				error = a80211_bind(handle, CFSTR("en0"));
+			}
+			error = a80211_set(handle, 20, NULL, &req, sizeof(req));
+			fprintf(stderr, "a80211_test: Apple80211Set 20 (join %.*s) -> %d\n",
+			    (int)saved.ssid_length, saved.ssid, error);
+			{
+				int (*assoc2)(void *, const void *) = dlsym(io, "Apple80211Associate2");
+				int (*assoc1)(void *, const void *) = dlsym(io, "Apple80211Associate");
+
+				if (assoc2 != NULL) {
+					fprintf(stderr, "a80211_test: Apple80211Associate2 -> %d\n",
+					    assoc2(handle, &req));
+				}
+				if (assoc1 != NULL) {
+					fprintf(stderr, "a80211_test: Apple80211Associate -> %d\n",
+					    assoc1(handle, &req));
+				}
+			}
+			for (int i = 0; i < 12; i++) {
+				sleep(1);
+				if (a80211_get(handle, 13, 0, state, sizeof(state)) == 0 &&
+				    state[0] == 4) {
+					fprintf(stderr, "a80211_test: ajoin: state RUN after %ds\n", i + 1);
+					break;
+				}
+			}
+			fprintf(stderr, "a80211_test: ajoin: final state %u\n", state[0]);
+			return 0;
 		}
 		void *mw = dlopen("/System/Library/PrivateFrameworks/MobileWiFi.framework/MobileWiFi", RTLD_NOW);
 		CFTypeRef (*client_create)(CFAllocatorRef, int) =
