@@ -1,0 +1,100 @@
+--- a/src/freedreno/drm/msm/msm_bo.c
++++ b/src/freedreno/drm/msm/msm_bo.c
+@@ -90,6 +90,9 @@
+ static uint64_t
+ msm_bo_iova(struct fd_bo *bo)
+ {
++   if (bo->iova)
++      return bo->iova;
++
+    struct drm_msm_gem_info req = {
+       .handle = bo->handle,
+       .info = MSM_INFO_GET_IOVA,
+@@ -193,7 +196,7 @@
+
+ /* allocate a buffer handle: */
+ static int
+-new_handle(struct fd_device *dev, uint32_t size, uint32_t flags, uint32_t *handle)
++new_handle(struct fd_device *dev, uint32_t size, uint32_t flags, uint64_t *iova, uint32_t *handle)
+ {
+    struct drm_msm_gem_new req = {
+       .size = size,
+@@ -211,7 +214,19 @@
+    else
+       req.flags |= MSM_BO_WC;
+
++#ifdef __APPLE__
++   /* The original user client echoes the zero extension. GEM_INFO then supplies
++    * the address through the existing path in fd_bo_init_common. */
++   struct {
++      struct drm_msm_gem_new request;
++      uint64_t iova;
++   } reply = { .request = req };
++   ret = drmCommandWriteRead(dev->fd, DRM_MSM_GEM_NEW, &reply, sizeof(reply));
++   req.handle = reply.request.handle;
++   *iova = reply.iova;
++#else
+    ret = drmCommandWriteRead(dev->fd, DRM_MSM_GEM_NEW, &req, sizeof(req));
++#endif
+    if (ret)
+       return ret;
+
+@@ -220,37 +235,34 @@
+    return 0;
+ }
+
+-/* allocate a new buffer object */
+-struct fd_bo *
+-msm_bo_new(struct fd_device *dev, uint32_t size, uint32_t flags)
+-{
+-   uint32_t handle;
+-   int ret;
+-
+-   ret = new_handle(dev, size, flags, &handle);
+-   if (ret)
+-      return NULL;
+-
+-   return msm_bo_from_handle(dev, size, handle);
+-}
+-
+-/* allocate a new buffer object from existing handle (import) */
+-struct fd_bo *
+-msm_bo_from_handle(struct fd_device *dev, uint32_t size, uint32_t handle)
+-{
+-   struct msm_bo *msm_bo;
+-   struct fd_bo *bo;
+-
+-   msm_bo = calloc(1, sizeof(*msm_bo));
++static struct fd_bo *
++msm_bo_create(struct fd_device *dev, uint32_t size, uint32_t handle, uint32_t flags)
++{
++   struct msm_bo *msm_bo = calloc(1, sizeof(*msm_bo));
+    if (!msm_bo)
+       return NULL;
+
+-   bo = &msm_bo->base;
++   struct fd_bo *bo = &msm_bo->base;
++   if (!handle && new_handle(dev, size, flags, &bo->iova, &handle)) {
++      free(msm_bo);
++      return NULL;
++   }
+    bo->size = size;
+    bo->handle = handle;
+    bo->funcs = &funcs;
+
+    fd_bo_init_common(bo, dev);
+-
+    return bo;
+ }
++
++struct fd_bo *
++msm_bo_new(struct fd_device *dev, uint32_t size, uint32_t flags)
++{
++   return msm_bo_create(dev, size, 0, flags);
++}
++
++struct fd_bo *
++msm_bo_from_handle(struct fd_device *dev, uint32_t size, uint32_t handle)
++{
++   return handle ? msm_bo_create(dev, size, handle, 0) : NULL;
++}
