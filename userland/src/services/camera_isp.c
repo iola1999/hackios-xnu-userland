@@ -495,13 +495,14 @@ struct x_sample {
 struct cell_lines {
 	struct x_sample *horizontal;
 	uint32_t x0, y0, cw, ch;
+	uint32_t first_cell, last_cell;
 	int32_t         cy[2];          /* which line each holds (-1: none) */
 	float           *rgb[2];        /* 3 floats a cell */
 };
 
 static void
 cell_line(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, uint32_t cy, int r, int b,
-    float *out)
+    const struct cell_lines *lines, float *out)
 {
 	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
 	const uint8_t *top = raw + (size_t)cy * 2 * f->stride;
@@ -519,7 +520,7 @@ cell_line(const struct isp *isp, const struct annibale_camera_frame *f, const ui
 			}
 		}
 	}
-	for (uint32_t cx = 0; cx < cells_w; cx++) {
+	for (uint32_t cx = lines->first_cell; cx <= lines->last_cell; cx++) {
 		int v[4], g = 0;
 		float gains[3] = { 1, 1, 1 };
 
@@ -554,7 +555,7 @@ cells_of(const struct isp *isp, const struct annibale_camera_frame *f, const uin
 	}
 	int slot = lines->cy[0] == keep ? 1 : 0;
 
-	cell_line(isp, f, raw, cy, r, b, lines->rgb[slot]);
+	cell_line(isp, f, raw, cy, r, b, lines, lines->rgb[slot]);
 	lines->cy[slot] = (int32_t)cy;
 	return lines->rgb[slot];
 }
@@ -655,6 +656,9 @@ thread_cell_lines(const struct isp *isp, const struct annibale_camera_frame *f, 
 
 		lines.horizontal[x] = (struct x_sample){ 3 * left, 3 * right, fx < (float)left ? 0 : fx - left };
 	}
+	/* The interpolation endpoints include the neighbouring cells at both crop edges. */
+	lines.first_cell = lines.horizontal[0].left / 3;
+	lines.last_cell = lines.horizontal[width - 1].right / 3;
 	return lines;
 }
 
