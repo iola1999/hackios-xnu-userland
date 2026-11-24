@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build Mesa for THIS machine (x86-64 Linux) with the AIR frontend in it: the
+# macOS or --replay builds the current K90 frontend with CPU rasterizers in build/mesa-host-replay.
+# The legacy x86-64 Linux build includes the
 # frontend itself, ir3 (so a Metal shader can be compiled for the Adreno
 # without the phone) and softpipe (so it can be run without a GPU at all).
 #
@@ -19,6 +20,9 @@
 #                                                      driver links (tools/mesa/air/air_metal.h)
 #   src/gallium/drivers/freedreno/air_metal_test       that library driven through its own header
 set -e
+if [ "${1:-}" = "--replay" ] || [ "$(uname -s)" = Darwin ]; then
+	exec "$(dirname "$0")/mk-replay.sh"
+fi
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/../.." && pwd)
 VERSION=25.0.7
 SHA256=592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6
