@@ -7,6 +7,8 @@ numeric_array(const struct air_type *type)
       return false;
    while (type && type->kind == AIR_TYPE_ARRAY)
       type = type->elem;
+   if (type && type->kind == AIR_TYPE_VECTOR)
+      type = type->elem;
    return type && (air_type_is_float(type) || type->kind == AIR_TYPE_INT) &&
           air_type_bit_size(type) && air_type_bit_size(type) <= 64;
 }
@@ -20,6 +22,43 @@ write_array_constant(const struct air_module *m, const struct air_type *t,
    if (k->ckind == AIR_CONST_NULL || k->ckind == AIR_CONST_UNDEF ||
        k->ckind == AIR_CONST_POISON)
       return true; /* The section is zero-filled. */
+   if (t->kind == AIR_TYPE_VECTOR) {
+      /* LLVM packs the lanes consecutively. Array stride and tail padding
+       * belong to the whole vector, including the fourth lane's space in T3. */
+      unsigned bits = air_type_bit_size(t->elem);
+      if (!bits || bits > 64 || (uint64_t)t->count * bits > (uint64_t)size * 8 ||
+          k->num_elems != t->count)
+         return false;
+      for (unsigned i = 0; i < t->count; i++) {
+         uint64_t value;
+         if (k->ckind == AIR_CONST_DATA) {
+            value = k->data[i];
+         } else if (k->ckind == AIR_CONST_AGGREGATE) {
+            const struct air_constant *lane = air_value_as_constant(k->elems[i]);
+            if (!lane || lane->base.type != t->elem)
+               return false;
+            if (lane->ckind == AIR_CONST_NULL || lane->ckind == AIR_CONST_UNDEF ||
+                lane->ckind == AIR_CONST_POISON)
+               continue;
+            if (lane->ckind != AIR_CONST_INT && lane->ckind != AIR_CONST_FLOAT)
+               return false;
+            value = lane->u;
+         } else {
+            return false;
+         }
+
+         uint64_t offset = (uint64_t)i * bits;
+         for (unsigned remaining = bits; remaining;) {
+            unsigned shift = offset & 7;
+            unsigned n = MIN2(remaining, 8 - shift);
+            dst[offset / 8] |= (value & ((1u << n) - 1u)) << shift;
+            value >>= n;
+            offset += n;
+            remaining -= n;
+         }
+      }
+      return true;
+   }
    if (t->kind != AIR_TYPE_ARRAY) {
       if (k->ckind != AIR_CONST_INT && k->ckind != AIR_CONST_FLOAT)
          return false;
@@ -38,7 +77,7 @@ write_array_constant(const struct air_module *m, const struct air_type *t,
       if (k->ckind == AIR_CONST_AGGREGATE) {
          if (!write_array_constant(m, t->elem, air_value_as_constant(k->elems[i]), elem, stride))
             return false;
-      } else if (k->ckind == AIR_CONST_DATA && t->elem->kind != AIR_TYPE_ARRAY) {
+      } else if (k->ckind == AIR_CONST_DATA && (air_type_is_float(t->elem) || t->elem->kind == AIR_TYPE_INT)) {
          struct air_constant value = { .base.type = t->elem, .ckind = air_type_is_float(t->elem) ?
                                         AIR_CONST_FLOAT : AIR_CONST_INT, .u = k->data[i] };
          if (!write_array_constant(m, t->elem, &value, elem, stride))
