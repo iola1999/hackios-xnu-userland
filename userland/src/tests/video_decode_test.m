@@ -1,7 +1,7 @@
 /*
  * Decode a local video's compressed samples through AVAssetReader and VideoToolbox.
  * Usage: video_decode_test [--deadline SECONDS] [--frames COUNT]
- *                         [--require-hardware | --software] [--report-file PATH] FILE
+ *                         [--require-hardware | --software] [--finish-after-first] [--report-file PATH] FILE
  * Defaults: 12 seconds, 60 frames, hardware allowed. COUNT is limited to 10000.
  * Exit: 0 decoded every submitted frame; 1 input/decode/output failure; 2 arguments;
  *       124 whole-process deadline, including asset loading, draining and cleanup.
@@ -30,7 +30,7 @@
 struct options {
 	double deadline;
 	unsigned frames;
-	bool require_hardware, software;
+	bool require_hardware, software, finish_after_first;
 	const char *path, *report_path;
 };
 
@@ -302,6 +302,14 @@ decode(const struct options *options)
 					break;
 				}
 				accepted++;
+				if (options->finish_after_first && accepted == 1) {
+					status = VTDecompressionSessionFinishDelayedFrames(session);
+					printf("video_decode_test: stage=finish_after_first accepted=%u status=%d\n", accepted, (int)status);
+					if (status != noErr) {
+						failed = true;
+						break;
+					}
+				}
 			}
 			limit_reached = submitted == options->frames;
 		} while (false);
@@ -361,6 +369,8 @@ main(int argc, char **argv)
 			unsigned long count = strtoul(argv[++i], &end, 10);
 			if (errno || end == argv[i] || *end || count == 0 || count > 10000) goto usage;
 			options.frames = (unsigned)count;
+		} else if (!strcmp(argv[i], "--finish-after-first")) {
+			options.finish_after_first = true;
 		} else if (!strcmp(argv[i], "--require-hardware")) {
 			options.require_hardware = true;
 		} else if (!strcmp(argv[i], "--software")) {
@@ -392,6 +402,6 @@ main(int argc, char **argv)
 		return decode(&options);
 	}
 usage:
-	fprintf(stderr, "usage: video_decode_test [--deadline SECONDS] [--frames COUNT] [--require-hardware | --software] [--report-file PATH] FILE\n");
+	fprintf(stderr, "usage: video_decode_test [--deadline SECONDS] [--frames COUNT] [--require-hardware | --software] [--finish-after-first] [--report-file PATH] FILE\n");
 	return 2;
 }

@@ -152,6 +152,12 @@ class VideoDecodeTest(unittest.TestCase):
         self.assertEqual([row['fnv1a64'] for row in frames], self.reference)
         self.assertEqual(records(result.stdout, 'summary')[-1]['hardware'], '1')
 
+    def test_finish_after_first_keeps_later_references(self):
+        output = self.run_probe('--software', '--finish-after-first', self.movie)
+        self.assertEqual(records(output, 'finish_after_first'), [{'accepted': '1', 'status': '0', 'stage': 'finish_after_first'}])
+        frames = self.check_frames(output, 12)
+        self.assertEqual([row['fnv1a64'] for row in frames], self.reference)
+
     def test_frame_limit(self):
         output = self.run_probe('--software', '--frames', '3', self.movie)
         self.check_frames(output, 3)
