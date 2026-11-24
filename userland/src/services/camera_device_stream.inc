@@ -651,6 +651,27 @@ load_tuning(struct isp *isp, uint32_t sensor)
 	}
 }
 
+struct flash_meter {
+	unsigned frames;
+	uint32_t lines, gain;
+};
+
+static bool
+flash_wait_for_exposure(struct flash_meter *meter, const struct isp *isp, const struct annibale_camera_frame *f)
+{
+	/* Two queued frames can predate the lamp. Wait for the first metered
+	 * correction, even if AE has already requested another for the next frame. */
+	const unsigned warmup = 2;
+	if (++meter->frames <= warmup)
+		return true;
+	if (meter->frames == warmup + 1 && isp_ae_pending(isp, f)) {
+		meter->lines = isp->asked_lines;
+		meter->gain = isp->asked_gain;
+	}
+	return meter->lines != 0 && meter->frames <= warmup + ISP_AE_READBACK_FRAMES &&
+	    (f->exposure_lines != meter->lines || f->gain != meter->gain);
+}
+
 static void *
 worker(void *context)
 {
@@ -659,6 +680,7 @@ worker(void *context)
 	struct annibale_camera_profile profile;
 	struct annibale_camera_capture capture;
 	struct isp isp;
+	struct flash_meter flash = {0};
 	struct isp_stats st;
 	uint8_t *buffer = NULL;
 	size_t bytes = 0;
@@ -809,16 +831,15 @@ worker(void *context)
 
 				if (write(s->torch, &full, sizeof(full)) == (ssize_t)sizeof(full)) {
 					s->flash_lit = true;
-					s->flash_warmup = 2;
+					flash = (struct flash_meter){0};
 					hold_still = true;
 					say("still flash lit (1000/1000) for photograph warmup");
 				} else {
 					s->still_flash_wanted = false;
 					say("still flash write failed; delivering photograph without flash");
 				}
-			} else if (s->flash_warmup > 0) {
-				s->flash_warmup--;
-				hold_still = true;
+			} else {
+				hold_still = flash_wait_for_exposure(&flash, &isp, f);
 			}
 		}
 		bool gave_still = false;
@@ -862,7 +883,6 @@ worker(void *context)
 				}
 				s->flash_lit = false;
 				s->still_flash_wanted = false;
-				s->flash_warmup = 0;
 			}
 			say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 		}
@@ -905,7 +925,6 @@ worker(void *context)
 	s->flash_lit = false;
 	s->still_flash_wanted = false;
 	s->still_redeye_wanted = false;
-	s->flash_warmup = 0;
 	pthread_mutex_unlock(&s->lock);
 	if (s->state == CAM_STREAM_ACTIVE) {
 		s->state = CAM_STREAM_FAULTED;
@@ -981,7 +1000,6 @@ stream_stop(CMBaseObjectRef o)
 	s->still_flash_wanted = false;
 	s->still_redeye_wanted = false;
 	s->stills_wanted = 0;
-	s->flash_warmup = 0;
 	pthread_mutex_unlock(&s->lock);
 	return 0;
 }

@@ -262,7 +262,7 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 	if (fabs(drc - isp->drc) > 0.005 * isp->drc) {
 		tone(isp, (float)drc);
 	}
-	if (isp->ae_wait > 0 && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain)) {
+	if (isp_ae_pending(isp, f)) {
 		isp->ae_wait--;
 		return false;                   /* (the last change not in the frames yet) */
 	}
@@ -300,7 +300,7 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 	isp->asked_lines = lines;
 	isp->asked_gain = gain;
 	isp->asked_frame_lines = frame_lines;
-	isp->ae_wait = 4;
+	isp->ae_wait = ISP_AE_READBACK_FRAMES;
 	memset(c, 0, sizeof(*c));
 	c->command = ANNIBALE_CAMERA_EXPOSURE;
 	c->a = lines;

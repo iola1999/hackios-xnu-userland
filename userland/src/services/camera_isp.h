@@ -97,6 +97,14 @@ void isp_destroy(struct isp *isp);
 float isp_sharpness(const struct annibale_camera_frame *f, const uint8_t *raw, float x0, float y0, float x1, float y1, float *level);
 /* the levels, from every 4th cell of every 4th pair of lines (with the processor's lens shading and white balance, if isp) */
 void isp_measure(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, struct isp_stats *s);
+#define ISP_AE_READBACK_FRAMES 4u
+
+static inline bool
+isp_ae_pending(const struct isp *isp, const struct annibale_camera_frame *f)
+{
+	return isp->ae_wait > 0 && (f->exposure_lines != isp->asked_lines || f->gain != isp->asked_gain);
+}
+
 /* Exposure adjustment requires known timing/gain and valid frame limits; true fills the next command. */
 bool isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_stats *s, struct annibale_camera_command *c);
 /*

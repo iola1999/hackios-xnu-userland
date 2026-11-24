@@ -455,7 +455,6 @@ struct stream {
 	bool            still_flash_wanted;
 	bool            still_redeye_wanted;
 	bool            flash_lit;
-	unsigned        flash_warmup;
 	float           last_lux, last_cct;
 	uint64_t        frames, stills_given;
 };

@@ -453,6 +453,22 @@ static void native_boundaries(CMBaseObjectRef front) {
     free(buffer);
 }
 
+static void flash_exposure_readback(void) {
+    struct flash_meter meter = {0};
+    struct isp isp = {.ae_wait = 4, .asked_lines = 6218, .asked_gain = 689};
+    struct annibale_camera_frame frame = {.exposure_lines = 6218, .gain = 1180};
+    for (int i = 0; i < 4; i++)
+        assert(flash_wait_for_exposure(&meter, &isp, &frame));
+    frame.gain = 689;
+    isp.asked_gain = 570;
+    assert(!flash_wait_for_exposure(&meter, &isp, &frame));
+
+    meter = (struct flash_meter){0};
+    for (unsigned i = 0; i < 2 + ISP_AE_READBACK_FRAMES; i++)
+        assert(flash_wait_for_exposure(&meter, &isp, &frame));
+    assert(!flash_wait_for_exposure(&meter, &isp, &frame));
+}
+
 static void metadata_boundaries(void) {
     struct isp isp;
     isp_init(&isp);
@@ -997,6 +1013,7 @@ int main(void) {
     assert(stream_of(front)->out[0].enabled == true);
 
     native_boundaries(front);
+    flash_exposure_readback();
     metadata_boundaries();
     pixel_buffer_consumer(front);
     writes = torch_writes;
