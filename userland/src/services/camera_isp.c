@@ -487,10 +487,16 @@ lsc_at(const struct isp *isp, float u, float v, float g[3])
  * A line of cells (cy) as R, G, B above black, lens-shaded: what the magnified picture is made of,
  * each line made once for the two or three lines of the picture between it and the next.
  */
+struct x_sample {
+	uint32_t left, right;          /* channel offsets in the source RGB row */
+	float weight;
+};
+
 struct cell_lines {
+	struct x_sample *horizontal;
+	uint32_t x0, y0, cw, ch;
 	int32_t         cy[2];          /* which line each holds (-1: none) */
 	float           *rgb[2];        /* 3 floats a cell */
-	uint32_t        cells;          /* room in each */
 };
 
 static void
@@ -558,17 +564,17 @@ static void
 render_line(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, uint32_t width, uint32_t height,
     uint32_t row, uint8_t *rgb, struct cell_lines *lines)
 {
-	uint32_t x0, y0, cw, ch, cells_w = f->width / 2, cells_h = f->height / 2;
+	uint32_t x0 = lines->x0, y0 = lines->y0, cw = lines->cw, ch = lines->ch;
+	uint32_t cells_w = f->width / 2, cells_h = f->height / 2;
 	int r, b;
 	struct pipe p;
 
-	crop(isp, f, width, height, &x0, &y0, &cw, &ch);
 	cell_places(f->bayer, &r, &b);
 	pipe_init(isp, &p, f->black);
 	if (isp->turned) {
 		row = height - 1 - row;         /* (and each line from its end, below) */
 	}
-	if (cw < width && ch < height && lines->cells >= cells_w) {
+	if (lines->horizontal != NULL) {
 		/*
 		 * Magnified (the zoom): each pixel between the four cells around it. The nearest cell blown up
 		 * to a square of pixels showed every cell's own colour, its noise and the colours a 2x2 cell
@@ -584,15 +590,13 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 		const float *c1 = cells_of(isp, f, raw, cy1, r, b, lines, (int32_t)cy0);
 
 		for (uint32_t x = 0; x < width; x++) {
-			float fx = x0 + (x + 0.5f) * cw / width - 0.5f, tx, c[3];
-			uint32_t cx0 = fx < 0 ? 0 : (uint32_t)fx, cx1;
+			const struct x_sample *sample = &lines->horizontal[x];
+			uint32_t cx0 = sample->left, cx1 = sample->right;
+			float tx = sample->weight, c[3];
 
-			cx0 = cx0 > cells_w - 1 ? cells_w - 1 : cx0;
-			cx1 = cx0 + 1 > cells_w - 1 ? cells_w - 1 : cx0 + 1;
-			tx = fx < (float)cx0 ? 0 : fx - cx0;
 			for (int k = 0; k < 3; k++) {
-				float top = a[3 * cx0 + k] + (a[3 * cx1 + k] - a[3 * cx0 + k]) * tx;
-				float bottom = c1[3 * cx0 + k] + (c1[3 * cx1 + k] - c1[3 * cx0 + k]) * tx;
+				float top = a[cx0 + k] + (a[cx1 + k] - a[cx0 + k]) * tx;
+				float bottom = c1[cx0 + k] + (c1[cx1 + k] - c1[cx0 + k]) * tx;
 
 				c[k] = top + (bottom - top) * ty;
 			}
@@ -620,25 +624,36 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 	}
 }
 
-/* this thread's two lines of cells, room for a frame cells_w cells wide (cells 0 when there is none) */
+/* A worker uses the same source columns for every row in its output slice. */
 static struct cell_lines
-thread_cell_lines(uint32_t cells_w)
+thread_cell_lines(const struct isp *isp, const struct annibale_camera_frame *f, uint32_t width, uint32_t height)
 {
-	static __thread float *rgb[2];
-	static __thread uint32_t have;
-	struct cell_lines lines = { { -1, -1 }, { NULL, NULL }, 0 };
+	static __thread void *storage;
+	static __thread size_t capacity;
+	struct cell_lines lines = { .cy = { -1, -1 } };
+	size_t cells = f->width / 2, row_bytes = cells * 3 * sizeof(float);
+	size_t need = 2 * row_bytes + width * sizeof(struct x_sample);
 
-	if (cells_w > have) {
-		for (int i = 0; i < 2; i++) {
-			free(rgb[i]);
-			rgb[i] = malloc(3 * sizeof(float) * cells_w);
-		}
-		have = rgb[0] != NULL && rgb[1] != NULL ? cells_w : 0;
+	crop(isp, f, width, height, &lines.x0, &lines.y0, &lines.cw, &lines.ch);
+	if (lines.cw >= width || lines.ch >= height)
+		return lines;
+	if (need > capacity) {
+		void *resized = realloc(storage, need);
+		if (resized == NULL)
+			return lines;
+		storage = resized;
+		capacity = need;
 	}
-	if (have >= cells_w) {
-		lines.rgb[0] = rgb[0];
-		lines.rgb[1] = rgb[1];
-		lines.cells = have;
+	lines.horizontal = storage;
+	lines.rgb[0] = (float *)(lines.horizontal + width);
+	lines.rgb[1] = lines.rgb[0] + 3 * cells;
+	for (uint32_t x = 0; x < width; x++) {
+		float fx = lines.x0 + (x + 0.5f) * lines.cw / width - 0.5f;
+		uint32_t left = fx < 0 ? 0 : (uint32_t)fx;
+		left = left >= cells ? (uint32_t)cells - 1 : left;
+		uint32_t right = left + 1 < cells ? left + 1 : left;
+
+		lines.horizontal[x] = (struct x_sample){ 3 * left, 3 * right, fx < (float)left ? 0 : fx - left };
 	}
 	return lines;
 }
@@ -689,11 +704,11 @@ isp_render_nv12(const struct isp *isp, const struct annibale_camera_frame *f, co
     uint8_t *uv, size_t uv_stride, uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row, bool video_range)
 {
 	uint8_t line[2][3 * 8192];
-	struct cell_lines lines = thread_cell_lines(f->width / 2);
 
-	if (width > 8192) {
+	if (width == 0 || width > 8192 || height == 0) {
 		return;
 	}
+	struct cell_lines lines = thread_cell_lines(isp, f, width, height);
 	for (uint32_t row = first_row & ~1u; row < end_row && row < height; row += 2) {
 		bool second = row + 1 < height;
 
@@ -709,11 +724,11 @@ isp_render_bgra(const struct isp *isp, const struct annibale_camera_frame *f, co
     uint32_t width, uint32_t height, uint32_t first_row, uint32_t end_row)
 {
 	uint8_t line[3 * 8192];
-	struct cell_lines lines = thread_cell_lines(f->width / 2);
 
-	if (width > 8192) {
+	if (width == 0 || width > 8192 || height == 0) {
 		return;
 	}
+	struct cell_lines lines = thread_cell_lines(isp, f, width, height);
 	for (uint32_t row = first_row; row < end_row && row < height; row++) {
 		uint8_t *o = out + (size_t)row * stride;
 

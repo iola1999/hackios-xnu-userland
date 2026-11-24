@@ -458,7 +458,7 @@ static void metadata_boundaries(void) {
     isp_init(&isp);
     complete_capture();
     assert(isnan(lux_index(&isp, &next_frame)));
-    CFDictionaryRef metadata = frame_metadata(&isp, &next_frame, k_front);
+    CFDictionaryRef metadata = frame_metadata(&isp, &next_frame, k_front, -1, false, 0, 0);
     assert(CFDictionaryGetCount(metadata) == 4);
     assert(CFDictionaryContainsKey(metadata, md_key[MD_PORT]));
     assert(CFDictionaryContainsKey(metadata, md_key[MD_PTS]));
@@ -472,7 +472,7 @@ static void metadata_boundaries(void) {
     next_frame.line_ns = 10000;
     next_frame.gain = next_frame.gain_unity = 256;
     next_frame.frame_lines = 3333;
-    metadata = frame_metadata(&isp, &next_frame, k_front);
+    metadata = frame_metadata(&isp, &next_frame, k_front, -1, false, 0, 0);
     assert(CFDictionaryGetCount(metadata) == 7);
     assert(fabs(get_double(metadata, md_key[MD_EXPOSURE]) - 0.001) < 1e-9);
     assert(get_int(metadata, md_key[MD_AGC]) == 256);
