@@ -283,6 +283,9 @@ echo "== argument buffers: the member table and the indices it allocates"
 python3 "$ROOT/tools/air/argbufcheck.py" 2>&1 | tail -30
 argbuf_rc=${PIPESTATUS[0]}
 
+threadgroup_rc=0
+python3 "$ROOT/tools/air/threadgroup-input-check.py" || threadgroup_rc=$?
+
 echo
 echo "== argument buffers at run time: the encoder that records instead of writing"
 # The runtime half of the stage above, and the first stage in this file that drives
@@ -333,4 +336,4 @@ metal_rc=${PIPESTATUS[0]}
 
 exit $((reader_rc | cpu_rc | intrin_rc | ffma_rc | run_rc | atomic_rc | texop_rc | samp_rc \
 	| pixfmt_rc | blend_rc | lowering_rc | fbfetch_rc | vattr_rc | argbuf_rc \
-	| argbufrun_rc | lib_rc | metal_rc))
+	| argbufrun_rc | threadgroup_rc | lib_rc | metal_rc))

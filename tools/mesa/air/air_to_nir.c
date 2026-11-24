@@ -1315,7 +1315,6 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
                        c->fn->num_args);
    const struct air_type *t = c->fn->args[param].type;
 
-   /* resources */
    if (md_key(node, "air.buffer") >= 0) {
       uint64_t as = 0, index = 0, size = 0;
       md_key_int(node, "air.address_space", &as);
@@ -1332,10 +1331,11 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       case 3:
          p.class = AIR_PTR_SHARED;
          rk = AIR_RESOURCE_THREADGROUP_BUFFER;
-         /* a threadgroup argument is sized at dispatch. One is all the corpus
-          * uses, and anything else is refused; its base is set after
-          * plan_globals, past the static threadgroup arrays.
-          */
+         /* Specialization can retain the argument after removing its uses. */
+         if (md_key(node, "air.arg_unused") >= 0) {
+            c->params[param] = air_val_ptr(c, p);
+            return true;
+         }
          if (index != 0)
             return air_error(c, "interface: a second threadgroup buffer (index %u)",
                              (unsigned)index);
