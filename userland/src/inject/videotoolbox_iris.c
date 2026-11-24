@@ -521,6 +521,26 @@ iris_vt_copy_supported_properties(CFTypeRef decoder, CFDictionaryRef *out_props)
 	return *out_props != NULL ? noErr : memFullErr;
 }
 
+static CFDataRef
+iris_codec_config(CMFormatDescriptionRef format, uint32_t codec)
+{
+	CFDictionaryRef atoms = (CFDictionaryRef)CMFormatDescriptionGetExtension(format,
+	    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
+	return atoms == NULL ? NULL : (CFDataRef)CFDictionaryGetValue(atoms,
+	    codec == IRIS_CODEC_H264 ? CFSTR("avcC") : CFSTR("hvcC"));
+}
+
+static bool
+iris_hevc_depth_supported(CFDataRef config)
+{
+	/* hvcC v1 stores bitDepthLumaMinus8 and bitDepthChromaMinus8 in the low
+	 * three bits of bytes 17 and 18. Main 10 can also carry 8-bit samples.
+	 * Without a configuration record, the Iris stream-settings check decides. */
+	if (config == NULL || CFDataGetLength(config) < 23) return true;
+	const uint8_t *p = CFDataGetBytePtr(config);
+	return p[0] != 1 || ((p[17] | p[18]) & 7u) == 0;
+}
+
 static OSStatus
 iris_configure_session_Locked(struct iris_vt_decoder *dec, VTDecoderSessionRef session,
     CMVideoFormatDescriptionRef format_desc)
@@ -533,6 +553,11 @@ iris_configure_session_Locked(struct iris_vt_decoder *dec, VTDecoderSessionRef s
 		return kVTVideoDecoderUnsupportedDataFormatErr;
 	}
 
+	CFDataRef cfg = iris_codec_config(format_desc, dec->iris_codec);
+	if (dec->iris_codec == IRIS_CODEC_HEVC && !iris_hevc_depth_supported(cfg)) {
+		return kVTVideoDecoderUnsupportedDataFormatErr;
+	}
+
 	if (dec->param_annexb == NULL) {
 		dec->param_annexb = (uint8_t *)malloc(IRIS_VT_PARAM_CAP);
 		if (dec->param_annexb == NULL) {
@@ -542,21 +567,13 @@ iris_configure_session_Locked(struct iris_vt_decoder *dec, VTDecoderSessionRef s
 	dec->param_annexb_len = 0;
 	dec->nal_len_size = 4u;
 
-	CFDictionaryRef atoms = (CFDictionaryRef)CMFormatDescriptionGetExtension(format_desc,
-	    kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms);
-	if (atoms != NULL) {
-		CFDataRef cfg = (CFDataRef)CFDictionaryGetValue(atoms,
-		    dec->iris_codec == IRIS_CODEC_H264 ? CFSTR("avcC") : CFSTR("hvcC"));
-		if (cfg != NULL) {
-			const uint8_t *ptr = CFDataGetBytePtr(cfg);
-			size_t len = (size_t)CFDataGetLength(cfg);
-			bool ok = (dec->iris_codec == IRIS_CODEC_H264) ?
-			    iris_parse_avcc(ptr, len, &dec->nal_len_size, dec->param_annexb, IRIS_VT_PARAM_CAP, &dec->param_annexb_len) :
-			    iris_parse_hvcc(ptr, len, &dec->nal_len_size, dec->param_annexb, IRIS_VT_PARAM_CAP, &dec->param_annexb_len);
-			if (!ok) {
-				return kVTVideoDecoderBadDataErr;
-			}
-		}
+	if (cfg != NULL) {
+		const uint8_t *ptr = CFDataGetBytePtr(cfg);
+		size_t len = (size_t)CFDataGetLength(cfg);
+		bool ok = (dec->iris_codec == IRIS_CODEC_H264) ?
+		    iris_parse_avcc(ptr, len, &dec->nal_len_size, dec->param_annexb, IRIS_VT_PARAM_CAP, &dec->param_annexb_len) :
+		    iris_parse_hvcc(ptr, len, &dec->nal_len_size, dec->param_annexb, IRIS_VT_PARAM_CAP, &dec->param_annexb_len);
+		if (!ok) return kVTVideoDecoderBadDataErr;
 	}
 
 	if (dec->annexb_buf == NULL) {
@@ -647,7 +664,8 @@ iris_vt_can_accept_format(CFTypeRef decoder, CMFormatDescriptionRef new_format)
 	if (dec == NULL || new_format == NULL) {
 		return false;
 	}
-	if (CMFormatDescriptionGetMediaSubType(new_format) != dec->codec) {
+	if (CMFormatDescriptionGetMediaSubType(new_format) != dec->codec ||
+	    (dec->iris_codec == IRIS_CODEC_HEVC && !iris_hevc_depth_supported(iris_codec_config(new_format, dec->iris_codec)))) {
 		return false;
 	}
 	CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)new_format);
@@ -691,7 +709,7 @@ iris_run_decode_step_Locked(struct iris_vt_decoder *dec, VTDecodeFrameRef alloc_
 			    getpid(), dec->session_id, mode_flags, (unsigned long long)in_tag, annexb_len, ioctl_error);
 		}
 		CFRelease(pixbuf);
-		return kVTVideoDecoderBadDataErr;
+		return ioctl_error == EOPNOTSUPP ? kVTVideoDecoderUnsupportedDataFormatErr : kVTVideoDecoderBadDataErr;
 	}
 
 	bool decoded = (req.flags & IRIS_FRAME_DECODED) != 0;
