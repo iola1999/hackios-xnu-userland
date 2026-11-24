@@ -778,44 +778,7 @@ unpack_line(const struct annibale_camera_frame *f, const uint8_t *raw, int y, in
 	}
 }
 
-/* one line (y) at full size as 8-bit R, G, B, from the lines y - 1, y, y + 1 (l[0..2]) */
-static void
-full_line(const struct isp *isp, const struct annibale_camera_frame *f, const int *const l[3], uint32_t y, const int colour[4],
-    const struct pipe *p, uint8_t *rgb)
-{
-	int w = (int)f->width;
-	float v_pos = f->height > 1 ? (float)y / (f->height - 1) : 0, gains[3] = { 1, 1, 1 };
-
-	for (int x = 0; x < w; x++) {
-		float sum[3] = { 0, 0, 0 };
-		int n[3] = { 0, 0, 0 };
-
-		/* each colour: its own value where the site has it, else the mean of its sites in the 3x3 around */
-		for (int dy = -1; dy <= 1; dy++) {
-			const int *line = l[dy + 1];
-			int yy = (int)y + dy;
-
-			yy = yy < 0 ? 0 : yy >= (int)f->height ? (int)f->height - 1 : yy;
-			for (int dx = -1; dx <= 1; dx++) {
-				int xx = x + dx < 0 ? 0 : x + dx >= w ? w - 1 : x + dx;
-				int c = colour[(yy & 1) * 2 + (xx & 1)];
-
-				if (dx == 0 && dy == 0) {
-					sum[c] = (float)line[xx] * 64;          /* (its own value wins over the neighbours') */
-					n[c] = 64;
-				} else if (n[c] < 64) {
-					sum[c] += (float)line[xx];
-					n[c]++;
-				}
-			}
-		}
-		if (isp->lsc.on) {
-			lsc_at(isp, w > 1 ? (float)x / (w - 1) : 0, v_pos, gains);
-		}
-		pixel(isp, p, sum[0] / (n[0] ? n[0] : 1) * gains[0], sum[1] / (n[1] ? n[1] : 1) * gains[1],
-		    sum[2] / (n[2] ? n[2] : 1) * gains[2], rgb + 3 * x);
-	}
-}
+#include "camera_isp_demosaic.inc"
 
 void
 isp_render_full_nv12(const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, uint8_t *y, size_t y_stride,
