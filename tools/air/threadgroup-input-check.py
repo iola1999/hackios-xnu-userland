@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""Check which dynamic threadgroup inputs a specialized kernel requires."""
+"""Check dynamic threadgroup bindings and a shared pointer used under its defining condition."""
+import re
+import subprocess
 import tempfile
+from pathlib import Path
 
-from argbufcheck import assemble, interface_of
+from argbufcheck import AIR2NIR, AIR_RUN, assemble, interface_of
 
 
 with tempfile.TemporaryDirectory() as work:
@@ -32,3 +35,25 @@ define void @test(ptr addrspace(3) %scratch) {{
         if error or slots != expected:
             raise SystemExit(f"active={active}: expected {expected}, got {slots}, error={error}")
 print("PASS: only the active dynamic threadgroup input needs a binding")
+
+with tempfile.TemporaryDirectory() as work:
+    source = Path(__file__).with_name("guarded-shared-phi.ll").read_text()
+    bitcode, error = assemble(work, "guarded", source)
+    if error:
+        raise SystemExit(error)
+    for mode, expected in [(0, 83), (1, 151)]:
+        patch = f"0@4={mode.to_bytes(4, 'little').hex()}"
+        run = subprocess.run([AIR_RUN, "--block", "1,1,1", "--zero", "--buffer", patch, bitcode],
+                             capture_output=True, text=True)
+        if run.returncode or not re.search(rf"^  \[ *0\] +{expected}  0x", run.stdout, re.M):
+            raise SystemExit(f"mode {mode}: expected {expected} in word 0\n{run.stdout}{run.stderr}")
+
+    unguarded = source.replace("br i1 %cond, label %use0, label %other",
+                               "br i1 %cond, label %other, label %use0")
+    bitcode, error = assemble(work, "unguarded", unguarded)
+    if error:
+        raise SystemExit(error)
+    run = subprocess.run([AIR2NIR, bitcode], capture_output=True, text=True)
+    if not run.returncode or "different resource" not in run.stderr:
+        raise SystemExit(f"unguarded pointer: expected translation to fail\n{run.stdout}{run.stderr}")
+print("PASS: shared pointer reads return 83 and 151 on the two defined paths")

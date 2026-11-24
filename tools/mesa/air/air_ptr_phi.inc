@@ -141,6 +141,116 @@ phi_find_place_and_offset(struct air_ctx *c, const struct air_ptr_phi_reg *r,
    return false;
 }
 
+/* A conditional can leave a threadgroup pointer undefined on one incoming edge.
+ * Use the defined offset only if the same branch condition excludes every use
+ * of the pointer on the undefined edge. */
+static const struct air_inst *
+block_terminator(const struct air_block *block)
+{
+   return block->num_insts ? block->insts[block->num_insts - 1] : NULL;
+}
+
+static bool
+opposite_predicate(const struct air_value *a, const struct air_value *b)
+{
+   if (a->kind != AIR_VALUE_INSTRUCTION || b->kind != AIR_VALUE_INSTRUCTION)
+      return false;
+   const struct air_inst *x = (const struct air_inst *)a, *y = (const struct air_inst *)b;
+   return x->op == AIR_OP_CMP && y->op == AIR_OP_CMP &&
+          ((x->sub == AIR_ICMP_EQ && y->sub == AIR_ICMP_NE) ||
+           (x->sub == AIR_ICMP_NE && y->sub == AIR_ICMP_EQ)) &&
+          x->operands[0] == y->operands[0] && x->operands[1] == y->operands[1];
+}
+
+static bool
+resolve_guarded_shared_phi(struct air_ctx *c, const struct air_inst *phi)
+{
+   if (phi->num_operands != 2)
+      return false;
+   unsigned u = 0;
+   const struct air_constant *undef = air_value_as_constant(phi->operands[u]);
+   if (!undef || undef->ckind != AIR_CONST_UNDEF) {
+      u = 1;
+      undef = air_value_as_constant(phi->operands[u]);
+   }
+   if (!undef || undef->ckind != AIR_CONST_UNDEF)
+      return false;
+   const struct hash_entry *e = _mesa_hash_table_search(c->values, phi->operands[1 - u]);
+   const struct air_val *defined = e ? e->data : NULL;
+   if (!defined || defined->kind != AIR_VAL_PTR || defined->ptr.class != AIR_PTR_SHARED)
+      return false;
+
+   /* Both incoming arms must be entered exclusively from the same conditional. */
+   const struct air_block *missing = phi->targets[u], *present = phi->targets[1 - u];
+   if (!missing || !present || missing == present || missing->index == 0 || present->index == 0)
+      return false;
+   const struct air_inst *branch = NULL;
+   for (unsigned i = 0; i < c->fn->num_blocks; i++) {
+      const struct air_inst *t = block_terminator(&c->fn->blocks[i]);
+      if (!t)
+         return false;
+      for (unsigned k = 0; k < t->num_targets; k++) {
+         if (t->targets[k] != missing && t->targets[k] != present)
+            continue;
+         if (t->op != AIR_OP_BR || t->num_targets != 2 ||
+             !((t->targets[0] == missing && t->targets[1] == present) ||
+               (t->targets[0] == present && t->targets[1] == missing)) ||
+             (branch && branch != t))
+            return false;
+         branch = t;
+      }
+   }
+   if (!branch)
+      return false;
+   const struct air_value *cond = branch->operands[0];
+   const struct air_inst *cmp = cond->kind == AIR_VALUE_INSTRUCTION &&
+      ((const struct air_inst *)cond)->op == AIR_OP_CMP ? (const struct air_inst *)cond : NULL;
+   unsigned missing_arm = branch->targets[0] == missing ? 0 : 1;
+   bool *seen = rzalloc_array(c->mem_ctx, bool, c->fn->num_blocks);
+   const struct air_block **todo = ralloc_array(c->mem_ctx, const struct air_block *, c->fn->num_blocks);
+   unsigned n = 0;
+   todo[n++] = phi->parent;
+   seen[phi->parent->index] = true;
+   while (n) {
+      const struct air_block *blk = todo[--n];
+      if (blk == branch->parent)
+         return false;
+      for (unsigned j = 0; j < blk->num_insts; j++) {
+         const struct air_inst *ins = blk->insts[j];
+         if (&ins->base == cond || (cmp && (&ins->base == cmp->operands[0] || &ins->base == cmp->operands[1])))
+            return false;
+         for (unsigned k = 0; k < ins->num_operands; k++)
+            if (ins->operands[k] == &phi->base)
+               return false;
+      }
+      const struct air_inst *t = block_terminator(blk);
+      for (unsigned k = 0; k < t->num_targets; k++) {
+         if (t->op == AIR_OP_BR && t->num_targets == 2 &&
+             ((t->operands[0] == cond && k != missing_arm) ||
+              (opposite_predicate(t->operands[0], cond) && k == missing_arm)))
+            continue;
+         const struct air_block *to = t->targets[k];
+         if (!seen[to->index]) {
+            seen[to->index] = true;
+            todo[n++] = to;
+         }
+      }
+   }
+
+   struct hash_entry *ce = _mesa_hash_table_search(c->phi_cursors, present);
+   if (!ce)
+      return false;
+   nir_builder entry = nir_builder_at(nir_before_impl(c->b.impl));
+   nir_def *reg = nir_decl_reg(&entry, 1, 32, 0);
+   nir_builder edge = nir_builder_at(*(nir_cursor *)ce->data);
+   nir_store_reg(&edge, defined->ptr.offset ? defined->ptr.offset : nir_imm_int(&edge, 0), reg);
+   *(nir_cursor *)ce->data = edge.cursor;
+   struct air_ptr p = defined->ptr;
+   p.offset = nir_load_reg(&c->b, reg);
+   air_set(c, &phi->base, air_val_ptr(c, p));
+   return true;
+}
+
 /* A phi of POINTERS, resolved rather than carried in a register.
  *
  * A pointer here is *(which resource, which byte offset)* decided while
@@ -165,7 +275,7 @@ phi_find_place_and_offset(struct air_ctx *c, const struct air_ptr_phi_reg *r,
 static bool
 resolve_pointer_phi(struct air_ctx *c, const struct air_inst *in, const bool *reachable)
 {
-   if (resolve_texture_phi(c, in, reachable))
+   if (resolve_guarded_shared_phi(c, in) || resolve_texture_phi(c, in, reachable))
       return true;
 
    struct air_val *first = NULL;
