@@ -396,12 +396,12 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       NIR_PASS(_, c.nir, nir_opt_dce);
    }
 
-   /* Stitching copy/load helpers use addressable temporaries. All callees are
-    * now inlined, so Mesa can promote that scratch to ordinary local values. */
-   if (kernel) {
+   if (kernel)
       NIR_PASS(_, c.nir, nir_lower_returns);
+   /* After inlining, fragment-local arrays and stitching temporaries belong
+    * to a single function. Expose their accesses to Mesa's SSA optimizations. */
+   if (kernel || stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, c.nir, nir_lower_scratch_to_var);
-   }
    if (c.imageblock_dim_var) {
       NIR_PASS(_, c.nir, nir_lower_global_vars_to_local);
       NIR_PASS(_, c.nir, nir_lower_vars_to_ssa);
