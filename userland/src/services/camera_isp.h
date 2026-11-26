@@ -15,7 +15,7 @@
 #include "annibale_camera.h"
 
 struct isp_stats {
-	double          mean[3];        /* R, G, B above black, in 10-bit steps */
+	double          mean[3];        /* input R, G, B above black before lens shading and white balance, in 10-bit steps */
 	/* lens-shaded, as the picture will have it: */
 	double          key;            /* green's log average, a cell near black counted as near black (24) */
 	double          bright;         /* the level that 1 % of the cells' brightest colour (white balanced) is above */
@@ -75,7 +75,9 @@ struct isp {
 	float           digital;        /* more gain, for what AE cannot reach with the sensor's */
 	float           bias;           /* AE's target times this: the exposure bias asked for (2^EV) */
 	float           zoom;           /* the picture is the middle 1/zoom of the sensor each way (1: the whole of it) */
-	bool            turned;         /* the picture turned half round (a sensor mounted the other way up) */
+	bool            turned;         /* the picture turned half round: the test rigging's fallback (camera_device_orient.inc); normally
+	                                 * false -- the frames go out in the sensor's own orientation, righting them is the
+	                                 * capture pipeline's */
 	float           ccm[3][3];      /* the colour matrix, camera RGB (white balanced) to linear sRGB; rows sum to 1 */
 	struct isp_lsc  lsc;
 	float           drc;            /* the tone curve's gain at black (isp_ae(): 1 to 2) */

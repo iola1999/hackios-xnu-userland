@@ -98,3 +98,37 @@ af_window(struct stream *s, CFTypeRef value)
 	s->af_window[2] = (float)x1;
 	s->af_window[3] = (float)y1;
 }
+
+/*
+ * The FocusNow command id echoed in the frames' metadata. CMCapture latches the last frame id
+ * that reads as a positive int32 into its most-recent-valid-command slot (a signed >= 1 test;
+ * afstatus-semantics.md §3), so the frames carry the command's id while its search is
+ * outstanding and the idle sentinel otherwise: int32 -559038737, bit pattern 0xDEADBEEF, which
+ * that signed test sorts out of the valid ids. When the native pipeline switches a completed
+ * command back to the sentinel is not traced (§7); here the echo ends once the search the
+ * command asked for has been seen in AF_SEARCH/AF_SETTLE and left it -- the AF_STEADY frames
+ * before the search starts are the command's, not its end.
+ */
+#define FOCUS_CMDID_IDLE    (-559038737)    /* the idle echo as an int32: bit pattern 0xDEADBEEF */
+
+struct focus_cmdid_echo {
+	int64_t         id;             /* the command being answered, 0 once its search is done */
+	bool            search_seen;    /* its search has run: a pre-search frame is not its end */
+};
+
+/* `arrived` is the command newly taken from the stream's mailbox this frame, 0 when none. */
+static int64_t
+focus_cmdid_echo_frame(struct focus_cmdid_echo *echo, int64_t arrived, bool searching)
+{
+	if (arrived != 0) {
+		echo->id = arrived;
+		echo->search_seen = false;
+	}
+	if (searching) {
+		echo->search_seen = true;
+	} else if (echo->search_seen) {
+		echo->id = 0;
+		echo->search_seen = false;
+	}
+	return echo->id;
+}

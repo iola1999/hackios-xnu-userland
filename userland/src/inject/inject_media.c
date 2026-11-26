@@ -44,6 +44,9 @@ extern uint32_t IOSurfaceGetID(IOSurfaceRef buffer);
 extern int IOSurfaceLock(IOSurfaceRef buffer, uint32_t options, uint32_t *seed);
 extern void *IOSurfaceGetBaseAddress(IOSurfaceRef buffer);
 extern void *IOSurfaceGetBaseAddressOfPlane(IOSurfaceRef buffer, size_t plane);
+extern size_t IOSurfaceGetWidth(IOSurfaceRef buffer);
+extern size_t IOSurfaceGetHeight(IOSurfaceRef buffer);
+extern size_t IOSurfaceGetAllocSize(IOSurfaceRef buffer);
 
 /* ---- CPU reads of an IOSurface wait for pending GPU writes ---------------------------------------
  *
@@ -127,6 +130,20 @@ wait_pending_writes(IOSurfaceRef sf, const char *how)
 	}
 }
 
+static void
+fourcc_text(uint32_t value, char text[5])
+{
+	if (value == 0) {
+		memcpy(text, "----", 5);
+		return;
+	}
+	for (unsigned i = 0; i < 4; i++) {
+		unsigned char c = (unsigned char)(value >> (24 - i * 8));
+		text[i] = c >= 0x20 && c <= 0x7e ? (char)c : '?';
+	}
+	text[4] = '\0';
+}
+
 static CVReturn
 watched_CVPixelBufferLockBaseAddress(CVPixelBufferRef pixelBuffer, CVOptionFlags lockFlags)
 {
@@ -201,6 +218,8 @@ extern const void *_dyld_get_shared_cache_range(size_t *length);
 #define CACHE_BASE 0x180000000UL                /* where the cache was built to be, before the slide */
 
 static uintptr_t slide;
+
+#include "inject_media_mg.inc"
 
 /* +[BWCoreImageFilterRenderer prewarmPortraitFilterVersion:semanticStyleFilters:] */
 static void
@@ -463,6 +482,48 @@ is_node(id node, const char *name)
 	return node != nil && strcmp(object_getClassName(node), name) == 0;
 }
 
+static void
+emit_image_format(id node, CVImageBufferRef img, unsigned surf, unsigned seq)
+{
+	uint32_t fmt = 0;
+	char fmt_text[5] = "----";
+	size_t pc = 0, shown = 0, w[3] = { 0 }, h[3] = { 0 }, stride[3] = { 0 };
+	size_t ep_left = 0, ep_right = 0, ep_top = 0, ep_bottom = 0;
+	size_t sw = 0, sh = 0, alloc = 0;
+
+	if (img != NULL) {
+		fmt = CVPixelBufferGetPixelFormatType(img);
+		pc = CVPixelBufferGetPlaneCount(img);
+		shown = pc == 0 ? 1 : pc;
+		if (shown > 3) {
+			shown = 3;
+		}
+		for (size_t i = 0; i < shown; i++) {
+			if (pc == 0) {
+				w[i] = CVPixelBufferGetWidth(img);
+				h[i] = CVPixelBufferGetHeight(img);
+				stride[i] = CVPixelBufferGetBytesPerRow(img);
+			} else {
+				w[i] = CVPixelBufferGetWidthOfPlane(img, i);
+				h[i] = CVPixelBufferGetHeightOfPlane(img, i);
+				stride[i] = CVPixelBufferGetBytesPerRowOfPlane(img, i);
+			}
+		}
+		CVPixelBufferGetExtendedPixels(img, &ep_left, &ep_right, &ep_top, &ep_bottom);
+		IOSurfaceRef sf = CVPixelBufferGetIOSurface(img);
+		if (sf != NULL) {
+			sw = IOSurfaceGetWidth(sf);
+			sh = IOSurfaceGetHeight(sf);
+			alloc = IOSurfaceGetAllocSize(sf);
+		}
+		fourcc_text(fmt, fmt_text);
+	}
+	say("annibale: media: emitfmt %s img=%p fmt=%s/%08x pc=%zu p0=%zux%zur%zu p1=%zux%zur%zu p2=%zux%zur%zu more=%zu surf=%u sw=%zu sh=%zu alloc=%zu ep=%zu,%zu,%zu,%zu seq=%u\n",
+	    object_getClassName(node), img, fmt_text, fmt, pc,
+	    w[0], h[0], stride[0], w[1], h[1], stride[1], w[2], h[2], stride[2],
+	    pc > shown ? pc - shown : 0, surf, sw, sh, alloc, ep_left, ep_right, ep_top, ep_bottom, seq);
+}
+
 /*
  * How long a photograph's encoding took, from the picture handed to the photo encoder node to the one
  * it hands on (HEVC in software, see register_hevc_encoder below: the slowest step of a photograph).
@@ -507,10 +568,43 @@ time_photo_encoder(id output, CMSampleBufferRef sample_buffer)
  */
 static IMP original_emit_sample_buffer;
 static IMP original_emit_node_error;
+static IMP original_photo_encoder_render;
 static IMP original_ms_configure;
 static IMP original_ms_allocate_pools;
 static IMP original_ms_prepare;
 static IMP original_ms_start;
+
+/* The encoder input is downstream of every still-chain emit; a separate entry line shows whether
+ * the frame reached BWPhotoEncoderNode before the first node error. */
+static void
+photo_encoder_render(id self, SEL selector, CMSampleBufferRef sample_buffer, id input)
+{
+	static unsigned encinput_count;
+	CVImageBufferRef img = sample_buffer != NULL ? CMSampleBufferGetImageBuffer(sample_buffer) : NULL;
+	CMBlockBufferRef block = sample_buffer != NULL ? CMSampleBufferGetDataBuffer(sample_buffer) : NULL;
+	uint32_t fmt = img != NULL ? CVPixelBufferGetPixelFormatType(img) : 0;
+	char fmt_text[5] = "----";
+	unsigned surf = 0;
+
+	if (encinput_count < 32) {
+		encinput_count++;
+		if (img != NULL) {
+			IOSurfaceRef sf = CVPixelBufferGetIOSurface(img);
+			if (sf != NULL) {
+				surf = IOSurfaceGetID(sf);
+			}
+			fourcc_text(fmt, fmt_text);
+		}
+		say("annibale: media: encinput node=%p input=%p sbuf=%p img=%zux%zu@%p fmt=%s/%08x surf=%u blk=%zu seq=%u\n",
+		    self, input, sample_buffer,
+		    img != NULL ? CVPixelBufferGetWidth(img) : 0,
+		    img != NULL ? CVPixelBufferGetHeight(img) : 0, img,
+		    fmt_text, fmt, surf, block != NULL ? CMBlockBufferGetDataLength(block) : 0, encinput_count);
+	}
+	if (original_photo_encoder_render != NULL) {
+		((void (*)(id, SEL, CMSampleBufferRef, id))original_photo_encoder_render)(self, selector, sample_buffer, input);
+	}
+}
 
 static int
 ms_configure(id self, SEL selector, id *error)
@@ -559,7 +653,9 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 	}
 	id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
 	BOOL still = is_node(node, "BWStillImageCoordinatorNode") ||
-	    is_node(node, "BWPhotonicEngineNode") || is_node(node, "BWPhotoEncoderNode");
+	    is_node(node, "BWPhotonicEngineNode") || is_node(node, "BWStillImageFilterNode") ||
+	    is_node(node, "BWStillImageTurnstileNode") || is_node(node, "BWStillImageScalerNode") ||
+	    is_node(node, "BWPhotoEncoderNode");
 	CVImageBufferRef img = CMSampleBufferGetImageBuffer(sample_buffer);
 	/* The still graph's own contract: a node emits a buffer whose contents are complete.
 	 * On our driver the engine's GPU write can still be in flight here (first shot dark),
@@ -635,6 +731,7 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 			    img != NULL ? CVPixelBufferGetHeight(img) : 0, img,
 			    bb != NULL ? CMBlockBufferGetDataLength(bb) : 0,
 			    redeye, lum_ok, lum, surf, emit_trace_count);
+			emit_image_format(node, img, surf, emit_trace_count);
 		}
 	}
 	time_photo_encoder(self, sample_buffer);
@@ -644,20 +741,29 @@ emit_sample_buffer(id self, SEL selector, CMSampleBufferRef sample_buffer)
 static void
 emit_node_error(id self, __unused SEL selector, id nodeError)
 {
-	static unsigned err_trace_count;
+	id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
+	id connection = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("connection"));
+	id input = connection != nil ? ((id (*)(id, SEL))objc_msgSend)(connection, sel_registerName("input")) : nil;
+	SEL output_sel = sel_registerName("output");
+	BOOL has_output = connection != nil && ((BOOL (*)(id, SEL, SEL))objc_msgSend)(connection,
+	    sel_registerName("respondsToSelector:"), output_sel);
+	id output_end = has_output ? ((id (*)(id, SEL))objc_msgSend)(connection, output_sel) : self;
+	id out_node = output_end != nil ? ((id (*)(id, SEL))objc_msgSend)(output_end, sel_registerName("node")) : node;
+	id in_node = input != nil ? ((id (*)(id, SEL))objc_msgSend)(input, sel_registerName("node")) : nil;
+	int code = 0;
 
-	if (err_trace_count < 32) {
-		err_trace_count++;
-		id node = ((id (*)(id, SEL))objc_msgSend)(self, sel_registerName("node"));
-		int code = 0;
-		if (nodeError != nil &&
-		    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(nodeError, sel_registerName("respondsToSelector:"),
-		        sel_registerName("errorCode"))) {
-			code = ((int (*)(id, SEL))objc_msgSend)(nodeError, sel_registerName("errorCode"));
-		}
-		say("annibale: media: emitNodeError node=%s code=%d\n",
-		    node != nil ? object_getClassName(node) : "nil", code);
+	if (out_node == nil) {
+		out_node = node;
 	}
+	if (nodeError != nil &&
+	    ((BOOL (*)(id, SEL, SEL))objc_msgSend)(nodeError, sel_registerName("respondsToSelector:"),
+	        sel_registerName("errorCode"))) {
+		code = ((int (*)(id, SEL))objc_msgSend)(nodeError, sel_registerName("errorCode"));
+	}
+	say("annibale: media: emitNodeError node=%s err=%p code=%d dir=%s@%p->%s@%p out=%p conn=%p in=%p\n",
+	    node != nil ? object_getClassName(node) : "nil", nodeError, code,
+	    out_node != nil ? object_getClassName(out_node) : "nil", out_node,
+	    in_node != nil ? object_getClassName(in_node) : "nil", in_node, self, connection, input);
 	if (original_emit_node_error != NULL) {
 		((void (*)(id, SEL, id))original_emit_node_error)(self, selector, nodeError);
 	}
@@ -759,6 +865,8 @@ static struct replacement {
 	{ "BWGNRNode", "renderSampleBuffer:forInput:", 0x1a1ec83b8UL, (IMP)gnr_render, NULL, true, false },
 	{ "BWNodeOutput", "emitSampleBuffer:", 0x1a1ea37e0UL, (IMP)emit_sample_buffer, &original_emit_sample_buffer, true, false },
 	{ "BWNodeOutput", "emitNodeError:", 0UL, (IMP)emit_node_error, &original_emit_node_error, true, false },
+	{ "BWPhotoEncoderNode", "renderSampleBuffer:forInput:", 0UL, (IMP)photo_encoder_render,
+	  &original_photo_encoder_render, true, false },
 	{ "BWMultiStreamCameraSourceNode", "configure:", 0UL, (IMP)ms_configure, &original_ms_configure, true, false },
 	{ "BWMultiStreamCameraSourceNode", "allocateOrReuseBufferPoolsFromSourceNode:", 0UL, (IMP)ms_allocate_pools,
 	  &original_ms_allocate_pools, true, false },
@@ -982,6 +1090,7 @@ annibale_media_init(void)
 		(void)dlopen("/System/Library/PrivateFrameworks/CMCapture.framework/CMCapture", RTLD_LAZY | RTLD_GLOBAL);
 		align_cmcapture_compression_caps();
 	}
+	front_cam_rotation_watch_start();
 	{
 		Dl_info info;
 		char uuid_str[40] = "none", line[160];

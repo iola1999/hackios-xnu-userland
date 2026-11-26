@@ -518,6 +518,7 @@ own_tree(const char *path, int uid)
 }
 
 #include "init_mount.inc"
+#include "init_weights.inc"
 
 static int
 count_entries(const char *path)
@@ -1028,6 +1029,7 @@ main(int argc, char **argv, char **envp)
 		return 1;
 	}
 	restore_var();
+	bind_weights();
 	{
 		const char *selftest = boot_arg("init_selftest");
 		if (selftest != NULL && strcmp(selftest, "1") == 0) {

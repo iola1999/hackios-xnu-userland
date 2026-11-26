@@ -7,6 +7,7 @@
  * colour matrix and the lens shading can come from the camera's own tuning (isp_load_tuning(),
  * isp_tune()).
  */
+#include <arm_neon.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdlib.h>
@@ -498,6 +499,7 @@ struct cell_lines {
 	uint32_t first_cell, last_cell;
 	int32_t         cy[2];          /* which line each holds (-1: none) */
 	float           *rgb[2];        /* 3 floats a cell */
+	float           *vert;          /* the two blended top to bottom, once a line */
 };
 
 static void
@@ -589,19 +591,46 @@ render_line(const struct isp *isp, const struct annibale_camera_frame *f, const 
 		ty = fy < (float)cy0 ? 0 : fy - cy0;
 		const float *a = cells_of(isp, f, raw, cy0, r, b, lines, -1);
 		const float *c1 = cells_of(isp, f, raw, cy1, r, b, lines, (int32_t)cy0);
+		/*
+		 * The two cell lines are blended top to bottom once for the whole line, so each pixel's
+		 * colour is one lerp across cells instead of three. And since the colour matrix is a
+		 * linear map, a run of pixels between the same two cells (a `sample->left' that does not
+		 * change) shares one pair of line equations: out[c] = curve(m_c.A + m_c.D * tx), where
+		 * every pixel used to lerp twice and apply the matrix in full.
+		 */
+		float *vert = lines->vert;
+		uint32_t i0 = lines->first_cell * 3, n = (lines->last_cell - lines->first_cell + 1) * 3;
+		uint8_t *dst = rgb + (isp->turned ? 3 * (width - 1) : 0);
+		const int dstep = isp->turned ? -3 : 3;
 
-		for (uint32_t x = 0; x < width; x++) {
+		for (uint32_t i = 0; i < n; i++) {
+			vert[i] = a[i0 + i] + (c1[i0 + i] - a[i0 + i]) * ty;
+		}
+		for (uint32_t x = 0; x < width;) {
 			const struct x_sample *sample = &lines->horizontal[x];
-			uint32_t cx0 = sample->left, cx1 = sample->right;
-			float tx = sample->weight, c[3];
+			const float *v = vert + sample->left - i0;
+			uint32_t d = sample->right - sample->left, xe = x + 1;
+			float e[3], g[3];
 
-			for (int k = 0; k < 3; k++) {
-				float top = a[cx0 + k] + (a[cx1 + k] - a[cx0 + k]) * tx;
-				float bottom = c1[cx0 + k] + (c1[cx1 + k] - c1[cx0 + k]) * tx;
-
-				c[k] = top + (bottom - top) * ty;
+			while (xe < width && lines->horizontal[xe].left == sample->left) {
+				xe++;
 			}
-			pixel(isp, &p, c[0], c[1], c[2], rgb + 3 * (isp->turned ? width - 1 - x : x));
+			for (int c = 0; c < 3; c++) {
+				e[c] = p.m[c][0] * v[0] + p.m[c][1] * v[1] + p.m[c][2] * v[2];
+				g[c] = p.m[c][0] * (v[d] - v[0]) + p.m[c][1] * (v[d + 1] - v[1]) + p.m[c][2] * (v[d + 2] - v[2]);
+			}
+			float32x4_t ve = { e[0], e[1], e[2], 0 }, vg = { g[0], g[1], g[2], 0 };
+
+			for (; x < xe; x++, dst += dstep) {
+				float32x4_t colour = vfmaq_n_f32(ve, vg, lines->horizontal[x].weight);
+				int32x4_t at = vcvtq_s32_f32(vaddq_f32(colour, vdupq_n_f32(0.5f)));
+
+				at = vmaxq_s32(at, vdupq_n_s32(0));
+				at = vminq_s32(at, vdupq_n_s32(LUT_WHITE + 3));
+				dst[0] = isp->gamma[vgetq_lane_s32(at, 0)];
+				dst[1] = isp->gamma[vgetq_lane_s32(at, 1)];
+				dst[2] = isp->gamma[vgetq_lane_s32(at, 2)];
+			}
 		}
 		return;
 	}
@@ -633,7 +662,7 @@ thread_cell_lines(const struct isp *isp, const struct annibale_camera_frame *f, 
 	static __thread size_t capacity;
 	struct cell_lines lines = { .cy = { -1, -1 } };
 	size_t cells = f->width / 2, row_bytes = cells * 3 * sizeof(float);
-	size_t need = 2 * row_bytes + width * sizeof(struct x_sample);
+	size_t need = 3 * row_bytes + width * sizeof(struct x_sample);
 
 	crop(isp, f, width, height, &lines.x0, &lines.y0, &lines.cw, &lines.ch);
 	if (lines.cw >= width || lines.ch >= height)
@@ -648,6 +677,7 @@ thread_cell_lines(const struct isp *isp, const struct annibale_camera_frame *f, 
 	lines.horizontal = storage;
 	lines.rgb[0] = (float *)(lines.horizontal + width);
 	lines.rgb[1] = lines.rgb[0] + 3 * cells;
+	lines.vert = lines.rgb[1] + 3 * cells;
 	for (uint32_t x = 0; x < width; x++) {
 		float fx = lines.x0 + (x + 0.5f) * lines.cw / width - 0.5f;
 		uint32_t left = fx < 0 ? 0 : (uint32_t)fx;
@@ -681,12 +711,73 @@ nv12_pair(const uint8_t *rgb0, const uint8_t *rgb1, uint32_t width, uint8_t *y0,
 	for (int l = 0; l < 2; l++) {
 		const uint8_t *p = l ? rgb1 : rgb0;
 		uint8_t *out = l ? y1 : y0;
+		uint32_t x = 0;
 
-		for (uint32_t x = 0; out != NULL && x < width; x++, p += 3) {
+		for (; out != NULL && x + 16 <= width; x += 16, p += 48) {
+			uint8x16x3_t rgbv = vld3q_u8(p);
+			uint8x8_t y8[2];
+
+			for (int h = 0; h < 2; h++) {
+				uint16x8_t r16 = vmovl_u8(h ? vget_high_u8(rgbv.val[0]) : vget_low_u8(rgbv.val[0]));
+				uint16x8_t g16 = vmovl_u8(h ? vget_high_u8(rgbv.val[1]) : vget_low_u8(rgbv.val[1]));
+				uint16x8_t b16 = vmovl_u8(h ? vget_high_u8(rgbv.val[2]) : vget_low_u8(rgbv.val[2]));
+				uint32x4_t a0 = vmull_u16(vget_low_u16(r16), vdup_n_u16(k[0]));
+				uint32x4_t a1 = vmull_u16(vget_high_u16(r16), vdup_n_u16(k[0]));
+
+				a0 = vmlal_u16(a0, vget_low_u16(g16), vdup_n_u16(k[1]));
+				a1 = vmlal_u16(a1, vget_high_u16(g16), vdup_n_u16(k[1]));
+				a0 = vmlal_u16(a0, vget_low_u16(b16), vdup_n_u16(k[2]));
+				a1 = vmlal_u16(a1, vget_high_u16(b16), vdup_n_u16(k[2]));
+				y8[h] = vmovn_u16(vcombine_u16(
+				    vmovn_u32(vshrq_n_u32(vaddq_u32(a0, vdupq_n_u32(oy)), 16)),
+				    vmovn_u32(vshrq_n_u32(vaddq_u32(a1, vdupq_n_u32(oy)), 16))));
+			}
+			vst1q_u8(out + x, vcombine_u8(y8[0], y8[1]));
+		}
+		for (; out != NULL && x < width; x++, p += 3) {
 			out[x] = (uint8_t)((k[0] * p[0] + k[1] * p[1] + k[2] * p[2] + oy) >> 16);
 		}
 	}
-	for (uint32_t x = 0; x < width; x += 2) {
+	uint32_t x = 0;
+	for (; x + 16 <= width; x += 16) {
+		uint8x16x3_t a = vld3q_u8(rgb0 + 3 * x), b = vld3q_u8(rgb1 + 3 * x);
+		uint16x8_t R = vpaddq_u16(vaddl_u8(vget_low_u8(a.val[0]), vget_low_u8(b.val[0])),
+		    vaddl_u8(vget_high_u8(a.val[0]), vget_high_u8(b.val[0])));
+		uint16x8_t G = vpaddq_u16(vaddl_u8(vget_low_u8(a.val[1]), vget_low_u8(b.val[1])),
+		    vaddl_u8(vget_high_u8(a.val[1]), vget_high_u8(b.val[1])));
+		uint16x8_t B = vpaddq_u16(vaddl_u8(vget_low_u8(a.val[2]), vget_low_u8(b.val[2])),
+		    vaddl_u8(vget_high_u8(a.val[2]), vget_high_u8(b.val[2])));
+		int16x4_t cb16[2], cr16[2];
+
+		for (int h = 0; h < 2; h++) {
+			uint16x4_t rh = h ? vget_high_u16(R) : vget_low_u16(R);
+			uint16x4_t gh = h ? vget_high_u16(G) : vget_low_u16(G);
+			uint16x4_t bh = h ? vget_high_u16(B) : vget_low_u16(B);
+			/*
+			 * The negative coefficients subtract (the widening multiplies are unsigned): the
+			 * rounding offset first, the positive terms added, the rest taken away. The offset
+			 * alone is larger than what the subtractions can take, so the running sum stays
+			 * above zero as the plain arithmetic's would.
+			 */
+			uint32x4_t cb = vdupq_n_u32((128 << 18) + (1 << 17) - 1);
+			uint32x4_t cr = vdupq_n_u32((128 << 18) + (1 << 17) - 1);
+
+			cb = vmlal_u16(cb, bh, vdup_n_u16(k[5]));
+			cr = vmlal_u16(cr, rh, vdup_n_u16(k[6]));
+			cb = vmlsl_u16(cb, rh, vdup_n_u16((uint16_t)-k[3]));
+			cb = vmlsl_u16(cb, gh, vdup_n_u16((uint16_t)-k[4]));
+			cr = vmlsl_u16(cr, gh, vdup_n_u16((uint16_t)-k[7]));
+			cr = vmlsl_u16(cr, bh, vdup_n_u16((uint16_t)-k[8]));
+			cb16[h] = vqmovn_s32(vshrq_n_s32(vreinterpretq_s32_u32(cb), 18));
+			cr16[h] = vqmovn_s32(vshrq_n_s32(vreinterpretq_s32_u32(cr), 18));
+		}
+		uint8x8x2_t pair;
+
+		pair.val[0] = vqmovun_s16(vcombine_s16(cb16[0], cb16[1]));
+		pair.val[1] = vqmovun_s16(vcombine_s16(cr16[0], cr16[1]));
+		vst2_u8(uv + x, pair);
+	}
+	for (; x < width; x += 2) {
 		uint32_t x1 = x + 1 < width ? x + 1 : x;
 		int32_t R = rgb0[3 * x] + rgb0[3 * x1] + rgb1[3 * x] + rgb1[3 * x1];
 		int32_t G = rgb0[3 * x + 1] + rgb0[3 * x1 + 1] + rgb1[3 * x + 1] + rgb1[3 * x1 + 1];

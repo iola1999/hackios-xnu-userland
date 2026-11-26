@@ -33,6 +33,7 @@ __pycache__/
 !/userland/build.sh
 !/userland/*.py
 !/userland/rc.*
+!/userland/weights.list
 !/userland/jobs/
 !/userland/com.annibale.*.plist
 !/userland/src/

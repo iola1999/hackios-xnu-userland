@@ -270,7 +270,9 @@ set_accessibility(const char *argument, const char *setter)
  * SpringBoard main thread RunLoop stall watcher (adapted for arm64e with touch_lat=1).
  * When a turn takes >25 ms, stall_watch wakes up, suspends the main thread,
  * walks up to 14 frames, strips arm64e PAC from lr using ptrauth_strip,
- * resolves symbols with dladdr(), and logs via kern.annibale.say.
+ * resolves symbols with dladdr(), and logs via kern.annibale.say. Every frame prints
+ * image+offset first so the line resolves offline against the shared cache; the dladdr
+ * symbol name, when a real one is near, follows in parentheses.
  */
 static volatile uint64_t turn_began;
 static uintptr_t main_stack_top, main_stack_bottom;
@@ -329,9 +331,21 @@ stall_say(thread_t thread, uint64_t ms)
         if (dladdr((void *)pcs[i], &info) != 0 && info.dli_fname != NULL) {
             const char *image = strrchr(info.dli_fname, '/');
 
-            at += info.dli_sname != NULL && pcs[i] - (uintptr_t)info.dli_saddr < 0x4000 ?
-                snprintf(line + at, sizeof(line) - at, " %s", info.dli_sname) :
-                snprintf(line + at, sizeof(line) - at, " %s+%#lx", image != NULL ? image + 1 : info.dli_fname, pcs[i] - (uintptr_t)info.dli_fbase);
+            /*
+             * image+offset leads every frame: it is independent of the shared cache slide and
+             * resolves offline against the cache files. The dladdr name is only a supplement,
+             * and the cache symbol table's own "<redacted>" entries carry nothing the offset
+             * does not, so they are left out. With two writes in one iteration the second has
+             * to be skipped once the first filled the line, or at would index past the buffer.
+             */
+            at += snprintf(line + at, sizeof(line) - at, " %s+%#lx",
+                image != NULL ? image + 1 : info.dli_fname, pcs[i] - (uintptr_t)info.dli_fbase);
+            if (at < (int)sizeof(line) && info.dli_sname != NULL &&
+                strcmp(info.dli_sname, "<redacted>") != 0 &&
+                pcs[i] - (uintptr_t)info.dli_saddr < 0x4000) {
+                at += snprintf(line + at, sizeof(line) - at, "(%s+%#lx)", info.dli_sname,
+                    pcs[i] - (uintptr_t)info.dli_saddr);
+            }
         } else {
             at += snprintf(line + at, sizeof(line) - at, " %#lx", pcs[i]);
         }
@@ -345,8 +359,15 @@ stall_watch(void *argument)
     thread_t main_thread = (thread_t)(uintptr_t)argument;
     uint64_t said_turn = 0, next_ms = 25;
 
+    /*
+     * A sample at 25 ms into a turn, then one every 15 ms. The 5 ms wakeups put the real
+     * spacing at 15..20 ms (a wakeup lands within 5 ms of the threshold), so a 140 ms turn
+     * yields 6..8 samples where the 50 ms spacing yielded 2. Each sample holds the main
+     * thread only for the state read and the frame walk; the dladdr formatting and the say
+     * run after thread_resume, on this thread.
+     */
     for (;;) {
-        usleep(10000);
+        usleep(5000);
         uint64_t began = turn_began;
         if (began == 0) {
             continue;
@@ -359,7 +380,7 @@ stall_watch(void *argument)
         }
         if (ms >= next_ms && ms < 2000) {
             stall_say(main_thread, ms);
-            next_ms = ms + 50;
+            next_ms = ms + 15;
         }
     }
     return NULL;

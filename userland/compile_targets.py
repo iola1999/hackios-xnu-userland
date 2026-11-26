@@ -215,7 +215,7 @@ TARGETS = [
         "type": "dylib",
         "install_name": "/annibale/lib/libannibale-media.dylib",
         "sources": ["src/inject/inject_media.c", "src/services/camera_device.c", "src/services/camera_isp.c"],
-        "flags": ["-O2", "-framework", "CoreFoundation", "-framework", "CoreMedia", "-framework", "CoreVideo", "-framework", "IOSurface", "-lobjc"],
+        "flags": ["-O2", "-framework", "CoreFoundation", "-framework", "CoreMedia", "-framework", "CoreVideo", "-framework", "IOSurface", "-lobjc", "-lMobileGestalt"],
     },
     {
         "name": "libannibale-vt.dylib",

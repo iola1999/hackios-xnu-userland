@@ -277,6 +277,7 @@ for line in Path('root/etc/inject.conf').read_text().splitlines():
         raise SystemExit('build.sh: input26-service conflicts with libannibale.dylib in backboardd')
 PYINPUT
 
+	cp weights.list root/etc/weights.list
 	cp $IOS/var.skel root/etc/var.skel
 	zone=$( { timedatectl show -p Timezone --value 2>/dev/null || readlink /etc/localtime 2>/dev/null | sed -E 's|.*/zoneinfo/||'; } || true ); zone=${zone:-UTC}
 	tmp=$(mktemp) && sed -e 's|^l\t/usr/share/zoneinfo\t/private/var/db/timezone/zoneinfo$|l\t/usr/share/zoneinfo.default\t/private/var/db/timezone/zoneinfo|' \

@@ -40,6 +40,10 @@
  *                              as many lines as fit, then "cat end SIZE next AT" (fetch.py on the host)
  *   ls PATH                    the directory's entries: type, size, name
  *   rm PATH                    unlink(2)
+ *   mv FROM TO                 rename(2): pieces pulled into a short temporary path become the
+ *                              file's own name, however long (the pull command itself must fit
+ *                              in one 119-byte "oem sh" line, the mv need not -- it runs after
+ *                              the binary pushes and so may be staged through the inbox)
  *   mkdir [-p] PATH            mkdir(2), with -p each missing parent too
  *   chmod MODE PATH            chmod(2), MODE in octal
  * Anything else is a program: posix_spawnp with stdout and stderr read back, killed after
@@ -869,6 +873,13 @@ run(char *text)
 	if (strcmp(argv[0], "rm") == 0 && argc == 2) {
 		if (unlink(argv[1]) != 0) {
 			out("rm %s: %s", argv[1], strerror(errno));
+			return 1;
+		}
+		return 0;
+	}
+	if (strcmp(argv[0], "mv") == 0 && argc == 3) {
+		if (rename(argv[1], argv[2]) != 0) {
+			out("mv %s %s: %s", argv[1], argv[2], strerror(errno));
 			return 1;
 		}
 		return 0;

@@ -128,16 +128,18 @@ static CFStringRef port_front;          /* kFigCapturePortType_FrontFacingCamera
  * statistics of.
  */
 enum { MD_PORT, MD_PTS, MD_EXPOSURE, MD_AGC, MD_ISP_DGAIN, MD_FRAME_RATE, MD_ZOOM, MD_AFSTATUS, MD_AFLOCKED,
-    MD_FOCUSPOS, MD_FOCUSCMDID, MD_KEYS };
+    MD_FOCUSPOS, MD_FOCUSCMDID, MD_AFSTABLE, MD_FOCUSPEAKS, MD_KEYS };
 static const char *const md_names[MD_KEYS] = {
 	"kFigCaptureStreamMetadata_PortType", "kFigCaptureSampleBufferAttachmentKey_OriginalPresentationTimeStamp",
 	"kFigCaptureStreamMetadata_ExposureTime", "kFigCaptureStreamMetadata_AGC", "kFigCaptureStreamMetadata_ispDGain",
 	"kFigCaptureStreamMetadata_CurrentFrameRate", "kFigCaptureStreamMetadata_ZoomFactor",
 	"kFigCaptureStreamMetadata_AFStatus", "kFigCaptureStreamMetadata_AFLocked",
 	"kFigCaptureStreamMetadata_CurrentFocusPosition", "kFigCaptureStreamMetadata_FocusNowCommandID",
+	"kFigCaptureStreamMetadata_AFStable", "kFigCaptureStreamMetadata_FocusPeakSumArray",
 };
 static CFStringRef md_key[MD_KEYS];
 static CFStringRef md_attachment;       /* kFigCaptureSampleBufferAttachmentKey_MetadataDictionary */
+static CFArrayRef md_focus_peaks;       /* the zeros every frame's FocusPeakSumArray is (find_functions()); never released */
 
 static bool
 find_functions(void)
@@ -168,6 +170,30 @@ find_functions(void)
 		md_key[i] = port != NULL ? *port : NULL;
 		if (md_key[i] == NULL) {
 			say("%s is not there: the frames' metadata go without it", md_names[i]);
+		}
+	}
+	/*
+	 * FocusPeakSumArray's content: the peak sums of the focus windows, up to 16 of them read as
+	 * SInt64. The autofocus processor skips its whole FocusNow command confirmation without the
+	 * key, and a photograph's reference-frame choice wants it too (focuspeaksem-array.md). The
+	 * driver has no focus statistics to fill them with -- the frames come up as RAW, and which
+	 * window each element means is not reversed -- so they are zeros: constant from frame to frame,
+	 * where one measured sharpness copied into every window would tell the continuous focus'
+	 * retrigger statistics a made-up uniform scene (§8). The plugin's own watch of the scene
+	 * searches again without waiting for that retrigger.
+	 */
+	if (md_focus_peaks == NULL) {
+		int64_t zero = 0;
+		CFNumberRef z = CFNumberCreate(NULL, kCFNumberSInt64Type, &zero);
+
+		if (z != NULL) {
+			const void *peaks[16];
+
+			for (size_t i = 0; i < sizeof(peaks) / sizeof(peaks[0]); i++) {
+				peaks[i] = z;
+			}
+			md_focus_peaks = CFArrayCreate(NULL, peaks, (CFIndex)(sizeof(peaks) / sizeof(peaks[0])), &kCFTypeArrayCallBacks);
+			CFRelease(z);
 		}
 	}
 	if (md_attachment == NULL || md_key[MD_PORT] == NULL) {
@@ -395,11 +421,10 @@ colour_attachments(void)
 static const struct camera {
 	uint32_t        sensor;
 	const char      *name, *unique_id;
-	bool            turned;
 	double          field_of_view, pixel_size;
 } cameras[2] = {
-	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", false, 69.4, 1.008 },
-	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", true, 77.3, 0.702 },
+	{ 1, "Back Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:0", 69.4, 1.008 },
+	{ 2, "Front Camera", "com.apple.avfoundation.avcapturedevice.built-in_video:1", 77.3, 0.702 },
 };
 
 enum camera_stream_state {
@@ -437,17 +462,20 @@ struct stream {
 	 * CMCapture's sender (0x1aea2eb08) makes it of the EV, llroundf(exp2f(EV) * 256): 256 none.
 	 */
 	uint32_t        exposure_bias, said_bias;
+	int64_t         device_orientation;     /* the last DeviceOrientation set (0: none yet) */
+	int             exif_mode;      /* the rigging's: what the photographs' ExifOrientation is (camera_device_orient.inc) */
 	struct af_search af_search;
 	const struct camera *camera;
 	struct annibale_camera_profile profile;
 	CFStringRef     port;
 	bool            af_now;         /* a focus asked for (AutoFocusNow and the like): a search at the next frame */
 	bool            af_locked;      /* LockAFNow: no search but one asked for */
-	int64_t         focus_cmdid;    /* the command id a FocusNow collection carried, echoed back in frame metadata */
+	int64_t         focus_cmdid;    /* mailbox: the command id a FocusNow collection carried, until the worker takes it */
 	float           af_window[4];   /* AFWindowParams: where to focus, as fractions of the frame (x0, y0, x1, y1) */
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
 	pthread_t       worker;
+	dispatch_queue_t still_queue;     /* the photographs' renders, off the worker (still_enqueue/still_run) */
 	volatile int    state;
 	bool            worker_started;
 	int             torch;
@@ -628,7 +656,11 @@ stream_copy_property(CMBaseObjectRef o, CFStringRef key, CFAllocatorRef allocato
 
 		value = CFArrayCreate(NULL, (const void **)&srgb, 1, &kCFTypeArrayCallBacks);
 		CFRelease(srgb);
-	} else if (key_is(key, "ColorSpace") || key_is(key, "DeviceOrientation")) {
+	} else if (key_is(key, "DeviceOrientation")) {
+		pthread_mutex_lock(&s->lock);
+		value = number_i(s->device_orientation);
+		pthread_mutex_unlock(&s->lock);
+	} else if (key_is(key, "ColorSpace")) {
 		value = number_i(0);
 	} else if (key_is(key, "FlashMode")) {
 		pthread_mutex_lock(&s->lock);
@@ -712,6 +744,7 @@ dict_number(CFDictionaryRef d, const char *name, double otherwise)
 }
 
 #include "camera_device_focus.inc"
+#include "camera_device_orient.inc"
 
 static OSStatus
 stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
@@ -888,6 +921,10 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		say("stream: flash mode %s", fm == 1 ? "ForceFlashOn" : (fm == 2 ? "Auto" : "ForceFlashOff"));
 		return 0;
 	}
+	if (key_is(key, "DeviceOrientation")) {
+		device_orientation_set(s, value);
+		return 0;
+	}
 	if (key_is(key, "StillImageCaptureNow")) {
 		pthread_mutex_lock(&s->lock);
 		int fm = s->flash_mode;
@@ -956,30 +993,6 @@ stream_set_property(CMBaseObjectRef o, CFStringRef key, CFTypeRef value)
 		/* (the name only: the order of what comes, a tap's for one) */
 		say_value("stream: set (not used) again:", key, NULL);
 	}
-	return 0;
-}
-
-/* TorchLevel uses 0..1; /dev/annibale-torch accepts uint32_t thousandths. */
-static OSStatus
-torch_set(struct stream *s, CFTypeRef value)
-{
-	double level = 0;
-	uint32_t thousandths;
-
-	if (s->torch < 0) {
-		return ERR_NOT_AVAILABLE;
-	}
-	if (value == NULL || CFGetTypeID(value) != CFNumberGetTypeID() ||
-	    !CFNumberGetValue(value, kCFNumberDoubleType, &level) || !isfinite(level)) {
-		return ERR_PARAM;
-	}
-	level = level < 0 ? 0 : level > 1 ? 1 : level;
-	thousandths = (uint32_t)(level * 1000 + 0.5);
-	if (write(s->torch, &thousandths, sizeof(thousandths)) != (ssize_t)sizeof(thousandths)) {
-		say("the flashlight write failed at %u of 1000", thousandths);
-		return ERR_NOT_AVAILABLE;
-	}
-	say("the flashlight requested at %u of 1000", thousandths);
 	return 0;
 }
 

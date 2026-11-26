@@ -85,6 +85,30 @@ stream_gdc_rects(const struct stream *s)
 	return d;
 }
 
+/* TorchLevel uses 0..1; /dev/annibale-torch accepts uint32_t thousandths. */
+static OSStatus
+torch_set(struct stream *s, CFTypeRef value)
+{
+	double level = 0;
+	uint32_t thousandths;
+
+	if (s->torch < 0) {
+		return ERR_NOT_AVAILABLE;
+	}
+	if (value == NULL || CFGetTypeID(value) != CFNumberGetTypeID() ||
+	    !CFNumberGetValue(value, kCFNumberDoubleType, &level) || !isfinite(level)) {
+		return ERR_PARAM;
+	}
+	level = level < 0 ? 0 : level > 1 ? 1 : level;
+	thousandths = (uint32_t)(level * 1000 + 0.5);
+	if (write(s->torch, &thousandths, sizeof(thousandths)) != (ssize_t)sizeof(thousandths)) {
+		say("the flashlight write failed at %u of 1000", thousandths);
+		return ERR_NOT_AVAILABLE;
+	}
+	say("the flashlight requested at %u of 1000", thousandths);
+	return 0;
+}
+
 /* ---- the frames ------------------------------------------------------------------------------------- */
 
 struct render_job {
@@ -198,7 +222,7 @@ md_put(CFMutableDictionaryRef m, int key, CFTypeRef value)
 /* the frame's metadata, as H10ISP's stream gives them (see md_names) */
 static CFDictionaryRef
 frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, CFStringRef port, int af_status,
-    bool af_locked, unsigned focus_pos, int64_t focus_cmdid)
+    bool af_locked, bool af_stable, unsigned focus_pos, int64_t focus_cmdid)
 {
 	CFMutableDictionaryRef m;
 	if (md_attachment == NULL) {
@@ -223,52 +247,74 @@ frame_metadata(const struct isp *isp, const struct annibale_camera_frame *f, CFS
 	 * and would make up the rest of what was asked for itself; without it, a zoomed preview stood still.
 	 */
 	md_put(m, MD_ZOOM, number_f(isp->zoom));
-	/* the AF state CMCapture watches to drive adjustingFocus and the still-image focus wait:
-	   1 while a search is moving the lens, 2 once settled (FigCapture afStatus) */
+	/*
+	 * The focus state as CMCapture consumes it (afstatus-semantics.md): AFStatus 2 while the lens
+	 * searches or settles on the peak, 4 parked and watching -- control-mode transitions wait on
+	 * ==2, frames weigh a quarter at ==2 and full at ==4, the stable-frame count goes on only at
+	 * ==4. AFStable is a CFBoolean, read with CFBooleanGetValue; it is also one of the keys the
+	 * autofocus processor requires present before it latches FocusNowCommandID. That id is the
+	 * command being answered, or the int32 idle sentinel (focus_cmdid_echo_frame()).
+	 */
 	if (af_status >= 0) {
 		md_put(m, MD_AFSTATUS, number_i(af_status));
 		md_put(m, MD_AFLOCKED, af_locked ? kCFBooleanTrue : kCFBooleanFalse);
+		md_put(m, MD_AFSTABLE, af_stable ? kCFBooleanTrue : kCFBooleanFalse);
 		md_put(m, MD_FOCUSPOS, number_i((int64_t)focus_pos));
-		if (focus_cmdid != 0) {
-			md_put(m, MD_FOCUSCMDID, number_i(focus_cmdid));
-		}
+		md_put(m, MD_FOCUSCMDID, focus_cmdid != 0 ? number_i(focus_cmdid) : number_i32(FOCUS_CMDID_IDLE));
 	}
+	/* wanted on every frame, a motor or not: the photograph's reference-frame choice reads it too */
+	md_put(m, MD_FOCUSPEAKS, md_focus_peaks != NULL ? CFRetain(md_focus_peaks) : NULL);
 	return m;
 }
 
-static void
-deliver(struct stream *s, struct output *out, const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw,
-    CFDictionaryRef metadata)
+struct shot_env {
+	float           lux, cct;
+	bool            redeye, flash_lit, torch;
+	int32_t         exif_orientation;       /* the photograph's ExifOrientation attachment (0: none written) */
+};
+
+static CVPixelBufferRef
+picture_buffer(struct output *out, uint32_t *pf, uint32_t *width, uint32_t *height)
 {
 	CVPixelBufferRef pb = output_buffer(out);
-	uint32_t pf, width, height;
 
-	(void)s;
 	if (pb == NULL) {
-		return;
+		return NULL;
 	}
-	pf = CVPixelBufferGetPixelFormatType(pb);
-	width = (uint32_t)CVPixelBufferGetWidth(pb);
-	height = (uint32_t)CVPixelBufferGetHeight(pb);
-	if (width == 0 || height == 0 ||
-	    (pf != PF_420F && pf != PF_420V && pf != PF_X420 && pf != PF_X422 && pf != PF_XF20 && pf != PF_BGRA)) {
+	*pf = CVPixelBufferGetPixelFormatType(pb);
+	*width = (uint32_t)CVPixelBufferGetWidth(pb);
+	*height = (uint32_t)CVPixelBufferGetHeight(pb);
+	if (*width == 0 || *height == 0 ||
+	    (*pf != PF_420F && *pf != PF_420V && *pf != PF_X420 && *pf != PF_X422 && *pf != PF_XF20 && *pf != PF_BGRA)) {
 		if (out->delivered == 0 && out->said_shape == false) {
 			out->said_shape = true;
-			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, width, height, pf >> 24, pf >> 16 & 255,
-			    pf >> 8 & 255, pf & 255);
+			say("%s: %ux%u %c%c%c%c buffers are not for this ISP", out->name, *width, *height, *pf >> 24,
+			    *pf >> 16 & 255, *pf >> 8 & 255, *pf & 255);
 		}
 		CVPixelBufferRelease(pb);
-		return;
+		return NULL;
 	}
-	CVPixelBufferLockBaseAddress(pb, 0);
+	return pb;
+}
 
-	bool is_still = strncmp(out->name, "StillImage", 10) == 0;
-	struct render_job job = { isp, f, raw, pb, pf, width, height, 8, is_still && pf != PF_BGRA };
-	uint64_t began = mach_absolute_time();
-
-	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+/*
+ * The picture into the buffer: the render in pieces on the interactive queue, the photograph's mean
+ * levels, and for the X formats the 8-to-16-bit expansion in place. A photograph's turn through this
+ * is ~110 ms (isp_render_still_nv12): it runs on the stills' queue (still_enqueue/still_run), and the
+ * worker that owes the next preview frame is not made to wait for it.
+ */
+static void
+render_picture(struct output *out, CVPixelBufferRef pb, uint32_t pf, uint32_t width, uint32_t height,
+    const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, bool still)
+{
+	struct render_job job = { isp, f, raw, pb, pf, width, height, 24, still && pf != PF_BGRA };
+	uint64_t began, applied, sampled, expanded;
 	double still_y = 0, still_cb = 0, still_cr = 0;
 
+	CVPixelBufferLockBaseAddress(pb, 0);
+	began = mach_absolute_time();
+	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	applied = mach_absolute_time();
 	if (job.still) {
 		/* (the picture as made, 8 bits a value, every 16th pixel each way: what the photograph starts from) */
 		const uint8_t *yp = CVPixelBufferGetBaseAddressOfPlane(pb, 0), *cp = CVPixelBufferGetBaseAddressOfPlane(pb, 1);
@@ -288,6 +334,7 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 			still_cr /= n;
 		}
 	}
+	sampled = mach_absolute_time();
 	if (pf == PF_X420 || pf == PF_X422 || pf == PF_XF20) {
 		uint8_t *y_base = CVPixelBufferGetBaseAddressOfPlane(pb, 0);
 		size_t y_stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
@@ -322,48 +369,81 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 			}
 		}
 	}
+	expanded = mach_absolute_time();
 	if (job.still) {
 		static mach_timebase_info_data_t tb;
 
 		if (tb.denom == 0) {
 			mach_timebase_info(&tb);
 		}
-		say("%s: %ux%u %c%c%c%c made of every pixel in %.0f ms; Y %.0f Cb %.0f Cr %.0f; exposure %u lines gain %.2fx, AE's tone curve %.2f",
+		double ms = (double)tb.numer / tb.denom / 1e6;
+
+		say("%s: %ux%u %c%c%c%c made of every pixel in %.0f ms (demosaic %.0f, means %.0f, 8-to-16 expansion %.0f; "
+		    "%u pieces on QOS_CLASS_USER_INTERACTIVE); Y %.0f Cb %.0f Cr %.0f; exposure %u lines gain %.2fx, AE's tone curve %.2f",
 		    out->name, width, height, pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255,
-		    (double)(mach_absolute_time() - began) * tb.numer / tb.denom / 1e6, still_y, still_cb, still_cr,
+		    (mach_absolute_time() - began) * ms, (applied - began) * ms, (sampled - applied) * ms, (expanded - sampled) * ms,
+		    job.pieces, still_y, still_cb, still_cr,
 		    f->exposure_lines, f->gain_unity ? (double)f->gain / f->gain_unity : 0, isp->drc);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
-	CVBufferSetAttachments(pb, colour_attachments(), kCVAttachmentMode_ShouldPropagate);
+}
 
-	if (metadata != NULL) {
-		CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(NULL, 0, metadata);
+static void
+attach_metadata(struct stream *s, struct output *out, CVPixelBufferRef pb, CFDictionaryRef metadata,
+    const struct isp *isp, const struct shot_env *env)
+{
+	CFMutableDictionaryRef m;
 
-		if (is_still) {
-			put(m, "SensorID", number_i32(s->camera->sensor == 1 ? 0x0904 : 0x0914));
-			put(m, "ExifOrientation", number_i32(6));
-			put(m, "AWBRGain", number_i32((int32_t)(isp->wb[0] * 4096.0f + 0.5f)));
-			put(m, "AWBGGain", number_i32(4096));
-			put(m, "AWBBGain", number_i32((int32_t)(isp->wb[2] * 4096.0f + 0.5f)));
-			if (s->last_lux >= 0 && isfinite(s->last_lux)) {
-				put(m, "LuxLevel", number_f(s->last_lux));
-			}
-			if (s->last_cct > 0 && isfinite(s->last_cct)) {
-				put(m, "CCT", number_f(s->last_cct));
-			}
-			if (s->still_redeye_wanted) {
-				put(m, "RedEyeAuxiliaryImage", CFRetain(kCFBooleanTrue));
-			}
-			if (s->torch >= 0) {
-				CFMutableDictionaryRef exif = (CFMutableDictionaryRef)new_dict();
-
-				put(exif, "Flash", number_i32(s->flash_lit ? 1 : 16));
-				put(m, "{Exif}", exif);
-			}
-		}
-		CVBufferSetAttachment(pb, md_attachment, m, kCVAttachmentMode_ShouldPropagate);
-		CFRelease(m);
+	if (metadata == NULL) {
+		return;
 	}
+	m = CFDictionaryCreateMutableCopy(NULL, 0, metadata);
+	if (strncmp(out->name, "StillImage", 10) == 0) {
+		put(m, "SensorID", number_i32(s->camera->sensor == 1 ? 0x0904 : 0x0914));
+		if (env->exif_orientation != 0) {
+			put(m, "ExifOrientation", number_i32(env->exif_orientation));
+		}
+		put(m, "AWBRGain", number_i32((int32_t)(isp->wb[0] * 4096.0f + 0.5f)));
+		put(m, "AWBGGain", number_i32(4096));
+		put(m, "AWBBGain", number_i32((int32_t)(isp->wb[2] * 4096.0f + 0.5f)));
+		if (env->lux >= 0 && isfinite(env->lux)) {
+			put(m, "LuxLevel", number_f(env->lux));
+		}
+		if (env->cct > 0 && isfinite(env->cct)) {
+			put(m, "CCT", number_f(env->cct));
+		}
+		if (env->redeye) {
+			put(m, "RedEyeAuxiliaryImage", CFRetain(kCFBooleanTrue));
+		}
+		if (env->torch) {
+			CFMutableDictionaryRef exif = (CFMutableDictionaryRef)new_dict();
+
+			put(exif, "Flash", number_i32(env->flash_lit ? 1 : 16));
+			put(m, "{Exif}", exif);
+		}
+	}
+	CVBufferSetAttachment(pb, md_attachment, m, kCVAttachmentMode_ShouldPropagate);
+	CFRelease(m);
+}
+
+static void
+deliver(struct stream *s, struct output *out, const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw,
+    CFDictionaryRef metadata)
+{
+	uint32_t pf, width, height;
+	CVPixelBufferRef pb = picture_buffer(out, &pf, &width, &height);
+	struct shot_env env;
+	bool is_still;
+
+	if (pb == NULL) {
+		return;
+	}
+	is_still = strncmp(out->name, "StillImage", 10) == 0;
+	render_picture(out, pb, pf, width, height, isp, f, raw, is_still);
+	CVBufferSetAttachments(pb, colour_attachments(), kCVAttachmentMode_ShouldPropagate);
+	env = (struct shot_env){ s->last_lux, s->last_cct, s->still_redeye_wanted, s->flash_lit, s->torch >= 0,
+	    still_exif_orientation(s) };
+	attach_metadata(s, out, pb, metadata, isp, &env);
 
 	CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
 
@@ -387,6 +467,133 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
 	if (out->delivered++ == 0) {
 		say("%s: the first picture given (%ux%u %c%c%c%c)", out->name, width, height, pf >> 24, pf >> 16 & 255,
 		    pf >> 8 & 255, pf & 255);
+	}
+}
+
+/*
+ * A photograph does not render on this worker: ~110 ms of every-pixel demosaic is ~130 ms of no
+ * preview frames on screen (the shutter-stall analysis in out/goal-1124/batch2/u21-shutter.md).
+ * The still outputs' frames go to the stills' serial queue instead -- each as a self-contained job:
+ * the frame's bytes, the ISP as this frame had it, the pool's buffer and the handler taken while the
+ * frame is here -- and the worker goes on to the next frame. The queue's order keeps the
+ * photographs' order; the render itself fans out on the interactive queue as the previews' does.
+ */
+struct still_job {
+	struct stream *s;
+	struct output *out;
+	void *          handler;        /* the block, kept for the queue's run of it */
+	CVPixelBufferRef pb;
+	CFDictionaryRef metadata;
+	struct isp      isp;            /* this frame's state; the tuning pointer is borrowed, not used */
+	struct shot_env env;            /* the frame's, for the photograph's own metadata */
+	uint32_t        pf, width, height;
+	uint64_t        enqueued;       /* when it went on the queue (mach_absolute_time): the wait before it renders */
+	uint8_t         frame[];        /* the frame and the RAW picture after it, copied */
+};
+
+static void
+still_free(struct still_job *j)
+{
+	CVPixelBufferRelease(j->pb);
+	if (j->handler != NULL) {
+		CFRelease(j->handler);
+	}
+	if (j->metadata != NULL) {
+		CFRelease(j->metadata);
+	}
+	free(j);
+}
+
+static void
+still_run(void *context)
+{
+	struct still_job *j = context;
+	struct stream *s = j->s;
+	const struct annibale_camera_frame *f = (const void *)j->frame;
+	const uint8_t *raw = j->frame + f->header_bytes;
+	static mach_timebase_info_data_t tb;
+	bool live;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	pthread_mutex_lock(&s->lock);
+	live = s->state == CAM_STREAM_ACTIVE;
+	pthread_mutex_unlock(&s->lock);
+	/*
+	 * A stopped stream drops the photographs queued but not begun; one already rendering finishes
+	 * and gives its buffer, as a frame mid-deliver() does. The handlers outlive the queue: the
+	 * worker's exit waits for what is queued before join returns.
+	 */
+	if (live) {
+		say("the %s's photograph of frame %llu begins rendering after %.0f ms in the queue", j->out->name, f->sequence,
+		    (double)(mach_absolute_time() - j->enqueued) * tb.numer / tb.denom / 1e6);
+		render_picture(j->out, j->pb, j->pf, j->width, j->height, &j->isp, f, raw, true);
+		CVBufferSetAttachments(j->pb, colour_attachments(), kCVAttachmentMode_ShouldPropagate);
+		attach_metadata(s, j->out, j->pb, j->metadata, &j->isp, &j->env);
+		pthread_mutex_lock(&s->lock);
+		live = s->state == CAM_STREAM_ACTIVE;
+		pthread_mutex_unlock(&s->lock);
+	}
+	if (live) {
+		CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
+		uint64_t hand = mach_absolute_time();
+
+		((pixel_buffer_handler)j->handler)(j->pb, pts);
+		double handler_ms = (double)(mach_absolute_time() - hand) * tb.numer / tb.denom / 1e6;
+
+		if (j->out->delivered++ == 0) {
+			say("%s: the first picture given (%ux%u %c%c%c%c)", j->out->name, j->width, j->height,
+			    j->pf >> 24, j->pf >> 16 & 255, j->pf >> 8 & 255, j->pf & 255);
+		}
+		pthread_mutex_lock(&s->lock);
+		say("the photograph is given (%llu so far): %.0f ms in the graph's handler",
+		    (unsigned long long)++s->stills_given, handler_ms);
+		pthread_mutex_unlock(&s->lock);
+	}
+	still_free(j);
+}
+
+/*
+ * A still output's frame is spent here only for the copying (~6 MB of RAW, single-digit ms); the
+ * render waits its turn on the queue. Called under s->lock, as the output loop around it is.
+ */
+static void
+still_enqueue(struct stream *s, struct output *out, const struct isp *isp, const uint8_t *frame,
+    uint32_t frame_bytes, CFDictionaryRef metadata)
+{
+	uint32_t pf, width, height;
+	CVPixelBufferRef pb = picture_buffer(out, &pf, &width, &height);
+	struct still_job *j;
+
+	if (pb == NULL) {
+		return;
+	}
+	j = malloc(sizeof(*j) + frame_bytes);
+	if (j == NULL) {
+		CVPixelBufferRelease(pb);
+		say("%s: no room for the photograph's frame: skipped", out->name);
+		return;
+	}
+	j->s = s;
+	j->out = out;
+	j->handler = out->handler != NULL ? (void *)CFRetain(out->handler) : NULL;
+	j->pb = pb;
+	j->metadata = metadata != NULL ? (CFDictionaryRef)CFRetain(metadata) : NULL;
+	j->isp = *isp;
+	j->isp.tuning = NULL;
+	j->env = (struct shot_env){ s->last_lux, s->last_cct, s->still_redeye_wanted, s->flash_lit, s->torch >= 0,
+	    still_exif_orientation(s) };
+	j->pf = pf;
+	j->width = width;
+	j->height = height;
+	memcpy(j->frame, frame, frame_bytes);
+	j->enqueued = mach_absolute_time();
+	if (s->still_queue != NULL) {
+		dispatch_async_f(s->still_queue, j, still_run);
+	} else {
+		say("%s: the stills' queue is not there: the photograph is skipped", out->name);
+		still_free(j);
 	}
 }
 
@@ -687,6 +894,7 @@ worker(void *context)
 	uint32_t tuned_for = ~0u;
 	float lux = -1, cct = -1;
 	struct af af = { 0 };
+	struct focus_cmdid_echo cmd_echo = { 0 };
 	int device = camera_native_open(s->camera->sensor, &profile);
 
 	pthread_setname_np("annibale-camera");
@@ -707,9 +915,26 @@ worker(void *context)
 	mach_timebase_info_data_t tb;
 	uint64_t got = 0, pace_from = 0, longest = 0, work = 0, rendering = 0;
 	uint32_t pace_frames = 0, skipped = 0, last_sequence = 0;
+	/* the shutter's window: a photograph asked for arms the frames' spacing one line a frame */
+	unsigned pace_armed = 0, wanted = 0;
 
 	mach_timebase_info(&tb);
 	isp_init(&isp);
+	/*
+	 * The rigging's orientation switches, once a stream start (camera_device_orient.inc): the front
+	 * camera's frames turned half round in the pixel domain as they used to be, against the
+	 * sensor-native delivery that leaves righting them to the pipeline.
+	 */
+	isp.turned = s->camera->sensor == 2 && orient_switch_on("ANNIBALE_FRONT_TURNED", "/private/var/tmp/annibale_front_turned");
+	if (isp.turned) {
+		say("stream: the front camera's frames turned half round here (the rigging's): the pipeline's correction comes on top");
+	}
+	s->exif_mode = orient_exif_mode();
+	if (s->exif_mode > 0) {
+		say("stream: the photographs' ExifOrientation fixed at %d (the rigging's)", s->exif_mode);
+	} else if (s->exif_mode < 0) {
+		say("stream: the photographs' ExifOrientation from the device orientation (the rigging's)");
+	}
 	while (s->state == CAM_STREAM_ACTIVE) {
 		uint64_t asked = mach_absolute_time();
 
@@ -735,6 +960,13 @@ worker(void *context)
 			/* (which side the time went to: the kernel's wait for the frame, or this loop's work) */
 			say("frame %llu came %.0f ms after the one before: %.0f ms of it waiting for it", f->sequence,
 			    (now - got) * (double)tb.numer / tb.denom / 1e6, (now - asked) * (double)tb.numer / tb.denom / 1e6);
+		}
+		if (pace_armed != 0 && got != 0) {
+			/* (the spacing exactly and only around a shutter: the 300 frames' longest cannot say where it was) */
+			pace_armed--;
+			say("frame %llu came %.1f ms after the one before: %.1f ms of it waiting for it, %.1f ms here",
+			    f->sequence, (now - got) * (double)tb.numer / tb.denom / 1e6,
+			    (now - asked) * (double)tb.numer / tb.denom / 1e6, (asked - got) * (double)tb.numer / tb.denom / 1e6);
 		}
 		if (last_sequence != 0 && f->sequence > last_sequence + 1) {
 			skipped += f->sequence - last_sequence - 1;
@@ -769,7 +1001,6 @@ worker(void *context)
 			isp_tune(&isp, lux, cct);
 		}
 		isp.zoom = s->zoom;
-		isp.turned = s->camera->turned;
 		pthread_mutex_lock(&s->lock);
 		isp.bias = s->exposure_bias / 256.0f;
 		pthread_mutex_unlock(&s->lock);
@@ -803,10 +1034,14 @@ worker(void *context)
 		int64_t focus_cmdid;
 		pthread_mutex_lock(&s->lock);
 		focus_cmdid = s->focus_cmdid;
+		s->focus_cmdid = 0;             /* (taken: the echo keeps it until its search is done) */
 		pthread_mutex_unlock(&s->lock);
-		int af_status = f->focus == ANNIBALE_CAMERA_NO_FOCUS ? -1 :
-		    (af.state == AF_SEARCH || af.state == AF_SETTLE ? 1 : 2);
-		CFDictionaryRef metadata = frame_metadata(&isp, f, s->port, af_status, af_locked, af.at, focus_cmdid);
+		bool af_searching = af.state == AF_SEARCH || af.state == AF_SETTLE;
+		int af_status = f->focus == ANNIBALE_CAMERA_NO_FOCUS ? -1 : (af_searching ? 2 : 4);
+		/* parked and the scene still what it was focused on: the frame is a stable focus result */
+		bool af_stable = af.state == AF_WATCH && af.unlike == 0;
+		focus_cmdid = focus_cmdid_echo_frame(&cmd_echo, focus_cmdid, af_searching);
+		CFDictionaryRef metadata = frame_metadata(&isp, f, s->port, af_status, af_locked, af_stable, af.at, focus_cmdid);
 
 		/*
 		 * Only once the graph has started the stream. Its PixelBufferHandler blocks hand the buffer
@@ -824,6 +1059,11 @@ worker(void *context)
 			pthread_mutex_unlock(&s->metadata_lock);
 		}
 		pthread_mutex_lock(&s->lock);
+		/* a rise is a shutter just asked for, read on the way in: a lone photograph is asked for and given within one pass */
+		if (s->stills_wanted > wanted) {
+			pace_armed = 15;        /* (~500 ms at 30 frames a second: both photographs' renders are inside) */
+		}
+		wanted = s->stills_wanted;
 		bool hold_still = false;
 		if (s->stills_wanted > 0 && !s->still_redeye_wanted && s->still_flash_wanted && s->torch >= 0) {
 			if (!s->flash_lit) {
@@ -864,9 +1104,11 @@ worker(void *context)
 			if (still && (s->stills_wanted == 0 || hold_still)) {
 				continue;
 			}
-			deliver(s, out, &isp, f, raw, metadata);
 			if (still) {
+				still_enqueue(s, out, &isp, buffer, (uint32_t)bytes, metadata);
 				gave_still = true;
+			} else {
+				deliver(s, out, &isp, f, raw, metadata);
 			}
 		}
 		mark[4] = mach_absolute_time();
@@ -884,7 +1126,6 @@ worker(void *context)
 				s->flash_lit = false;
 				s->still_flash_wanted = false;
 			}
-			say("the photograph is given (%llu so far)", (unsigned long long)++s->stills_given);
 		}
 		pthread_mutex_unlock(&s->lock);
 		if (metadata != NULL) {
@@ -909,9 +1150,17 @@ worker(void *context)
 			longest = work = rendering = 0;
 		}
 		if (s->frames == 1 || s->frames % 300 == 0) {
-			say("frame %llu: %ux%u RAW10, green %.0f above black; white balance R %.2f B %.2f",
-			    f->sequence, f->width, f->height, st.mean[1], isp.wb[0], isp.wb[2]);
+			say("frame %llu: %ux%u RAW10, input mean R %.0f G %.0f B %.0f above black; white balance R %.2f B %.2f",
+			    f->sequence, f->width, f->height, st.mean[0], st.mean[1], st.mean[2], isp.wb[0], isp.wb[2]);
 		}
+	}
+	/*
+	 * The stills' queue drains before the worker returns: a job's out, handler and stream are this
+	 * stream's to keep or release, and the caller's join is what lets stop/finalize go on. A job
+	 * not yet begun sees the stream's state and lets its frame go at once; one running finishes.
+	 */
+	if (s->still_queue != NULL) {
+		dispatch_sync(s->still_queue, ^{});
 	}
 	free(buffer);
 	isp_destroy(&isp);
@@ -1106,6 +1355,9 @@ stream_finalize(CMBaseObjectRef o)
 	if (s->metadata) {
 		CFRelease(s->metadata);
 	}
+	if (s->still_queue != NULL) {
+		dispatch_release(s->still_queue);
+	}
 	if (s->torch >= 0) {
 		close(s->torch);
 	}
@@ -1139,6 +1391,7 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
+	s->still_queue = dispatch_queue_create("annibale-camera-still", NULL);
 	s->torch = torch_fd;
 	s->zoom = 1;
 	s->exposure_bias = s->said_bias = 256;
