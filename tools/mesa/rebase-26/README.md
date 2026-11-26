@@ -31,6 +31,18 @@
 
 26. `0026-slab-push-time-detection.patch`：slab 自由链损坏机制的诊断轮（判定依据与探针设计见 `out/goal-1124/batch7/slab-corruption-mechanism.md` §6），叠在 0025 之后应用，不改变降级语义。release 构建下被 `NDEBUG` 编译掉的 slab 元素 magic 改为无条件写入与校验：`slab_free` 推入时 magic 非 ALLOCATED（第二次推入的犯罪现场）或自推（`pool->free == elt`）即打印元素头与池状态并 abort；`slab_alloc` 弹出时 magic 非 FREE 同样处理。`fd_ringbuffer_sp` 尾部加金丝雀字段，init 写入 `RINGLIVE`、destroy 校验后改写 `RINGDEAD`：金丝雀既非 LIVE 亦非 DEAD 证明野写进入 ring 对象，读到 DEAD 证明同一对象销毁两次，refcnt 非 0 证明引用计数失衡；三者均打印 ring 状态并 abort。accounting 顺序修正：先按 magic 做全元素普查算出 live 数，再遍历三条链交叉核对，遍历逐节点校验属于池内页面、异常只记录不中断，b5r15 丢失的 live-ring 判定恢复；核对在 `fd_submit_sp_destroy`，live 非零、magic 未知、链异常、普查与链计数不符、在外 ring 金丝雀损坏任一成立即打印全部账目并 abort。犯罪现场打印 `probe frames` 行（dylib 基址加返回地址链，`backtrace()` 原始地址，供离线对 unstripped 库符号化）。递归与降级观测补盲：`fd_batch_check_size` 三处 flush 触发点、`alloc_batch_locked` 槽位耗尽强刷最旧 batch、batch 分配重试与最终放弃（0024 有界重试的静默降级）各加一行计数打印。主机侧功能验证（健康流量零误报、双重释放必抓获 SIGABRT、live 普查正确）与探针输出判别字典见 `out/0026-probes/implementation.md`。
 
+27. `0027-ring-refcnt-history.patch`：ring 双重销毁失衡点定位的诊断轮（判别性探针设计见 `out/goal-1124/batch7/ring-double-destroy-location.md` §5），叠在 0026 之后应用，全部只读与记录，不改变所有权语义。`struct fd_ringbuffer` 内嵌 8 槽环形引用计数转移史：每个 ref/del 点写入（site_id、转移后计数），创建、suballoc 槽位 ref/替换 del、submit destroy 槽位 del、emit unref del、cleanup_submit 各字段 del、subpass 系 del、primary ref/del、对象环 CSO 系 del 与 fastpath ref 各占一个 site id，未标注调用点记 unknown；二次销毁等三类 ring 违规打印全部 8 槽与对应 site 名，配平流式环历史固定为 `create1 subref2 subdel1 emitdel0`，多出的 del 的 site 直接给出失衡点。`fd_submit_sp_destroy` 改为先清空 suballoc 槽位再归还引用，ring 销毁时仍在槽位即打印 `fd ring in suballoc slot` 并 abort（计数算术已错的当场报告，比第二次 del 早一个环节）。flush 重入检测：`fd6_draw_vbos` 与 `fd6_emit_3d_state` 进出各升降 ctx 发射段深度，`fd_batch_flush` 入口深度非零即打印 `fd flush inside emit`（被刷 batch 与当前 batch 并列，相等才是形态乙证据）并附帧链。tile 系环（tile_loads/tile_store/subpass_clears）创建时打印 `fd tile ring create`（种类、ring、submit、seqno），供与历史交叉对照，每进程限 256 行。主机侧功能验证（健康流量零误报、双重释放历史含致命条目、槽位不变量命中）与输出判别字典见 `out/0027-probes/implementation.md`。
+
+28. `0028-fd6-emit-ownership-probes.patch`：fd6 发射路径双重消费修复与 emitdel sharpen 探针，叠在 0027 之后应用。
+    - 修复：`fd6_state_take_group` 在同一 state 对象已有同一 ring 的 unref 槽时，为新 take 槽补一条引用，记账方式与对象环 fastpath 的 ref+take 相同；`fd6_state_emit` 消费组后清空槽位，结束时清零 `num_groups`。
+    - 探针：0027 的 hist 条目扩展 `group_id` 与发射 pass，emitdel 打印 `group %u pass %u`；同一 ring 的两条 emitdel pass 相同表示同一次发射内两次消费。重复入组补偿命中时打印 `fd state duplicate take`（ring、两个 group 与槽位、线程号，每进程 16 行上限）。
+    - 验证：主机 harness 覆盖正常生命周期、入组点补偿、发射消费终止化、补偿后双 take 生命周期、双重销毁打印和槽位不变量，见 `out/0028-probes/implementation.md`。
+
+29. `0029-suballoc-install-ref-fix.patch`：suballoc 安装引用缺失修复与安装点防回归探针，叠在 0028 之后应用。
+    - 修复：`fd_submit_sp_new_ringbuffer` 在 `refcnt = 1` 相邻处提前写入 `flags`，使流式环安装路径的 sink 判别读取本世代值；`fd_ringbuffer_sp_init` 内同值重写保留。init 失败路径回退为上游的直接 `return NULL`，已装槽环不再退回 slab 池。
+    - 探针：`fd_submit_suballoc_ring_bo` 装槽前若读出 sink 标志，打印 `fd suballoc sink install`（ring、flags、pid、tid）与帧链，每进程 16 行上限；0029 修复后预期零命中。0026 canary/magic、0027 hist 与槽位不变量、0028 duplicate-take 补偿及归属探针保持不变。
+    - 验证：主机 harness 在 0028 场景之外覆盖写入 SINK 残留的复用元素与 init 失败上游对齐，构建与反汇编核查见顶层工作区 `out/goal-1124/batch7/0029-implementation.md`。
+
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，修改的文件互不重叠。应用这一层补丁后的源码树，加上 `tools/mesa/annibale-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只执行到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 
 `smoke-osmesa.c` / `smoke-osmesa-es.c` 是构建后冒烟测试，在 macOS 主机上编译运行，见顶层 `docs/analysis/mesa-rebase-2026-10.md` 第 3 节。

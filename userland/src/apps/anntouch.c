@@ -151,7 +151,7 @@ sleep_until(uint64_t start, uint64_t at)
  * 60 frames, and an application that is moved by the samples drew no more frames than that.)
  */
 static void
-drag(double x0, double y0, double x1, double y1, int ms, int hold, int grab, int step_ms)
+drag(double x0, double y0, double x1, double y1, int ms, int hold, int grab, int step_ms, int pause_ms)
 {
 	uint64_t start, total_us = (uint64_t)(ms > 0 ? ms : 1) * 1000;
 	/* step_ms overrides the touch screen's 8 ms sample rate, to tell whether the frame stream
@@ -182,7 +182,9 @@ drag(double x0, double y0, double x1, double y1, int ms, int hold, int grab, int
 			break;
 		}
 	}
-	usleep(16000);
+	if (pause_ms > 0) {
+		usleep((useconds_t)pause_ms * 1000);
+	}
 	if (hold > 0) {
 		/* (a sample now and then, as a finger that stays still still gives) */
 		for (int waited = 0; waited < hold; waited += 100) {
@@ -280,7 +282,14 @@ main(int argc, char **argv)
 		} else if (strcmp(step, "swipe") == 0 && left >= 4) {
 			int ms = left >= 5 && argv[i + 5][0] >= '0' && argv[i + 5][0] <= '9' ? atoi(argv[i + 5]) : 0;
 
-			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300, 0, 0, 0);
+			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 300, 0, 0, 0, 16);
+			i += ms ? 5 : 4;
+		} else if (strcmp(step, "flick") == 0 && left >= 4) {
+			int ms = left >= 5 && argv[i + 5][0] >= '0' && argv[i + 5][0] <= '9' ? atoi(argv[i + 5]) : 0;
+
+			/* A flick lifts the finger while it is still moving: the up follows the last
+			 * move without the pause swipe and drag keep for recognizers that need it. */
+			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), ms ? ms : 200, 0, 0, 0, 0);
 			i += ms ? 5 : 4;
 		} else if (strcmp(step, "drag") == 0 && left >= 6) {
 			int grab = left >= 7 && argv[i + 7][0] >= '0' && argv[i + 7][0] <= '9' ? atoi(argv[i + 7]) : 0;
@@ -288,7 +297,7 @@ main(int argc, char **argv)
 			int step_ms = left >= 8 && argv[i + 8][0] >= '0' && argv[i + 8][0] <= '9' ? atoi(argv[i + 8]) : 0;
 
 			drag(atof(argv[i + 1]), atof(argv[i + 2]), atof(argv[i + 3]), atof(argv[i + 4]), atoi(argv[i + 5]),
-			    atoi(argv[i + 6]), grab, step_ms);
+			    atoi(argv[i + 6]), grab, step_ms, 16);
 			i += step_ms ? 8 : (grab ? 7 : 6);
 		} else if (strcmp(step, "notify") == 0 && left >= 1) {
 			uint32_t status = notify_post(argv[i + 1]);

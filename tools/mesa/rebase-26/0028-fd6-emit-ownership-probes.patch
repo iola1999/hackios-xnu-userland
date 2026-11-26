@@ -1,0 +1,233 @@
+--- a/src/freedreno/drm/freedreno_ringbuffer.c
++++ b/src/freedreno/drm/freedreno_ringbuffer.c
+@@ -12,6 +12,19 @@
+ #include "freedreno_priv.h"
+ #include "freedreno_ringbuffer.h"
+ 
++/* HackiOS diagnostic probe (ring-history family, rebase-26 patch 0028):
++ * process-wide emission pass counter.  Atomic because compute and draw
++ * emission can enter fd6_state_emit from different driver threads even
++ * though the current air frontend serializes them.
++ */
++static uint32_t fd_ring_probe_emit_pass_counter;
++
++uint32_t
++fd_ring_probe_next_emit_pass(void)
++{
++   return p_atomic_inc_return(&fd_ring_probe_emit_pass_counter);
++}
++
+ static void
+ fd_ringbuffer_sink_destroy(struct fd_ringbuffer *ring)
+ {
+--- a/src/freedreno/drm/freedreno_ringbuffer.h
++++ b/src/freedreno/drm/freedreno_ringbuffer.h
+@@ -158,9 +158,17 @@
+ 
+ struct fd_ring_hist_entry {
+    uint8_t site;
++   uint8_t group_id;
+    int32_t refcnt_after;
++   uint32_t emit_pass;
+ };
+ 
++/* Return the next process-wide emission pass number.  The first emission
++ * pass is 1; zero is reserved for transfers that did not happen during
++ * emission.
++ */
++uint32_t fd_ring_probe_next_emit_pass(void);
++
+ /* the ringbuffer object is not opaque so that OUT_RING() type stuff
+  * can be inlined.  Note that users should not make assumptions about
+  * the size of this struct.
+@@ -243,31 +251,60 @@
+  * single-threaded AIR model serializes both.
+  */
+ static inline void
+-fd_ring_probe_record(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
++fd_ring_probe_record_meta(struct fd_ringbuffer *ring,
++                          enum fd_ring_probe_site site,
++                          uint8_t group_id, uint32_t emit_pass)
+ {
+    unsigned slot = ring->probe_hist_head;
+ 
+    ring->probe_hist[slot].site = site;
++   ring->probe_hist[slot].group_id = group_id;
+    ring->probe_hist[slot].refcnt_after = ring->refcnt;
++   ring->probe_hist[slot].emit_pass = emit_pass;
+    ring->probe_hist_head = (ring->probe_hist_head + 1) % FD_RING_HIST_LEN;
+    if (ring->probe_hist_head == 0)
+       ring->probe_hist_filled = 1;
+ }
+ 
+ static inline void
+-fd_ringbuffer_del_site(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
++fd_ring_probe_record(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
+ {
++   fd_ring_probe_record_meta(ring, site, 0, 0);
++}
++
++static inline void
++fd_ringbuffer_del_meta(struct fd_ringbuffer *ring,
++                       enum fd_ring_probe_site site,
++                       uint8_t group_id, uint32_t emit_pass)
++{
+    if (fd_ringbuffer_is_sink(ring))
+       return;
+ 
+    int32_t count = --ring->refcnt;
+-   fd_ring_probe_record(ring, site);
++   fd_ring_probe_record_meta(ring, site, group_id, emit_pass);
+    if (count > 0)
+       return;
+ 
+    ring->funcs->destroy(ring);
+ }
+ 
++static inline void
++fd_ringbuffer_del_site(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
++{
++   fd_ringbuffer_del_meta(ring, site, 0, 0);
++}
++
++/* Emit consume entries carry the state group and emission pass, so two
++ * consume entries in one history can be attributed to their groups and
++ * checked for whether they came from the same fd6_state_emit call.
++ */
++static inline void
++fd_ringbuffer_del_emit(struct fd_ringbuffer *ring, uint8_t group_id,
++                       uint32_t emit_pass)
++{
++   fd_ringbuffer_del_meta(ring, FD_RING_SITE_EMIT_DEL, group_id, emit_pass);
++}
++
+ static inline struct fd_ringbuffer *
+ fd_ringbuffer_ref_site(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
+ {
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -1012,11 +1012,20 @@
+    for (unsigned i = 0; i < count; i++) {
+       unsigned slot = ring->probe_hist_filled ?
+             (ring->probe_hist_head + i) % FD_RING_HIST_LEN : i;
+-      unsigned site = ring->probe_hist[slot].site;
++      struct fd_ring_hist_entry *entry = &ring->probe_hist[slot];
++      unsigned site = entry->site;
+ 
+-      printf("fd ring hist: ring %p seq %u site %u %s refcnt %d\n",
+-             (void *)ring, i, site, fd_ring_probe_site_name(site),
+-             ring->probe_hist[slot].refcnt_after);
++      if (site == FD_RING_SITE_EMIT_DEL) {
++         printf("fd ring hist: ring %p seq %u site %u %s refcnt %d "
++                "group %u pass %u\n",
++                (void *)ring, i, site, fd_ring_probe_site_name(site),
++                entry->refcnt_after, (unsigned)entry->group_id,
++                entry->emit_pass);
++      } else {
++         printf("fd ring hist: ring %p seq %u site %u %s refcnt %d\n",
++                (void *)ring, i, site, fd_ring_probe_site_name(site),
++                entry->refcnt_after);
++      }
+    }
+    fflush(stdout);
+ }
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
+@@ -10,6 +10,9 @@
+ #ifndef FD6_EMIT_H
+ #define FD6_EMIT_H
+ 
++#include <pthread.h>
++#include <stdio.h>
++
+ #include "pipe/p_context.h"
+ 
+ #include "fd6_context.h"
+@@ -127,6 +130,32 @@
+       ctx->emit_depth--;
+    }
+ };
++
++/* HackiOS diagnostic probe (ring-history family, rebase-26 patch 0028):
++ * duplicate take slots are the only case where fd6_state_take_group adds
++ * a reference.  Printing each hit, capped at 16 per process, measures how
++ * often that ownership repair is needed without waiting for a violation.
++ */
++static inline void
++fd6_probe_duplicate_take(struct fd_ringbuffer *stateobj,
++                         enum fd6_state_id group_id, unsigned slot,
++                         enum fd6_state_id other_group_id,
++                         unsigned other_slot)
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= 16)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd state duplicate take: ring %p group %u slot %u "
++          "othergroup %u otherslot %u tid %llu\n",
++          (void *)stateobj, (unsigned)group_id, slot,
++          (unsigned)other_group_id, other_slot, (unsigned long long)tid);
++   fflush(stdout);
++}
+ 
+ static inline void
+ fd6_state_emit(struct fd6_state *state, fd_cs &cs)
+@@ -135,6 +164,7 @@
+       return;
+ 
+    fd_pkt7 pkt(cs, CP_SET_DRAW_STATE, 3 * state->num_groups);
++   uint32_t emit_pass = fd_ring_probe_next_emit_pass();
+ 
+    for (unsigned i = 0; i < state->num_groups; i++) {
+       struct fd6_state_group *g = &state->groups[i];
+@@ -152,7 +182,13 @@
+          pkt.add(g->stateobj, 0, NULL);
+ 
+          if (g->unref)
+-            fd_ringbuffer_del_site(g->stateobj, FD_RING_SITE_EMIT_DEL);
++            fd_ringbuffer_del_emit(g->stateobj, (uint8_t)g->group_id,
++                                   emit_pass);
++
++         /* Emission consumes this slot.  The pointer must not remain
++          * available to a later re-emission of the same state object.
++          */
++         g->stateobj = NULL;
+       } else {
+          pkt.add(CP_SET_DRAW_STATE__0(i,
+             .disable = true,
+@@ -162,6 +198,8 @@
+          pkt.add(CP_SET_DRAW_STATE__ADDR(i));
+       }
+    }
++
++   state->num_groups = 0;
+ }
+ 
+ static inline unsigned
+@@ -195,6 +233,22 @@
+ fd6_state_take_group(struct fd6_state *state, struct fd_ringbuffer *stateobj,
+                      enum fd6_state_id group_id)
+ {
++   /* A take slot transfers ownership of one reference to emission.  When
++    * two take slots in the same state object name the same ring, each slot
++    * needs its own reference, the same accounting the object-ring fastpath
++    * applies when it reuses a shared stateobj.  Emission still consumes
++    * exactly one reference per slot.
++    */
++   if (stateobj) {
++      for (unsigned i = 0; i < state->num_groups; i++) {
++         if (state->groups[i].unref && state->groups[i].stateobj == stateobj) {
++            fd_ringbuffer_ref(stateobj);
++            fd6_probe_duplicate_take(stateobj, group_id, state->num_groups,
++                                     state->groups[i].group_id, i);
++            break;
++         }
++      }
++   }
+    __append_state_group(state, stateobj, group_id, true);
+ }
+ 

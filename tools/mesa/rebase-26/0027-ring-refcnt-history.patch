@@ -1,0 +1,781 @@
+--- a/src/freedreno/drm/freedreno_ringbuffer.c
++++ b/src/freedreno/drm/freedreno_ringbuffer.c
+@@ -113,7 +113,7 @@
+       return;
+ 
+    if (submit->primary)
+-      fd_ringbuffer_del(submit->primary);
++      fd_ringbuffer_del_site(submit->primary, FD_RING_SITE_SUBMIT_PRIMARY_DEL);
+ 
+    struct fd_pipe *pipe = submit->pipe;
+    struct fd_device *dev = submit->dev;
+@@ -158,7 +158,7 @@
+ 
+    if (flags & FD_RINGBUFFER_PRIMARY) {
+       assert(!submit->primary);
+-      submit->primary = fd_ringbuffer_ref(ring);
++      submit->primary = fd_ringbuffer_ref_site(ring, FD_RING_SITE_SUBMIT_PRIMARY_REF);
+    }
+ 
+    return ring;
+--- a/src/freedreno/drm/freedreno_ringbuffer.h
++++ b/src/freedreno/drm/freedreno_ringbuffer.h
+@@ -114,6 +114,53 @@
+    void (*destroy)(struct fd_ringbuffer *ring);
+ };
+ 
++/* HackiOS diagnostic probe (ring-history family, rebase-26 patch 0027):
++ * per-ring reference transfer history.  Every ref/del point in the driver
++ * is annotated with a site id, and each transition appends (site, refcnt
++ * after the change) to an 8-slot ring buffer living inside the object.
++ * Slab pool elements keep their contents after slab_free until reuse, so
++ * the history of a properly destroyed ring remains readable when a second
++ * destroy runs on it: the printout then names the site of every transfer,
++ * and a ring whose arithmetic is wrong shows an entry no legal sequence
++ * can produce.  The balanced streaming-ring reference shape is
++ * "create1 subref2 subdel1 emitdel0" (see the 0027 implementation report).
++ *
++ * The enum values double as indices into the name table in
++ * freedreno_ringbuffer_sp.c; new sites append before FD_RING_SITE_COUNT.
++ */
++enum fd_ring_probe_site {
++   FD_RING_SITE_UNKNOWN = 0,     /* unannotated callsite */
++   FD_RING_SITE_CREATE,          /* refcnt = 1 at creation */
++   FD_RING_SITE_SUBALLOC_REF,    /* suballoc slot takes the new ring */
++   FD_RING_SITE_SUBALLOC_REPLACE_DEL, /* slot replacement drops the old ring */
++   FD_RING_SITE_SUBMIT_DESTROY_DEL,   /* submit destroy drops the slot ring */
++   FD_RING_SITE_SUBMIT_PRIMARY_REF,   /* submit holds its primary ring */
++   FD_RING_SITE_SUBMIT_PRIMARY_DEL,   /* submit destroy drops the primary */
++   FD_RING_SITE_EMIT_DEL,        /* fd6_state_emit unref group del */
++   FD_RING_SITE_CLEANUP_DRAW,    /* cleanup_submit batch->draw */
++   FD_RING_SITE_CLEANUP_GMEM,    /* cleanup_submit batch->gmem */
++   FD_RING_SITE_CLEANUP_BINNING, /* cleanup_submit batch->binning */
++   FD_RING_SITE_CLEANUP_PROLOGUE,   /* cleanup_submit batch->prologue */
++   FD_RING_SITE_CLEANUP_TILE_EPILOGUE, /* cleanup_submit batch->tile_epilogue */
++   FD_RING_SITE_CLEANUP_EPILOGUE,   /* cleanup_submit batch->epilogue */
++   FD_RING_SITE_CLEANUP_TILE_LOADS, /* cleanup_submit batch->tile_loads */
++   FD_RING_SITE_CLEANUP_TILE_STORE, /* cleanup_submit batch->tile_store */
++   FD_RING_SITE_SUBPASS_CREATE_REF, /* subpass_create batch->draw acquire */
++   FD_RING_SITE_SUBPASS_CREATE_DEL, /* subpass_create batch->draw replace */
++   FD_RING_SITE_SUBPASS_DRAW_DEL,   /* subpass_destroy subpass->draw */
++   FD_RING_SITE_SUBPASS_CLEARS_DEL, /* subpass_destroy subpass->subpass_clears */
++   FD_RING_SITE_OBJ_CSO_DEL,        /* object-ring CSO family stateobj release */
++   FD_RING_SITE_OBJ_FASTPATH_REF,   /* object-ring fastpath ref before take */
++   FD_RING_SITE_COUNT
++};
++
++#define FD_RING_HIST_LEN 8
++
++struct fd_ring_hist_entry {
++   uint8_t site;
++   int32_t refcnt_after;
++};
++
+ /* the ringbuffer object is not opaque so that OUT_RING() type stuff
+  * can be inlined.  Note that users should not make assumptions about
+  * the size of this struct.
+@@ -126,6 +173,18 @@
+    int size;
+    int32_t refcnt;
+    enum fd_ringbuffer_flags flags;
++
++   /* HackiOS diagnostic probe (ring-history family): the transfer history
++    * ring.  probe_hist_head is the next slot to write, wrapping mod
++    * FD_RING_HIST_LEN; probe_hist_filled latches once the first wrap
++    * happens, which is what tells the printer the whole ring is valid
++    * rather than only the slots before head.  Both are zeroed and the
++    * create entry is written where the object is initialised, so a reused
++    * slab element starts its new owner's history from scratch.
++    */
++   uint8_t probe_hist_head;
++   uint8_t probe_hist_filled;
++   struct fd_ring_hist_entry probe_hist[FD_RING_HIST_LEN];
+ };
+ 
+ /* Allocate a new long-lived state object, not associated with
+@@ -176,24 +235,65 @@
+    return count == 0;
+ }
+ 
++/* HackiOS diagnostic probe (ring-history family): append one transfer to
++ * the object's history ring.  Called after the refcnt change it belongs
++ * to, so refcnt_after is the count the transfer left behind; the fatal
++ * transfer of a double destroy is therefore in the ring when the destroy
++ * path prints it.  Not atomic, exactly like the refcnt it follows: the
++ * single-threaded AIR model serializes both.
++ */
+ static inline void
+-fd_ringbuffer_del(struct fd_ringbuffer *ring)
++fd_ring_probe_record(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
+ {
++   unsigned slot = ring->probe_hist_head;
++
++   ring->probe_hist[slot].site = site;
++   ring->probe_hist[slot].refcnt_after = ring->refcnt;
++   ring->probe_hist_head = (ring->probe_hist_head + 1) % FD_RING_HIST_LEN;
++   if (ring->probe_hist_head == 0)
++      ring->probe_hist_filled = 1;
++}
++
++static inline void
++fd_ringbuffer_del_site(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
++{
+    if (fd_ringbuffer_is_sink(ring))
+       return;
+ 
+-   if (--ring->refcnt > 0)
++   int32_t count = --ring->refcnt;
++   fd_ring_probe_record(ring, site);
++   if (count > 0)
+       return;
+ 
+    ring->funcs->destroy(ring);
+ }
+ 
+ static inline struct fd_ringbuffer *
+-fd_ringbuffer_ref(struct fd_ringbuffer *ring)
++fd_ringbuffer_ref_site(struct fd_ringbuffer *ring, enum fd_ring_probe_site site)
+ {
+-   if (!fd_ringbuffer_is_sink(ring))
++   if (!fd_ringbuffer_is_sink(ring)) {
+       ring->refcnt++;
++      fd_ring_probe_record(ring, site);
++   }
+    return ring;
++}
++
++/* HackiOS diagnostic probe (ring-history family): the unannotated forms
++ * record FD_RING_SITE_UNKNOWN, so a transition history can only ever show
++ * a named site where the audit enumerated the callsite, and an unknown
++ * entry means the imbalance reached the object through a path the audit
++ * did not name.
++ */
++static inline void
++fd_ringbuffer_del(struct fd_ringbuffer *ring)
++{
++   fd_ringbuffer_del_site(ring, FD_RING_SITE_UNKNOWN);
++}
++
++static inline struct fd_ringbuffer *
++fd_ringbuffer_ref(struct fd_ringbuffer *ring)
++{
++   return fd_ringbuffer_ref_site(ring, FD_RING_SITE_UNKNOWN);
+ }
+ 
+ static inline void
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -34,7 +34,61 @@
+ fd_ringbuffer_sp_init(struct fd_ringbuffer_sp *fd_ring, uint32_t size,
+                       enum fd_ringbuffer_flags flags);
+ 
++/* HackiOS diagnostic probe (ring-history family, rebase-26 patch 0027):
++ * where the history of a new ring starts.  The reset and the create entry
++ * cannot live in fd_ringbuffer_sp_init: for streaming rings the suballoc
++ * slot reference is taken before init runs, and a reset there would wipe
++ * it.  Both creation paths call this right after the refcnt = 1 store,
++ * so slot 0 of a reused slab element is always the create entry of its
++ * new owner rather than a leftover of the previous one.
++ */
++static inline void
++fd_ring_probe_create(struct fd_ringbuffer *ring)
++{
++   memset(ring->probe_hist, 0, sizeof(ring->probe_hist));
++   ring->probe_hist_head = 0;
++   ring->probe_hist_filled = 0;
++   fd_ring_probe_record(ring, FD_RING_SITE_CREATE);
++}
+ 
++/* Names for the history printout, indexed by the site id.  Anything
++ * outside the table reads as "bad", which is what a wild write into the
++ * object would leave behind.
++ */
++static const char *const fd_ring_probe_site_names[FD_RING_SITE_COUNT] = {
++   [FD_RING_SITE_UNKNOWN] = "unknown",
++   [FD_RING_SITE_CREATE] = "create",
++   [FD_RING_SITE_SUBALLOC_REF] = "subref",
++   [FD_RING_SITE_SUBALLOC_REPLACE_DEL] = "subdel",
++   [FD_RING_SITE_SUBMIT_DESTROY_DEL] = "submitdel",
++   [FD_RING_SITE_SUBMIT_PRIMARY_REF] = "primaryref",
++   [FD_RING_SITE_SUBMIT_PRIMARY_DEL] = "primarydel",
++   [FD_RING_SITE_EMIT_DEL] = "emitdel",
++   [FD_RING_SITE_CLEANUP_DRAW] = "cleandraw",
++   [FD_RING_SITE_CLEANUP_GMEM] = "cleangmem",
++   [FD_RING_SITE_CLEANUP_BINNING] = "cleanbinning",
++   [FD_RING_SITE_CLEANUP_PROLOGUE] = "cleanprologue",
++   [FD_RING_SITE_CLEANUP_TILE_EPILOGUE] = "cleantileepi",
++   [FD_RING_SITE_CLEANUP_EPILOGUE] = "cleanepilogue",
++   [FD_RING_SITE_CLEANUP_TILE_LOADS] = "cleantileloads",
++   [FD_RING_SITE_CLEANUP_TILE_STORE] = "cleantilestore",
++   [FD_RING_SITE_SUBPASS_CREATE_REF] = "spnewref",
++   [FD_RING_SITE_SUBPASS_CREATE_DEL] = "spnewdel",
++   [FD_RING_SITE_SUBPASS_DRAW_DEL] = "spdrawdel",
++   [FD_RING_SITE_SUBPASS_CLEARS_DEL] = "spclearsdel",
++   [FD_RING_SITE_OBJ_CSO_DEL] = "objcso",
++   [FD_RING_SITE_OBJ_FASTPATH_REF] = "objfastref",
++};
++
++static const char *
++fd_ring_probe_site_name(unsigned site)
++{
++   if (site >= FD_RING_SITE_COUNT)
++      return "bad";
++   return fd_ring_probe_site_names[site];
++}
++
++
+ static inline bool
+ check_append_suballoc_bo(struct fd_submit_sp *submit, struct fd_bo *bo, bool check)
+ {
+@@ -185,10 +239,11 @@
+ 
+    struct fd_ringbuffer *old_suballoc_ring = fd_submit->suballoc_ring;
+ 
+-   fd_submit->suballoc_ring = fd_ringbuffer_ref(&fd_ring->base);
++   fd_submit->suballoc_ring =
++      fd_ringbuffer_ref_site(&fd_ring->base, FD_RING_SITE_SUBALLOC_REF);
+ 
+    if (old_suballoc_ring)
+-      fd_ringbuffer_del(old_suballoc_ring);
++      fd_ringbuffer_del_site(old_suballoc_ring, FD_RING_SITE_SUBALLOC_REPLACE_DEL);
+ }
+ 
+ static struct fd_ringbuffer *
+@@ -206,6 +261,7 @@
+     * increment the refcnt of the current ring
+     */
+    fd_ring->base.refcnt = 1;
++   fd_ring_probe_create(&fd_ring->base);
+ 
+    if (flags & FD_RINGBUFFER_STREAMING) {
+       fd_submit_suballoc_ring_bo(submit, fd_ring, size);
+@@ -570,9 +626,22 @@
+ {
+    struct fd_submit_sp *fd_submit = to_fd_submit_sp(submit);
+ 
+-   if (fd_submit->suballoc_ring)
+-      fd_ringbuffer_del(fd_submit->suballoc_ring);
++   /* HackiOS diagnostic probe (ring-history family): drop the slot before
++    * dropping the reference.  The reference the slot holds is what keeps
++    * the ring's count above zero, so a correctly counted ring can never be
++    * in the slot when its own destroy runs -- which is exactly what the
++    * invariant check in fd_ringbuffer_sp_destroy verifies.  Clearing the
++    * slot first is what makes that invariant testable at all here: the
++    * slot dies with the submit either way, so the ordering change carries
++    * no ownership semantics.
++    */
++   if (fd_submit->suballoc_ring) {
++      struct fd_ringbuffer *slot_ring = fd_submit->suballoc_ring;
+ 
++      fd_submit->suballoc_ring = NULL;
++      fd_ringbuffer_del_site(slot_ring, FD_RING_SITE_SUBMIT_DESTROY_DEL);
++   }
++
+    _mesa_hash_table_destroy(fd_submit->bo_table, NULL);
+    _mesa_hash_table_destroy(fd_submit->suballoc_bo_table, NULL);
+ 
+@@ -925,7 +994,34 @@
+  * The frames and the owner detail follow as their own lines, in that order,
+  * so a poisoned submit pointer can only cost the last of the three.
+  */
++/* HackiOS diagnostic probe (ring-history family): print the transfer
++ * history oldest first, one line per slot.  Everything printed sits
++ * inside the object itself, so the lines cannot be poisoned by anything
++ * the corruption did outside it any more than the canary already was --
++ * wild writes into the object itself still show, as garbage site ids the
++ * name table reports as "bad".  A balanced streaming ring reads
++ * "create1 subref2 subdel1 emitdel0"; whatever extra del the imbalance
++ * added appears as one more entry whose site names the transfer point.
++ */
+ static void
++fd_ring_probe_history_print(struct fd_ringbuffer *ring)
++{
++   unsigned count = ring->probe_hist_filled ?
++         FD_RING_HIST_LEN : ring->probe_hist_head;
++
++   for (unsigned i = 0; i < count; i++) {
++      unsigned slot = ring->probe_hist_filled ?
++            (ring->probe_hist_head + i) % FD_RING_HIST_LEN : i;
++      unsigned site = ring->probe_hist[slot].site;
++
++      printf("fd ring hist: ring %p seq %u site %u %s refcnt %d\n",
++             (void *)ring, i, site, fd_ring_probe_site_name(site),
++             ring->probe_hist[slot].refcnt_after);
++   }
++   fflush(stdout);
++}
++
++static void
+ fd_ring_destroy_violation(const char *where, struct fd_ringbuffer *ring,
+                           struct fd_ringbuffer_sp *fd_ring)
+ {
+@@ -940,6 +1036,7 @@
+           (unsigned long long)tid);
+    fflush(stdout);
+    slab_probe_frames();
++   fd_ring_probe_history_print(ring);
+ 
+    if (!(ring->flags & _FD_RINGBUFFER_OBJECT) && fd_ring->u.submit) {
+       struct fd_submit *submit = fd_ring->u.submit;
+@@ -972,6 +1069,18 @@
+    if (unlikely(ring->refcnt != 0))
+       fd_ring_destroy_violation("fd ring refcnt at destroy", ring, fd_ring);
+ 
++   /* HackiOS diagnostic probe (ring-history family): the suballoc slot
++    * holds a reference on the ring it names, so a correctly counted ring
++    * still in the slot cannot reach zero and cannot be here.  Catching it
++    * says the counting arithmetic is already wrong one step earlier than
++    * the second del that the canary would otherwise be the first word of.
++    * The submit is dereferenced either way -- slab_free below returns the
++    * object to its pool -- so the check exposes the object to nothing new.
++    */
++   if (!(ring->flags & _FD_RINGBUFFER_OBJECT) && fd_ring->u.submit &&
++       unlikely(to_fd_submit_sp(fd_ring->u.submit)->suballoc_ring == ring))
++      fd_ring_destroy_violation("fd ring in suballoc slot", ring, fd_ring);
++
+    fd_ring->probe_canary = FD_RING_CANARY_DEAD;
+ 
+    fd_bo_del(fd_ring->ring_bo);
+@@ -1130,6 +1239,7 @@
+    fd_ring->u.pipe = pipe;
+    fd_ring->ring_bo = fd_bo_ref(dev->suballoc_bo);
+    fd_ring->base.refcnt = 1;
++   fd_ring_probe_create(&fd_ring->base);
+    fd_ring->u.last_submit_seqno = 0;
+ 
+    dev->suballoc_offset = fd_ring->offset + size;
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_blend.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_blend.cc
+@@ -184,7 +184,7 @@
+ 
+    util_dynarray_foreach (&so->variants, struct fd6_blend_variant *, vp) {
+       struct fd6_blend_variant *v = *vp;
+-      fd_ringbuffer_del(v->stateobj);
++      fd_ringbuffer_del_site(v->stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+    }
+ 
+    ralloc_free(so);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
+@@ -326,7 +326,7 @@
+    struct fd6_compute_state *hwcso = (struct fd6_compute_state *)_hwcso;
+    ir3_shader_state_delete(pctx, hwcso->hwcso);
+    if (hwcso->stateobj)
+-      fd_ringbuffer_del(hwcso->stateobj);
++      fd_ringbuffer_del_site(hwcso->stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+    free(hwcso);
+ }
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_context.cc
+@@ -37,19 +37,19 @@
+       fd6_descriptor_set_invalidate(&fd6_ctx->descriptor_sets[i]);
+ 
+    if (fd6_ctx->streamout_disable_stateobj)
+-      fd_ringbuffer_del(fd6_ctx->streamout_disable_stateobj);
++      fd_ringbuffer_del_site(fd6_ctx->streamout_disable_stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+ 
+    if (fd6_ctx->sample_locations_disable_stateobj)
+-      fd_ringbuffer_del(fd6_ctx->sample_locations_disable_stateobj);
++      fd_ringbuffer_del_site(fd6_ctx->sample_locations_disable_stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+ 
+    if (fd6_ctx->sysmem_preamble)
+-      fd_ringbuffer_del(fd6_ctx->sysmem_preamble);
++      fd_ringbuffer_del_site(fd6_ctx->sysmem_preamble, FD_RING_SITE_OBJ_CSO_DEL);
+ 
+    if (fd6_ctx->gmem_preamble)
+-      fd_ringbuffer_del(fd6_ctx->gmem_preamble);
++      fd_ringbuffer_del_site(fd6_ctx->gmem_preamble, FD_RING_SITE_OBJ_CSO_DEL);
+ 
+    if (fd6_ctx->restore)
+-      fd_ringbuffer_del(fd6_ctx->restore);
++      fd_ringbuffer_del_site(fd6_ctx->restore, FD_RING_SITE_OBJ_CSO_DEL);
+ 
+    fd_context_destroy(pctx);
+ 
+@@ -118,7 +118,7 @@
+ {
+    struct fd6_vertex_stateobj *so = (struct fd6_vertex_stateobj *)hwcso;
+ 
+-   fd_ringbuffer_del(so->stateobj);
++   fd_ringbuffer_del_site(so->stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+    FREE(hwcso);
+ }
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -406,6 +406,7 @@
+ 
+    struct fd6_context *fd6_ctx = fd6_context(ctx);
+    struct fd6_emit emit;
++   fd6_emit_section emit_section(ctx);
+ 
+    /* The state emission between here and the first draw_emit is where the sleeps measured so far
+     * have to be: the three segments after the emit printed nothing while this function's own span
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.cc
+@@ -45,7 +45,7 @@
+    if (!state || !state->stateobj)
+       return NULL;
+ 
+-   return fd_ringbuffer_ref(state->stateobj);
++   return fd_ringbuffer_ref_site(state->stateobj, FD_RING_SITE_OBJ_FASTPATH_REF);
+ }
+ 
+ static struct fd_ringbuffer *
+@@ -336,7 +336,8 @@
+ 
+    if (!ctx->sample_locations_enabled) {
+       struct fd6_context *fd6_ctx = fd6_context(ctx);
+-      return fd_ringbuffer_ref(fd6_ctx->sample_locations_disable_stateobj);
++      return fd_ringbuffer_ref_site(fd6_ctx->sample_locations_disable_stateobj,
++                                    FD_RING_SITE_OBJ_FASTPATH_REF);
+    }
+ 
+    uint32_t sample_locations = 0;
+@@ -548,6 +549,7 @@
+ fd6_emit_3d_state(fd_cs &cs, struct fd6_emit *emit)
+ {
+    struct fd_context *ctx = emit->ctx;
++   fd6_emit_section emit_section(ctx);
+    struct pipe_framebuffer_state *pfb = &ctx->batch->framebuffer;
+    const struct fd6_program_state *prog = fd6_emit_get_prog(emit);
+    const struct ir3_shader_variant *fs = emit->fs;
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_emit.h
+@@ -104,6 +104,30 @@
+    unsigned num_groups;
+ };
+ 
++/* HackiOS diagnostic probe (ring-history family, rebase-26 patch 0027):
++ * emission-section guard.  Depth rather than a flag, because draw_vbos
++ * covers fd6_emit_3d_state and the two nest; RAII because draw_vbos
++ * returns early in several places.  fd_batch_flush reads the depth: a
++ * flush entered while it is nonzero means the batch under construction
++ * is being flushed out from inside the emission that is still writing
++ * it, the timing violation the ring-history round calls form B.  The air
++ * frontend serializes everything with rwa_lock, so a plain per-context
++ * counter needs no atomic.
++ */
++struct fd6_emit_section {
++   struct fd_context *ctx;
++
++   fd6_emit_section(struct fd_context *c) : ctx(c)
++   {
++      ctx->emit_depth++;
++   }
++
++   ~fd6_emit_section()
++   {
++      ctx->emit_depth--;
++   }
++};
++
+ static inline void
+ fd6_state_emit(struct fd6_state *state, fd_cs &cs)
+ {
+@@ -128,7 +152,7 @@
+          pkt.add(g->stateobj, 0, NULL);
+ 
+          if (g->unref)
+-            fd_ringbuffer_del(g->stateobj);
++            fd_ringbuffer_del_site(g->stateobj, FD_RING_SITE_EMIT_DEL);
+       } else {
+          pkt.add(CP_SET_DRAW_STATE__0(i,
+             .disable = true,
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_gmem.cc
+@@ -8,6 +8,7 @@
+  */
+ 
+ #include <stdio.h>
++#include <pthread.h>
+ 
+ #include "pipe/p_state.h"
+ #include "util/format/u_format.h"
+@@ -1737,6 +1738,34 @@
+    }
+ }
+ 
++/* HackiOS diagnostic probe (ring-history family, rebase-26 patch 0027):
++ * creation-point record of the tile ring family.  The rings are created
++ * once per flushed batch rather than per draw, so the volume stays in the
++ * hundreds per second only while frames are being drawn, and the cap is
++ * sized well past the deterministic early-frame crash window this round
++ * is after.  The line exists for cross-reference: a ring in a violation
++ * printout can be matched to the submit seqno it was created for, and the
++ * kind names which prepare sequence made it -- information the transfer
++ * history itself does not carry.
++ */
++static void
++fd_probe_tile_ring_create(const char *kind, struct fd_batch *batch,
++                          struct fd_ringbuffer *ring)
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= 256)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd tile ring create: %s ring %p submit %p seqno %u tid %llu\n",
++          kind, (void *)ring, (void *)batch->submit, batch->seqno,
++          (unsigned long long)tid);
++   fflush(stdout);
++}
++
+ template <chip CHIP>
+ static void
+ prepare_tile_setup(struct fd_batch *batch)
+@@ -1745,6 +1774,8 @@
+       batch->tile_loads =
+          fd_submit_new_ringbuffer(batch->submit, 0x1000, FD_RINGBUFFER_STREAMING);
+ 
++      fd_probe_tile_ring_create("loads", batch, batch->tile_loads);
++
+       fd_cs cs(batch->tile_loads);
+ 
+       set_blit_scissor(batch, cs);
+@@ -1758,6 +1789,8 @@
+       subpass->subpass_clears =
+          fd_submit_new_ringbuffer(batch->submit, 0x1000, FD_RINGBUFFER_STREAMING);
+ 
++      fd_probe_tile_ring_create("clears", batch, subpass->subpass_clears);
++
+       fd_cs cs(subpass->subpass_clears);
+ 
+       set_blit_scissor(batch, cs);
+@@ -1898,6 +1931,8 @@
+ 
+    batch->tile_store =
+       fd_submit_new_ringbuffer(batch->submit, 0x1000, FD_RINGBUFFER_STREAMING);
++
++   fd_probe_tile_ring_create("store", batch, batch->tile_store);
+ 
+    fd_cs cs(batch->tile_store);
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
+@@ -1376,7 +1376,8 @@
+ 
+    if (!unlikely(emit->rasterflat || emit->sprite_coord_enable)) {
+       /* fastpath: */
+-      return fd_ringbuffer_ref(state->interp_stateobj);
++      return fd_ringbuffer_ref_site(state->interp_stateobj,
++                                    FD_RING_SITE_OBJ_FASTPATH_REF);
+    } else {
+       fd_crb crb(emit->ctx->batch->submit, 16);
+ 
+@@ -1514,12 +1515,12 @@
+ fd6_program_destroy(void *data, struct ir3_program_state *state)
+ {
+    struct fd6_program_state *so = fd6_program_state(state);
+-   fd_ringbuffer_del(so->stateobj);
+-   fd_ringbuffer_del(so->binning_stateobj);
+-   fd_ringbuffer_del(so->config_stateobj);
+-   fd_ringbuffer_del(so->interp_stateobj);
++   fd_ringbuffer_del_site(so->stateobj, FD_RING_SITE_OBJ_CSO_DEL);
++   fd_ringbuffer_del_site(so->binning_stateobj, FD_RING_SITE_OBJ_CSO_DEL);
++   fd_ringbuffer_del_site(so->config_stateobj, FD_RING_SITE_OBJ_CSO_DEL);
++   fd_ringbuffer_del_site(so->interp_stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+    if (so->streamout_stateobj)
+-      fd_ringbuffer_del(so->streamout_stateobj);
++      fd_ringbuffer_del_site(so->streamout_stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+    free(so);
+ }
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_rasterizer.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_rasterizer.cc
+@@ -163,7 +163,7 @@
+ 
+    for (unsigned i = 0; i < ARRAY_SIZE(so->stateobjs); i++)
+       if (so->stateobjs[i])
+-         fd_ringbuffer_del(so->stateobjs[i]);
++         fd_ringbuffer_del_site(so->stateobjs[i], FD_RING_SITE_OBJ_CSO_DEL);
+ 
+    FREE(hwcso);
+ }
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_texture.cc
+@@ -794,7 +794,7 @@
+    if (samp_desc)
+       fd_bo_del(samp_desc);
+ fail_cs:
+-   fd_ringbuffer_del((struct fd_ringbuffer *)cs);
++   fd_ringbuffer_del_site((struct fd_ringbuffer *)cs, FD_RING_SITE_OBJ_CSO_DEL);
+    return NULL;
+ }
+ 
+@@ -939,7 +939,7 @@
+ static void
+ fd6_texture_state_destroy(struct fd6_texture_state *state)
+ {
+-   fd_ringbuffer_del(state->stateobj);
++   fd_ringbuffer_del_site(state->stateobj, FD_RING_SITE_OBJ_CSO_DEL);
+    free(state);
+ }
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_zsa.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_zsa.cc
+@@ -250,6 +250,6 @@
+    struct fd6_zsa_stateobj *so = (struct fd6_zsa_stateobj *)hwcso;
+ 
+    for (int i = 0; i < ARRAY_SIZE(so->stateobj); i++)
+-      fd_ringbuffer_del(so->stateobj[i]);
++      fd_ringbuffer_del_site(so->stateobj[i], FD_RING_SITE_OBJ_CSO_DEL);
+    FREE(hwcso);
+ }
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c
+@@ -117,6 +117,40 @@
+    fflush(stdout);
+ }
+ 
++static void fd_probe_flush_inside_emit(struct fd_batch *batch) assert_dt;
++
++/* HackiOS diagnostic probe (ring-history family, rebase-26 patch 0027):
++ * a flush entered while the emission section is open.  Upstream's own
++ * invariant is that the batch under construction survives emission --
++ * fd_draw_vbos asserts !batch->flushed right after the emit returns --
++ * so a flush of the batch being emitted can only come from reentrance:
++ * resource tracking, a blitter or a copy flushing on a hot path underneath
++ * the emission itself.  The line prints both the flushed batch and the
++ * context's current batch because they are not necessarily the same:
++ * write-write hazard handling legitimately flushes other batches, and
++ * only curbatch == batch is the form-B smoking gun.  Print-only, since
++ * the legitimate case exists; the frames line names the reentry path.
++ */
++static void
++fd_probe_flush_inside_emit(struct fd_batch *batch) assert_dt
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd flush inside emit: batch %p seqno %u curbatch %p curseqno %u "
++          "depth %u tid %llu\n",
++          (void *)batch, batch->seqno, (void *)batch->ctx->batch,
++          batch->ctx->batch ? batch->ctx->batch->seqno : 0,
++          batch->ctx->emit_depth, (unsigned long long)tid);
++   fflush(stdout);
++   slab_probe_frames();
++}
++
+ static struct fd_ringbuffer *
+ alloc_ring(struct fd_batch *batch, unsigned sz, enum fd_ringbuffer_flags flags)
+ {
+@@ -157,8 +191,8 @@
+     * backwards compat with code that is not subpass aware.
+     */
+    if (batch->draw)
+-      fd_ringbuffer_del(batch->draw);
+-   batch->draw = fd_ringbuffer_ref(subpass->draw);
++      fd_ringbuffer_del_site(batch->draw, FD_RING_SITE_SUBPASS_CREATE_DEL);
++   batch->draw = fd_ringbuffer_ref_site(subpass->draw, FD_RING_SITE_SUBPASS_CREATE_REF);
+ 
+    list_addtail(&subpass->node, &batch->subpasses);
+ 
+@@ -168,9 +202,9 @@
+ static void
+ subpass_destroy(struct fd_batch_subpass *subpass)
+ {
+-   fd_ringbuffer_del(subpass->draw);
++   fd_ringbuffer_del_site(subpass->draw, FD_RING_SITE_SUBPASS_DRAW_DEL);
+    if (subpass->subpass_clears)
+-      fd_ringbuffer_del(subpass->subpass_clears);
++      fd_ringbuffer_del_site(subpass->subpass_clears, FD_RING_SITE_SUBPASS_CLEARS_DEL);
+    list_del(&subpass->node);
+    if (subpass->lrz)
+       fd_bo_del(subpass->lrz);
+@@ -305,42 +339,42 @@
+    }
+ 
+    if (batch->draw) {
+-      fd_ringbuffer_del(batch->draw);
++      fd_ringbuffer_del_site(batch->draw, FD_RING_SITE_CLEANUP_DRAW);
+       batch->draw = NULL;
+    }
+ 
+    if (batch->gmem) {
+-      fd_ringbuffer_del(batch->gmem);
++      fd_ringbuffer_del_site(batch->gmem, FD_RING_SITE_CLEANUP_GMEM);
+       batch->gmem = NULL;
+    }
+ 
+    if (batch->binning) {
+-      fd_ringbuffer_del(batch->binning);
++      fd_ringbuffer_del_site(batch->binning, FD_RING_SITE_CLEANUP_BINNING);
+       batch->binning = NULL;
+    }
+ 
+    if (batch->prologue) {
+-      fd_ringbuffer_del(batch->prologue);
++      fd_ringbuffer_del_site(batch->prologue, FD_RING_SITE_CLEANUP_PROLOGUE);
+       batch->prologue = NULL;
+    }
+ 
+    if (batch->tile_epilogue) {
+-      fd_ringbuffer_del(batch->tile_epilogue);
++      fd_ringbuffer_del_site(batch->tile_epilogue, FD_RING_SITE_CLEANUP_TILE_EPILOGUE);
+       batch->tile_epilogue = NULL;
+    }
+ 
+    if (batch->epilogue) {
+-      fd_ringbuffer_del(batch->epilogue);
++      fd_ringbuffer_del_site(batch->epilogue, FD_RING_SITE_CLEANUP_EPILOGUE);
+       batch->epilogue = NULL;
+    }
+ 
+    if (batch->tile_loads) {
+-      fd_ringbuffer_del(batch->tile_loads);
++      fd_ringbuffer_del_site(batch->tile_loads, FD_RING_SITE_CLEANUP_TILE_LOADS);
+       batch->tile_loads = NULL;
+    }
+ 
+    if (batch->tile_store) {
+-      fd_ringbuffer_del(batch->tile_store);
++      fd_ringbuffer_del_site(batch->tile_store, FD_RING_SITE_CLEANUP_TILE_STORE);
+       batch->tile_store = NULL;
+    }
+ 
+@@ -577,6 +611,14 @@
+ fd_batch_flush(struct fd_batch *batch)
+ {
+    struct fd_batch *tmp = NULL;
++
++   /* HackiOS diagnostic probe (ring-history family): every recursive
++    * flush path -- resource tracking, fd_bc_flush_writer/readers, the
++    * blitter -- funnels through here, so this one test covers all of
++    * them.  See fd_probe_flush_inside_emit for why curbatch is printed.
++    */
++   if (unlikely(batch->ctx->emit_depth > 0))
++      fd_probe_flush_inside_emit(batch);
+ 
+    /* NOTE: we need to hold an extra ref across the body of flush,
+     * since the last ref to this batch could be dropped when cleaning
+--- a/src/gallium/drivers/freedreno/freedreno_context.h
++++ b/src/gallium/drivers/freedreno/freedreno_context.h
+@@ -359,6 +359,18 @@
+     */
+    struct pipe_fence_handle *last_fence dt;
+ 
++   /* HackiOS diagnostic probe (ring-history family, rebase-26 patch
++    * 0027): emission-section depth, raised by the fd6_emit_section guard
++    * on entering draw_vbos or fd6_emit_3d_state and dropped on the way
++    * out.  fd_batch_flush reads it: entering a flush with the depth
++    * nonzero means the batch under construction is being flushed from
++    * inside the emission that is still writing it.  Left unannotated
++    * rather than dt because the probe reading it, fd_batch_flush, is not
++    * a driver-thread-only entry point, and because the air frontend's
++    * rwa_lock already serializes every writer and reader of it.
++    */
++   unsigned emit_depth;
++
+    /*
+     * Counter to keep track of batch's most recent update.  Ie. the batch with
+     * the higher update count is the one that has been drawn/etc to the most

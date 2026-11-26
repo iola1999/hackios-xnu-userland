@@ -99,6 +99,16 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 
 #define ANNIBALE_SENSORS_DEVICE          "/dev/annibale-sensors"
 
+/* Sample source flags of the kernel driver (bsd/sys/annibale_sensors.h). The ALS service may be
+ * registered only while one of these bits is set: the compile-time placeholder carries none of
+ * them, so without real hardware data the system never hears of an ambient light sensor and the
+ * auto-brightness control loop gets no input. INJECTED covers ALS-carrying writes only; a
+ * proximity-only injection does not open the gate. */
+#define SENSOR_SRC_HW_I2C         0x02
+#define SENSOR_SRC_ADSP_SSC       0x04
+#define SENSOR_SRC_INJECTED       0x08
+#define SENSOR_SRC_ALS_PUBLISH    (SENSOR_SRC_HW_I2C | SENSOR_SRC_ADSP_SSC | SENSOR_SRC_INJECTED)
+
 struct annibale_sensor_sample {
 	uint64_t timestamp;
 	uint32_t als_lux;
@@ -516,12 +526,12 @@ send_button(IOHIDServiceClientRef buttons, const struct annibale_touch *t)
 	CFRelease(event);
 }
 
+/* The ALS service registers late, whenever the kernel sample first carries a real source
+ * (hardware I2C, ADSP SSC, or injection), because kernel probing finishes after this process
+ * starts and injection happens at arbitrary times. The proximity service stays unconditional. */
 static void
-start_sensors_poller(dispatch_queue_t queue, IOHIDServiceClientRef als_service, IOHIDServiceClientRef prox_service)
+start_sensors_poller(dispatch_queue_t queue, IOHIDEventSystemClientRef client, IOHIDServiceClientRef prox_service)
 {
-	if (!als_service && !prox_service) {
-		return;
-	}
 	dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
 	if (!timer) {
 		return;
@@ -530,6 +540,7 @@ start_sensors_poller(dispatch_queue_t queue, IOHIDServiceClientRef als_service, 
 	static uint32_t last_als_lux = UINT32_MAX;
 	static uint32_t last_prox_near = UINT32_MAX;
 	static int last_prox_mode = 0;
+	static IOHIDServiceClientRef als_service = NULL;
 
 	dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC),
 	    250 * NSEC_PER_MSEC, 25 * NSEC_PER_MSEC);
@@ -570,6 +581,13 @@ start_sensors_poller(dispatch_queue_t queue, IOHIDServiceClientRef als_service, 
 		cached_ir_raw = sample.ir_raw;
 		cached_prox_near = sample.prox_near;
 
+		if (!als_service && (sample.source_flags & SENSOR_SRC_ALS_PUBLISH) != 0) {
+			als_service = make_service_ext(client, "Annibale ambient light sensor",
+			    HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_ALS, true, false);
+			if (als_service) {
+				say("input26: ALS service registered (source_flags=%#x)\n", sample.source_flags);
+			}
+		}
 		if (als_service && sample.als_lux != last_als_lux) {
 			IOHIDEventRef ev = create_als_event(sample.timestamp, sample.als_lux,
 			    sample.clear_raw, sample.ir_raw);
@@ -604,7 +622,7 @@ static int
 input_run(void)
 {
 	IOHIDEventSystemClientRef client = NULL;
-	IOHIDServiceClientRef screen = NULL, buttons = NULL, als_service = NULL, prox_service = NULL;
+	IOHIDServiceClientRef screen = NULL, buttons = NULL, prox_service = NULL;
 	struct annibale_touch t;
 	unsigned count = 0;
 	int device;
@@ -658,21 +676,9 @@ input_run(void)
         CFRelease(client);
         return 1;
     }
-    {
-        struct annibale_sensor_sample init_sample = { 0 };
-        int sfd = open(ANNIBALE_SENSORS_DEVICE, O_RDONLY | O_NONBLOCK);
-        if (sfd >= 0) {
-            (void)pread(sfd, &init_sample, sizeof(init_sample), 0);
-            close(sfd);
-        }
-        /* Register ALS only when hardware I2C, ADSP SSC, or explicit injection is active. */
-        if ((init_sample.source_flags & 0x0eu) != 0) {
-            als_service = make_service_ext(client, "Annibale ambient light sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_ALS, true, false);
-        }
-    }
     prox_service = make_service_ext(client, "Annibale proximity sensor", HID_PAGE_APPLE_VENDOR, HID_USAGE_APPLE_PROXIMITY, false, false);
-    start_sensors_poller(queue, als_service, prox_service);
-    say("input26: services registered (als=%p prox=%p); reading %s\n", (void *)als_service, (void *)prox_service, ANNIBALE_TOUCH_DEVICE);
+    start_sensors_poller(queue, client, prox_service);
+    say("input26: services registered (prox=%p, ALS pending a real source); reading %s\n", (void *)prox_service, ANNIBALE_TOUCH_DEVICE);
     device = open(ANNIBALE_TOUCH_DEVICE, O_RDONLY);
     if (device < 0) {
         say("input26: %s: %s\n", ANNIBALE_TOUCH_DEVICE, strerror(errno));

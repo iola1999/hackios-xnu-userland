@@ -1,0 +1,61 @@
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -9,6 +9,7 @@
+ #include <assert.h>
+ #include <inttypes.h>
+ #include <pthread.h>
++#include <unistd.h>
+ 
+ #include "util/hash_table.h"
+ #include "util/libsync.h"
+@@ -238,6 +239,25 @@
+    }
+ 
+    struct fd_ringbuffer *old_suballoc_ring = fd_submit->suballoc_ring;
++
++   /* HackiOS regression probe (rebase-26 patch 0029): installation must
++    * never read SINK here.  Print the object state; the reference and
++    * slot update still run so the probe does not alter ownership.
++    */
++   if (unlikely(fd_ringbuffer_is_sink(&fd_ring->base))) {
++      static unsigned prints;
++      uint64_t tid = 0;
++
++      if (prints < 16) {
++         prints++;
++         pthread_threadid_np(NULL, &tid);
++         printf("fd suballoc sink install: ring %p flags 0x%x pid %d tid %llu\n",
++                (void *)&fd_ring->base, (unsigned)fd_ring->base.flags,
++                getpid(), (unsigned long long)tid);
++         fflush(stdout);
++         slab_probe_frames();
++      }
++   }
+ 
+    fd_submit->suballoc_ring =
+       fd_ringbuffer_ref_site(&fd_ring->base, FD_RING_SITE_SUBALLOC_REF);
+@@ -261,6 +281,10 @@
+     * increment the refcnt of the current ring
+     */
+    fd_ring->base.refcnt = 1;
++   /* HackiOS: the suballoc reference below reads flags through the sink test;
++    * init rewrites the same value after mapping the bo.
++    */
++   fd_ring->base.flags = flags;
+    fd_ring_probe_create(&fd_ring->base);
+ 
+    if (flags & FD_RINGBUFFER_STREAMING) {
+@@ -273,12 +297,8 @@
+       fd_ring->ring_bo = fd_bo_new_ring(submit->pipe->dev, size);
+    }
+ 
+-   if (!fd_ringbuffer_sp_init(fd_ring, size, flags)) {
+-      if (fd_ring->ring_bo)
+-         fd_bo_del(fd_ring->ring_bo);
+-      slab_free(&fd_submit->ring_pool, fd_ring);
++   if (!fd_ringbuffer_sp_init(fd_ring, size, flags))
+       return NULL;
+-   }
+ 
+    return &fd_ring->base;
+ }

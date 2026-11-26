@@ -14,12 +14,15 @@
  *   dl_log=1   every display link made and every rate asked of one, with the caller (first 300).
  *   ax_rt=1    Reduce Transparency, ax_rm=1 Reduce Motion, set through libAccessibility's own setters
  *              as SpringBoard starts (oosexgang/hakios-xnu-kernel a48d2b2).
+ *   xfm_log=1  sample SBIconScrollView's horizontal scrolling state on its smooth-scroll display
+ *              link and in setContentOffset:, buffered in memory and written in batches.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <objc/runtime.h>
 #include <objc/message.h>
 #include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -28,6 +31,8 @@
 #include <pthread.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach-o/dyld.h>
+#include <os/lock.h>
 #include <sys/sysctl.h>
 #include <stdarg.h>
 #include <unistd.h>
@@ -140,6 +145,22 @@ static void (*original_set_range)(id, SEL, frame_rate_range);
 static int dl_max, dl_log;
 static atomic_uint dl_logged;
 static char dl_full_key;                /* the associated object a display link made for DL_FULL_FOR carries */
+static mach_timebase_info_data_t dl_timebase;
+
+/*
+ * Microseconds since boot, on the timeline of the kernel's "tl:" lines. Without one, a display
+ * link line can only be placed against the frame stream by the lines that happen to surround it,
+ * and whether a rate request came before or inside a settle stall is exactly what dl_log=1 is
+ * meant to answer.
+ */
+static unsigned long long
+dl_micros(void)
+{
+    if (dl_timebase.denom == 0) {
+        mach_timebase_info(&dl_timebase);
+    }
+    return (unsigned long long)((mach_absolute_time() * dl_timebase.numer / dl_timebase.denom) / 1000);
+}
 
 static int
 full_rate(id link)
@@ -174,9 +195,9 @@ made(id link, id target, SEL action, const void *from)
         if (!strcmp(object_getClassName(target), dl_full_for[i]))
             objc_setAssociatedObject(link, &dl_full_key, (id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
     if (log_slot())
-        fprintf(stderr, "sb26: display link %p made for -[%s %s] by %s\n", (void *)link,
+        fprintf(stderr, "sb26: display link %p made for -[%s %s] by %s at %llu\n", (void *)link,
             target ? object_getClassName(target) : "nil", action ? sel_getName(action) : "",
-            caller(from, who, sizeof(who)));
+            caller(from, who, sizeof(who)), dl_micros());
 }
 
 static id
@@ -201,8 +222,8 @@ set_fps(id self, SEL selector, long fps)
     char who[256];
     int full = full_rate(self);
     if (log_slot())
-        fprintf(stderr, "sb26: display link %p asked for %ld a second%s by %s\n", (void *)self, fps,
-            full ? " (dropped)" : "", caller(__builtin_return_address(0), who, sizeof(who)));
+        fprintf(stderr, "sb26: display link %p asked for %ld a second%s by %s at %llu\n", (void *)self, fps,
+            full ? " (dropped)" : "", caller(__builtin_return_address(0), who, sizeof(who)), dl_micros());
     original_set_fps(self, selector, full ? 0 : fps);
 }
 
@@ -212,9 +233,9 @@ set_range(id self, SEL selector, frame_rate_range range)
     char who[256];
     int full = full_rate(self);
     if (log_slot())
-        fprintf(stderr, "sb26: display link %p asked for %.0f..%.0f, %.0f a second%s by %s\n", (void *)self,
+        fprintf(stderr, "sb26: display link %p asked for %.0f..%.0f, %.0f a second%s by %s at %llu\n", (void *)self,
             range.minimum, range.maximum, range.preferred, full ? " (dropped)" : "",
-            caller(__builtin_return_address(0), who, sizeof(who)));
+            caller(__builtin_return_address(0), who, sizeof(who)), dl_micros());
     if (full) range = (frame_rate_range){ 0, 0, 0 };
     original_set_range(self, selector, range);
 }
@@ -249,6 +270,418 @@ install_display_links(void)
         original_with_display != NULL, original_set_fps != NULL, original_set_range != NULL,
         dl_max ? "; the in-process animation manager's at the panel's rate (dl_max=1)" : "",
         dl_log ? "; logged (dl_log=1)" : "");
+}
+
+/* ---- page transform samples --------------------------------------------------------------------- */
+
+/*
+ * xfm_log=1: the motion truth probe for home-screen page scrolling. SBIconScrollView inherits
+ * _smoothScrollDisplayLink: from UIScrollView on the checked 23G90 cache and overrides
+ * setContentOffset: itself. Both scrolling hooks therefore go onto SBIconScrollView: inherited methods are
+ * added as subclass overrides, so UIScrollView and the other scroll views in the process keep their
+ * original implementations. The display-link hook samples after the original callback has advanced
+ * the animation. The content-offset hook covers synchronous scrolling and suppresses the nested
+ * sample when the display-link implementation itself sets the offset.
+ *
+ * Samples are appended to a fixed ring on the calling thread. A serial dispatch queue copies and
+ * writes them in batches: once when the ring is three quarters full, and once 900 ms after the last
+ * finger of a touch sequence leaves the screen. The delay covers the settle segment whose motion the
+ * probe is meant to resolve, and finishes before the measurement tour's 1.2 s page-turn settle
+ * window ends. No sample is written to stderr on the main RunLoop.
+ *
+ * Line fields: off is contentOffset.x; mx/px are model/presentation layer position.x; mtx/ptx are
+ * the x translations of their transforms; mbx/pbx are their bounds.origin.x. Bounds x is included
+ * because UIScrollView represents scrolling through the layer bounds; position and transform alone
+ * can stay constant while the content scrolls.
+ */
+#define XFM_RING_CAP 1024
+#define XFM_RING_FLUSH_AT (XFM_RING_CAP * 3 / 4)
+/* 900 ms covers the roughly 0.7 s spring settle and still leaves a quiet gap before the 1.2 s
+ * page-turn settle window used by the measurement tour ends. */
+#define XFM_FLUSH_AFTER_LIFT_NS (900LL * 1000LL * 1000LL)
+
+struct xfm_point { double x, y; };
+struct xfm_rect { double x, y, w, h; };
+struct xfm_transform3d {
+    double m11, m12, m13, m14;
+    double m21, m22, m23, m24;
+    double m31, m32, m33, m34;
+    double m41, m42, m43, m44;
+};
+
+struct xfm_record {
+    unsigned long long micros;
+    const void *link;
+    const void *view;
+    double offset_x;
+    double model_x, model_tx, model_bx;
+    double presentation_x, presentation_tx, presentation_bx;
+    unsigned gesture;
+    unsigned char source;
+};
+
+static int xfm_log;
+static os_unfair_lock xfm_ring_lock = OS_UNFAIR_LOCK_INIT;
+static struct xfm_record xfm_ring[XFM_RING_CAP];
+static struct xfm_record xfm_flush_copy[XFM_RING_CAP];
+static unsigned xfm_write, xfm_read, xfm_dropped;
+static dispatch_queue_t xfm_flush_queue;
+static atomic_int xfm_flush_pending;
+static atomic_uint xfm_gesture;
+static unsigned xfm_active_touches;
+static __thread int xfm_in_smooth;
+
+static SEL xfm_sel_content_offset, xfm_sel_layer, xfm_sel_presentation_layer;
+static SEL xfm_sel_position, xfm_sel_transform, xfm_sel_bounds;
+static SEL xfm_sel_type, xfm_sel_all_touches, xfm_sel_count, xfm_sel_any_object;
+static SEL xfm_sel_object_enumerator, xfm_sel_next_object, xfm_sel_phase;
+
+static void (*xfm_original_smooth)(id, SEL, id);
+static void (*xfm_original_set_offset)(id, SEL, struct xfm_point);
+static void (*xfm_original_send_event)(id, SEL, id);
+
+static id
+xfm_object0(id object, SEL selector)
+{
+    if (!object) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static struct xfm_point
+xfm_point0(id object, SEL selector)
+{
+    if (!object) return (struct xfm_point){ NAN, NAN };
+    return ((struct xfm_point (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static struct xfm_rect
+xfm_rect0(id object, SEL selector)
+{
+    if (!object) return (struct xfm_rect){ NAN, NAN, NAN, NAN };
+    return ((struct xfm_rect (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static struct xfm_transform3d
+xfm_transform0(id object, SEL selector)
+{
+    struct xfm_transform3d zero = { 0 };
+    if (!object) return zero;
+    return ((struct xfm_transform3d (*)(id, SEL))objc_msgSend)(object, selector);
+}
+
+static void
+xfm_fill_layer(id layer, double *x, double *tx, double *bx)
+{
+    struct xfm_point at = xfm_point0(layer, xfm_sel_position);
+    struct xfm_transform3d transform = xfm_transform0(layer, xfm_sel_transform);
+    struct xfm_rect bounds = xfm_rect0(layer, xfm_sel_bounds);
+    *x = at.x;
+    *tx = transform.m41;
+    *bx = bounds.x;
+}
+
+static void xfm_flush_now(void);
+static void xfm_flush_entry(void *context);
+
+static void
+xfm_request_flush(void)
+{
+    if (!xfm_flush_queue) return;
+    if (!atomic_exchange_explicit(&xfm_flush_pending, 1, memory_order_acq_rel))
+        dispatch_async_f(xfm_flush_queue, NULL, xfm_flush_entry);
+}
+
+static void
+xfm_ring_push(const struct xfm_record *record)
+{
+    int near_full;
+    os_unfair_lock_lock(&xfm_ring_lock);
+    if (xfm_write - xfm_read == XFM_RING_CAP) {
+        xfm_read++;
+        xfm_dropped++;
+    }
+    xfm_ring[xfm_write % XFM_RING_CAP] = *record;
+    xfm_write++;
+    near_full = xfm_write - xfm_read >= XFM_RING_FLUSH_AT;
+    os_unfair_lock_unlock(&xfm_ring_lock);
+    if (near_full) xfm_request_flush();
+}
+
+static void
+xfm_flush_now(void)
+{
+    unsigned count, dropped;
+
+    os_unfair_lock_lock(&xfm_ring_lock);
+    count = xfm_write - xfm_read;
+    for (unsigned i = 0; i < count; i++)
+        xfm_flush_copy[i] = xfm_ring[(xfm_read + i) % XFM_RING_CAP];
+    xfm_read = xfm_write;
+    dropped = xfm_dropped;
+    xfm_dropped = 0;
+    os_unfair_lock_unlock(&xfm_ring_lock);
+
+    if (!count && !dropped) return;
+    fprintf(stderr, "sb26: xfm batch at %llu n=%u dropped=%u\n", dl_micros(), count, dropped);
+    for (unsigned i = 0; i < count; i++) {
+        const struct xfm_record *r = &xfm_flush_copy[i];
+        fprintf(stderr,
+            "sb26: xfm t=%llu g=%u src=%c dl=%p sv=%p off=%.3f mx=%.3f mtx=%.3f mbx=%.3f "
+            "px=%.3f ptx=%.3f pbx=%.3f\n",
+            r->micros, r->gesture, r->source, r->link, r->view, r->offset_x,
+            r->model_x, r->model_tx, r->model_bx,
+            r->presentation_x, r->presentation_tx, r->presentation_bx);
+    }
+}
+
+static void
+xfm_flush_entry(void *context)
+{
+    (void)context;
+    for (;;) {
+        xfm_flush_now();
+        os_unfair_lock_lock(&xfm_ring_lock);
+        int empty = xfm_write == xfm_read;
+        if (empty)
+            atomic_store_explicit(&xfm_flush_pending, 0, memory_order_release);
+        os_unfair_lock_unlock(&xfm_ring_lock);
+        if (empty) break;
+    }
+}
+
+static void
+xfm_delayed_flush(void *context)
+{
+    (void)context;
+    xfm_flush_now();
+}
+
+static void
+xfm_schedule_settle_flush(void)
+{
+    if (!xfm_flush_queue) return;
+    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, XFM_FLUSH_AFTER_LIFT_NS),
+        xfm_flush_queue, NULL, xfm_delayed_flush);
+}
+
+/* UIEventTypeTouches and UITouchPhaseBegan/Ended/Cancelled, kept numeric because this file does not use UIKit. */
+static void
+xfm_note_event(id event)
+{
+    if (!event || ((long (*)(id, SEL))objc_msgSend)(event, xfm_sel_type) != 0) return;
+    id touches = xfm_object0(event, xfm_sel_all_touches);
+    long touch_count = touches ? ((long (*)(id, SEL))objc_msgSend)(touches, xfm_sel_count) : 0;
+    unsigned began = 0, finished = 0;
+
+    /* The measured scrolling path is single-touch; keep that path off the enumerator and reserve it
+     * for multi-touch events. */
+    if (touch_count == 1) {
+        id touch = xfm_object0(touches, xfm_sel_any_object);
+        long phase = touch ? ((long (*)(id, SEL))objc_msgSend)(touch, xfm_sel_phase) : -1;
+        if (phase == 0) began = 1;
+        else if (phase == 3 || phase == 4) finished = 1;
+    } else if (touch_count > 1) {
+        id enumerator = xfm_object0(touches, xfm_sel_object_enumerator);
+        id touch;
+        while ((touch = xfm_object0(enumerator, xfm_sel_next_object)) != nil) {
+            long phase = ((long (*)(id, SEL))objc_msgSend)(touch, xfm_sel_phase);
+            if (phase == 0) began++;
+            else if (phase == 3 || phase == 4) finished++;
+        }
+    }
+    if (!began && !finished) return;
+
+    unsigned active_before = xfm_active_touches;
+    if (began) {
+        if (!xfm_active_touches)
+            atomic_fetch_add_explicit(&xfm_gesture, 1, memory_order_relaxed);
+        xfm_active_touches += began;
+    }
+    if (finished)
+        xfm_active_touches = finished >= xfm_active_touches ? 0 : xfm_active_touches - finished;
+    if (active_before && !xfm_active_touches) xfm_schedule_settle_flush();
+}
+
+static void
+xfm_send_event(id self, SEL selector, id event)
+{
+    /* Count before the original: samples produced while the first touch is handled carry its gesture. */
+    xfm_note_event(event);
+    xfm_original_send_event(self, selector, event);
+}
+
+static void
+xfm_sample(id view, id link, unsigned char source, double fallback_offset_x)
+{
+    unsigned gesture = atomic_load_explicit(&xfm_gesture, memory_order_relaxed);
+
+    struct xfm_record record = {
+        .micros = dl_micros(),
+        .link = (const void *)link,
+        .view = (const void *)view,
+        .offset_x = fallback_offset_x,
+        .model_x = NAN, .model_tx = NAN, .model_bx = NAN,
+        .presentation_x = NAN, .presentation_tx = NAN, .presentation_bx = NAN,
+        .gesture = gesture,
+        .source = source,
+    };
+
+    /* UIKit layers belong to the main thread. The display-link callback runs there; an unusual
+     * background setContentOffset: still leaves a time-stamped offset sample, without layer reads. */
+    if (pthread_main_np()) {
+        struct xfm_point offset = xfm_point0(view, xfm_sel_content_offset);
+        if (!isnan(offset.x)) record.offset_x = offset.x;
+        id layer = xfm_object0(view, xfm_sel_layer);
+        if (layer) {
+            xfm_fill_layer(layer, &record.model_x, &record.model_tx, &record.model_bx);
+            id presentation = xfm_object0(layer, xfm_sel_presentation_layer);
+            if (presentation)
+                xfm_fill_layer(presentation, &record.presentation_x, &record.presentation_tx,
+                    &record.presentation_bx);
+        }
+    }
+    xfm_ring_push(&record);
+}
+
+static void
+xfm_smooth_display_link(id self, SEL selector, id link)
+{
+    xfm_in_smooth++;
+    xfm_original_smooth(self, selector, link);
+    xfm_in_smooth--;
+    xfm_sample(self, link, 'd', NAN);
+}
+
+static void
+xfm_set_content_offset(id self, SEL selector, struct xfm_point offset)
+{
+    xfm_original_set_offset(self, selector, offset);
+    if (!xfm_in_smooth) xfm_sample(self, nil, 's', offset.x);
+}
+
+/*
+ * class_getInstanceMethod walks up the inheritance chain. When the method it finds belongs to a
+ * superclass, add a method with the same selector to the subclass and keep the superclass IMP as the
+ * original; when the class owns the method, replace it in place. The expected encodings are checked
+ * because the replacement ABI has to match exactly.
+ */
+static IMP
+xfm_hook_method(Class cls, const char *name, const char *encoding, IMP replacement)
+{
+    SEL selector = sel_registerName(name);
+    Method method = class_getInstanceMethod(cls, selector);
+    const char *found = method ? method_getTypeEncoding(method) : NULL;
+    if (!method || !found || strcmp(found, encoding)) {
+        fprintf(stderr, "sb26: xfm: -[%s %s] not hooked (encoding %s)\n",
+            class_getName(cls), name, found ? found : "missing");
+        return NULL;
+    }
+    IMP original = method_getImplementation(method);
+    if (!original) return NULL;
+
+    Class superclass = class_getSuperclass(cls);
+    Method inherited = superclass ? class_getInstanceMethod(superclass, selector) : NULL;
+    if (inherited == method) {
+        if (!class_addMethod(cls, selector, replacement, found)) {
+            fprintf(stderr, "sb26: xfm: -[%s %s] override add failed\n", class_getName(cls), name);
+            return NULL;
+        }
+        return original;
+    }
+    return method_setImplementation(method, replacement);
+}
+
+static void
+xfm_restore_method(Class cls, const char *name, IMP original)
+{
+    if (!original) return;
+    Method method = class_getInstanceMethod(cls, sel_registerName(name));
+    if (method) method_setImplementation(method, original);
+}
+
+static os_unfair_lock xfm_install_lock = OS_UNFAIR_LOCK_INIT;
+static int xfm_probe_installed, xfm_probe_failed, xfm_image_callback_registered;
+static void xfm_install_probe(void);
+
+static void
+xfm_image_added(__unused const struct mach_header *header, __unused intptr_t slide)
+{
+    xfm_install_probe();
+}
+
+/*
+ * dyld invokes a newly registered add-image callback for the images already loaded. Registration
+ * therefore stays outside xfm_install_lock; the callback re-enters xfm_install_probe for those
+ * images before the explicit initial attempt below.
+ */
+static void
+xfm_start_probe(void)
+{
+    xfm_flush_queue = dispatch_queue_create("annibale.sb26.xfm", DISPATCH_QUEUE_SERIAL);
+    if (!xfm_flush_queue) {
+        xfm_probe_failed = 1;
+        fprintf(stderr, "sb26: xfm: no flush queue, probe not installed\n");
+        return;
+    }
+    if (!xfm_image_callback_registered) {
+        xfm_image_callback_registered = 1;
+        _dyld_register_func_for_add_image(xfm_image_added);
+    }
+    xfm_install_probe();
+}
+
+static void
+xfm_install_probe(void)
+{
+    os_unfair_lock_lock(&xfm_install_lock);
+    if (xfm_probe_installed || xfm_probe_failed) {
+        os_unfair_lock_unlock(&xfm_install_lock);
+        return;
+    }
+
+    Class scroll = objc_getClass("SBIconScrollView");
+    Class application = objc_getClass("SpringBoard");
+    if (!scroll || !application) {
+        os_unfair_lock_unlock(&xfm_install_lock);
+        return;
+    }
+    (void)dl_micros();
+    xfm_sel_content_offset = sel_registerName("contentOffset");
+    xfm_sel_layer = sel_registerName("layer");
+    xfm_sel_presentation_layer = sel_registerName("presentationLayer");
+    xfm_sel_position = sel_registerName("position");
+    xfm_sel_transform = sel_registerName("transform");
+    xfm_sel_bounds = sel_registerName("bounds");
+    xfm_sel_type = sel_registerName("type");
+    xfm_sel_all_touches = sel_registerName("allTouches");
+    xfm_sel_count = sel_registerName("count");
+    xfm_sel_any_object = sel_registerName("anyObject");
+    xfm_sel_object_enumerator = sel_registerName("objectEnumerator");
+    xfm_sel_next_object = sel_registerName("nextObject");
+    xfm_sel_phase = sel_registerName("phase");
+
+    xfm_original_smooth = (void (*)(id, SEL, id))xfm_hook_method(scroll,
+        "_smoothScrollDisplayLink:", "v24@0:8@16", (IMP)xfm_smooth_display_link);
+    xfm_original_set_offset = (void (*)(id, SEL, struct xfm_point))xfm_hook_method(scroll,
+        "setContentOffset:", "v32@0:8{CGPoint=dd}16", (IMP)xfm_set_content_offset);
+    xfm_original_send_event = (void (*)(id, SEL, id))xfm_hook_method(application,
+        "sendEvent:", "v24@0:8@16", (IMP)xfm_send_event);
+
+    if (xfm_original_smooth && xfm_original_set_offset && xfm_original_send_event) {
+        xfm_probe_installed = 1;
+        fprintf(stderr, "sb26: xfm: scroll probe installed, ring %u, batch flush at %u or 900 ms after touch-up\n",
+            XFM_RING_CAP, XFM_RING_FLUSH_AT);
+    } else {
+        xfm_restore_method(scroll, "_smoothScrollDisplayLink:", (IMP)xfm_original_smooth);
+        xfm_restore_method(scroll, "setContentOffset:", (IMP)xfm_original_set_offset);
+        xfm_restore_method(application, "sendEvent:", (IMP)xfm_original_send_event);
+        xfm_original_smooth = NULL;
+        xfm_original_set_offset = NULL;
+        xfm_original_send_event = NULL;
+        xfm_probe_failed = 1;
+        fprintf(stderr, "sb26: xfm: probe not installed (smooth/offset/event hooks incomplete)\n");
+    }
+    os_unfair_lock_unlock(&xfm_install_lock);
 }
 
 /* ---- accessibility ------------------------------------------------------------------------------ */
@@ -436,7 +869,9 @@ sb26_install_rate(uintptr_t slide)
     set_accessibility("ax_rm=1", "_AXSSetReduceMotionEnabled");
     dl_max = sb26_boot_arg_present("dl_max=1");
     dl_log = sb26_boot_arg_present("dl_log=1");
+    xfm_log = sb26_boot_arg_present("xfm_log=1");
     if (dl_max || dl_log) install_display_links();
+    if (xfm_log) xfm_start_probe();
     watch_main_loop();
     /* once the home screen is up, and again once the boot's work has settled */
     dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), dispatch_get_main_queue(),
