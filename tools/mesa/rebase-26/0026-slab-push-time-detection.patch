@@ -1,0 +1,794 @@
+--- a/src/util/slab.c
++++ b/src/util/slab.c
+@@ -30,6 +30,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <execinfo.h>
++#include <dlfcn.h>
+ 
+ #define SLAB_MAGIC_ALLOCATED 0xcafe4321
+ #define SLAB_MAGIC_FREE 0x7ee01234
+@@ -43,13 +45,16 @@
+  */
+ #define SLAB_DESTROY_POP_LIMIT 10000
+ 
+-#ifndef NDEBUG
++/* HackiOS diagnostic probe (push-time detection family, rebase-26 patch
++ * 0026): the magic word is unconditional now.  Upstream compiles it out with
++ * NDEBUG, which this build sets, so the release library ran without the one
++ * check that catches a double free where it happens: the second slab_free of
++ * the same element.  With the write and the tests compiled in, slab_free
++ * detects the repeat push before it links the element into the free list a
++ * second time -- the corruption that the merge-cleanup probes could only
++ * observe after the fact, as a cycle at pool destroy.
++ */
+ #define SET_MAGIC(element, value)   (element)->magic = (value)
+-#define CHECK_MAGIC(element, value) assert((element)->magic == (value))
+-#else
+-#define SET_MAGIC(element, value)
+-#define CHECK_MAGIC(element, value)
+-#endif
+ 
+ /* One array element within a big buffer. */
+ struct slab_element_header {
+@@ -63,9 +68,7 @@
+     */
+    intptr_t owner;
+ 
+-#ifndef NDEBUG
+    intptr_t magic;
+-#endif
+ };
+ 
+ /* The page is an array of allocations in one block. */
+@@ -82,6 +85,55 @@
+     */
+ };
+ 
++/* HackiOS diagnostic probe (push-time detection family): the caller chain as
++ * raw return addresses, one line, ending the evidence a crime scene leaves
++ * in the log.  backtrace_symbols() is no use here: it allocates, and the
++ * investigations this serves are heap-corruption ones where a malloc inside
++ * the probe can wedge before the state line is out.  The library base goes
++ * with the frames so the addresses resolve offline against the unstripped
++ * libannibaleair.dylib; frame 0 is inside slab_probe_frames itself.
++ */
++void
++slab_probe_frames(void)
++{
++   void *frames[12];
++   int n = backtrace(frames, ARRAY_SIZE(frames));
++   Dl_info info;
++   void *base = NULL;
++
++   if (dladdr((void *)&slab_probe_frames, &info))
++      base = info.dli_fbase;
++
++   printf("probe frames: base %p n %d:", base, n);
++   for (int i = 0; i < n; i++)
++      printf(" %p", frames[i]);
++   printf("\n");
++   fflush(stdout);
++}
++
++/* The magic test of slab_free/slab_alloc, criminal evidence variant: the
++ * printout carries everything the element header and the pool can say
++ * without chasing a pointer that corruption may have poisoned, and the
++ * abort happens where the evidence is rather than in the destroy-time spin
++ * it used to become.  Never returns.
++ */
++static void
++slab_magic_violation(const char *where, struct slab_child_pool *pool,
++                     struct slab_element_header *elt, intptr_t expected)
++{
++   uint64_t tid = 0;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("%s: pool %p elt %p obj %p magic 0x%lx expect 0x%lx owner 0x%lx "
++          "free %p tid %llu\n",
++          where, (void *)pool, (void *)elt, (void *)(elt + 1),
++          (unsigned long)elt->magic, (unsigned long)expected,
++          (unsigned long)elt->owner, (void *)pool->free,
++          (unsigned long long)tid);
++   fflush(stdout);
++   slab_probe_frames();
++   abort();
++}
+ 
+ static struct slab_element_header *
+ slab_get_element(struct slab_parent_pool *parent,
+@@ -211,54 +263,126 @@
+    pool->parent = NULL;
+ }
+ 
+-/* HackiOS diagnostic probe (merge-cleanup family): account for the child
+- * pool's elements, so a caller about to destroy the pool can tell whether
+- * allocations are still out.  npages*num_elements - nfree - nmigrated of them
+- * are.  The free list and the page list are the owner thread's by the slab
+- * design; the migrated list is taken under the parent mutex like slab_alloc
+- * does.
++/* HackiOS diagnostic probe (merge-cleanup family, reworked by the push-time
++ * detection round): account for the child pool's elements, so a caller about
++ * to destroy the pool can tell whether allocations are still out.
++ *
++ * The 0025 form walked the three lists first and derived the live count from
++ * the tallies, so a cyclic free list aborted inside the walk and the live
++ * verdict -- the one number that separates a merging/ownership bug from a
++ * free-list corruption -- never reached the log.  The order is inverted
++ * here: the census comes first and does not trust any list pointer, because
++ * the magic word is unconditional now and every element says by itself
++ * whether it is out.  The list walks that follow validate each node against
++ * the pool's own pages before following it and stop at the first foreign or
++ * overlong node instead of aborting, so the caller prints everything no
++ * matter what the corruption looks like.
++ *
++ * Nothing here writes the pool, and nothing here aborts: the caller decides
++ * what is fatal after the evidence is out.
+  */
+-void
+-slab_child_accounting(struct slab_child_pool *pool, unsigned *npages,
+-                      unsigned *nfree, unsigned *nmigrated)
++
++/* Is elt one of the pool's own elements?  A free-list node that fails this
++ * test came from a write into the list, not from a double push: a pushed
++ * element is always a page element of some pool, and cross-pool pushes go
++ * through the owner mechanics, never into a foreign pool's list.
++ */
++static bool
++slab_element_in_pages(struct slab_child_pool *pool,
++                      struct slab_element_header *elt)
+ {
+-   unsigned pages = 0, n_free = 0, n_migrated = 0;
++   unsigned pages = 0;
+ 
+-   /* The same corruption the destroy probe exists for would otherwise just
+-    * move the spin into this walk.  A list longer than the limit cannot be
+-    * intact, so this is the same decisive crash with the same evidence.
+-    */
+    for (struct slab_page_header *page = pool->pages; page; page = page->u.next) {
+-      if (unlikely(++pages > SLAB_DESTROY_POP_LIMIT)) {
+-         printf("slab accounting overrun: pool %p list pages\n", (void *)pool);
+-         fflush(stdout);
+-         abort();
+-      }
+-   }
++      uintptr_t begin = (uintptr_t)&page[1];
++      uintptr_t end = begin + pool->parent->num_elements * pool->parent->element_size;
+ 
+-   for (struct slab_element_header *elt = pool->free; elt; elt = elt->next) {
+-      if (unlikely(++n_free > SLAB_DESTROY_POP_LIMIT)) {
+-         printf("slab accounting overrun: pool %p list free\n", (void *)pool);
+-         fflush(stdout);
+-         abort();
+-      }
++      if (++pages > SLAB_DESTROY_POP_LIMIT)
++         return false;
++      if ((uintptr_t)elt >= begin && (uintptr_t)elt < end)
++         return true;
+    }
+ 
+-   if (pool->parent) {
+-      simple_mtx_lock(&pool->parent->mutex);
+-      for (struct slab_element_header *elt = pool->migrated; elt; elt = elt->next) {
+-         if (unlikely(++n_migrated > SLAB_DESTROY_POP_LIMIT)) {
+-            printf("slab accounting overrun: pool %p list migrated\n", (void *)pool);
+-            fflush(stdout);
+-            abort();
++   return false;
++}
++
++void
++slab_child_accounting(struct slab_child_pool *pool,
++                      struct slab_child_accounts *accounts,
++                      slab_element_probe_fn probe, void *probe_data)
++{
++   memset(accounts, 0, sizeof(*accounts));
++
++   if (!pool->parent)
++      return;
++
++   /* The census: pages walked once, elements scanned in place.  The page
++    * count cannot legitimately reach the limit any more than the old walk's
++    * could; past it, the page list itself is corrupted and the census is
++    * partial, which the anomaly bits say.
++    */
++   unsigned pages = 0;
++
++   for (struct slab_page_header *page = pool->pages; page; page = page->u.next) {
++      if (unlikely(++pages > SLAB_DESTROY_POP_LIMIT)) {
++         accounts->anomalies |= SLAB_ACCT_PAGES_OVERRUN;
++         break;
++      }
++
++      for (unsigned i = 0; i < pool->parent->num_elements; ++i) {
++         struct slab_element_header *elt = slab_get_element(pool->parent, page, i);
++         bool allocated = false;
++
++         if (elt->magic == SLAB_MAGIC_ALLOCATED) {
++            accounts->live++;
++            allocated = true;
++         } else if (elt->magic == SLAB_MAGIC_FREE) {
++            accounts->free_by_magic++;
++         } else {
++            accounts->unknown_magic++;
+          }
++
++         if (probe)
++            probe(&elt[1], allocated, probe_data);
+       }
+-      simple_mtx_unlock(&pool->parent->mutex);
+    }
++   accounts->npages = pages;
+ 
+-   *npages = pages;
+-   *nfree = n_free;
+-   *nmigrated = n_migrated;
++   /* The list walks: each node is validated before it is followed, so a
++    * foreign node ends the walk with evidence instead of sending it into
++    * memory that is not the pool's.  An overlong walk is the cycle the 0025
++    * probe aborted inside; here it is one more anomaly bit.
++    */
++   struct slab_element_header *elt = pool->free;
++
++   while (elt) {
++      if (unlikely(accounts->nfree_list >= SLAB_DESTROY_POP_LIMIT)) {
++         accounts->anomalies |= SLAB_ACCT_FREE_OVERRUN;
++         break;
++      }
++      accounts->nfree_list++;
++      if (unlikely(!slab_element_in_pages(pool, elt))) {
++         accounts->anomalies |= SLAB_ACCT_FREE_FOREIGN;
++         break;
++      }
++      elt = elt->next;
++   }
++
++   simple_mtx_lock(&pool->parent->mutex);
++   elt = pool->migrated;
++   while (elt) {
++      if (unlikely(accounts->nmigrated_list >= SLAB_DESTROY_POP_LIMIT)) {
++         accounts->anomalies |= SLAB_ACCT_MIGRATED_OVERRUN;
++         break;
++      }
++      accounts->nmigrated_list++;
++      if (unlikely(!slab_element_in_pages(pool, elt))) {
++         accounts->anomalies |= SLAB_ACCT_MIGRATED_FOREIGN;
++         break;
++      }
++      elt = elt->next;
++   }
++   simple_mtx_unlock(&pool->parent->mutex);
+ }
+ 
+ static bool
+@@ -313,7 +437,14 @@
+    elt = pool->free;
+    pool->free = elt->next;
+ 
+-   CHECK_MAGIC(elt, SLAB_MAGIC_FREE);
++   /* An element coming off the free list reads FREE; anything else means
++    * the list handed us memory whose owner never freed it -- a double push
++    * that already happened, or a write into the element header -- and the
++    * allocation it was about to become would have been a second owner of
++    * the same bytes.
++    */
++   if (unlikely(elt->magic != SLAB_MAGIC_FREE))
++      slab_magic_violation("slab alloc magic", pool, elt, SLAB_MAGIC_FREE);
+    SET_MAGIC(elt, SLAB_MAGIC_ALLOCATED);
+ 
+    return &elt[1];
+@@ -345,18 +476,36 @@
+    struct slab_element_header *elt = ((struct slab_element_header*)ptr - 1);
+    intptr_t owner_int;
+ 
+-   CHECK_MAGIC(elt, SLAB_MAGIC_ALLOCATED);
+-   SET_MAGIC(elt, SLAB_MAGIC_FREE);
++   /* The push-time test this probe round exists for: an element being freed
++    * reads ALLOCATED.  Reading FREE here means this same element was pushed
++    * before without an allocation in between -- a double free, caught at
++    * the second push, before the link below writes the self-loop that the
++    * merge-cleanup round only found at pool destroy.  Both tests run before
++    * the header is written, so the printout reads as the crime scene was.
++    */
++   if (unlikely(elt->magic != SLAB_MAGIC_ALLOCATED))
++      slab_magic_violation("slab free magic", pool, elt, SLAB_MAGIC_ALLOCATED);
+ 
+    if (p_atomic_read(&elt->owner) == (intptr_t)pool) {
+       /* This is the simple case: The caller guarantees that we can safely
+        * access the free list.
++       *
++       * The magic test above already answers the double push; this one
++       * remains meaningful when the write that corrupted the list also
++       * rewrote the magic back into a passing value: a head-of-list repeat
++       * is the one piece of evidence that lives outside the element.
+        */
++      if (unlikely(pool->free == elt))
++         slab_magic_violation("slab free self push", pool, elt,
++                              SLAB_MAGIC_ALLOCATED);
++      SET_MAGIC(elt, SLAB_MAGIC_FREE);
+       elt->next = pool->free;
+       pool->free = elt;
+       return;
+    }
+ 
++   SET_MAGIC(elt, SLAB_MAGIC_FREE);
++
+    /* The slow case: migration or an orphaned page. */
+    if (pool->parent)
+       simple_mtx_lock(&pool->parent->mutex);
+--- a/src/util/slab.h
++++ b/src/util/slab.h
+@@ -42,6 +42,8 @@
+ #ifndef SLAB_H
+ #define SLAB_H
+ 
++#include <stdbool.h>
++
+ #include "simple_mtx.h"
+ 
+ #ifdef __cplusplus
+@@ -81,12 +83,48 @@
+ void slab_create_child(struct slab_child_pool *pool,
+                        struct slab_parent_pool *parent);
+ void slab_destroy_child(struct slab_child_pool *pool);
+-/* HackiOS diagnostic probe: count a child pool's pages and the elements on
+- * its free and migrated lists; the caller compares against the element
+- * capacity to tell whether allocations are still out.
++
++/* HackiOS diagnostic probes (push-time detection family, rebase-26 patch
++ * 0026).  slab_child_accounting() collects everything a caller needs to
++ * judge a pool's health in one pass that cannot spin or dereference a
++ * corrupted list pointer: the element census comes from scanning the pages
++ * (no list pointers involved), the list walks validate every node against
++ * the pool's pages before following it, and nothing aborts before the
++ * caller has printed.  The per-element probe callback lets the owner of the
++ * objects (the ring pool, in this build) check its own invariants without
++ * slab.c knowing the object layout.
+  */
+-void slab_child_accounting(struct slab_child_pool *pool, unsigned *npages,
+-                           unsigned *nfree, unsigned *nmigrated);
++#define SLAB_ACCT_PAGES_OVERRUN    0x1
++#define SLAB_ACCT_FREE_OVERRUN     0x2
++#define SLAB_ACCT_FREE_FOREIGN     0x4
++#define SLAB_ACCT_MIGRATED_OVERRUN 0x8
++#define SLAB_ACCT_MIGRATED_FOREIGN 0x10
++
++struct slab_child_accounts {
++   unsigned npages;
++   /* Census by the element magic, written unconditionally since 0026: */
++   unsigned live;          /* elements whose magic reads ALLOCATED */
++   unsigned free_by_magic; /* elements whose magic reads FREE, on any list */
++   unsigned unknown_magic; /* neither: the element header itself was written */
++   /* List walks, each node validated against the pool's pages: */
++   unsigned nfree_list;
++   unsigned nmigrated_list;
++   unsigned anomalies;     /* SLAB_ACCT_* bitmask */
++};
++
++typedef void (*slab_element_probe_fn)(void *object, bool allocated,
++                                      void *data);
++
++void slab_child_accounting(struct slab_child_pool *pool,
++                           struct slab_child_accounts *accounts,
++                           slab_element_probe_fn probe, void *probe_data);
++
++/* Prints one "probe frames:" line with the library base and the return
++ * addresses leading to the caller, for offline symbolication; shared by the
++ * slab layer and the freedreno layer so every crime scene reads the same.
++ */
++void slab_probe_frames(void);
++
+ void *slab_alloc(struct slab_child_pool *pool);
+ void *slab_zalloc(struct slab_child_pool *pool);
+ void slab_free(struct slab_child_pool *pool, void *ptr);
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -533,8 +533,39 @@
+    }
+    pthread_mutex_unlock(&flush_mtx);
+ }
++
++/* HackiOS diagnostic probe (push-time detection family): per-element canary
++ * census for the accounting pass.  A pool element only ever holds rings, so
++ * a free element keeps the DEAD poison its last destroy wrote until reuse,
++ * a live element must read LIVE, and anything else was written from outside
++ * the object.  The never-used elements of a fresh page count as other,
++ * which is why only live_ring_bad is fatal.
++ */
++struct fd_ring_canary_stats {
++   unsigned live_count;
++   unsigned dead_count;
++   unsigned other_count;
++   unsigned live_ring_bad;
++};
+ 
+ static void
++fd_ring_canary_probe(void *object, bool allocated, void *data)
++{
++   struct fd_ringbuffer_sp *fd_ring = object;
++   struct fd_ring_canary_stats *stats = data;
++
++   if (fd_ring->probe_canary == FD_RING_CANARY_LIVE)
++      stats->live_count++;
++   else if (fd_ring->probe_canary == FD_RING_CANARY_DEAD)
++      stats->dead_count++;
++   else
++      stats->other_count++;
++
++   if (allocated && fd_ring->probe_canary != FD_RING_CANARY_LIVE)
++      stats->live_ring_bad++;
++}
++
++static void
+ fd_submit_sp_destroy(struct fd_submit *submit)
+ {
+    struct fd_submit_sp *fd_submit = to_fd_submit_sp(submit);
+@@ -545,31 +576,55 @@
+    _mesa_hash_table_destroy(fd_submit->bo_table, NULL);
+    _mesa_hash_table_destroy(fd_submit->suballoc_bo_table, NULL);
+ 
+-   /* HackiOS diagnostic probe (merge-cleanup family): the ring pool may only
+-    * be destroyed once every ring created from it is back, which is what the
+-    * note above fd_submit_del() requires.  Count what is still out before the
+-    * orphaning hides it: a nonzero count means the pool is being destroyed
+-    * while rings of this submit are still referenced, the lifecycle violation
+-    * that the b5r14 stall chain ended in.  Crash here, where the evidence is,
+-    * rather than in the slab free-list spin it used to become.
+-    */
+-   unsigned npages = 0, nfree = 0, nmigrated = 0;
+-   slab_child_accounting(&fd_submit->ring_pool, &npages, &nfree, &nmigrated);
++   /* HackiOS diagnostic probe (merge-cleanup family, reworked by the
++    * push-time detection round): the ring pool may only be destroyed once
++    * every ring created from it is back, which is what the note above
++    * fd_submit_del() requires.  The accounting now reads the live count off
++    * the element magic directly, before touching any list, so the verdict
++    * reaches the log even when the free list is corrupt; the list walks
++    * cross-check the census instead of producing it.  A healthy submit
++    * destroy prints nothing.  The verdicts:
++    *
++    *   live nonzero          -- rings of this submit are still out: merging
++    *                            or ownership dropped a reference
++    *   unknown nonzero       -- element headers were written over
++    *   anomalies nonzero     -- a list is cyclic or carries foreign nodes
++    *   census/list mismatch  -- free and migrated tallies disagree with the
++    *                            magic census: elements pushed more than once
++    *                            or dropped off the list
++    *   livecanarybad nonzero -- a ring still out has its canary overwritten
++    *
++    * Crash here, where the evidence is, rather than in the slab free-list
++    * spin it used to become.
++    */
++   struct slab_child_accounts accounts;
++   struct fd_ring_canary_stats canaries = { 0 };
+ 
+-   long capacity = (long)npages * fd_submit->ring_pool.parent->num_elements;
+-   long live = capacity - (long)nfree - (long)nmigrated;
++   slab_child_accounting(&fd_submit->ring_pool, &accounts,
++                         fd_ring_canary_probe, &canaries);
+ 
+-   if (unlikely(live != 0)) {
++   unsigned capacity = accounts.npages * fd_submit->ring_pool.parent->num_elements;
++   bool mismatch =
++      accounts.free_by_magic != accounts.nfree_list + accounts.nmigrated_list;
++
++   if (unlikely(accounts.live != 0 || accounts.unknown_magic != 0 ||
++                accounts.anomalies != 0 || mismatch ||
++                canaries.live_ring_bad != 0)) {
+       uint64_t tid = 0;
+ 
+       pthread_threadid_np(NULL, &tid);
+-      printf("fd submit destroy live rings: fence %u seqno %u live %ld "
+-             "capacity %ld free %u migrated %u pages %u pool %p submit %p "
+-             "tid %llu\n",
+-             submit->fence, fd_submit->seqno, live, capacity, nfree,
+-             nmigrated, npages, (void *)&fd_submit->ring_pool,
++      printf("fd submit destroy rings: fence %u seqno %u live %u "
++             "freemagic %u unknown %u capacity %u freelist %u migratedlist %u "
++             "anomalies 0x%x canarylive %u canarydead %u canaryother %u "
++             "livecanarybad %u pool %p submit %p tid %llu\n",
++             submit->fence, fd_submit->seqno, accounts.live,
++             accounts.free_by_magic, accounts.unknown_magic, capacity,
++             accounts.nfree_list, accounts.nmigrated_list, accounts.anomalies,
++             canaries.live_count, canaries.dead_count, canaries.other_count,
++             canaries.live_ring_bad, (void *)&fd_submit->ring_pool,
+              (void *)submit, (unsigned long long)tid);
+       fflush(stdout);
++      slab_probe_frames();
+       abort();
+    }
+ 
+@@ -853,11 +908,72 @@
+    return true;
+ }
+ 
++/* HackiOS diagnostic probe (push-time detection family, rebase-26 patch
++ * 0026): what destroy may read out of the object without following a
++ * pointer, printed before anything is dereferenced or freed.  The token
++ * names the evidence, not the suspicion:
++ *
++ *   fd ring canary corrupt  -- the canary is neither LIVE nor DEAD: writes
++ *                              outside the object reached into it
++ *   fd ring double destroy  -- the canary reads DEAD: destroy already ran
++ *                              on this object once
++ *   fd ring refcnt at destroy -- canary LIVE but the count is not the 0 a
++ *                              first destroy must see: the reference
++ *                              arithmetic itself is off, or the bytes were
++ *                              reused underneath a dangling caller
++ *
++ * The frames and the owner detail follow as their own lines, in that order,
++ * so a poisoned submit pointer can only cost the last of the three.
++ */
+ static void
++fd_ring_destroy_violation(const char *where, struct fd_ringbuffer *ring,
++                          struct fd_ringbuffer_sp *fd_ring)
++{
++   uint64_t tid = 0;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("%s: ring %p refcnt %d canary 0x%llx flags 0x%x uptr %p "
++          "ring_bo %p tid %llu\n",
++          where, (void *)ring, ring->refcnt,
++          (unsigned long long)fd_ring->probe_canary, (unsigned)ring->flags,
++          (void *)fd_ring->u.submit, (void *)fd_ring->ring_bo,
++          (unsigned long long)tid);
++   fflush(stdout);
++   slab_probe_frames();
++
++   if (!(ring->flags & _FD_RINGBUFFER_OBJECT) && fd_ring->u.submit) {
++      struct fd_submit *submit = fd_ring->u.submit;
++
++      printf("fd ring owner detail: ring %p submit %p fence %u seqno %u\n",
++             (void *)ring, (void *)submit, submit->fence,
++             to_fd_submit_sp(submit)->seqno);
++      fflush(stdout);
++   }
++
++   abort();
++}
++
++static void
+ fd_ringbuffer_sp_destroy(struct fd_ringbuffer *ring)
+ {
+    struct fd_ringbuffer_sp *fd_ring = to_fd_ringbuffer_sp(ring);
+ 
++   /* The tests destroy is the only push point for: slab pool rings enter
++    * the free list exclusively below, so a repeat destruction of the same
++    * object is caught here with the object state intact, one call before
++    * the slab layer would see it.
++    */
++   if (unlikely(fd_ring->probe_canary != FD_RING_CANARY_LIVE)) {
++      if (fd_ring->probe_canary == FD_RING_CANARY_DEAD)
++         fd_ring_destroy_violation("fd ring double destroy", ring, fd_ring);
++      else
++         fd_ring_destroy_violation("fd ring canary corrupt", ring, fd_ring);
++   }
++   if (unlikely(ring->refcnt != 0))
++      fd_ring_destroy_violation("fd ring refcnt at destroy", ring, fd_ring);
++
++   fd_ring->probe_canary = FD_RING_CANARY_DEAD;
++
+    fd_bo_del(fd_ring->ring_bo);
+ 
+    if (ring->flags & _FD_RINGBUFFER_OBJECT) {
+@@ -973,6 +1089,12 @@
+    fd_ring->u.nr_assert_bos = fd_ring->u.max_assert_bos = 0;
+ #endif
+ 
++   /* HackiOS diagnostic probe (push-time detection family): every ring
++    * creation passes through here, slab elements included on each reuse,
++    * so a live object always carries the canary destroy verifies.
++    */
++   fd_ring->probe_canary = FD_RING_CANARY_LIVE;
++
+    return ring;
+ }
+ 
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.h
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.h
+@@ -116,9 +116,22 @@
+    } u;
+ 
+    struct fd_bo *ring_bo;
++
++   /* HackiOS diagnostic probe (push-time detection family, rebase-26 patch
++    * 0026): object canary.  Written FD_RING_CANARY_LIVE at init, verified at
++    * destroy and poisoned FD_RING_CANARY_DEAD on the way out.  Anything else
++    * at destroy means memory outside the object was written over it, and a
++    * DEAD read means destroy itself is running twice on one object; slab
++    * pool elements only ever hold rings, so the poison of a properly
++    * destroyed ring remains readable in the free element until reuse.
++    */
++   uint64_t probe_canary;
+ };
+ FD_DEFINE_CAST(fd_ringbuffer, fd_ringbuffer_sp);
+ 
++#define FD_RING_CANARY_LIVE 0x52494e474c495645ULL /* "RINGLIVE" */
++#define FD_RING_CANARY_DEAD 0x52494e4744454144ULL /* "RINGDEAD" */
++
+ void fd_pipe_sp_flush(struct fd_pipe *pipe, uint32_t fence);
+ uint32_t fd_submit_append_bo(struct fd_submit_sp *submit, struct fd_bo *bo);
+ bool fd_submit_sp_references_bo(struct fd_submit_sp *submit, struct fd_bo *bo);
+--- a/src/gallium/drivers/freedreno/freedreno_batch_cache.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch_cache.c
+@@ -6,6 +6,8 @@
+  *    Rob Clark <robclark@freedesktop.org>
+  */
+ 
++#include <pthread.h>
++
+ #include "util/hash_table.h"
+ #include "util/list.h"
+ #include "util/os_time.h"
+@@ -24,7 +26,71 @@
+  * draw/blit operation is dropped by its caller.
+  */
+ #define BATCH_ALLOC_ATTEMPTS 4
++
++/* HackiOS diagnostic probes (push-time detection family, rebase-26 patch
++ * 0026): the recursion-and-degradation observability the merge-cleanup
++ * round lacked.  None of this changes what the driver does; each family is
++ * capped per process like the 0025 probes.  The questions they answer:
++ * whether slot exhaustion ever force-flushes the oldest batch mid-draw,
++ * whether the bounded retry of 0024 ever actually runs, and whether it ever
++ * gives up -- the last one is the silent degradation that drops work with
++ * no other trace.
++ */
++#define FD_PROBE_PRINT_CAP 16
++
++static void
++fd_probe_batch_force_flush(struct fd_batch *batch)
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd batch force flush: batch %p seqno %u idx %u tid %llu\n",
++          (void *)batch, batch->seqno, batch->idx, (unsigned long long)tid);
++   fflush(stdout);
++}
++
++/* Retry and fail are capped separately: a run of retries must not spend
++ * the budget of the line that proves the operation was dropped.
++ */
++static void
++fd_probe_batch_alloc_print(const char *what, const char *where,
++                           unsigned attempt)
++{
++   uint64_t tid = 0;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd batch alloc %s: %s attempt %u tid %llu\n", what, where,
++          attempt, (unsigned long long)tid);
++   fflush(stdout);
++}
+ 
++static void
++fd_probe_batch_alloc_retry(const char *where, unsigned attempt)
++{
++   static unsigned prints;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++   fd_probe_batch_alloc_print("retry", where, attempt);
++}
++
++static void
++fd_probe_batch_alloc_fail(const char *where, unsigned attempt)
++{
++   static unsigned prints;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++   fd_probe_batch_alloc_print("fail", where, attempt);
++}
++
+ /* Overview:
+  *
+  *   The batch cache provides lookup for mapping pipe_framebuffer_state
+@@ -411,6 +477,7 @@
+        */
+       fd_screen_unlock(ctx->screen);
+       DBG("%p: too many batches!  flush forced!", flush_batch);
++      fd_probe_batch_force_flush(flush_batch);
+       fd_batch_flush(flush_batch);
+       fd_screen_lock(ctx->screen);
+ 
+@@ -498,12 +565,16 @@
+       batch = alloc_batch_locked(cache, ctx, nondraw);
+       fd_screen_unlock(ctx->screen);
+ 
+-      if (!batch && attempt + 1 < BATCH_ALLOC_ATTEMPTS)
++      if (!batch && attempt + 1 < BATCH_ALLOC_ATTEMPTS) {
++         fd_probe_batch_alloc_retry("bc", attempt + 1);
+          os_time_sleep(1000ULL << attempt);
++      }
+    }
+ 
+-   if (!batch)
++   if (!batch) {
++      fd_probe_batch_alloc_fail("bc", BATCH_ALLOC_ATTEMPTS);
+       return NULL;
++   }
+ 
+    alloc_query_buf(ctx, batch);
+ 
+@@ -606,11 +677,14 @@
+       batch = batch_from_key(ctx, key);
+       fd_screen_unlock(ctx->screen);
+ 
+-      if (!batch && attempt + 1 < BATCH_ALLOC_ATTEMPTS)
++      if (!batch && attempt + 1 < BATCH_ALLOC_ATTEMPTS) {
++         fd_probe_batch_alloc_retry("fb", attempt + 1);
+          os_time_sleep(1000ULL << attempt);
++      }
+    }
+ 
+    if (!batch) {
++      fd_probe_batch_alloc_fail("fb", BATCH_ALLOC_ATTEMPTS);
+       free(key);
+       return NULL;
+    }
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c
+@@ -49,6 +49,31 @@
+    printf("fd batch use after flush: %s batch %p seqno %u flushed %u "
+           "tid %llu\n",
+           where, (void *)batch, batch->seqno, batch->flushed,
++          (unsigned long long)tid);
++   fflush(stdout);
++}
++
++/* HackiOS diagnostic probe (push-time detection family, rebase-26 patch
++ * 0026): fd_batch_check_size is upstream logic on a legal boundary of the
++ * draw sequence, but it flushes the batch the draw stream is being emitted
++ * into, and the merge-cleanup round had no coverage of whether it ever
++ * fires.  The token names which of the three limits did it.
++ */
++static void
++fd_probe_check_size_flush(const char *where, struct fd_batch *batch)
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd batch check size flush: %s batch %p seqno %u draws %u "
++          "prim_bits %u draw_bits %u tid %llu\n",
++          where, (void *)batch, batch->seqno, batch->num_draws,
++          batch->prim_strm_bits, batch->draw_strm_bits,
+           (unsigned long long)tid);
+    fflush(stdout);
+ }
+@@ -780,6 +805,7 @@
+ {
+    if (batch->num_draws > 100000) {
+       fd_perf_batch_cuts++;
++      fd_probe_check_size_flush("draws", batch);
+       fd_batch_flush(batch);
+       return;
+    }
+@@ -789,12 +815,14 @@
+    if ((batch->prim_strm_bits > limit_bits) ||
+        (batch->draw_strm_bits > limit_bits)) {
+       fd_perf_batch_cuts++;
++      fd_probe_check_size_flush("bits", batch);
+       fd_batch_flush(batch);
+       return;
+    }
+ 
+    if (!fd_ringbuffer_check_size(batch->draw)) {
+       fd_perf_batch_cuts++;
++      fd_probe_check_size_flush("ring", batch);
+       fd_batch_flush(batch);
+    }
+ }

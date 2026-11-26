@@ -2,6 +2,7 @@
  * Stream frame rendering, metadata attachment, contrast autofocus state machine,
  * and /dev/annibale-camera worker thread (included by camera_device.c).
  */
+#include <sys/sysctl.h>
 
 /*
  * ModuleInfo follows V57/CameraSetup.plist's ModuleIDSchemeVersion 1 and BWFigVideoCaptureDevice.
@@ -298,22 +299,61 @@ picture_buffer(struct output *out, uint32_t *pf, uint32_t *width, uint32_t *heig
 }
 
 /*
- * The picture into the buffer: the render in pieces on the interactive queue, the photograph's mean
- * levels, and for the X formats the 8-to-16-bit expansion in place. A photograph's turn through this
- * is ~110 ms (isp_render_still_nv12): it runs on the stills' queue (still_enqueue/still_run), and the
- * worker that owes the next preview frame is not made to wait for it.
+ * A photograph's width when governed: half the cores the kernel runs, two at least. hw.ncpu
+ * follows the rigs' cpus= boot-arg -- the camera rounds boot cpus=4, so a photograph renders
+ * two pieces wide there.
+ */
+static uint32_t
+still_render_pieces(void)
+{
+	int ncpu = 0;
+	size_t size = sizeof(ncpu);
+	unsigned half;
+
+	if (sysctlbyname("hw.ncpu", &ncpu, &size, NULL, 0) != 0 || ncpu < 1) {
+		return 2;
+	}
+	half = (unsigned)ncpu / 2;
+	return half < 2 ? 2 : half;
+}
+
+/*
+ * The picture into the buffer: the render in pieces, the photograph's mean levels, and for the
+ * X formats the 8-to-16-bit expansion in place. A photograph's turn through this was ~110 ms
+ * (isp_render_still_nv12) and is longer governed, on purpose: it runs on the stills' queue
+ * (still_enqueue/still_run), and the worker that owes the next preview frame is not made to
+ * wait for it.
+ *
+ * Governed, a photograph's pieces go half the machine's cores wide at QOS_CLASS_UTILITY; the
+ * previews' pieces stay 24 wide at QOS_CLASS_USER_INTERACTIVE. As it was, one photograph's
+ * every-pixel demosaic spread over all four cores the rig boots with (cpus=4) for ~100 ms;
+ * the preview's pieces, same queue and same priority, waited behind it, and a frame's
+ * processing here inflated to a mean of twice, at worst five times, its ~10 ms baseline
+ * through both photographs' renders (out/goal-1124/batch5/post-capture-gap-v2.md, b5r6 §2.4).
+ * At utility the pieces sit below the capture worker and every interactive piece: nothing a
+ * photograph does holds a core against a frame's capture or render, and at half width they
+ * leave half the machine even if nothing preempts them. The picture itself is untouched --
+ * the same rows through the same math, only the scheduling changes; what the photograph pays
+ * is wall time, the render at least doubling inside the seconds its encoding already takes.
+ * The rigging's switch returns the swarm as it was for the comparison round; it is read for
+ * each photograph, and the render's line says the pieces and QoS as they ran.
  */
 static void
 render_picture(struct output *out, CVPixelBufferRef pb, uint32_t pf, uint32_t width, uint32_t height,
     const struct isp *isp, const struct annibale_camera_frame *f, const uint8_t *raw, bool still)
 {
 	struct render_job job = { isp, f, raw, pb, pf, width, height, 24, still && pf != PF_BGRA };
+	bool governed = still && !rigging_switch_on("ANNIBALE_STILL_SWARM", "/private/var/tmp/annibale_still_swarm");
 	uint64_t began, applied, sampled, expanded;
 	double still_y = 0, still_cb = 0, still_cr = 0;
 
+	if (governed) {
+		job.pieces = still_render_pieces();
+	}
 	CVPixelBufferLockBaseAddress(pb, 0);
 	began = mach_absolute_time();
-	dispatch_apply_f(job.pieces, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), &job, render_piece);
+	dispatch_apply_f(job.pieces, dispatch_get_global_queue(governed ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INTERACTIVE, 0), &job,
+	    render_piece);
 	applied = mach_absolute_time();
 	if (job.still) {
 		/* (the picture as made, 8 bits a value, every 16th pixel each way: what the photograph starts from) */
@@ -379,10 +419,10 @@ render_picture(struct output *out, CVPixelBufferRef pb, uint32_t pf, uint32_t wi
 		double ms = (double)tb.numer / tb.denom / 1e6;
 
 		say("%s: %ux%u %c%c%c%c made of every pixel in %.0f ms (demosaic %.0f, means %.0f, 8-to-16 expansion %.0f; "
-		    "%u pieces on QOS_CLASS_USER_INTERACTIVE); Y %.0f Cb %.0f Cr %.0f; exposure %u lines gain %.2fx, AE's tone curve %.2f",
+		    "%u pieces on %s); Y %.0f Cb %.0f Cr %.0f; exposure %u lines gain %.2fx, AE's tone curve %.2f",
 		    out->name, width, height, pf >> 24, pf >> 16 & 255, pf >> 8 & 255, pf & 255,
 		    (mach_absolute_time() - began) * ms, (applied - began) * ms, (sampled - applied) * ms, (expanded - sampled) * ms,
-		    job.pieces, still_y, still_cb, still_cr,
+		    job.pieces, governed ? "QOS_CLASS_UTILITY" : "QOS_CLASS_USER_INTERACTIVE", still_y, still_cb, still_cr,
 		    f->exposure_lines, f->gain_unity ? (double)f->gain / f->gain_unity : 0, isp->drc);
 	}
 	CVPixelBufferUnlockBaseAddress(pb, 0);
@@ -476,7 +516,8 @@ deliver(struct stream *s, struct output *out, const struct isp *isp, const struc
  * The still outputs' frames go to the stills' serial queue instead -- each as a self-contained job:
  * the frame's bytes, the ISP as this frame had it, the pool's buffer and the handler taken while the
  * frame is here -- and the worker goes on to the next frame. The queue's order keeps the
- * photographs' order; the render itself fans out on the interactive queue as the previews' does.
+ * photographs' order; the render itself fans out governed, half width at utility priority
+ * where the previews' renders stay wide and interactive (render_picture).
  */
 struct still_job {
 	struct stream *s;
@@ -925,7 +966,7 @@ worker(void *context)
 	 * camera's frames turned half round in the pixel domain as they used to be, against the
 	 * sensor-native delivery that leaves righting them to the pipeline.
 	 */
-	isp.turned = s->camera->sensor == 2 && orient_switch_on("ANNIBALE_FRONT_TURNED", "/private/var/tmp/annibale_front_turned");
+	isp.turned = s->camera->sensor == 2 && rigging_switch_on("ANNIBALE_FRONT_TURNED", "/private/var/tmp/annibale_front_turned");
 	if (isp.turned) {
 		say("stream: the front camera's frames turned half round here (the rigging's): the pipeline's correction comes on top");
 	}

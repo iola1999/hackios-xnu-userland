@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Match CFBundleIdentifier in photoimport.plist. -->
+	<key>application-identifier</key>
+	<string>com.annibale.photoimport</string>
+	<!-- This port does not create per-application data containers for command-line test tools. -->
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<!-- PhotoLibraryServicesCore checks this array against the Photos service names before accepting a library change. -->
+	<key>com.apple.private.tcc.allow</key>
+	<array>
+		<string>kTCCServicePhotos</string>
+		<string>kTCCServicePhotosAdd</string>
+	</array>
+	<!-- kern_minimac.c requires this key before an adhoc application inside /private/var/containers/Bundle is marked as a platform binary. -->
+	<key>platform-application</key>
+	<true/>
+</dict>
+</plist>

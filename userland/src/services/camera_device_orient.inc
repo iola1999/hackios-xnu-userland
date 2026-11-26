@@ -11,9 +11,9 @@
  * stream's worker starts, so closing and opening the camera is enough to change it.
  */
 
-/* env set and not "0", or the file there at all */
+/* the rigging's switches, orientation's own or another concern's: env set and not "0", or the file there at all */
 static bool
-orient_switch_on(const char *env, const char *path)
+rigging_switch_on(const char *env, const char *path)
 {
 	const char *v = getenv(env);
 
@@ -22,7 +22,7 @@ orient_switch_on(const char *env, const char *path)
 
 /* env's value, else the file's first bytes; NULL: neither */
 static const char *
-orient_switch_value(const char *env, const char *path, char *buf, size_t bytes)
+rigging_switch_value(const char *env, const char *path, char *buf, size_t bytes)
 {
 	const char *v = getenv(env);
 	int fd;
@@ -104,7 +104,7 @@ static int
 orient_exif_mode(void)
 {
 	char buf[16];
-	const char *v = orient_switch_value("ANNIBALE_EXIF_ORIENTATION", "/private/var/tmp/annibale_exif_orientation",
+	const char *v = rigging_switch_value("ANNIBALE_EXIF_ORIENTATION", "/private/var/tmp/annibale_exif_orientation",
 	    buf, sizeof(buf));
 
 	if (v != NULL) {

@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Generate weights.list, the manifest init binds the espresso weights by.
 
-usage: python3 mkweightslist.py [COPY-MAP-JSON] [E5-BUILD-DIR]
+usage: python3 mkweightslist.py [COPY-MAP-JSON] [E5-BUILD-DIR] [OVERLAY-CANDIDATE-DIR]
 
 COPY-MAP-JSON is the batch's deploy/copy-map-final.json (default: the batch 5 evidence path
 relative to this checkout) and E5-BUILD-DIR the harness output with md7/jit.bundle and
-md8/jit.bundle. The output is userland/weights.list, one tab-separated line per entry:
+md8/jit.bundle. OVERLAY-CANDIDATE-DIR holds the camera network replacement trees laid out
+as they will sit in the staging tree (default: the batch 7 personsemantics deploy candidate).
+The output is userland/weights.list, one tab-separated line per entry:
 
   f SIZE SRC TARGET SHA256   a single file: bind SRC onto TARGET, SIZE bytes expected
   d SIZE SRC TARGET -        a directory tree: bind SRC onto TARGET, SIZE = total bytes of the tree
+  o SIZE SRC TARGET -        an overlay tree: bind SRC over TARGET, which the volume already has
 
 SRC is relative to the staging tree /private/var/annibale-weights and mirrors the target's
 position inside its framework (framework name without ".framework", then the rest of the path),
-so the staging tree reads like the frameworks it feeds. TARGET is the absolute framework path.
+so the staging tree reads like the frameworks it feeds; the overlay target is not in a framework
+and keeps its path under System/Library instead. TARGET is the absolute framework path.
 The two mubb entries deploy the jit compile products under the universal.bundle name, as the
 harness report recommends (e5-compile-harness.md §6): fast steady state, small memory.
+The overlay entry deploys the personsemantics CPU bundle over the ANE one the system volume
+shipped; see out/goal-1124/batch7/personsemantics-deploy-design.md.
 """
 import json
 import sys
@@ -22,6 +28,13 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BATCH = HERE.parent.parent / "out/goal-1124/batch5"
+BATCH7 = HERE.parent.parent / "out/goal-1124/batch7"
+
+# The camera networks' replacement bundles: (composite bundle name, platform sub-bundle),
+# overlaid onto their shipped counterparts in /System/Library/ImagingNetworks.
+OVERLAYS = [
+    ("personsemantics-preview-lowfps.H18.E5.espresso.bundle", "H18.bundle"),
+]
 
 
 def framework_rel(target):
@@ -43,6 +56,7 @@ def tree_bytes(path):
 def main():
     copy_map = Path(sys.argv[1]) if len(sys.argv) > 1 else BATCH / "deploy/copy-map-final.json"
     e5_build = Path(sys.argv[2]) if len(sys.argv) > 2 else BATCH / "e5-build"
+    candidates = Path(sys.argv[3]) if len(sys.argv) > 3 else BATCH7 / "personsemantics-deploy/deploy-candidate"
     entries = json.loads(copy_map.read_text())
     lines = [
         "# the espresso weights and mubb backbones mediaanalysisd's models load, bound into the",
@@ -50,6 +64,7 @@ def main():
         "# out/goal-1124/batch5/weights-bind-impl.md. init reads this as etc/weights.list.",
         "# f: size, staging source (in /private/var/annibale-weights), target, sha256 of the source file.",
         "# d: total bytes of the tree, staging source, target.",
+        "# o: total bytes of the tree, staging source, target the volume already has (bound over it).",
     ]
     longest = 0
     total = 0
@@ -68,10 +83,21 @@ def main():
         rel = f"MediaAnalysis/mubb_{md}.bundle/universal.bundle"
         target = f"/System/Library/PrivateFrameworks/MediaAnalysis.framework/mubb_{md}.bundle/universal.bundle"
         lines.append(f"d\t{size}\t{rel}\t{target}\t-")
+    n_overlays = 0
+    for bundle, platform in OVERLAYS:
+        rel = f"ImagingNetworks/{bundle}/{platform}"
+        tree = candidates / rel
+        if not tree.is_dir():
+            raise SystemExit(f"mkweightslist.py: {tree} is missing (the overlay deploy candidate)")
+        size = tree_bytes(tree)
+        total += size
+        target = f"/System/Library/ImagingNetworks/{bundle}/{platform}"
+        lines.append(f"o\t{size}\t{rel}\t{target}\t-")
+        n_overlays += 1
     out = HERE / "weights.list"
     out.write_text("\n".join(lines) + "\n")
     n_files = sum(1 for line in lines if line.startswith("f\t"))
-    print(f"mkweightslist.py: {out.name}: {n_files} files, 2 directory trees, "
+    print(f"mkweightslist.py: {out.name}: {n_files} files, 2 directory trees, {n_overlays} overlay, "
           f"{total / 1e6:.1f} MB; longest target name {longest} bytes")
     if longest > 255:
         print("mkweightslist.py: a target name is over 255 bytes and cannot be a synthetic entry")

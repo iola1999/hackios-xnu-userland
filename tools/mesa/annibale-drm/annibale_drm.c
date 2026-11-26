@@ -116,6 +116,13 @@ error_from_return(kern_return_t result)
 		return 0;
 	case kIOReturnNoMemory:
 		return ENOMEM;
+	case kIOReturnNoResources:
+		return EMFILE;          /* the client's GEM handles are all in use: objects like files */
+	case kIOReturnNoSpace:
+	case kIOReturnVMError:
+		return ENOSPC;          /* no span of GPU addresses, or no page table for one */
+	case kIOReturnNotReady:
+		return ENXIO;           /* the GPU is going or gone: a device that is not there */
 	case kIOReturnBadArgument:
 		return EINVAL;
 	case kIOReturnTimeout:
@@ -128,6 +135,87 @@ error_from_return(kern_return_t result)
 		return ENOSYS;
 	default:
 		return EIO;
+	}
+}
+
+/*
+ * An allocation the kernel refused, said with its size and the refusal spelled out where a round
+ * of tests can read it: the kernel's own lines about it stay on the serial. Which shortage it was
+ * decides what there is to do about the refusal, and the IOReturns of the allocation requests are
+ * distinct enough to tell (AnnibaleGPUMemory.inc): wired memory of the kernel's
+ * (kIOReturnNoMemory), this client's handles all in use (kIOReturnNoResources), no free span in
+ * the GPU's address space (kIOReturnNoSpace), no page table for the span (kIOReturnVMError), or
+ * the GPU going or gone (kIOReturnNotReady). Anything else one of these requests is refused with
+ * is the caller's own bad argument or a surface that is not there, which the caller knows and
+ * handles already. 32 lines of a kind per program, then quiet: a dead GPU refuses everything
+ * asked of it for the rest of the process, and that needs no more lines.
+ */
+#define GPU_REQUEST_MEMORY    0x7c   /* the caller's own memory as a buffer (the kernel's kAnnibaleMemory) */
+
+/* the kernel's struct annibale_memory, the request of selector 0x7c */
+struct annibale_memory_request {
+	uint64_t address, size;
+	uint32_t handle, pad;
+};
+
+static const char *
+alloc_refusal(kern_return_t result)
+{
+	switch (result) {
+	case kIOReturnNoMemory:
+		return "kernel wired memory exhausted";
+	case kIOReturnNoResources:
+		return "the client's GPU handles are all in use";
+	case kIOReturnNoSpace:
+		return "no free span in the GPU's address space";
+	case kIOReturnVMError:
+		return "no page table for the span";
+	case kIOReturnNotReady:
+		return "the GPU is not ready or has stopped";
+	default:
+		return NULL;
+	}
+}
+
+static void
+alloc_refused(unsigned number, const void *data, size_t size, kern_return_t result)
+{
+	static unsigned refused[3];
+	const char *why = alloc_refusal(result);
+	unsigned kind, count;
+
+	if (why == NULL) {
+		return;
+	}
+	kind = number == (unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_NEW) ? 0 :
+	    number == ANNIBALE_GPU_SURFACE ? 1 : 2;
+	count = __sync_fetch_and_add(&refused[kind], 1);
+	if (count >= 32) {
+		if (count == 32) {
+			printf("annibaledrm[%d]: request %#x keeps being refused; no more lines about it\n",
+			    (int)getpid(), number);
+		}
+		return;
+	}
+	if (number == (unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_NEW) && size >= sizeof(struct drm_msm_gem_new)) {
+		const struct drm_msm_gem_new *gem = data;
+
+		printf("annibaledrm[%d]: gemNew %llu bytes flags %#x refused: %s (IOReturn %#x)\n",
+		    (int)getpid(), (unsigned long long)gem->size, gem->flags, why, result);
+	} else if (number == ANNIBALE_GPU_SURFACE && size >= sizeof(struct annibale_drm_surface)) {
+		/* the size is the kernel's answer, which a refusal does not carry back: the id is what there is */
+		const struct annibale_drm_surface *surface = data;
+
+		printf("annibaledrm[%d]: surface %u as a buffer refused: %s (IOReturn %#x)\n",
+		    (int)getpid(), surface->surface, why, result);
+	} else if (number == GPU_REQUEST_MEMORY && size >= sizeof(struct annibale_memory_request)) {
+		const struct annibale_memory_request *memory = data;
+
+		printf("annibaledrm[%d]: memory %#llx of %llu bytes as a buffer refused: %s (IOReturn %#x)\n",
+		    (int)getpid(), (unsigned long long)memory->address, (unsigned long long)memory->size, why, result);
+	} else {
+		printf("annibaledrm[%d]: allocation request %#x refused: %s (IOReturn %#x)\n",
+		    (int)getpid(), number, why, result);
 	}
 }
 
@@ -183,6 +271,7 @@ call_with_return(unsigned number, void *data, size_t size, kern_return_t *raw_re
 	struct timespec began, ended;
 	uint64_t us;
 	kern_return_t result;
+	int error;
 
 	clock_gettime(CLOCK_MONOTONIC, &began);
 	result = IOConnectCallStructMethod(connection, number, data, size, data, &returned);
@@ -198,7 +287,16 @@ call_with_return(unsigned number, void *data, size_t size, kern_return_t *raw_re
 	if (raw_result != NULL) {
 		*raw_result = result;
 	}
-	return error_from_return(result);
+	error = error_from_return(result);
+	if (error != 0) {
+		/* what a real ioctl leaves: freedreno prints strerror(errno) beside its refusals */
+		errno = error;
+		if (number == (unsigned)(DRM_COMMAND_BASE + DRM_MSM_GEM_NEW) || number == GPU_REQUEST_MEMORY ||
+		    number == ANNIBALE_GPU_SURFACE) {
+			alloc_refused(number, data, size, result);
+		}
+	}
+	return error;
 }
 
 static int
@@ -337,16 +435,10 @@ int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {
 	struct annibale_drm_surface request = { .surface = (uint32_t)surface };
-	kern_return_t raw_result = KERN_SUCCESS;
-	int error = call_with_return(ANNIBALE_GPU_SURFACE, &request, sizeof(request), &raw_result);
+	int error = call(ANNIBALE_GPU_SURFACE, &request, sizeof(request));
 
 	(void)fd;
 	if (error != 0) {
-		static unsigned reports;
-		if (__sync_fetch_and_add(&reports, 1) < 8) {
-			fprintf(stderr, "annibale-drm: IOSurface %d import failed: IOReturn=%#x errno=%d\n",
-			    surface, raw_result, error);
-		}
 		errno = error;
 		return -1;
 	}

@@ -1,0 +1,1096 @@
+--- a/src/freedreno/drm/freedreno_ringbuffer.h
++++ b/src/freedreno/drm/freedreno_ringbuffer.h
+@@ -58,6 +58,12 @@
+ 
+    /* Internal use only: */
+    _FD_RINGBUFFER_OBJECT = 0x10,
++
++   /* Internal use only: a ring whose writes are discarded.  Sink rings are
++    * used when allocation of a state object fails, so partially emitted
++    * state can be dropped without dereferencing a NULL ring.
++    */
++   _FD_RINGBUFFER_SINK = 0x20,
+ };
+ 
+ /* A submit object manages/tracks all the state buildup for a "submit"
+@@ -130,6 +136,23 @@
+ struct fd_ringbuffer *
+ fd_ringbuffer_new_shareable_object(struct fd_pipe *pipe, uint32_t size);
+ 
++/* Process-wide immutable ring used to discard state object writes after an
++ * allocation failure.  It is never submitted and never grows.
++ */
++struct fd_ringbuffer *fd_ringbuffer_sink(void);
++
++static inline bool
++fd_ringbuffer_is_sink(struct fd_ringbuffer *ring)
++{
++   return ring->flags & _FD_RINGBUFFER_SINK;
++}
++
++static inline struct fd_ringbuffer *
++fd_ringbuffer_or_sink(struct fd_ringbuffer *ring)
++{
++   return ring ? ring : fd_ringbuffer_sink();
++}
++
+ /*
+  * Helpers for ref/unref with some extra debugging.. unref() returns true if
+  * the object is still live
+@@ -156,6 +179,9 @@
+ static inline void
+ fd_ringbuffer_del(struct fd_ringbuffer *ring)
+ {
++   if (fd_ringbuffer_is_sink(ring))
++      return;
++
+    if (--ring->refcnt > 0)
+       return;
+ 
+@@ -165,13 +191,17 @@
+ static inline struct fd_ringbuffer *
+ fd_ringbuffer_ref(struct fd_ringbuffer *ring)
+ {
+-   ring->refcnt++;
++   if (!fd_ringbuffer_is_sink(ring))
++      ring->refcnt++;
+    return ring;
+ }
+ 
+ static inline void
+ fd_ringbuffer_grow(struct fd_ringbuffer *ring, uint32_t ndwords)
+ {
++   if (fd_ringbuffer_is_sink(ring))
++      return;
++
+    assert(ring->funcs->grow); /* unsupported on kgsl */
+ 
+    ring->funcs->grow(ring, ring->size);
+@@ -186,6 +216,9 @@
+ static inline void
+ fd_ringbuffer_emit(struct fd_ringbuffer *ring, uint32_t data)
+ {
++   if (fd_ringbuffer_is_sink(ring))
++      return;
++
+    (*ring->cur++) = data;
+ }
+ 
+@@ -215,6 +248,9 @@
+ static inline void
+ fd_ringbuffer_attach_bo(struct fd_ringbuffer *ring, struct fd_bo *bo)
+ {
++   if (fd_ringbuffer_is_sink(ring))
++      return;
++
+    ring->funcs->attach_bo(ring, bo);
+ }
+ 
+@@ -223,6 +259,11 @@
+                                    struct fd_ringbuffer *target,
+                                    uint32_t cmd_idx, uint64_t *iova)
+ {
++   if (fd_ringbuffer_is_sink(ring) || fd_ringbuffer_is_sink(target)) {
++      *iova = 0;
++      return 0;
++   }
++
+    return ring->funcs->attach_ring(ring, target, cmd_idx, iova);
+ }
+ 
+@@ -237,6 +278,9 @@
+ static inline void
+ fd_ringbuffer_reloc(struct fd_ringbuffer *ring, const struct fd_reloc *reloc)
+ {
++   if (fd_ringbuffer_is_sink(ring))
++      return;
++
+    ring->funcs->emit_reloc(ring, reloc);
+ }
+ 
+@@ -253,6 +297,9 @@
+                                    struct fd_ringbuffer *target,
+                                    uint32_t cmd_idx)
+ {
++   if (fd_ringbuffer_is_sink(ring) || fd_ringbuffer_is_sink(target))
++      return 0;
++
+    return ring->funcs->emit_reloc_ring(ring, target, cmd_idx);
+ }
+ 
+@@ -387,6 +434,9 @@
+       fprintf(stderr, "ring[%p]: OUT_RELOC   %04x:  %p+%u << %d", ring,
+               (uint32_t)(ring->cur - ring->start), bo, offset, shift);
+    }
++   if (fd_ringbuffer_is_sink(ring))
++      return;
++
+    assert(offset < fd_bo_size(bo));
+ 
+    uint64_t iova = __reloc_iova(bo, offset, orval, shift);
+--- a/src/freedreno/drm/freedreno_ringbuffer.c
++++ b/src/freedreno/drm/freedreno_ringbuffer.c
+@@ -12,6 +12,90 @@
+ #include "freedreno_priv.h"
+ #include "freedreno_ringbuffer.h"
+ 
++static void
++fd_ringbuffer_sink_destroy(struct fd_ringbuffer *ring)
++{
++}
++
++static void
++fd_ringbuffer_sink_assert_attached(struct fd_ringbuffer *ring, struct fd_bo *bo)
++{
++}
++
++static void
++fd_ringbuffer_sink_grow(struct fd_ringbuffer *ring, uint32_t size)
++{
++}
++
++static void
++fd_ringbuffer_sink_attach_bo(struct fd_ringbuffer *ring, struct fd_bo *bo)
++{
++}
++
++static uint32_t
++fd_ringbuffer_sink_attach_ring(struct fd_ringbuffer *ring,
++                               struct fd_ringbuffer *target, uint32_t cmd_idx,
++                               uint64_t *iova)
++{
++   *iova = 0;
++   return 0;
++}
++
++static void
++fd_ringbuffer_sink_emit_reloc(struct fd_ringbuffer *ring,
++                              const struct fd_reloc *reloc)
++{
++}
++
++static uint32_t
++fd_ringbuffer_sink_emit_reloc_ring(struct fd_ringbuffer *ring,
++                                   struct fd_ringbuffer *target,
++                                   uint32_t cmd_idx)
++{
++   return 0;
++}
++
++static uint32_t
++fd_ringbuffer_sink_cmd_count(struct fd_ringbuffer *ring)
++{
++   return 1;
++}
++
++static bool
++fd_ringbuffer_sink_check_size(struct fd_ringbuffer *ring)
++{
++   return true;
++}
++
++static const struct fd_ringbuffer_funcs fd_ringbuffer_sink_funcs = {
++   .grow = fd_ringbuffer_sink_grow,
++   .attach_bo = fd_ringbuffer_sink_attach_bo,
++   .attach_ring = fd_ringbuffer_sink_attach_ring,
++   .assert_attached = fd_ringbuffer_sink_assert_attached,
++   .emit_reloc = fd_ringbuffer_sink_emit_reloc,
++   .emit_reloc_ring = fd_ringbuffer_sink_emit_reloc_ring,
++   .cmd_count = fd_ringbuffer_sink_cmd_count,
++   .check_size = fd_ringbuffer_sink_check_size,
++   .destroy = fd_ringbuffer_sink_destroy,
++};
++
++static uint32_t fd_ringbuffer_sink_storage[1];
++static struct fd_ringbuffer fd_ringbuffer_sink_ring = {
++   .cur = fd_ringbuffer_sink_storage,
++   .end = fd_ringbuffer_sink_storage + ARRAY_SIZE(fd_ringbuffer_sink_storage),
++   .start = fd_ringbuffer_sink_storage,
++   .funcs = &fd_ringbuffer_sink_funcs,
++   .size = sizeof(fd_ringbuffer_sink_storage),
++   .refcnt = 1,
++   .flags = _FD_RINGBUFFER_SINK,
++};
++
++struct fd_ringbuffer *
++fd_ringbuffer_sink(void)
++{
++   return &fd_ringbuffer_sink_ring;
++}
++
+ struct fd_submit *
+ fd_submit_new(struct fd_pipe *pipe)
+ {
+@@ -66,6 +150,12 @@
+    struct fd_ringbuffer *ring =
+          submit->funcs->new_ringbuffer(submit, size, flags);
+ 
++   if (!ring) {
++      printf("fd submit new ringbuffer failed: %u bytes flags 0x%x\n", size,
++             flags);
++      return NULL;
++   }
++
+    if (flags & FD_RINGBUFFER_PRIMARY) {
+       assert(!submit->primary);
+       submit->primary = fd_ringbuffer_ref(ring);
+@@ -84,6 +174,9 @@
+ fd_ringbuffer_new_shareable_object(struct fd_pipe *pipe, uint32_t size)
+ {
+    struct fd_ringbuffer *ring = fd_ringbuffer_new_object(pipe, size);
++   if (!ring)
++      return NULL;
++
+    ring->flags |= FD_RINGBUFFER_SHAREABLE;
+    return ring;
+ }
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -158,8 +158,15 @@
+              (unsigned long long)took, (unsigned long long)tid);
+       fflush(stdout);
+    }
+-   if (!bo)
++   if (!bo) {
++      uint64_t tid = 0;
++
++      pthread_threadid_np(NULL, &tid);
++      printf("fd bo new failed: %u bytes flags 0x%x %llu us tid %llu\n", size,
++             flags, (unsigned long long)took, (unsigned long long)tid);
++      fflush(stdout);
+       return NULL;
++   }
+ 
+    simple_mtx_lock(&table_lock);
+    /* add ourself into the handle table: */
+--- a/src/freedreno/common/fd6_pack.h
++++ b/src/freedreno/common/fd6_pack.h
+@@ -99,17 +99,18 @@
+  */
+ class fd_cs : public fd_ringbuffer_builder {
+ public:
+-   fd_cs(struct fd_ringbuffer *ring) : fd_ringbuffer_builder(ring) {
++   fd_cs(struct fd_ringbuffer *ring) : fd_ringbuffer_builder(fd_ringbuffer_or_sink(ring)) {
+    }
+ 
+    /* Constructor for streaming state tied to the submit: */
+    fd_cs(struct fd_submit *submit, unsigned ndwords) :
+-      fd_ringbuffer_builder(fd_submit_new_ringbuffer(submit, ndwords, FD_RINGBUFFER_STREAMING))
++      fd_ringbuffer_builder(fd_ringbuffer_or_sink(
++            fd_submit_new_ringbuffer(submit, ndwords, FD_RINGBUFFER_STREAMING)))
+    {}
+ 
+    /* Constructor for long lived state objects: */
+    fd_cs(struct fd_pipe *pipe, unsigned ndwords) :
+-      fd_ringbuffer_builder(fd_ringbuffer_new_object(pipe, ndwords))
++      fd_ringbuffer_builder(fd_ringbuffer_or_sink(fd_ringbuffer_new_object(pipe, ndwords)))
+    {}
+ 
+    /* If this assert fails, the currently built packet has not gone out of
+@@ -228,6 +229,9 @@
+       /* Catch any use-after-flush: */
+       cur_ = NULL;
+ 
++      if (fd_ringbuffer_is_sink(ring_))
++         return;
++
+       unsigned cnt = cur - ring_->cur - 1;
+ 
+       assert(cnt > 0);
+@@ -245,7 +249,8 @@
+    }
+ 
+    void append(uint32_t dword) {
+-      *(cur_++) = dword;
++      if (!fd_ringbuffer_is_sink(ring_))
++         *(cur_++) = dword;
+    }
+ 
+    uint32_t reg_ = 0;
+@@ -294,10 +299,14 @@
+    }
+ 
+    void append(uint32_t dword) {
+-      *(cur_++) = dword;
++      if (!fd_ringbuffer_is_sink(ring_))
++         *(cur_++) = dword;
+    }
+ 
+    void append(const uint32_t *dwords, uint32_t sizedwords) {
++      if (fd_ringbuffer_is_sink(ring_))
++         return;
++
+       memcpy(cur_, dwords, 4 * sizedwords);
+       cur_ += sizedwords;
+    }
+@@ -326,6 +335,9 @@
+       /* Catch any use-after-flush: */
+       cur_ = NULL;
+ 
++      if (fd_ringbuffer_is_sink(ring_))
++         return;
++
+       unsigned cnt = cur - ring_->cur - 1;
+ 
+       /* Check for under-estimate of dwords emitted: */
+@@ -363,14 +375,15 @@
+ public:
+    /* Constructor for streaming state tied to the submit: */
+    fd_crb(struct fd_submit *submit, unsigned nregs) :
+-      fd_pkt(fd_submit_new_ringbuffer(submit, cs_size(nregs), FD_RINGBUFFER_STREAMING))
++      fd_pkt(fd_ringbuffer_or_sink(
++            fd_submit_new_ringbuffer(submit, cs_size(nregs), FD_RINGBUFFER_STREAMING)))
+    {
+       init(CP_CONTEXT_REG_BUNCH, nregs * 2);
+    }
+ 
+    /* Constructor for long lived state objects: */
+    fd_crb(struct fd_pipe *pipe, unsigned nregs) :
+-      fd_pkt(fd_ringbuffer_new_object(pipe, cs_size(nregs)))
++      fd_pkt(fd_ringbuffer_or_sink(fd_ringbuffer_new_object(pipe, cs_size(nregs))))
+    {
+       init(CP_CONTEXT_REG_BUNCH, nregs * 2);
+    }
+--- a/src/freedreno/ir3/ir3_shader.c
++++ b/src/freedreno/ir3/ir3_shader.c
+@@ -731,7 +731,7 @@
+ struct ir3_shader_variant *
+ ir3_shader_get_variant(struct ir3_shader *shader, const struct ir3_shader_key *key,
+                        bool binning_pass, bool write_disasm,
+-                       void (*upload)(struct ir3_shader_variant *v, void *),
++                       bool (*upload)(struct ir3_shader_variant *v, void *),
+                        void *arg)
+ {
+    MESA_TRACE_FUNC();
+@@ -742,14 +742,18 @@
+    if (!v) {
+       /* compile new variant if it doesn't exist already: */
+       v = create_variant(shader, key, write_disasm, shader);
++      if (v && upload &&
++          (!upload(v, arg) || (v->binning && !upload(v->binning, arg)))) {
++         if (v->bo)
++            fd_bo_del(v->bo);
++         if (v->binning && v->binning->bo)
++            fd_bo_del(v->binning->bo);
++         ralloc_free(v);
++         v = NULL;
++      }
+       if (v) {
+          v->next = shader->variants;
+          shader->variants = v;
+-         if (upload) {
+-            upload(v, arg);
+-            if (v->binning)
+-               upload(v->binning, arg);
+-         }
+       }
+    }
+ 
+--- a/src/freedreno/ir3/ir3_shader.h
++++ b/src/freedreno/ir3/ir3_shader.h
+@@ -1213,7 +1213,7 @@
+ struct ir3_shader_variant *
+ ir3_shader_get_variant(struct ir3_shader *shader, const struct ir3_shader_key *key,
+                        bool binning_pass, bool write_disasm,
+-                       void (*upload)(struct ir3_shader_variant *v, void *),
++                       bool (*upload)(struct ir3_shader_variant *v, void *),
+                        void *arg);
+ 
+ struct ir3_shader *
+--- a/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_gallium.c
+@@ -168,7 +168,7 @@
+       v->info.preamble_instrs_count, v->info.early_preamble);
+ }
+ 
+-static void
++static bool
+ upload_shader_variant(struct ir3_shader_variant *v, void *arg)
+ {
+    struct util_debug_callback *debug = arg;
+@@ -180,7 +180,7 @@
+       fd_bo_new(compiler->dev, v->info.size, FD_BO_NOMAP,
+                 "%s:%s", ir3_shader_stage(v), v->name);
+    if (!v->bo)
+-      return;
++      return false;
+ 
+    /* Always include shaders in kernel crash dumps. */
+    fd_bo_mark_for_dump(v->bo);
+@@ -196,6 +196,7 @@
+    }
+ 
+    dump_shader_info(v, debug);
++   return true;
+ }
+ 
+ struct ir3_shader_variant *
+--- a/src/gallium/drivers/freedreno/ir3/ir3_cache.c
++++ b/src/gallium/drivers/freedreno/ir3/ir3_cache.c
+@@ -166,6 +166,9 @@
+       variants[MESA_SHADER_TESS_CTRL], variants[MESA_SHADER_TESS_EVAL],
+       variants[MESA_SHADER_GEOMETRY], variants[MESA_SHADER_FRAGMENT],
+       key);
++   if (!state)
++      return NULL;
++
+    state->key = *key;
+ 
+    /* NOTE: uses copy of key in state obj, because pointer passed by caller
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c
+@@ -44,7 +44,14 @@
+ {
+    struct fd_batch_subpass *subpass = CALLOC_STRUCT(fd_batch_subpass);
+ 
++   if (!subpass)
++      return NULL;
++
+    subpass->draw = alloc_ring(batch, 0x100000, 0);
++   if (!subpass->draw) {
++      free(subpass);
++      return NULL;
++   }
+ 
+    /* Replace batch->draw with reference to current subpass, for
+     * backwards compat with code that is not subpass aware.
+@@ -70,6 +77,16 @@
+    free(subpass);
+ }
+ 
++static void cleanup_submit(struct fd_batch *batch);
++
++static void
++batch_create_fail(struct fd_batch *batch)
++{
++   cleanup_submit(batch);
++   _mesa_set_destroy(batch->resources, NULL);
++   free(batch);
++}
++
+ struct fd_batch *
+ fd_batch_create(struct fd_context *ctx, bool nondraw)
+ {
+@@ -90,22 +107,30 @@
+    list_inithead(&batch->subpasses);
+ 
+    batch->submit = fd_submit_new(ctx->pipe);
++   if (!batch->submit)
++      goto fail;
++
+    if (batch->nondraw) {
+       batch->gmem = alloc_ring(batch, 0x1000, FD_RINGBUFFER_PRIMARY);
+    } else {
+       batch->gmem = alloc_ring(batch, 0x100000, FD_RINGBUFFER_PRIMARY);
+ 
+       /* a6xx+ re-uses draw rb for both draw and binning pass: */
+-      if (ctx->screen->gen < 6) {
++      if ((ctx->screen->gen < 6) && batch->gmem)
+          batch->binning = alloc_ring(batch, 0x100000, 0);
+-      }
+    }
+ 
++   if (!batch->gmem ||
++       (!nondraw && (ctx->screen->gen < 6) && !batch->binning))
++      goto fail;
++
+    /* Pre-attach private BOs: */
+    for (unsigned i = 0; i < ctx->num_private_bos; i++)
+       fd_ringbuffer_attach_bo(batch->gmem, ctx->private_bos[i]);
+ 
+    batch->subpass = subpass_create(batch);
++   if (!batch->subpass)
++      goto fail;
+ 
+    batch->in_fence_fd = -1;
+    batch->fence = NULL;
+@@ -137,6 +162,10 @@
+    batch->last_timestamp_cmd = NULL;
+ 
+    return batch;
++
++fail:
++   batch_create_fail(batch);
++   return NULL;
+ }
+ 
+ struct fd_batch_subpass *
+@@ -145,6 +174,9 @@
+    assert(!batch->nondraw);
+ 
+    struct fd_batch_subpass *subpass = subpass_create(batch);
++
++   if (!subpass)
++      return NULL;
+ 
+    /* This new subpass inherits the current subpass.. this is replaced
+     * if there is a depth clear
+@@ -172,9 +204,16 @@
+       subpass_destroy(subpass);
+    }
+ 
+-   fd_ringbuffer_del(batch->draw);
+-   fd_ringbuffer_del(batch->gmem);
++   if (batch->draw) {
++      fd_ringbuffer_del(batch->draw);
++      batch->draw = NULL;
++   }
+ 
++   if (batch->gmem) {
++      fd_ringbuffer_del(batch->gmem);
++      batch->gmem = NULL;
++   }
++
+    if (batch->binning) {
+       fd_ringbuffer_del(batch->binning);
+       batch->binning = NULL;
+@@ -491,6 +530,13 @@
+ static void
+ fd_batch_add_resource(struct fd_batch *batch, struct fd_resource *rsc)
+ {
++   /* Resource tracking can recursively flush the batch it is updating.
++    * Once flushed, the submit rings are gone and the caller is expected
++    * to restart tracking on a fresh batch.
++    */
++   if (unlikely(batch->flushed))
++      return;
++
+    if (likely(fd_batch_references_resource(batch, rsc))) {
+       assert(_mesa_set_search_pre_hashed(batch->resources, rsc->hash, rsc));
+       return;
+@@ -515,6 +561,9 @@
+ 
+    fd_screen_assert_locked(batch->ctx->screen);
+ 
++   if (unlikely(batch->flushed))
++      return;
++
+    DBG("%p: write %p", batch, rsc);
+ 
+    /* Must do this before the early out, so we unset a previous resource
+@@ -528,6 +577,9 @@
+    if (rsc->stencil)
+       fd_batch_resource_write(batch, rsc->stencil);
+ 
++   if (unlikely(batch->flushed))
++      return;
++
+    /* note, invalidate write batch, to avoid further writes to rsc
+     * resulting in a write-after-read hazard.
+     */
+@@ -551,6 +603,8 @@
+          }
+ 
+          flush_write_batch(rsc);
++         if (unlikely(batch->flushed))
++            return;
+       }
+ 
+       foreach_batch (dep, cache, track->batch_mask) {
+@@ -579,9 +633,15 @@
+ {
+    fd_screen_assert_locked(batch->ctx->screen);
+ 
++   if (unlikely(batch->flushed))
++      return;
++
+    if (rsc->stencil)
+       fd_batch_resource_read(batch, rsc->stencil);
+ 
++   if (unlikely(batch->flushed))
++      return;
++
+    DBG("%p: read %p", batch, rsc);
+ 
+    struct fd_resource_tracking *track = rsc->track;
+@@ -602,6 +662,8 @@
+       }
+ 
+       flush_write_batch(rsc);
++      if (unlikely(batch->flushed))
++         return;
+    }
+ 
+    fd_batch_add_resource(batch, rsc);
+--- a/src/gallium/drivers/freedreno/freedreno_batch_cache.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch_cache.c
+@@ -8,6 +8,7 @@
+ 
+ #include "util/hash_table.h"
+ #include "util/list.h"
++#include "util/os_time.h"
+ #include "util/set.h"
+ #include "util/u_string.h"
+ #define XXH_INLINE_ALL
+@@ -18,6 +19,12 @@
+ #include "freedreno_context.h"
+ #include "freedreno_resource.h"
+ 
++/* Memory pressure is usually transient after forcing pending batches out.
++ * Bound the retry cost to a few milliseconds; if allocation still fails the
++ * draw/blit operation is dropped by its caller.
++ */
++#define BATCH_ALLOC_ATTEMPTS 4
++
+ /* Overview:
+  *
+  *   The batch cache provides lookup for mapping pipe_framebuffer_state
+@@ -485,12 +492,19 @@
+    if (nondraw)
+       fd_context_switch_from(ctx);
+ 
+-   while (!batch) {
++   for (unsigned attempt = 0; !batch && attempt < BATCH_ALLOC_ATTEMPTS;
++        attempt++) {
+       fd_screen_lock(ctx->screen);
+       batch = alloc_batch_locked(cache, ctx, nondraw);
+       fd_screen_unlock(ctx->screen);
++
++      if (!batch && attempt + 1 < BATCH_ALLOC_ATTEMPTS)
++         os_time_sleep(1000ULL << attempt);
+    }
+ 
++   if (!batch)
++      return NULL;
++
+    alloc_query_buf(ctx, batch);
+ 
+    if (batch && nondraw)
+@@ -586,12 +600,21 @@
+    key->num_surfs = idx;
+ 
+    struct fd_batch *batch = NULL;
+-   while (!batch) {
++   for (unsigned attempt = 0; !batch && attempt < BATCH_ALLOC_ATTEMPTS;
++        attempt++) {
+       fd_screen_lock(ctx->screen);
+       batch = batch_from_key(ctx, key);
+       fd_screen_unlock(ctx->screen);
++
++      if (!batch && attempt + 1 < BATCH_ALLOC_ATTEMPTS)
++         os_time_sleep(1000ULL << attempt);
+    }
+ 
++   if (!batch) {
++      free(key);
++      return NULL;
++   }
++
+    alloc_query_buf(ctx, batch);
+ 
+    fd_batch_set_fb(batch, pfb);
+--- a/src/gallium/drivers/freedreno/freedreno_draw.c
++++ b/src/gallium/drivers/freedreno/freedreno_draw.c
+@@ -263,10 +263,20 @@
+    if (ctx->dirty_resource)
+       batch_draw_tracking_for_dirty_bits(batch);
+ 
++   if (unlikely(batch->flushed)) {
++      fd_screen_unlock(ctx->screen);
++      return;
++   }
++
+    /* Mark index buffer as being read */
+    if (info->index_size)
+       resource_read(batch, info->index.resource);
+ 
++   if (unlikely(batch->flushed)) {
++      fd_screen_unlock(ctx->screen);
++      return;
++   }
++
+    /* Mark indirect draw buffer as being read */
+    if (indirect) {
+       resource_read(batch, indirect->buffer);
+@@ -277,10 +287,14 @@
+                       ->offset_buf);
+    }
+ 
+-   resource_written(batch, batch->query_buf);
++   if (!batch->flushed)
++      resource_written(batch, batch->query_buf);
+ 
+    fd_screen_unlock(ctx->screen);
+ 
++   if (unlikely(batch->flushed))
++      return;
++
+ out:
+    fd_batch_update_queries(batch);
+ }
+@@ -426,17 +440,22 @@
+ 
+    struct fd_batch *batch = fd_context_batch_draw(ctx);
+ 
++   if (!batch)
++      goto drop;
++
+    batch_draw_tracking(batch, info, indirect);
+    if (fd_perf_on())
+       fd_perf_current.track = fd_perf_us();
+ 
+-   while (unlikely(batch->flushed)) {
++   while (batch && unlikely(batch->flushed)) {
+       /* The current batch was flushed in batch_draw_tracking()
+        * so start anew.  We know this won't happen a second time
+        * since we are dealing with a fresh batch:
+        */
+       fd_batch_reference(&batch, NULL);
+       batch = fd_context_batch_draw(ctx);
++      if (!batch)
++         goto drop;
+       batch_draw_tracking(batch, info, indirect);
+       assert(ctx->batch == batch);
+    }
+@@ -521,6 +540,13 @@
+          fflush(stdout);
+       }
+    }
++
++   return;
++
++drop:
++   fd_draw_early("batch", fd_draw_began);
++   if (info == &new_info)
++      pipe_resource_reference(&indexbuf, NULL);
+ }
+ 
+ /* Nothing here reads the frame's state off this thread: the driver thread writes it and the flush on
+@@ -762,15 +788,20 @@
+ 
+    struct fd_batch *batch = fd_context_batch_draw(ctx);
+ 
++   if (!batch)
++      return;
++
+    batch_clear_tracking(batch, buffers);
+ 
+-   while (unlikely(batch->flushed)) {
++   while (batch && unlikely(batch->flushed)) {
+       /* The current batch was flushed in batch_clear_tracking()
+        * so start anew.  We know this won't happen a second time
+        * since we are dealing with a fresh batch:
+        */
+       fd_batch_reference(&batch, NULL);
+       batch = fd_context_batch_draw(ctx);
++      if (!batch)
++         return;
+       batch_clear_tracking(batch, buffers);
+       assert(ctx->batch == batch);
+    }
+@@ -854,6 +885,9 @@
+       return;
+ 
+    batch = fd_context_batch_nondraw(ctx);
++   if (!batch)
++      return;
++
+    fd_batch_reference(&save_batch, ctx->batch);
+    fd_batch_reference(&ctx->batch, batch);
+ 
+--- a/src/gallium/drivers/freedreno/freedreno_context.c
++++ b/src/gallium/drivers/freedreno/freedreno_context.c
+@@ -60,6 +60,9 @@
+       return;
+    }
+ 
++   if (!batch)
++      goto out;
++
+    /* With TC_FLUSH_ASYNC, the fence will have been pre-created from
+     * the front-end thread.  But not yet associated with a batch,
+     * because we cannot safely access ctx->batch outside of the driver
+@@ -227,6 +230,9 @@
+       return;
+ 
+    struct fd_batch *batch = fd_context_batch(ctx);
++
++   if (!batch)
++      return;
+ 
+    fd_batch_needs_flush(batch);
+ 
+@@ -363,6 +369,9 @@
+    if (unlikely(!batch)) {
+       batch =
+          fd_batch_from_fb(ctx, &ctx->framebuffer);
++      if (!batch)
++         return NULL;
++
+       fd_batch_reference(&ctx->batch, batch);
+       fd_context_all_dirty(ctx);
+    }
+@@ -385,6 +394,9 @@
+ 
+    if (unlikely(!batch)) {
+       batch = fd_bc_alloc_batch(ctx, true);
++      if (!batch)
++         return NULL;
++
+       fd_batch_reference(&ctx->batch_nondraw, batch);
+       fd_context_all_dirty(ctx);
+    }
+--- a/src/gallium/drivers/freedreno/freedreno_query_acc.c
++++ b/src/gallium/drivers/freedreno/freedreno_query_acc.c
+@@ -100,8 +100,10 @@
+     */
+    if (skip_begin_query(q->type)) {
+       struct fd_batch *batch = fd_context_batch(ctx);
+-      fd_acc_query_resume(aq, batch);
+-      fd_batch_reference(&batch, NULL);
++      if (batch) {
++         fd_acc_query_resume(aq, batch);
++         fd_batch_reference(&batch, NULL);
++      }
+    }
+ }
+ 
+@@ -119,6 +121,9 @@
+ 
+    /* mark the result available: */
+    struct fd_batch *batch = fd_context_batch(ctx);
++   if (!batch)
++      return;
++
+    struct fd_ringbuffer *ring = fd_batch_get_tile_epilogue(batch);
+    if (!ring)
+       return;
+@@ -193,6 +198,8 @@
+    struct fd_acc_query *aq = fd_acc_query(q);
+    const struct fd_acc_sample_provider *p = aq->provider;
+    struct fd_batch *batch = fd_context_batch(ctx);
++   if (!batch)
++      return;
+ 
+    assert(ctx->screen->gen >= 5);
+ 
+--- a/src/gallium/drivers/freedreno/freedreno_fence.c
++++ b/src/gallium/drivers/freedreno/freedreno_fence.c
+@@ -293,6 +293,8 @@
+           */
+          fd_batch_reference(&batch, NULL);
+          batch = fd_context_batch_nondraw(ctx);
++         if (!batch)
++            return;
+       }
+       fd_batch_reference(&fence->batch, batch);
+       fd_pipe_fence_ref(&batch->fence, fence);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -855,6 +855,8 @@
+    struct pipe_framebuffer_state *pfb = &ctx->batch->framebuffer;
+    struct fd_batch_subpass *subpass = ctx->batch->subpass;
+    unsigned color_buffers = buffers >> 2;
++   bool cleared_with_blitter = false;
++   bool lrz_clear = do_lrz_clear(ctx, buffers);
+ 
+    if (pfb->samples > 1) {
+       /* we need to do multisample clear on 3d pipe, so fallback to u_blitter.
+@@ -863,6 +865,7 @@
+        * LRZ state as valid *after* the fallback clear.
+        */
+       fd_blitter_clear(&ctx->base, (unsigned)buffers, color, depth, stencil);
++      cleared_with_blitter = true;
+    }
+ 
+    /* If we are clearing after draws, split out a new subpass:
+@@ -871,28 +874,39 @@
+       /* If we won't be able to do any fast-clears, avoid pointlessly
+        * splitting out a new subpass:
+        */
+-      if (pfb->samples > 1 && !do_lrz_clear(ctx, buffers))
++      if (pfb->samples > 1 && !lrz_clear)
+          return true;
+ 
+       subpass = fd_batch_create_subpass(ctx->batch);
++      if (!subpass) {
++         if (!cleared_with_blitter)
++            fd_blitter_clear(&ctx->base, (unsigned)buffers, color, depth,
++                             stencil);
++         return true;
++      }
+ 
+       /* If doing an LRZ clear, replace the existing LRZ buffer with a
+        * freshly allocated one so that we have valid LRZ state for the
+        * new pass.  Otherwise unconditional writes to the depth buffer
+        * would cause LRZ state to be invalid.
+        */
+-      if (do_lrz_clear(ctx, buffers)) {
++      if (lrz_clear) {
+          struct fd_resource *zsbuf = fd_resource(pfb->zsbuf.texture);
++         struct fd_bo *lrz = fd_bo_new(ctx->screen->dev, fd_bo_size(zsbuf->lrz),
++                                       FD_BO_NOMAP, "lrz");
+ 
+-         fd_bo_del(subpass->lrz);
+-         subpass->lrz = fd_bo_new(ctx->screen->dev, fd_bo_size(zsbuf->lrz),
+-                                  FD_BO_NOMAP, "lrz");
+-         fd_bo_del(zsbuf->lrz);
+-         zsbuf->lrz = fd_bo_ref(subpass->lrz);
++         if (lrz) {
++            fd_bo_del(subpass->lrz);
++            subpass->lrz = lrz;
++            fd_bo_del(zsbuf->lrz);
++            zsbuf->lrz = fd_bo_ref(subpass->lrz);
++         } else {
++            lrz_clear = false;
++         }
+       }
+    }
+ 
+-   if (do_lrz_clear(ctx, buffers)) {
++   if (lrz_clear) {
+       struct fd_resource *zsbuf = fd_resource(pfb->zsbuf.texture);
+ 
+       zsbuf->lrz_valid = true;
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+@@ -994,8 +994,8 @@
+    struct fd_context *ctx = fd_context(pctx);
+    struct fd_resource *rsc = fd_resource(prsc);
+    struct fd_batch *batch = fd_bc_alloc_batch(ctx, true);
++   if (!batch) return;
+    fd_cs cs(batch->draw);
+-
+    fd_screen_lock(ctx->screen);
+    fd_batch_resource_write(batch, rsc);
+    fd_screen_unlock(ctx->screen);
+@@ -1158,7 +1158,7 @@
+    }
+ 
+    struct fd_batch *batch = fd_bc_alloc_batch(ctx, true);
+-
++   if (!batch) return;
+    fd_screen_lock(ctx->screen);
+    fd_batch_resource_write(batch, rsc);
+    fd_screen_unlock(ctx->screen);
+@@ -1306,7 +1306,7 @@
+    fd6_validate_format(ctx, dst, info->dst.format);
+ 
+    batch = fd_bc_alloc_batch(ctx, true);
+-
++   if (!batch) return false;
+    fd_screen_lock(ctx->screen);
+ 
+    fd_batch_resource_read(batch, src);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_program.cc
+@@ -1508,6 +1508,19 @@
+    size += xs_immediate_size_dwords(v);
+ 
+    return size * 4;
++}
++
++static void
++fd6_program_destroy(void *data, struct ir3_program_state *state)
++{
++   struct fd6_program_state *so = fd6_program_state(state);
++   fd_ringbuffer_del(so->stateobj);
++   fd_ringbuffer_del(so->binning_stateobj);
++   fd_ringbuffer_del(so->config_stateobj);
++   fd_ringbuffer_del(so->interp_stateobj);
++   if (so->streamout_stateobj)
++      fd_ringbuffer_del(so->streamout_stateobj);
++   free(so);
+ }
+ 
+ template <chip CHIP>
+@@ -1540,8 +1553,8 @@
+    unsigned stateobj_size = xs_size(vs) + xs_size(hs) +
+       xs_size(ds) + xs_size(gs) + xs_size(fs);
+ 
+-   state->binning_stateobj = fd_ringbuffer_new_object(ctx->pipe, stateobj_size);
+-   state->stateobj = fd_ringbuffer_new_object(ctx->pipe, stateobj_size);
++   state->binning_stateobj = fd_ringbuffer_or_sink(fd_ringbuffer_new_object(ctx->pipe, stateobj_size));
++   state->stateobj = fd_ringbuffer_or_sink(fd_ringbuffer_new_object(ctx->pipe, stateobj_size));
+ 
+    if (hs) {
+       /* Allocate the fixed-size tess factor BO globally on the screen.  This
+@@ -1655,6 +1668,16 @@
+    /* dual source blending has an extra fs output in the 2nd slot */
+    if (fs->fs.color_is_dual_source) {
+       state->mrt_components |= 0xf << 4;
++   }
++
++   if (fd_ringbuffer_is_sink(state->stateobj) ||
++       fd_ringbuffer_is_sink(state->binning_stateobj) ||
++       fd_ringbuffer_is_sink(state->config_stateobj) ||
++       fd_ringbuffer_is_sink(state->interp_stateobj) ||
++       (state->streamout_stateobj &&
++        fd_ringbuffer_is_sink(state->streamout_stateobj))) {
++      fd6_program_destroy(data, &state->base);
++      return NULL;
+    }
+ 
+    state->lrz_mask.val = ~0;
+@@ -1681,19 +1704,6 @@
+    return &state->base;
+ }
+ 
+-static void
+-fd6_program_destroy(void *data, struct ir3_program_state *state)
+-{
+-   struct fd6_program_state *so = fd6_program_state(state);
+-   fd_ringbuffer_del(so->stateobj);
+-   fd_ringbuffer_del(so->binning_stateobj);
+-   fd_ringbuffer_del(so->config_stateobj);
+-   fd_ringbuffer_del(so->interp_stateobj);
+-   if (so->streamout_stateobj)
+-      fd_ringbuffer_del(so->streamout_stateobj);
+-   free(so);
+-}
+-
+ template <chip CHIP>
+ static const struct ir3_cache_funcs cache_funcs = {
+    .create_state = fd6_program_create<CHIP>,
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
+@@ -170,19 +170,24 @@
+          struct ir3_shader_variant *v =
+             ir3_shader_variant(ir3_get_shader(hwcso), key, false, &ctx->debug);
+          if (v) {
+-            cp->stateobj = fd_ringbuffer_new_shareable_object(ctx->pipe, 0x1000);
++            cp->stateobj = fd_ringbuffer_or_sink(
++                  fd_ringbuffer_new_shareable_object(ctx->pipe, 0x1000));
+             fd_cs cs(cp->stateobj);
+             with_crb (cs, 9)
+                cs_program_emit<CHIP>(screen, crb, v);
+             fd6_emit_shader<CHIP>(screen, cs, v);
+ 
+-            cp->v = v;
++            if (!fd_ringbuffer_is_sink(cp->stateobj))
++               cp->v = v;
+          }
+       }
+ 
+       simple_mtx_unlock(&lock);
+    }
+ 
++   if (!cp->v)
++      return;
++
+    fd_cs cs(ctx->batch->draw);
+ 
+    fd6_set_render_mode<CHIP>(cs, {RM6_COMPUTE});
+--- a/src/gallium/drivers/freedreno/a5xx/fd5_blitter.c
++++ b/src/gallium/drivers/freedreno/a5xx/fd5_blitter.c
+@@ -466,6 +466,8 @@
+    struct fd_resource *dst = fd_resource(info->dst.resource);
+ 
+    batch = fd_bc_alloc_batch(ctx, true);
++   if (!batch)
++      return false;
+ 
+    fd_screen_lock(ctx->screen);
+ 
+--- a/src/gallium/drivers/freedreno/a4xx/fd4_query.c
++++ b/src/gallium/drivers/freedreno/a4xx/fd4_query.c
+@@ -97,6 +97,9 @@
+     * have counters, we will need to be more clever.
+     */
+    struct fd_batch *batch = fd_context_batch(ctx);
++   if (!batch)
++      return;
++
+    fd_wfi(batch, ring);
+    OUT_PKT0(ring, REG_A4XX_CP_PERFCTR_CP_SEL_0, 1);
+    OUT_RING(ring, CP_ALWAYS_COUNT);

@@ -1,0 +1,689 @@
+--- a/src/util/slab.c
++++ b/src/util/slab.c
+@@ -24,13 +24,25 @@
+ #include "slab.h"
+ #include "macros.h"
+ #include "u_atomic.h"
++#include <pthread.h>
+ #include <stdint.h>
+ #include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #define SLAB_MAGIC_ALLOCATED 0xcafe4321
+ #define SLAB_MAGIC_FREE 0x7ee01234
+ 
++/* HackiOS diagnostic probe (merge-cleanup family): pop count at which
++ * slab_destroy_child stops believing the free list is intact.  The pools this
++ * build destroys hold one submit's rings: pages never shrink back, so the
++ * count is bounded by the peak number of rings a submit held at once, which
++ * even for the heaviest batches stays in the hundreds.  10000 is far above
++ * any legitimate pool and far below the seconds a corrupted list spins.
++ */
++#define SLAB_DESTROY_POP_LIMIT 10000
++
+ #ifndef NDEBUG
+ #define SET_MAGIC(element, value)   (element)->magic = (value)
+ #define CHECK_MAGIC(element, value) assert((element)->magic == (value))
+@@ -163,14 +175,90 @@
+ 
+    simple_mtx_unlock(&pool->parent->mutex);
+ 
++   /* HackiOS diagnostic probe (merge-cleanup family): the loop below is where
++    * the b5r14 restart storm stalled for seconds at a time.  Its correct
++    * length is bounded by the pool's element count, which for the freedreno
++    * ring pools is a small multiple of the page size in elements; thousands of
++    * pops mean the free list is corrupted into a cycle, or a live pool is
++    * being destroyed and concurrent frees keep feeding it.  Turn the spin
++    * into a decisive crash with the list state in the log instead.
++    */
++   struct slab_element_header *free_head = pool->free;
++   unsigned long pops = 0;
++
+    while (pool->free) {
+       struct slab_element_header *elt = pool->free;
+-      pool->free = elt->next;
++      struct slab_element_header *next = elt->next;
++
++      pool->free = next;
+       slab_free_orphaned(elt);
++
++      if (unlikely(++pops > SLAB_DESTROY_POP_LIMIT)) {
++         uint64_t tid = 0;
++
++         pthread_threadid_np(NULL, &tid);
++         printf("slab destroy overrun: pool %p parent %p head %p elt %p "
++                "next %p pops %lu elements %u tid %llu\n",
++                (void *)pool, (void *)pool->parent, (void *)free_head,
++                (void *)elt, (void *)next, pops,
++                pool->parent->num_elements, (unsigned long long)tid);
++         fflush(stdout);
++         abort();
++      }
+    }
+ 
+    /* Guard against use-after-free. */
+    pool->parent = NULL;
++}
++
++/* HackiOS diagnostic probe (merge-cleanup family): account for the child
++ * pool's elements, so a caller about to destroy the pool can tell whether
++ * allocations are still out.  npages*num_elements - nfree - nmigrated of them
++ * are.  The free list and the page list are the owner thread's by the slab
++ * design; the migrated list is taken under the parent mutex like slab_alloc
++ * does.
++ */
++void
++slab_child_accounting(struct slab_child_pool *pool, unsigned *npages,
++                      unsigned *nfree, unsigned *nmigrated)
++{
++   unsigned pages = 0, n_free = 0, n_migrated = 0;
++
++   /* The same corruption the destroy probe exists for would otherwise just
++    * move the spin into this walk.  A list longer than the limit cannot be
++    * intact, so this is the same decisive crash with the same evidence.
++    */
++   for (struct slab_page_header *page = pool->pages; page; page = page->u.next) {
++      if (unlikely(++pages > SLAB_DESTROY_POP_LIMIT)) {
++         printf("slab accounting overrun: pool %p list pages\n", (void *)pool);
++         fflush(stdout);
++         abort();
++      }
++   }
++
++   for (struct slab_element_header *elt = pool->free; elt; elt = elt->next) {
++      if (unlikely(++n_free > SLAB_DESTROY_POP_LIMIT)) {
++         printf("slab accounting overrun: pool %p list free\n", (void *)pool);
++         fflush(stdout);
++         abort();
++      }
++   }
++
++   if (pool->parent) {
++      simple_mtx_lock(&pool->parent->mutex);
++      for (struct slab_element_header *elt = pool->migrated; elt; elt = elt->next) {
++         if (unlikely(++n_migrated > SLAB_DESTROY_POP_LIMIT)) {
++            printf("slab accounting overrun: pool %p list migrated\n", (void *)pool);
++            fflush(stdout);
++            abort();
++         }
++      }
++      simple_mtx_unlock(&pool->parent->mutex);
++   }
++
++   *npages = pages;
++   *nfree = n_free;
++   *nmigrated = n_migrated;
+ }
+ 
+ static bool
+--- a/src/util/slab.h
++++ b/src/util/slab.h
+@@ -81,6 +81,12 @@
+ void slab_create_child(struct slab_child_pool *pool,
+                        struct slab_parent_pool *parent);
+ void slab_destroy_child(struct slab_child_pool *pool);
++/* HackiOS diagnostic probe: count a child pool's pages and the elements on
++ * its free and migrated lists; the caller compares against the element
++ * capacity to tell whether allocations are still out.
++ */
++void slab_child_accounting(struct slab_child_pool *pool, unsigned *npages,
++                           unsigned *nfree, unsigned *nmigrated);
+ void *slab_alloc(struct slab_child_pool *pool);
+ void *slab_zalloc(struct slab_child_pool *pool);
+ void slab_free(struct slab_child_pool *pool, void *ptr);
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -112,6 +112,41 @@
+ fd_submit_append_bo(struct fd_submit_sp *submit, struct fd_bo *bo)
+ {
+    return check_append_bo(submit, bo, false);
++}
++
++/* HackiOS diagnostic probe (merge-cleanup family): read-only form of
++ * fd_submit_append_bo(), for the batch flush-time check that every bo the
++ * resource tracking meant to attach actually made it into the submit.
++ * check_append_bo() cannot serve here even in its check mode: both it and
++ * check_append_suballoc_bo() write bo->idx on the way out, and a diagnostic
++ * query has no business mutating the lookup cache of the path it watches.
++ */
++bool
++fd_submit_sp_references_bo(struct fd_submit_sp *submit, struct fd_bo *bo)
++{
++   uint32_t hash;
++   uint32_t idx;
++
++   if (suballoc_bo(bo)) {
++      idx = READ_ONCE(bo->idx);
++      if ((idx < submit->nr_suballoc_bos) &&
++          (submit->suballoc_bos[idx] == bo)) {
++         /* cached index still valid: the suballoc block is referenced */
++      } else {
++         hash = _mesa_hash_pointer(bo);
++         if (!_mesa_hash_table_search_pre_hashed(submit->suballoc_bo_table,
++                                                 hash, bo))
++            return false;
++      }
++      bo = fd_bo_heap_block(bo);
++   }
++
++   idx = READ_ONCE(bo->idx);
++   if ((idx < submit->nr_bos) && (submit->bos[idx] == bo))
++      return true;
++
++   hash = _mesa_hash_pointer(bo);
++   return _mesa_hash_table_search_pre_hashed(submit->bo_table, hash, bo) != NULL;
+ }
+ 
+ static void
+@@ -275,6 +310,33 @@
+    list_replace(&dev->deferred_submits, &fd_submit->submit_list);
+    list_inithead(&dev->deferred_submits);
+    dev->deferred_cmds = 0;
++
++   /* HackiOS diagnostic probe (merge-cleanup family): the port removed the
++    * upstream merging limits, so how long these chains actually get is field
++    * data nobody has.  Print only on a new high for the process; the storm's
++    * stalls happen inside the cleanup of exactly these chains.  Deferred
++    * submits are serialized by submit_lock, which the caller holds, so the
++    * high-water mark needs no atomic.
++    */
++   static unsigned merge_chain_high;
++
++   unsigned chain_submits = 0, chain_cmds = 0;
++   foreach_submit (chain_submit, &fd_submit->submit_list) {
++      chain_submits++;
++      if (chain_submit->primary)
++         chain_cmds += fd_ringbuffer_cmd_count(chain_submit->primary);
++   }
++
++   if (chain_submits > merge_chain_high) {
++      uint64_t tid = 0;
++
++      merge_chain_high = chain_submits;
++      pthread_threadid_np(NULL, &tid);
++      printf("fd merge chain high: submits %u cmds %u fence %u tid %llu\n",
++             chain_submits, chain_cmds, submit->fence,
++             (unsigned long long)tid);
++      fflush(stdout);
++   }
+ 
+    /* If we have multiple submits with in-fence-fd's then merge them: */
+    foreach_submit (submit, &fd_submit->submit_list) {
+@@ -324,6 +386,28 @@
+     * kernel takes in one submission (GPU_A830_SUBMIT_CMDS); rwa_flush pushes the merged
+     * submission out at the command buffer's commit.
+     */
++   /* HackiOS (merge-cleanup family, rebase-26 patch 0025): restore the
++    * upstream nr_bos limit the override above dropped.  Deferring is a
++    * heuristic either way, so a submit naming many buffers flushing early
++    * cannot break correctness; whether this alone changes the b5r14 failure
++    * is what the probe round answers.  The hit count rides along because a
++    * cap that never fires can neither cause nor cure anything.
++    */
++   if (fd_submit->nr_bos > 30) {
++      static unsigned bos_cap_hits;
++      uint64_t tid = 0;
++
++      bos_cap_hits++;
++      if (bos_cap_hits < 16 || bos_cap_hits % 256 == 0) {
++         pthread_threadid_np(NULL, &tid);
++         printf("fd merge bos cap hit: nr_bos %u fence %u hits %u tid %llu\n",
++                fd_submit->nr_bos, submit->fence, bos_cap_hits,
++                (unsigned long long)tid);
++         fflush(stdout);
++      }
++      return false;
++   }
++
+    return submit->pipe->dev->deferred_cmds + fd_ringbuffer_cmd_count(submit->primary) <= 64;
+ #endif
+ 
+@@ -461,6 +545,34 @@
+    _mesa_hash_table_destroy(fd_submit->bo_table, NULL);
+    _mesa_hash_table_destroy(fd_submit->suballoc_bo_table, NULL);
+ 
++   /* HackiOS diagnostic probe (merge-cleanup family): the ring pool may only
++    * be destroyed once every ring created from it is back, which is what the
++    * note above fd_submit_del() requires.  Count what is still out before the
++    * orphaning hides it: a nonzero count means the pool is being destroyed
++    * while rings of this submit are still referenced, the lifecycle violation
++    * that the b5r14 stall chain ended in.  Crash here, where the evidence is,
++    * rather than in the slab free-list spin it used to become.
++    */
++   unsigned npages = 0, nfree = 0, nmigrated = 0;
++   slab_child_accounting(&fd_submit->ring_pool, &npages, &nfree, &nmigrated);
++
++   long capacity = (long)npages * fd_submit->ring_pool.parent->num_elements;
++   long live = capacity - (long)nfree - (long)nmigrated;
++
++   if (unlikely(live != 0)) {
++      uint64_t tid = 0;
++
++      pthread_threadid_np(NULL, &tid);
++      printf("fd submit destroy live rings: fence %u seqno %u live %ld "
++             "capacity %ld free %u migrated %u pages %u pool %p submit %p "
++             "tid %llu\n",
++             submit->fence, fd_submit->seqno, live, capacity, nfree,
++             nmigrated, npages, (void *)&fd_submit->ring_pool,
++             (void *)submit, (unsigned long long)tid);
++      fflush(stdout);
++      abort();
++   }
++
+    // TODO it would be nice to have a way to assert() if all
+    // rb's haven't been free'd back to the slab, because that is
+    // an indication that we are leaking bo's
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.h
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.h
+@@ -121,6 +121,7 @@
+ 
+ void fd_pipe_sp_flush(struct fd_pipe *pipe, uint32_t fence);
+ uint32_t fd_submit_append_bo(struct fd_submit_sp *submit, struct fd_bo *bo);
++bool fd_submit_sp_references_bo(struct fd_submit_sp *submit, struct fd_bo *bo);
+ struct fd_submit *fd_submit_sp_new(struct fd_pipe *pipe,
+                                    flush_submit_list_fn flush_submit_list);
+ void fd_pipe_sp_ringpool_init(struct fd_pipe *pipe);
+--- a/src/freedreno/drm/msm/msm_ringbuffer_sp.c
++++ b/src/freedreno/drm/msm/msm_ringbuffer_sp.c
+@@ -80,6 +80,28 @@
+          fd_submit_append_bo(fd_submit, fd_deferred_submit->bos[i]);
+       }
+ 
++      /* HackiOS diagnostic probe (merge-cleanup family): at this point the
++       * list is expected to be the submit's only remaining owner -- its batch
++       * dropped its reference when it was flushed.  Anything else means a
++       * lifecycle violation upstream of the destroy that follows.  Print
++       * rather than abort: a higher count only defers the destroy, and the
++       * decisive check is the live-ring one in fd_submit_sp_destroy().
++       */
++      if (unlikely(submit->refcnt != 1)) {
++         static unsigned merge_refcnt_prints;
++         if (merge_refcnt_prints < 16) {
++            uint64_t tid = 0;
++
++            merge_refcnt_prints++;
++            pthread_threadid_np(NULL, &tid);
++            printf("fd submit merge refcnt: fence %u refcnt %d nr_bos %u "
++                   "submit %p tid %llu\n",
++                   submit->fence, submit->refcnt, fd_deferred_submit->nr_bos,
++                   (void *)submit, (unsigned long long)tid);
++            fflush(stdout);
++         }
++      }
++
+       /* Now that the cmds/bos have been transfered over to the current submit,
+        * we can remove the deferred submit from the list and drop it's reference
+        */
+--- a/src/gallium/drivers/freedreno/freedreno_batch.c
++++ b/src/gallium/drivers/freedreno/freedreno_batch.c
+@@ -6,6 +6,8 @@
+  *    Rob Clark <robclark@freedesktop.org>
+  */
+ 
++#include <pthread.h>
++
+ #include "util/hash_table.h"
+ #include "util/list.h"
+ #include "util/set.h"
+@@ -17,6 +19,79 @@
+ #include "freedreno_query_hw.h"
+ #include "freedreno_resource.h"
+ 
++/* HackiOS diagnostic probes (merge-cleanup family, rebase-26 patch 0025).
++ * All of them print through the same stdout channel as the "fd bo new
++ * failed" line and none of them changes what the driver does: the flush
++ * after which they fire is going to drop the work either way.  Each family
++ * is capped per process, because a hit on a hot path would otherwise drown
++ * the one line that matters.
++ */
++#define FD_PROBE_PRINT_CAP 16
++
++/* The submit-side query lives in the drm layer (freedreno_ringbuffer_sp.c);
++ * declared here rather than through its header, which pulls freedreno_priv.h
++ * and its FD_DEFINE_CAST into files that already get the gallium copy.
++ */
++struct fd_submit_sp;
++bool fd_submit_sp_references_bo(struct fd_submit_sp *submit, struct fd_bo *bo);
++
++void
++fd_probe_use_after_flush(const char *where, struct fd_batch *batch)
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd batch use after flush: %s batch %p seqno %u flushed %u "
++          "tid %llu\n",
++          where, (void *)batch, batch->seqno, batch->flushed,
++          (unsigned long long)tid);
++   fflush(stdout);
++}
++
++static void
++fd_probe_dep_skip(const char *where, struct fd_batch *batch,
++                  struct fd_resource *rsc)
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd dep skip: %s batch %p seqno %u rsc %p bo %p write_batch %p "
++          "tid %llu\n",
++          where, (void *)batch, batch->seqno, (void *)rsc,
++          rsc ? (void *)rsc->bo : NULL,
++          (rsc && rsc->track) ? (void *)rsc->track->write_batch : NULL,
++          (unsigned long long)tid);
++   fflush(stdout);
++}
++
++static void
++fd_probe_dep_missing(struct fd_batch *batch, struct fd_resource *rsc)
++{
++   static unsigned prints;
++   uint64_t tid = 0;
++
++   if (prints >= FD_PROBE_PRINT_CAP)
++      return;
++   prints++;
++
++   pthread_threadid_np(NULL, &tid);
++   printf("fd dep missing: batch %p seqno %u rsc %p bo %p submit %p "
++          "tid %llu\n",
++          (void *)batch, batch->seqno, (void *)rsc, (void *)rsc->bo,
++          (void *)batch->submit, (unsigned long long)tid);
++   fflush(stdout);
++}
++
+ static struct fd_ringbuffer *
+ alloc_ring(struct fd_batch *batch, unsigned sz, enum fd_ringbuffer_flags flags)
+ {
+@@ -286,6 +361,18 @@
+ 
+    set_foreach (batch->resources, entry) {
+       struct fd_resource *rsc = (struct fd_resource *)entry->key;
++
++      /* HackiOS diagnostic probe (merge-cleanup family): every resource in
++       * the set was put there by fd_batch_add_resource(), which attaches the
++       * bo to the submit in the same breath.  This is the last point before
++       * the submit goes out where the set is intact, so a bo missing from
++       * the submit here means dependency registration was lost on the way.
++       */
++      if (batch->submit && rsc->bo &&
++          !fd_submit_sp_references_bo((struct fd_submit_sp *)batch->submit,
++                                      rsc->bo))
++         fd_probe_dep_missing(batch, rsc);
++
+       _mesa_set_remove(batch->resources, entry);
+       assert(rsc->track->batch_mask & (1 << batch->idx));
+       rsc->track->batch_mask &= ~(1 << batch->idx);
+@@ -534,8 +621,10 @@
+     * Once flushed, the submit rings are gone and the caller is expected
+     * to restart tracking on a fresh batch.
+     */
+-   if (unlikely(batch->flushed))
++   if (unlikely(batch->flushed)) {
++      fd_probe_dep_skip("add entry", batch, rsc);
+       return;
++   }
+ 
+    if (likely(fd_batch_references_resource(batch, rsc))) {
+       assert(_mesa_set_search_pre_hashed(batch->resources, rsc->hash, rsc));
+@@ -561,8 +650,10 @@
+ 
+    fd_screen_assert_locked(batch->ctx->screen);
+ 
+-   if (unlikely(batch->flushed))
++   if (unlikely(batch->flushed)) {
++      fd_probe_dep_skip("write entry", batch, rsc);
+       return;
++   }
+ 
+    DBG("%p: write %p", batch, rsc);
+ 
+@@ -577,8 +668,10 @@
+    if (rsc->stencil)
+       fd_batch_resource_write(batch, rsc->stencil);
+ 
+-   if (unlikely(batch->flushed))
++   if (unlikely(batch->flushed)) {
++      fd_probe_dep_skip("write stencil", batch, rsc);
+       return;
++   }
+ 
+    /* note, invalidate write batch, to avoid further writes to rsc
+     * resulting in a write-after-read hazard.
+@@ -603,8 +696,10 @@
+          }
+ 
+          flush_write_batch(rsc);
+-         if (unlikely(batch->flushed))
++         if (unlikely(batch->flushed)) {
++            fd_probe_dep_skip("write flush", batch, rsc);
+             return;
++         }
+       }
+ 
+       foreach_batch (dep, cache, track->batch_mask) {
+@@ -633,14 +728,18 @@
+ {
+    fd_screen_assert_locked(batch->ctx->screen);
+ 
+-   if (unlikely(batch->flushed))
++   if (unlikely(batch->flushed)) {
++      fd_probe_dep_skip("read entry", batch, rsc);
+       return;
++   }
+ 
+    if (rsc->stencil)
+       fd_batch_resource_read(batch, rsc->stencil);
+ 
+-   if (unlikely(batch->flushed))
++   if (unlikely(batch->flushed)) {
++      fd_probe_dep_skip("read stencil", batch, rsc);
+       return;
++   }
+ 
+    DBG("%p: read %p", batch, rsc);
+ 
+@@ -662,8 +761,10 @@
+       }
+ 
+       flush_write_batch(rsc);
+-      if (unlikely(batch->flushed))
++      if (unlikely(batch->flushed)) {
++         fd_probe_dep_skip("read flush", batch, rsc);
+          return;
++      }
+    }
+ 
+    fd_batch_add_resource(batch, rsc);
+--- a/src/gallium/drivers/freedreno/freedreno_batch.h
++++ b/src/gallium/drivers/freedreno/freedreno_batch.h
+@@ -448,6 +448,23 @@
+ }
+ #endif
+ 
++/* HackiOS diagnostic probe (merge-cleanup family, rebase-26 patch 0025):
++ * read batch->draw at an emission entry.  cleanup_submit() NULLs it when the
++ * batch is flushed, and an emission path that still reads it afterwards is
++ * the use-after-flush the NULL-ing was meant to catch -- except that the
++ * sink-ring conversion would silently swallow the write, so print the call
++ * site first.  Implemented in freedreno_batch.c for the rate limit.
++ */
++void fd_probe_use_after_flush(const char *where, struct fd_batch *batch);
++
++static inline struct fd_ringbuffer *
++fd_batch_draw_probe(struct fd_batch *batch, const char *where)
++{
++   if (unlikely(!batch->draw))
++      fd_probe_use_after_flush(where, batch);
++   return batch->draw;
++}
++
+ /* Get per-tile epilogue */
+ static inline struct fd_ringbuffer *
+ fd_batch_get_tile_epilogue(struct fd_batch *batch)
+--- a/src/gallium/drivers/freedreno/freedreno_query_acc.c
++++ b/src/gallium/drivers/freedreno/freedreno_query_acc.c
+@@ -218,7 +218,7 @@
+     */
+    if (index == -1) {
+       /* Mark the query as not-ready in the draw ring: */
+-      struct fd_ringbuffer *ring = batch->draw;
++      struct fd_ringbuffer *ring = fd_batch_draw_probe(batch, "acc_qbo");
+       bool is_64b = result_type >= PIPE_QUERY_TYPE_I64;
+ 
+       OUT_PKT7(ring, CP_MEM_WRITE, is_64b ? 4 : 3);
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+@@ -536,7 +536,7 @@
+       ctx->stats.fs_regs += ir3_shader_halfregs(emit.fs);
+    }
+ 
+-   fd_cs cs(ctx->batch->draw);
++   fd_cs cs(fd_batch_draw_probe(ctx->batch, "fd6_draw"));
+    mark("cs_begin");
+ 
+    struct CP_DRAW_INDX_OFFSET_0 draw0 = {
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_compute.cc
+@@ -188,7 +188,7 @@
+    if (!cp->v)
+       return;
+ 
+-   fd_cs cs(ctx->batch->draw);
++   fd_cs cs(fd_batch_draw_probe(ctx->batch, "fd6_launch_grid"));
+ 
+    fd6_set_render_mode<CHIP>(cs, {RM6_COMPUTE});
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_blitter.cc
+@@ -995,7 +995,7 @@
+    struct fd_resource *rsc = fd_resource(prsc);
+    struct fd_batch *batch = fd_bc_alloc_batch(ctx, true);
+    if (!batch) return;
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, "fd6_clear_buffer"));
+    fd_screen_lock(ctx->screen);
+    fd_batch_resource_write(batch, rsc);
+    fd_screen_unlock(ctx->screen);
+@@ -1173,7 +1173,7 @@
+ 
+    fd_batch_update_queries(batch);
+ 
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, "fd6_clear_texture"));
+ 
+    emit_setup<CHIP>(batch->ctx, cs);
+ 
+@@ -1324,7 +1324,7 @@
+ 
+    fd_batch_update_queries(batch);
+ 
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, "handle_rgba_blit"));
+ 
+    emit_setup<CHIP>(batch->ctx, cs);
+ 
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_query.cc
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_query.cc
+@@ -68,7 +68,7 @@
+ occlusion_resume(struct fd_acc_query *aq, struct fd_batch *batch)
+ {
+    struct fd_context *ctx = batch->ctx;
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    ASSERT_ALIGNED(struct fd6_query_sample, start, 16);
+ 
+@@ -116,7 +116,7 @@
+ occlusion_pause(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
+ {
+    struct fd_context *ctx = batch->ctx;
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    if (!ctx->screen->info->props.has_event_write_sample_count) {
+       fd_pkt7(cs, CP_MEM_WRITE, 4)
+@@ -287,7 +287,7 @@
+ static void
+ timestamp_resume(struct fd_acc_query *aq, struct fd_batch *batch)
+ {
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    fd6_record_ts<CHIP>(cs, query_sample(aq, start));
+ }
+@@ -296,7 +296,7 @@
+ static void
+ time_elapsed_pause(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
+ {
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    fd6_record_ts<CHIP>(cs, query_sample(aq, stop));
+ 
+@@ -507,7 +507,7 @@
+ {
+    enum stats_type type = get_stats_type(aq);
+    unsigned reg = stats_counter_reg<CHIP>(aq);
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    emit_counter_barrier<CHIP>(cs);
+ 
+@@ -530,7 +530,7 @@
+ {
+    enum stats_type type = get_stats_type(aq);
+    unsigned reg = stats_counter_reg<CHIP>(aq);
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    emit_counter_barrier<CHIP>(cs);
+ 
+@@ -641,7 +641,7 @@
+ primitives_emitted_resume(struct fd_acc_query *aq,
+                           struct fd_batch *batch) assert_dt
+ {
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    emit_counter_barrier<CHIP>(cs);
+ 
+@@ -682,7 +682,7 @@
+ primitives_emitted_pause(struct fd_acc_query *aq,
+                          struct fd_batch *batch) assert_dt
+ {
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    emit_counter_barrier<CHIP>(cs);
+ 
+@@ -839,7 +839,7 @@
+ {
+    struct fd_batch_query_data *data = (struct fd_batch_query_data *)aq->query_data;
+    struct fd_screen *screen = data->screen;
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    emit_counter_barrier<CHIP>(cs);
+ 
+@@ -879,7 +879,7 @@
+ perfcntr_pause(struct fd_acc_query *aq, struct fd_batch *batch) assert_dt
+ {
+    struct fd_batch_query_data *data = (struct fd_batch_query_data *)aq->query_data;
+-   fd_cs cs(batch->draw);
++   fd_cs cs(fd_batch_draw_probe(batch, __func__));
+ 
+    emit_counter_barrier<CHIP>(cs);
+ 

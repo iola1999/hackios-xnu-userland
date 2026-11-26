@@ -3,6 +3,7 @@
 # out/goal-1124/batch5/weights-bind-impl.md. init reads this as etc/weights.list.
 # f: size, staging source (in /private/var/annibale-weights), target, sha256 of the source file.
 # d: total bytes of the tree, staging source, target.
+# o: total bytes of the tree, staging source, target the volume already has (bound over it).
 f	8819520	Vision/SCL_v0.3.1_9c7zcipfrc_558001.espresso.weights_nonane	/System/Library/Frameworks/Vision.framework/SCL_v0.3.1_9c7zcipfrc_558001.espresso.weights_nonane	d767111d3cf103594804b5b07ef435930d8d63e7b38d6347faf4ea56ef405808
 f	1429394	Vision/faceSemantics_v1_15class_quant.espresso.weights_nonane	/System/Library/Frameworks/Vision.framework/faceSemantics_v1_15class_quant.espresso.weights_nonane	07274f2906d9d0ec0f61180b1f596407f630a5eb5f48961b87d757ed71809645
 f	3378816	Vision/facerec_fa1.3_lightweight_fp16.espresso.weights_nonane	/System/Library/Frameworks/Vision.framework/facerec_fa1.3_lightweight_fp16.espresso.weights_nonane	fd25ad356b7d03b8613e9d8ac4b851b7d3b604ff5f8ae68bc8cce3e8d9937d4b
@@ -27,3 +28,4 @@ f	3427568	ANSTKit/Models/anst.mlmodelc/model.espresso.weights	/System/Library/Pr
 f	2994320	ANSTKit/Models/vmrefiner.mlmodelc/model.espresso.weights	/System/Library/PrivateFrameworks/ANSTKit.framework/Models/vmrefiner.mlmodelc/model.espresso.weights	cc453f625fecfd785f50fc9fbfd3e08149d36bf5cc0b107c2df8b8a1fbdcbac6
 d	135919056	MediaAnalysis/mubb_md7.bundle/universal.bundle	/System/Library/PrivateFrameworks/MediaAnalysis.framework/mubb_md7.bundle/universal.bundle	-
 d	138939329	MediaAnalysis/mubb_md8.bundle/universal.bundle	/System/Library/PrivateFrameworks/MediaAnalysis.framework/mubb_md8.bundle/universal.bundle	-
+o	5274705	ImagingNetworks/personsemantics-preview-lowfps.H18.E5.espresso.bundle/H18.bundle	/System/Library/ImagingNetworks/personsemantics-preview-lowfps.H18.E5.espresso.bundle/H18.bundle	-

@@ -176,7 +176,7 @@ for d in $EXTRA_SHARE; do
 done
 
 if [ -d $IOS/rootfs/usr/lib ]; then
-	for t in hello_dyn svc_test surf_test drawable_test anntouch annsh annsig framewatch lsprobe mg_test \
+	for t in hello_dyn svc_test svcprobe surf_test drawable_test anntouch annsh annsig framewatch lsprobe mg_test \
 		cpu_test cow_test cg_test metal_dev metal_stubdev metal_drv_test ubo_test metal_caps metal_props \
 		shm_test apfs_mmap_test vol_ls snap_test font_test metal_test net_test store_test \
 		battery_test keychain_test attn_test wifipw_test a80211_test sound_test torch_test camera_test camera_avtest \
@@ -218,6 +218,55 @@ if [ -d $IOS/rootfs/usr/lib ]; then
 		    open('%s/AppIcon60x60@%dx.png' % (out, scale), 'wb').write(png)
 		PY
 		echo "  AnnibaleTriangle.app: $(du -sk obj/AnnibaleTriangle.app | cut -f1) KB for /Applications"
+	fi
+
+	# photoimport stays inside its bundle so PhotoKit/TCC can read the bundle identity and usage keys.
+	if [ -f obj/photoimport ]; then
+		rm -rf obj/PhotoImport.app
+		mkdir -p obj/PhotoImport.app
+		cp obj/photoimport obj/PhotoImport.app/
+		cp src/apps/photoimport.plist obj/PhotoImport.app/Info.plist
+		printf 'APPL????' > obj/PhotoImport.app/PkgInfo
+		python3 - obj/PhotoImport.app <<-'PY'
+		import struct, sys, zlib
+		out = sys.argv[1]
+		# A white picture frame on green: distinct on the home screen from the
+		# triangle application's orange on blue, so a screenshot states which of
+		# the two is installed.
+		for size, scale in ((120, 2), (180, 3)):
+		    rows = bytearray()
+		    inset = size // 5
+		    border = max(2, size // 16)
+		    for y in range(size):
+		        rows.append(0)
+		        for x in range(size):
+		            in_x = inset <= x < size - inset
+		            in_y = inset <= y < size - inset
+		            edge = not (inset + border <= x < size - inset - border) or \
+		                   not (inset + border <= y < size - inset - border)
+		            rows += bytes((255, 255, 255) if in_x and in_y and edge else (40, 160, 80))
+		    def chunk(kind, body):
+		        return (struct.pack('>I', len(body)) + kind + body +
+		                struct.pack('>I', zlib.crc32(kind + body)))
+		    png = (b'\x89PNG\r\n\x1a\n' +
+		           chunk(b'IHDR', struct.pack('>IIBBBBB', size, size, 8, 2, 0, 0, 0)) +
+		           chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + chunk(b'IEND', b''))
+		    open('%s/AppIcon60x60@%dx.png' % (out, scale), 'wb').write(png)
+		PY
+		if [ "$(uname)" = Darwin ]; then
+			/usr/bin/codesign --force --sign - --entitlements obj/.deps/photoimport.entitlements obj/PhotoImport.app
+		fi
+		echo "  PhotoImport.app: $(du -sk obj/PhotoImport.app | cut -f1) KB for /Applications"
+
+		# The same bundle as an installable IPA: TrollStore installs onto the writable
+		# data volume, so this channel updates the application without a new system
+		# image. install-ipa.py re-signs and merges entitlements before upload.
+		rm -rf obj/ipa obj/PhotoImport.ipa
+		mkdir -p obj/ipa/Payload
+		cp -a obj/PhotoImport.app obj/ipa/Payload/
+		(cd obj/ipa && python3 -m zipfile -c ../PhotoImport.ipa Payload)
+		rm -rf obj/ipa
+		echo "  PhotoImport.ipa: $(du -sk obj/PhotoImport.ipa | cut -f1) KB for trollstorehelper"
 	fi
 
 	mkdir -p root/dev root/private/var root/lib
@@ -539,6 +588,15 @@ if [ -f $IOS/system.manifest ] && [ -f $CACHE/$DSC ] &&
 	if [ -d obj/AnnibaleTriangle.app ]; then
 		cp -a obj/AnnibaleTriangle.app sysroot/Applications/
 		echo "  AnnibaleTriangle.app in /Applications (com.annibale.triangle, scheme annibaletriangle:)"
+	fi
+
+	# PHOTOIMPORT_IN_APPLICATIONS=0 leaves PhotoImport.app out of the image. The bundle
+	# identifier is the same one the installable IPA (obj/PhotoImport.ipa) registers, and
+	# LaunchServices resolving one identifier to two registered copies is undefined, so a
+	# boot meant for IPA installation rounds must not carry the /Applications copy.
+	if [ -d obj/PhotoImport.app ] && [ "${PHOTOIMPORT_IN_APPLICATIONS-1}" != 0 ]; then
+		cp -a obj/PhotoImport.app sysroot/Applications/
+		echo "  PhotoImport.app in /Applications (com.annibale.photoimport)"
 	fi
 
 	for app in ../apps/*.app; do

@@ -1,0 +1,112 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+	Info.plist of PhotoImport.app (src/apps/photoimport.m). The application-shaped keys
+	follow the AnnibaleTriangle.app shape (src/tests/triangle_app.plist), which is this
+	port's proven precedent for a bundle SpringBoard can launch; the Photos keys are what
+	PhotoKit and TCC read the client's identity and usage strings from.
+
+	  CFBundleURLTypes -> photoimport:
+		how a test round picks the action without argv: battery_test open
+		photoimport://probe (SBSOpenSensitiveURLAndUnlock) or trollstorehelper url
+		photoimport://import/wiki1.heic ask SpringBoard to open the URL, and the
+		scheme lands here because LaunchServices registers it from this dictionary.
+
+	  UILaunchScreen, CFBundleIcons, UIDeviceFamily, UIRequiredDeviceCapabilities,
+	  UISupportedInterfaceOrientations, UIRequiresFullScreen, UIStatusBarHidden,
+	  UIViewControllerBasedStatusBarAppearance
+		copied from the triangle shape: iOS wants a launch screen in a plist or a
+		storyboard, and this machine has no ibtool; the icon files are generated at
+		build time beside the executable.
+
+	NO UIApplicationSceneManifest, deliberately: without it UIKit uses the application
+	delegate's own window, which is the lifecycle src/apps/photoimport.m implements.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>PhotoImport</string>
+	<key>CFBundleExecutable</key>
+	<string>photoimport</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon60x60</string>
+			</array>
+			<key>CFBundleIconName</key>
+			<string>AppIcon</string>
+		</dict>
+	</dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.annibale.photoimport</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>PhotoImport</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleSignature</key>
+	<string>????</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>iPhoneOS</string>
+	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.annibale.photoimport</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>photoimport</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>DTPlatformName</key>
+	<string>iphoneos</string>
+	<key>DTSDKName</key>
+	<string>iphoneos26.0</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>26.0</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>PhotoImport adds test images to the photo library.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>PhotoImport imports test images into the photo library.</string>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+	</array>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UILaunchScreen</key>
+		<dict/>
+	</dict>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UIRequiresFullScreen</key>
+	<true/>
+	<key>UIStatusBarHidden</key>
+	<true/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+</dict>
+</plist>

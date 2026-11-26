@@ -111,6 +111,15 @@ output_info(int width, int height, double max_fps)
 	return o;
 }
 
+/*
+ * IntermediateTap has to be there even though no client of this phone's cameras asks for it:
+ * BWMultiStreamCameraSourceNode's reconfiguration bandwidth comparison reads
+ * SupportedOutputs[output]["SupportedPixelFormats"] of the active format for PrimaryScaler,
+ * SecondaryScaler and IntermediateTap without checking the output is in the session
+ * (0x1aee33850/0x1aee339c8 in CMCapture). A missing output reads as an empty pixel format
+ * array, FigCapturePixelFormatWithLeastAverageBandwidth picks nothing, and
+ * FigCapturePixelFormatBytesPerPixel(0) throws 'Unknown pixel format ()', killing cameracaptured.
+ */
 static void
 populate_outputs(CFMutableDictionaryRef f, uint32_t width, uint32_t height, double fps)
 {
@@ -118,6 +127,7 @@ populate_outputs(CFMutableDictionaryRef f, uint32_t width, uint32_t height, doub
 
 	put(outputs, "PrimaryScaler", output_info((int)width, (int)height, fps));
 	put(outputs, "SecondaryScaler", output_info((int)width, (int)height, fps));
+	put(outputs, "IntermediateTap", output_info((int)width, (int)height, fps));
 	put(outputs, "StillImage", output_info((int)width, (int)height, fps));
 	put(outputs, "StillImageRaw", output_info((int)width, (int)height, fps));
 	put(f, "SupportedOutputs", outputs);

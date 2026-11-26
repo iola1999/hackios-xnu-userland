@@ -80,6 +80,13 @@ TARGETS = [
     {"name": "annsig", "type": "exe", "sources": ["src/apps/annsig.m"], "flags": ["-O1"]},
     {"name": "framewatch", "type": "exe", "sources": ["src/apps/framewatch.m"], "flags": ["-O1"]},
     {"name": "lsprobe", "type": "exe", "sources": ["src/apps/lsprobe.m"], "flags": ["-O1", "-framework", "Foundation"]},
+    {
+        "name": "photoimport",
+        "type": "exe",
+        "sources": ["src/apps/photoimport.m"],
+        "flags": ["-O1", "-fobjc-arc", "-framework", "Foundation", "-framework", "Photos", "-framework", "Security", "-framework", "UIKit", "-framework", "CoreGraphics"],
+        "entitlements": "src/apps/photoimport.entitlements",
+    },
     {"name": "sound_test", "type": "exe", "sources": ["src/tests/sound_test.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "AudioToolbox", "-framework", "AVFoundation", "-lobjc"]},
     {"name": "mg_test", "type": "exe", "sources": ["src/tests/mg_test.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-lMobileGestalt"]},
     {"name": "torch_test", "type": "exe", "sources": ["src/tests/torch_test.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "AVFoundation", "-lobjc"]},
@@ -159,6 +166,7 @@ TARGETS = [
         "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "IOKit", "-lsqlite3"],
         "entitlements": "src/tests/battery_test.entitlements",
     },
+    {"name": "svcprobe", "type": "exe", "sources": ["src/tests/svcprobe.c"], "flags": ["-O1"]},
     {
         "name": "keychain_test",
         "type": "exe",
