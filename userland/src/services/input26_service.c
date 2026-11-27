@@ -88,6 +88,7 @@ extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, CFInd
 #define DIGITIZER_RANGE                 0x1     /* event mask: what has changed */
 #define DIGITIZER_TOUCH                 0x2
 #define DIGITIZER_POSITION              0x4
+#define DIGITIZER_IDENTITY              0x20    /* a contact path started or ended */
 #define DIGITIZER_FROM_EDGE_TIP         0x800   /* not a change: this finger came in over an edge of the screen */
 #define FIELD_IS_BUILT_IN               0x4
 #define FIELD_DIGITIZER_DISPLAY_INTEGRATED 0xb0019
@@ -458,7 +459,11 @@ send_touch(IOHIDServiceClientRef screen, const struct annibale_touch *t, uint64_
 		any |= fingers[i].state >= ANN_FINGER_ACTIVE_INNER;
 	}
 
-	hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, change & ~DIGITIZER_RANGE, 0, fingers[f].x,
+	uint32_t hand_change = change;
+	if (type != ANNIBALE_TOUCH_MOVE) {
+		hand_change |= DIGITIZER_IDENTITY;
+	}
+	hand = IOHIDEventCreateDigitizerEvent(NULL, t->time, DIGITIZER_HAND, 0, 0, hand_change, 0, fingers[f].x,
 	    fingers[f].y, 0, 0, 0, any, any, 0);
 	if (!hand) _exit(1);
 	IOHIDEventSetIntegerValue(hand, FIELD_DIGITIZER_DISPLAY_INTEGRATED, 1);
