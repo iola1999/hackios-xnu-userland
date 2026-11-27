@@ -11,7 +11,7 @@ rwa_buffer_fill(struct rwa_buffer *dst, size_t offset, size_t size, uint8_t valu
       say(why, why_size, "buffer fill range is out of bounds");
       return -1;
    }
-   if (dst->encodings) {
+   if (argbuf_has_encodings(dst)) {
       say(why, why_size, "filling buffers with argument-buffer encodings is unsupported");
       return -1;
    }
@@ -25,18 +25,29 @@ rwa_buffer_fill(struct rwa_buffer *dst, size_t offset, size_t size, uint8_t valu
    /* Copied texture views may hold newer bytes from an earlier draw. Store those
     * bytes first so a later texture refresh cannot overwrite the filled range. */
    buffer_mirror_pull(dst);
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
-      if (b->source == dst && b->written && buffer_texture_download(b, why, why_size))
+   struct rwa_btex_pin stack[16], *pins = NULL;
+   unsigned n = buffer_textures_collect(device, dst, false, stack, ARRAY_SIZE(stack), &pins);
+   for (unsigned i = 0; i < n; i++)
+      if (pins[i].b->written && buffer_texture_download(pins[i].b, why, why_size)) {
+         buffer_textures_release(pins, n, stack);
          return -1;
+      }
    pipe->clear_buffer(pipe, dst->res, (unsigned)offset, (unsigned)size, &value, 1);
-   if (finish_or_say_why(device, true, "buffer fill", why, why_size)) return -1;
+   if (finish_or_say_why(device, true, "buffer fill", why, why_size)) {
+      buffer_textures_release(pins, n, stack);
+      return -1;
+   }
    if (dst->mirror) {
       memset((char *)dst->mirror + offset, value, size);
       dst->mirror_hashed = false;
       buffer_mirror_pull(dst);
    }
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
-      if (b->source == dst && buffer_texture_upload(b, why, why_size)) return -1;
+   for (unsigned i = 0; i < n; i++)
+      if (pins[i].b->source == dst && buffer_texture_upload(pins[i].b, why, why_size)) {
+         buffer_textures_release(pins, n, stack);
+         return -1;
+      }
+   buffer_textures_release(pins, n, stack);
    return 0;
 }
 
@@ -50,7 +61,7 @@ rwa_buffer_fill_nowait(struct rwa_buffer *dst, size_t offset, size_t size, uint8
       say(why, why_size, "buffer fill range is out of bounds");
       return -1;
    }
-   if (dst->encodings) {
+   if (argbuf_has_encodings(dst)) {
       say(why, why_size, "filling buffers with argument-buffer encodings is unsupported");
       return -1;
    }
@@ -62,29 +73,31 @@ rwa_buffer_fill_nowait(struct rwa_buffer *dst, size_t offset, size_t size, uint8
       return -1;
    }
    buffer_mirror_pull(dst);
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
-      if (b->source == dst && b->written && buffer_texture_download(b, why, why_size))
+   struct rwa_btex_pin stack[16], *pins = NULL;
+   unsigned n = buffer_textures_collect(device, dst, false, stack, ARRAY_SIZE(stack), &pins);
+   for (unsigned i = 0; i < n; i++)
+      if (pins[i].b->written && buffer_texture_download(pins[i].b, why, why_size)) {
+         buffer_textures_release(pins, n, stack);
          return -1;
+      }
    pipe->clear_buffer(pipe, dst->res, (unsigned)offset, (unsigned)size, &value, 1);
    if (dst->mirror) {
       memset((char *)dst->mirror + offset, value, size);
       dst->mirror_hashed = false;
       buffer_mirror_pull(dst);
    }
-   bool has_buf_tex = false;
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
-      if (b->source == dst) {
-         has_buf_tex = true;
-         break;
-      }
-   }
-   if (has_buf_tex) {
-      if (finish_or_say_why(device, true, "buffer fill nowait", why, why_size))
+   if (n > 0) {
+      if (finish_or_say_why(device, true, "buffer fill nowait", why, why_size)) {
+         buffer_textures_release(pins, n, stack);
          return -1;
-      for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
-         if (b->source == dst && buffer_texture_upload(b, why, why_size))
+      }
+      for (unsigned i = 0; i < n; i++)
+         if (pins[i].b->source == dst && buffer_texture_upload(pins[i].b, why, why_size)) {
+            buffer_textures_release(pins, n, stack);
             return -1;
+         }
    }
+   buffer_textures_release(pins, n, stack);
    return 0;
 }
 
@@ -105,7 +118,7 @@ rwa_buffer_copy(struct rwa_buffer *src, size_t src_offset,
       say(why, why_size, "buffer copy range is empty, out of bounds or exceeds Gallium's signed coordinates");
       return -1;
    }
-   if (src->encodings || dst->encodings) {
+   if (argbuf_has_encodings(src) || argbuf_has_encodings(dst)) {
       say(why, why_size, "copying buffers with argument-buffer encodings is unsupported");
       return -1;
    }
@@ -141,7 +154,7 @@ rwa_buffer_copy_nowait(struct rwa_buffer *src, size_t src_offset,
       say(why, why_size, "buffer copy range is empty, out of bounds or exceeds Gallium's signed coordinates");
       return -1;
    }
-   if (src->encodings || dst->encodings) {
+   if (argbuf_has_encodings(src) || argbuf_has_encodings(dst)) {
       say(why, why_size, "copying buffers with argument-buffer encodings is unsupported");
       return -1;
    }
@@ -158,20 +171,20 @@ rwa_buffer_copy_nowait(struct rwa_buffer *src, size_t src_offset,
    struct pipe_box box = { .x = src_offset, .width = size, .height = 1, .depth = 1 };
    pipe->resource_copy_region(pipe, dst->res, 0, dst_offset, 0, 0, src->res, 0, &box);
    struct rwa_device *device = src->device;
-   bool has_buf_tex = false;
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
-      if (b->source == dst) {
-         has_buf_tex = true;
-         break;
-      }
-   }
-   if (has_buf_tex) {
-      if (finish_or_say_why(device, true, "buffer copy nowait", why, why_size))
+   struct rwa_btex_pin stack[16], *pins = NULL;
+   unsigned n = buffer_textures_collect(device, dst, false, stack, ARRAY_SIZE(stack), &pins);
+   if (n > 0) {
+      if (finish_or_say_why(device, true, "buffer copy nowait", why, why_size)) {
+         buffer_textures_release(pins, n, stack);
          return -1;
-      for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
-         if (b->source == dst && buffer_texture_upload(b, why, why_size))
+      }
+      for (unsigned i = 0; i < n; i++)
+         if (pins[i].b->source == dst && buffer_texture_upload(pins[i].b, why, why_size)) {
+            buffer_textures_release(pins, n, stack);
             return -1;
+         }
    }
+   buffer_textures_release(pins, n, stack);
    return 0;
 }
 
@@ -192,14 +205,15 @@ copy_texture_box(struct rwa_texture *texture, unsigned level, unsigned slice,
       say(why, why_size, "invalid texture copy level, slice or region");
       return false;
    }
+   unsigned abs_slice = texture->first_layer + slice;
    unsigned width = u_minify(res->width0, level), height = u_minify(res->height0, level);
    if (origin[0] > width || size[0] > width - origin[0] ||
        origin[1] > height || size[1] > height - origin[1] ||
-       width > INT32_MAX || height > INT32_MAX || slice > INT32_MAX) {
+       width > INT32_MAX || height > INT32_MAX || abs_slice > INT32_MAX) {
       say(why, why_size, "texture copy region is out of bounds");
       return false;
    }
-   *box = (struct pipe_box){ .x = origin[0], .y = origin[1], .z = slice,
+   *box = (struct pipe_box){ .x = origin[0], .y = origin[1], .z = abs_slice,
                             .width = size[0], .height = size[1], .depth = 1 };
    return true;
 }

@@ -60,6 +60,37 @@ rwa_unlock_scope(int *unused)
    int rwa_locked_ __attribute__((cleanup(rwa_unlock_scope))) = (pthread_mutex_lock(&rwa_lock), 0); \
    (void)rwa_locked_
 
+/* Narrower locks to keep background CSO builds and foreground resource destruction off rwa_lock.
+ * Lock order (outer -> inner): rwa_cso_create_lock -> rwa_vcso_lock;
+ * rwa_lock -> { rwa_vcso_lock, rwa_buffer_textures_lock, rwa_argbuf_lock, rwa_deferred_lock }. */
+static pthread_mutex_t rwa_cso_create_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t rwa_vcso_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t rwa_buffer_textures_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t rwa_argbuf_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t rwa_deferred_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline __attribute__((unused)) void rwa_cso_create_unlock_scope(int *u) { (void)u; pthread_mutex_unlock(&rwa_cso_create_lock); }
+static inline __attribute__((unused)) void rwa_vcso_unlock_scope(int *u) { (void)u; pthread_mutex_unlock(&rwa_vcso_lock); }
+static inline __attribute__((unused)) void rwa_btex_unlock_scope(int *u) { (void)u; pthread_mutex_unlock(&rwa_buffer_textures_lock); }
+static inline __attribute__((unused)) void rwa_argbuf_unlock_scope(int *u) { (void)u; pthread_mutex_unlock(&rwa_argbuf_lock); }
+static inline __attribute__((unused)) void rwa_deferred_unlock_scope(int *u) { (void)u; pthread_mutex_unlock(&rwa_deferred_lock); }
+
+#define RWA_CSO_CREATE_LOCKED \
+   int rwa_cso_l_ __attribute__((cleanup(rwa_cso_create_unlock_scope))) = (pthread_mutex_lock(&rwa_cso_create_lock), 0); \
+   (void)rwa_cso_l_
+#define RWA_VCSO_LOCKED \
+   int rwa_vcso_l_ __attribute__((cleanup(rwa_vcso_unlock_scope))) = (pthread_mutex_lock(&rwa_vcso_lock), 0); \
+   (void)rwa_vcso_l_
+#define RWA_BTEX_LOCKED \
+   int rwa_btex_l_ __attribute__((cleanup(rwa_btex_unlock_scope))) = (pthread_mutex_lock(&rwa_buffer_textures_lock), 0); \
+   (void)rwa_btex_l_
+#define RWA_ARGBUF_LOCKED \
+   int rwa_argbuf_l_ __attribute__((cleanup(rwa_argbuf_unlock_scope))) = (pthread_mutex_lock(&rwa_argbuf_lock), 0); \
+   (void)rwa_argbuf_l_
+#define RWA_DEFERRED_LOCKED \
+   int rwa_def_l_ __attribute__((cleanup(rwa_deferred_unlock_scope))) = (pthread_mutex_lock(&rwa_deferred_lock), 0); \
+   (void)rwa_def_l_
+
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_air.h"
@@ -232,8 +263,14 @@ static void argbuf_scrub(struct rwa_device *device, const struct rwa_buffer *buf
                          const struct rwa_texture *texture,
                          const struct rwa_sampler *sampler);
 static void argbuf_forget_all(struct rwa_buffer *dest);
+static bool argbuf_has_encodings(struct rwa_buffer *buffer);
 /* the buffer textures over a buffer that is going away (air_metal_texture.inc) */
 static void buffer_textures_forget(struct rwa_buffer *buffer);
+static void rwa_deferred_drain_locked(struct rwa_device *device);
+static void rwa_deferred_defer_texture(struct rwa_device *device, struct pipe_resource *res,
+                                       struct pipe_sampler_view *view);
+static void rwa_deferred_defer_buffer(struct rwa_device *device, struct pipe_transfer *xfer,
+                                      struct pipe_resource *res);
 /* and the mask of Metal buffer indices a module's sets are bound at, which both
  * pipeline-creating calls report and whose definition sits beside check_bindings */
 static int argbuf_mask_of(const struct air_shader_info *info, const char *name,
@@ -269,6 +306,10 @@ say(char *why, size_t why_size, const char *fmt, ...)
 /* Defined below; rwa_device_open's calibration times 1024 of them. */
 static uint64_t draw_mark(void);
 static void rwa_vertex_cso_cache_destroy(struct rwa_device *device);
+
+static const float rwa_quad_verts[] = {
+   -1, -1, 0, 1,   1, -1, 0, 1,   -1, 1, 0, 1,   1, 1, 0, 1,
+};
 
 struct rwa_device *
 rwa_device_open(char *why, size_t why_size)
@@ -429,6 +470,13 @@ rwa_device_open(char *why, size_t why_size)
    device->ubo_offset_align = MAX2(device->screen->caps.constant_buffer_offset_alignment, 1);
    device->ssbo_offset_align = MAX2(device->screen->caps.shader_buffer_offset_alignment, 1);
 
+   /* Pre-create the immutable full-screen quad vertex buffer so concurrent render pipeline
+    * builds reference it without acquiring rwa_lock. */
+   device->quad_vbuf = pipe_buffer_create(device->screen, PIPE_BIND_VERTEX_BUFFER,
+                                          PIPE_USAGE_DEFAULT, sizeof(rwa_quad_verts));
+   if (device->quad_vbuf)
+      pipe_buffer_write(device->pipe, device->quad_vbuf, 0, sizeof(rwa_quad_verts), rwa_quad_verts);
+
    /* What one timing mark costs. Every number printed about this library's own work is the
     * difference of two of them, and a slow clock here reads exactly like slow work.
     */
@@ -462,6 +510,7 @@ rwa_device_close(struct rwa_device *device)
    RWA_LOCKED;
    if (!device)
       return;
+   rwa_deferred_drain_locked(device);
    state_release(device);
    rgb2p_device_close(device);
    rwa_vertex_cso_cache_destroy(device);
@@ -505,6 +554,7 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
       say(why, why_size, "out of memory making a buffer");
       return NULL;
    }
+   buffer->references = 1;
    buffer->device = device;
    buffer->size = size;
 
@@ -576,21 +626,33 @@ rwa_buffer_size(struct rwa_buffer *buffer)
 void
 rwa_buffer_destroy(struct rwa_buffer *buffer)
 {
-   RWA_LOCKED;
-   if (!buffer)
+   if (!buffer || __atomic_sub_fetch(&buffer->references, 1u, __ATOMIC_ACQ_REL) != 0)
       return;
+   struct rwa_device *device = buffer->device;
    /* Out of every argument-buffer record that named it, and then its own records go:
     * see argbuf_scrub -- a pointer left in a record is memory this library would
     * dereference at the next draw, where Metal's own stale handle would at worst be
     * read by the GPU.
     */
-   argbuf_scrub(buffer->device, buffer, NULL, NULL);
+   argbuf_scrub(device, buffer, NULL, NULL);
    argbuf_forget_all(buffer);
 
    buffer_textures_forget(buffer);
 
-   pipe_buffer_unmap(buffer->device->pipe, buffer->xfer);
-   pipe_resource_reference(&buffer->res, NULL);
+   if (buffer->xfer) {
+      if (device && pthread_mutex_trylock(&rwa_lock) == 0) {
+         rwa_deferred_drain_locked(device);
+         pipe_buffer_unmap(device->pipe, buffer->xfer);
+         pipe_resource_reference(&buffer->res, NULL);
+         pthread_mutex_unlock(&rwa_lock);
+      } else {
+         rwa_deferred_defer_buffer(device, buffer->xfer, buffer->res);
+         buffer->res = NULL;
+      }
+      buffer->xfer = NULL;
+   } else {
+      pipe_resource_reference(&buffer->res, NULL);
+   }
    free(buffer);
 }
 

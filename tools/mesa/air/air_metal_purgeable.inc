@@ -42,7 +42,7 @@ texture_can_purge(const struct rwa_texture *texture, char *why, size_t why_size)
       say(why, why_size, "multi-plane texture cannot be purged");
       return false;
    }
-   if (texture->references > 1) {
+   if (__atomic_load_n(&texture->references, __ATOMIC_RELAXED) > 1) {
       say(why, why_size, "texture with active views cannot be purged");
       return false;
    }

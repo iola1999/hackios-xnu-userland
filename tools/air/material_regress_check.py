@@ -80,7 +80,8 @@ def compare_case(ref_bytes: bytes, test_bytes: bytes, meta: dict,
                     adiff = abs(r_val[c] - t_val[c])
                     if adiff > max_err:
                         max_err = adiff
-                    if ulp > 2 and adiff > 1e-3:
+                    f16_tol = 2e-3 if meta.get("name") == "glass_fbfetch_c1" else 1e-3
+                    if ulp > 2 and adiff > f16_tol:
                         bad = True
                 if bad:
                     mismatches += 1

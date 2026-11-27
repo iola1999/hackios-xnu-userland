@@ -110,17 +110,19 @@ rwa_argbuf_encode_buffer(struct rwa_buffer *dest, size_t dest_offset, unsigned i
                          struct rwa_buffer *buffer, size_t offset, char *why,
                          size_t why_size)
 {
-   RWA_LOCKED;
+   RWA_ARGBUF_LOCKED;
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a buffer", why, why_size);
 
    if (!e)
       return -1;
    if (!buffer) {
-      say(why, why_size, "no buffer was encoded at id %u, and a member of a set cannot "
-                         "be unbound: this library binds every member a shader declares "
-                         "and refuses the draw otherwise", id);
-      return -1;
+      if (e->slot[id].set) {
+         e->slot[id] = (struct rwa_argbuf_slot){ 0 };
+         if (e->members > 0)
+            e->members--;
+      }
+      return 0;
    }
    if (buffer->device != dest->device) {
       say(why, why_size, "the buffer encoded at id %u belongs to another device", id);
@@ -142,16 +144,19 @@ int
 rwa_argbuf_encode_texture(struct rwa_buffer *dest, size_t dest_offset, unsigned id,
                           struct rwa_texture *texture, char *why, size_t why_size)
 {
-   RWA_LOCKED;
+   RWA_ARGBUF_LOCKED;
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a texture", why, why_size);
 
    if (!e)
       return -1;
    if (!texture) {
-      say(why, why_size, "no texture was encoded at id %u, and a member of a set cannot "
-                         "be unbound", id);
-      return -1;
+      if (e->slot[id].set) {
+         e->slot[id] = (struct rwa_argbuf_slot){ 0 };
+         if (e->members > 0)
+            e->members--;
+      }
+      return 0;
    }
    if (texture->device != dest->device) {
       say(why, why_size, "the texture encoded at id %u belongs to another device", id);
@@ -168,16 +173,19 @@ int
 rwa_argbuf_encode_sampler(struct rwa_buffer *dest, size_t dest_offset, unsigned id,
                           struct rwa_sampler *sampler, char *why, size_t why_size)
 {
-   RWA_LOCKED;
+   RWA_ARGBUF_LOCKED;
    struct rwa_argbuf_encoding *e =
       argbuf_begin_member(dest, dest_offset, id, "a sampler", why, why_size);
 
    if (!e)
       return -1;
    if (!sampler) {
-      say(why, why_size, "no sampler was encoded at id %u, and a member of a set cannot "
-                         "be unbound", id);
-      return -1;
+      if (e->slot[id].set) {
+         e->slot[id] = (struct rwa_argbuf_slot){ 0 };
+         if (e->members > 0)
+            e->members--;
+      }
+      return 0;
    }
    if (sampler->device != dest->device) {
       say(why, why_size, "the sampler encoded at id %u belongs to another device", id);
@@ -193,10 +201,19 @@ rwa_argbuf_encode_sampler(struct rwa_buffer *dest, size_t dest_offset, unsigned 
 unsigned
 rwa_argbuf_encoded_members(const struct rwa_buffer *dest, size_t dest_offset)
 {
-   RWA_LOCKED;
+   RWA_ARGBUF_LOCKED;
    const struct rwa_argbuf_encoding *e = argbuf_find(dest, dest_offset);
 
    return e ? e->members : 0;
+}
+
+static bool
+argbuf_has_encodings(struct rwa_buffer *buffer)
+{
+   if (!buffer)
+      return false;
+   RWA_ARGBUF_LOCKED;
+   return buffer->encodings != NULL;
 }
 
 /*
@@ -212,6 +229,7 @@ static void
 argbuf_scrub(struct rwa_device *device, const struct rwa_buffer *buffer,
              const struct rwa_texture *texture, const struct rwa_sampler *sampler)
 {
+   RWA_ARGBUF_LOCKED;
    for (struct rwa_buffer *b = device ? device->encoded : NULL; b; b = b->next_encoded) {
       for (struct rwa_argbuf_encoding *e = b->encodings; e; e = e->next) {
          for (unsigned i = 0; i < e->slots; i++) {
@@ -238,6 +256,7 @@ argbuf_scrub(struct rwa_device *device, const struct rwa_buffer *buffer,
 static void
 argbuf_forget_all(struct rwa_buffer *dest)
 {
+   RWA_ARGBUF_LOCKED;
    struct rwa_argbuf_encoding *e = dest->encodings;
 
    while (e) {
@@ -374,7 +393,9 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
       return 0;
    }
    /* Resource descriptors must have been recorded via MTLArgumentEncoder. */
-   if (rwa_argbuf_encoded_members(bind->buffer, bind->offset) == 0) {
+   RWA_ARGBUF_LOCKED;
+   const struct rwa_argbuf_encoding *e = argbuf_find(bind->buffer, bind->offset);
+   if (!e || e->members == 0) {
       say(why, why_size, "the buffer bound as the argument buffer at Metal buffer index "
                          "%u (offset %zu) was never filled through an MTLArgumentEncoder, "
                          "so there is no record of what %s's %s `%s` (id %u) should be. "
@@ -386,9 +407,8 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
       return -1;
    }
 
-   const struct rwa_argbuf_encoding *e = argbuf_find(bind->buffer, bind->offset);
    const struct rwa_argbuf_slot *sl =
-      e && r->argbuf_id < e->slots ? &e->slot[r->argbuf_id] : NULL;
+      r->argbuf_id < e->slots ? &e->slot[r->argbuf_id] : NULL;
 
    /* Encoded, but not this member: Metal would have written a handle of zero there and
     * the GPU would read descriptor zero of the device, which is some other resource.

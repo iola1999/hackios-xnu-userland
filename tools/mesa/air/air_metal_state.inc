@@ -50,6 +50,120 @@ state_stage(mesa_shader_stage stage)
    return stage == MESA_SHADER_VERTEX ? 1 : 0;
 }
 
+static void
+fb_bound_sync_locked(struct rwa_device *device)
+{
+   struct rwa_bound_state *b = &device->bound;
+   RWA_DEFERRED_LOCKED;
+   unsigned count = 0;
+
+   if (b->fb_set) {
+      for (unsigned i = 0; i < b->fb.nr_cbufs && count < ARRAY_SIZE(device->fb_bound_res); i++) {
+         if (b->fb.cbufs[i].texture)
+            device->fb_bound_res[count++] = b->fb.cbufs[i].texture;
+      }
+      if (b->fb.zsbuf.texture && count < ARRAY_SIZE(device->fb_bound_res))
+         device->fb_bound_res[count++] = b->fb.zsbuf.texture;
+   }
+   device->fb_bound_count = count;
+}
+
+static bool
+fb_bound_match_locked(const struct rwa_device *device, const struct pipe_resource *res)
+{
+   if (!device || !res)
+      return false;
+   for (unsigned i = 0; i < device->fb_bound_count; i++) {
+      if (device->fb_bound_res[i] == res)
+         return true;
+   }
+   return false;
+}
+
+static void state_texture_gone(struct rwa_device *device, const struct pipe_resource *res);
+
+static void
+rwa_deferred_drain_locked(struct rwa_device *device)
+{
+   if (!device || !__atomic_load_n(&device->deferred_head, __ATOMIC_ACQUIRE))
+      return;
+   struct rwa_deferred_item *head = NULL;
+   {
+      RWA_DEFERRED_LOCKED;
+      head = device->deferred_head;
+      __atomic_store_n(&device->deferred_head, NULL, __ATOMIC_RELEASE);
+   }
+   while (head) {
+      struct rwa_deferred_item *next = head->next;
+      if (head->xfer) {
+         pipe_buffer_unmap(device->pipe, head->xfer);
+         pipe_resource_reference(&head->res, NULL);
+      } else if (head->res) {
+         state_texture_gone(device, head->res);
+         pipe_resource_reference(&head->res, NULL);
+      }
+      if (head->view)
+         pipe_sampler_view_release_ptr(&head->view);
+      free(head);
+      head = next;
+   }
+}
+
+static void
+rwa_deferred_defer_texture(struct rwa_device *device, struct pipe_resource *res,
+                           struct pipe_sampler_view *view)
+{
+   if (!device) {
+      pipe_sampler_view_release_ptr(&view);
+      return;
+   }
+   struct rwa_deferred_item *item = NULL;
+   bool need_fb = false;
+   {
+      RWA_DEFERRED_LOCKED;
+      need_fb = res && fb_bound_match_locked(device, res);
+      if (!need_fb && !view)
+         return;
+      item = calloc(1, sizeof(*item));
+      if (item) {
+         if (need_fb)
+            pipe_resource_reference(&item->res, res);
+         item->view = view;
+         item->next = device->deferred_head;
+         __atomic_store_n(&device->deferred_head, item, __ATOMIC_RELEASE);
+         return;
+      }
+   }
+   RWA_LOCKED;
+   rwa_deferred_drain_locked(device);
+   if (res)
+      state_texture_gone(device, res);
+   pipe_sampler_view_release_ptr(&view);
+}
+
+static void
+rwa_deferred_defer_buffer(struct rwa_device *device, struct pipe_transfer *xfer,
+                          struct pipe_resource *res)
+{
+   if (!device || !xfer) {
+      pipe_resource_reference(&res, NULL);
+      return;
+   }
+   struct rwa_deferred_item *item = calloc(1, sizeof(*item));
+   if (item) {
+      item->xfer = xfer;
+      item->res = res;
+      RWA_DEFERRED_LOCKED;
+      item->next = device->deferred_head;
+      __atomic_store_n(&device->deferred_head, item, __ATOMIC_RELEASE);
+      return;
+   }
+   RWA_LOCKED;
+   rwa_deferred_drain_locked(device);
+   pipe_buffer_unmap(device->pipe, xfer);
+   pipe_resource_reference(&res, NULL);
+}
+
 /* The next draw binds every state object again, and no sampler is left bound. */
 static void
 state_forget(struct rwa_device *device)
@@ -97,6 +211,7 @@ state_framebuffer(struct rwa_device *device, const struct pipe_framebuffer_state
    device->pipe->set_framebuffer_state(device->pipe, fb);
    util_copy_framebuffer_state(&b->fb, fb);
    b->fb_set = true;
+   fb_bound_sync_locked(device);
 }
 
 static void
@@ -109,6 +224,7 @@ state_release_framebuffer(struct rwa_device *device)
    device->pipe->set_framebuffer_state(device->pipe, &(struct pipe_framebuffer_state){ 0 });
    util_unreference_framebuffer_state(&b->fb);
    b->fb_set = false;
+   fb_bound_sync_locked(device);
 }
 
 /* A texture going away: the framebuffer lets go of it now rather than at the next draw into

@@ -57,6 +57,41 @@ static bool library_wrapper = false;
  * graph form of struct air_linked_function, for running a stitched call on the host. */
 static struct air_linked_function links[8];
 static unsigned num_links;
+static struct air_constant_value fc_overrides[64];
+static unsigned num_fc_overrides;
+
+static bool
+parse_fc(const char *spec)
+{
+   while (*spec) {
+      char *end = NULL;
+      unsigned long idx = strtoul(spec, &end, 0);
+      if (end == spec || *end != '=')
+         return false;
+      spec = end + 1;
+      unsigned long long val = strtoull(spec, &end, 0);
+      if (end == spec || (*end != '\0' && *end != ','))
+         return false;
+      if (num_fc_overrides >= ARRAY_SIZE(fc_overrides))
+         return false;
+      fc_overrides[num_fc_overrides++] = (struct air_constant_value){
+         .index = (unsigned)idx, .bits = (uint64_t)val,
+      };
+      spec = *end == ',' ? end + 1 : end;
+   }
+   return num_fc_overrides > 0;
+}
+
+static void
+apply_fc_overrides(struct air_constant_value *fc, unsigned num_fc)
+{
+   for (unsigned o = 0; o < num_fc_overrides; o++) {
+      for (unsigned k = 0; k < num_fc; k++) {
+         if (fc[k].index == fc_overrides[o].index)
+            fc[k].bits = fc_overrides[o].bits;
+      }
+   }
+}
 
 static const nir_shader_compiler_options default_options = {
    .lower_fdiv = false,
@@ -318,6 +353,7 @@ eval_module(const struct module_ref *mod)
    const char *err = NULL;
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
+   apply_fc_overrides(fc, num_fc);
    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper };
    struct air_shader_info info;
@@ -496,6 +532,7 @@ report_one(const struct module_ref *mod)
     */
    struct air_constant_value *fc;
    unsigned num_fc = air_module_function_constants(ctx, mod->bitcode, mod->size, &fc);
+   apply_fc_overrides(fc, num_fc);
    struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper };
    if (num_fc)
@@ -586,6 +623,12 @@ main(int argc, char **argv)
    for (;;) {
       if (i < argc && !strcmp(argv[i], "--library")) {
          library_wrapper = true, i++;
+      } else if (i + 1 < argc && !strcmp(argv[i], "--fc")) {
+         if (!parse_fc(argv[i + 1])) {
+            fprintf(stderr, "air2nir: --fc %s is not INDEX=VALUE[,...]\n", argv[i + 1]);
+            return 2;
+         }
+         i += 2;
       } else if (i + 1 < argc && !strcmp(argv[i], "--link")) {
          if (!parse_link(link_ctx, argv[i + 1])) {
             fprintf(stderr, "air2nir: --link %s is not NAME=PATH@FUNCTION@ARGS|...\n",
@@ -677,6 +720,7 @@ main(int argc, char **argv)
       }
       struct air_constant_value *fc;
       unsigned num_fc = air_module_function_constants(ctx, mods[k].bitcode, mods[k].size, &fc);
+      apply_fc_overrides(fc, num_fc);
       struct air_to_nir_options options = { .constants = fc, .num_constants = num_fc,
                                         .library_wrapper = library_wrapper,
                                         .linked = links, .num_linked = num_links };

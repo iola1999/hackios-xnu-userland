@@ -37,8 +37,8 @@ rwa_texture_combine_yuv(struct rwa_texture *y, struct rwa_texture *uv,
    t->yuv_full_range = full_range;
    t->yuv_bt709 = matrix == 1;
    t->yuv_bt2020 = matrix == 9;
-   y->references++;
-   uv->references++;
+   __atomic_fetch_add(&y->references, 1u, __ATOMIC_RELAXED);
+   __atomic_fetch_add(&uv->references, 1u, __ATOMIC_RELAXED);
    pipe_resource_reference(&t->res, y->res);
    return t;
 }

@@ -43,6 +43,7 @@ int
 rwa_flush(struct rwa_device *device, char *why, size_t why_size)
 {
    RWA_LOCKED;
+   rwa_deferred_drain_locked(device);
    struct pipe_fence_handle *fence = NULL;
 
    (void)why, (void)why_size;
@@ -826,10 +827,10 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             .shader_access = (r->read ? PIPE_IMAGE_ACCESS_READ : 0) |
                              (r->write ? PIPE_IMAGE_ACCESS_WRITE : 0),
             .u.tex.level = t->first_level,
-            .u.tex.first_layer = 0,
+            .u.tex.first_layer = t->shape.type == RWA_TYPE_3D ? 0 : t->first_layer,
             .u.tex.last_layer = (t->shape.type == RWA_TYPE_3D
                                     ? u_minify(t->res->depth0, t->first_level)
-                                    : t->layers) - 1,
+                                    : (t->first_layer + t->layers)) - 1,
          };
          num_images = MAX2(num_images, r->index + 1);
          /* One view per level for a shader that picks the level itself. Slots past the

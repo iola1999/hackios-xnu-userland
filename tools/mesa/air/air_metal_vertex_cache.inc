@@ -43,6 +43,7 @@ rwa_vertex_cso_lookup(struct rwa_device *device, const void *bitcode, size_t siz
    rwa_vertex_compute_hash(bitcode, size, hash);
 
    const char *name = entry_name ? entry_name : "";
+   RWA_VCSO_LOCKED;
    struct rwa_vertex_cso_entry *e = device->vertex_cso_cache;
    while (e) {
       if (memcmp(e->hash, hash, 32) == 0 && strcmp(e->entry_name, name) == 0) {
@@ -119,6 +120,7 @@ rwa_vertex_cso_insert(struct rwa_device *device, const void *bitcode, size_t siz
    e->fetched_count = fetched_count;
    e->refcnt = 1;
 
+   RWA_VCSO_LOCKED;
    e->next = device->vertex_cso_cache;
    device->vertex_cso_cache = e;
    return e;
@@ -133,6 +135,7 @@ rwa_vertex_cso_release(struct rwa_device *device, struct rwa_render *render)
    struct pipe_context *pipe = device ? device->pipe : render->device->pipe;
 
    if (render->cached_vcso_entry) {
+      RWA_VCSO_LOCKED;
       struct rwa_vertex_cso_entry *e = render->cached_vcso_entry;
       if (e->refcnt > 0)
          e->refcnt--;
@@ -152,7 +155,12 @@ rwa_vertex_cso_cache_destroy(struct rwa_device *device)
       return;
 
    struct pipe_context *pipe = device->pipe;
-   struct rwa_vertex_cso_entry *e = device->vertex_cso_cache;
+   struct rwa_vertex_cso_entry *e = NULL;
+   {
+      RWA_VCSO_LOCKED;
+      e = device->vertex_cso_cache;
+      device->vertex_cso_cache = NULL;
+   }
    while (e) {
       struct rwa_vertex_cso_entry *next = e->next;
       if (e->vs_cso && pipe)
@@ -162,7 +170,6 @@ rwa_vertex_cso_cache_destroy(struct rwa_device *device)
       free(e);
       e = next;
    }
-   device->vertex_cso_cache = NULL;
 }
 
 static nir_shader *
@@ -203,15 +210,21 @@ create_stage_cso(struct rwa_device *device, nir_shader *clone, mesa_shader_stage
 static struct pipe_resource *
 rwa_quad_vbuf_ref(struct rwa_device *device, const void *verts, size_t size)
 {
-   if (!device->quad_vbuf) {
-      device->quad_vbuf = pipe_buffer_create(device->screen, PIPE_BIND_VERTEX_BUFFER,
-                                             PIPE_USAGE_DEFAULT, size);
-      if (device->quad_vbuf)
-         pipe_buffer_write(device->pipe, device->quad_vbuf, 0, size, verts);
+   struct pipe_resource *vb = __atomic_load_n(&device->quad_vbuf, __ATOMIC_ACQUIRE);
+   if (!vb) {
+      RWA_LOCKED;
+      vb = device->quad_vbuf;
+      if (!vb) {
+         vb = pipe_buffer_create(device->screen, PIPE_BIND_VERTEX_BUFFER,
+                                 PIPE_USAGE_DEFAULT, size);
+         if (vb)
+            pipe_buffer_write(device->pipe, vb, 0, size, verts);
+         __atomic_store_n(&device->quad_vbuf, vb, __ATOMIC_RELEASE);
+      }
    }
    struct pipe_resource *ref = NULL;
-   if (device->quad_vbuf)
-      pipe_resource_reference(&ref, device->quad_vbuf);
+   if (vb)
+      pipe_resource_reference(&ref, vb);
    return ref;
 }
 

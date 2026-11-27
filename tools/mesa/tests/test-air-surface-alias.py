@@ -39,7 +39,9 @@ HARNESS = r"""
 
 #define MIN2(a, b) ((a) < (b) ? (a) : (b))
 #define DIV_ROUND_UP(a, b) (((a) + (b) - 1) / (b))
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define RWA_LOCKED
+#define RWA_BTEX_LOCKED
 #define PIPE_MAP_READ 1u
 
 struct pipe_context { int dummy; };
@@ -52,6 +54,7 @@ struct rwa_device {
     unsigned written_buffer_textures, buffer_textures_count;
 };
 struct rwa_buffer {
+    unsigned references;
     struct rwa_device *device;
     struct pipe_resource *res;
     void *map, *mirror;
@@ -60,6 +63,7 @@ struct rwa_buffer {
     bool mirror_hashed;
 };
 struct rwa_texture {
+    unsigned references;
     struct rwa_device *device;
     struct pipe_resource *res;
     struct rwa_buffer_texture *backing;
@@ -72,9 +76,21 @@ struct rwa_buffer_texture {
     struct rwa_buffer *source;
     size_t offset;
     unsigned row_bytes;
+    unsigned refs;
     uint64_t hash;
-    bool hashed, written;
+    bool unlinked, hashed, written;
 };
+struct rwa_btex_pin {
+    struct rwa_buffer_texture *b;
+    struct rwa_texture *tex;
+    struct rwa_buffer *src;
+};
+static void rwa_texture_destroy(struct rwa_texture *t) {
+    if (t) __atomic_sub_fetch(&t->references, 1u, __ATOMIC_ACQ_REL);
+}
+static void rwa_buffer_destroy(struct rwa_buffer *b) {
+    if (b) __atomic_sub_fetch(&b->references, 1u, __ATOMIC_ACQ_REL);
+}
 
 static unsigned g_uploads, g_downloads;
 static struct { unsigned refreshes, uploads, unchanged; } upload_count;
@@ -121,16 +137,16 @@ static struct rwa_buffer_texture *make_wrapper(struct rwa_device *dev, struct rw
                                                void *mirror, size_t buf_sz, size_t off, unsigned row,
                                                unsigned w, unsigned h, struct rwa_texture *tex,
                                                struct pipe_resource *res) {
-    *buf = (struct rwa_buffer){ .device = dev, .map = calloc(1, buf_sz), .size = buf_sz };
+    *buf = (struct rwa_buffer){ .references = 1, .device = dev, .map = calloc(1, buf_sz), .size = buf_sz };
     if (mirror) {
         memcpy(buf->map, mirror, buf_sz);
         rwa_buffer_set_mirror(buf, mirror);
     }
     *res = (struct pipe_resource){ .width0 = w, .height0 = h };
-    *tex = (struct rwa_texture){ .device = dev, .res = res, .pixels = calloc(w * h, 4u), .format_name = "BGRA8" };
+    *tex = (struct rwa_texture){ .references = 1, .device = dev, .res = res, .pixels = calloc(w * h, 4u), .format_name = "BGRA8" };
     struct rwa_buffer_texture *bt = calloc(1, sizeof(*bt));
     *bt = (struct rwa_buffer_texture){
-        .next = dev->buffer_textures, .texture = tex, .source = buf, .offset = off, .row_bytes = row,
+        .next = dev->buffer_textures, .texture = tex, .source = buf, .offset = off, .row_bytes = row, .refs = 1,
     };
     dev->buffer_textures = bt;
     tex->backing = bt;
@@ -178,13 +194,13 @@ int main(void) {
     assert(!bt1->written && t2.pixels[0] == 0x9c && t2.pixels[63] == 0x9c && surface_a[0] == 0x9c);
 
     /* 4. Same rwa_buffer (no mirror) overlapping slices sync; non-overlapping do not. */
-    struct rwa_buffer shared_buf = { .device = &dev, .map = calloc(1, 512), .size = 512 };
-    struct rwa_texture s1 = { .device = &dev, .res = &r1, .pixels = calloc(64, 1), .format_name = "BGRA8" };
-    struct rwa_texture s2 = { .device = &dev, .res = &r2, .pixels = calloc(64, 1), .format_name = "BGRA8" };
-    struct rwa_texture s3 = { .device = &dev, .res = &r3, .pixels = calloc(64, 1), .format_name = "BGRA8" };
-    struct rwa_buffer_texture bs1 = { .next = dev.buffer_textures, .texture = &s1, .source = &shared_buf, .offset = 0, .row_bytes = 32 };
-    struct rwa_buffer_texture bs2 = { .next = &bs1, .texture = &s2, .source = &shared_buf, .offset = 64, .row_bytes = 32 };
-    struct rwa_buffer_texture bs3 = { .next = &bs2, .texture = &s3, .source = &shared_buf, .offset = 256, .row_bytes = 32 };
+    struct rwa_buffer shared_buf = { .references = 1, .device = &dev, .map = calloc(1, 512), .size = 512 };
+    struct rwa_texture s1 = { .references = 1, .device = &dev, .res = &r1, .pixels = calloc(64, 1), .format_name = "BGRA8" };
+    struct rwa_texture s2 = { .references = 1, .device = &dev, .res = &r2, .pixels = calloc(64, 1), .format_name = "BGRA8" };
+    struct rwa_texture s3 = { .references = 1, .device = &dev, .res = &r3, .pixels = calloc(64, 1), .format_name = "BGRA8" };
+    struct rwa_buffer_texture bs1 = { .next = dev.buffer_textures, .texture = &s1, .source = &shared_buf, .offset = 0, .row_bytes = 32, .refs = 1 };
+    struct rwa_buffer_texture bs2 = { .next = &bs1, .texture = &s2, .source = &shared_buf, .offset = 64, .row_bytes = 32, .refs = 1 };
+    struct rwa_buffer_texture bs3 = { .next = &bs2, .texture = &s3, .source = &shared_buf, .offset = 256, .row_bytes = 32, .refs = 1 };
     dev.buffer_textures = &bs3; s1.backing = &bs1; s2.backing = &bs2; s3.backing = &bs3;
     memset(s1.pixels, 0x55, 64); mark_written(&s1);
     g_uploads = g_downloads = 0;
@@ -214,6 +230,9 @@ def main() -> None:
         "static int\nbuffer_texture_download(",
         "static size_t\nbuffer_texture_span(",
         "static bool\nbuffer_textures_alias(",
+        "static bool\nrwa_try_retain_u(",
+        "static unsigned\nbuffer_textures_collect(",
+        "static void\nbuffer_textures_release(",
         "static int\nbuffer_texture_sync_aliases(",
         "void\nrwa_buffer_textures_refresh(",
         "void\nrwa_buffer_textures_writeback(",

@@ -4,6 +4,7 @@ int
 rwa_finish(struct rwa_device *device, char *why, size_t why_size)
 {
    RWA_LOCKED;
+   rwa_deferred_drain_locked(device);
    return finish_or_say_why(device, false, "work", why, why_size);
 }
 
@@ -27,11 +28,8 @@ rwa_finish(struct rwa_device *device, char *why, size_t why_size)
 
 /* A full-screen quad covering the whole attachment, in clip space. A TRIANGLE_STRIP of
  * these four is what air_run draws and what rwa_render_draw expects when the library
- * supplied the vertex stage.
+ * supplied the vertex stage (rwa_quad_verts is defined in air_metal.c).
  */
-static const float rwa_quad_verts[] = {
-   -1, -1, 0, 1,   1, -1, 0, 1,   -1, 1, 0, 1,   1, 1, 0, 1,
-};
 
 /* The texel the generated vertex stage puts under every fragment, as air_run does
  * (TEX_SIZE/TEX_X/TEX_Y there). It matters only to a fragment shader that samples a
@@ -508,17 +506,8 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
    for (unsigned k = 0; k < n; k++) {
       struct rwa_argbuf_layout *l = &out[k];
       uint64_t seen = 0;
+      unsigned max_id = 0;
       for (unsigned i = 0; i < l->member_count; i++) {
-         if (l->encoded_length == 0 && l->members[i].id >= l->member_count) {
-            say(why, why_size, "the argument buffer %s declares at Metal buffer index %u "
-                               "has %u members and one of them (`%s`) is id %u: Metal's "
-                               "encodedLength is over the highest id, so this library "
-                               "will not answer a length for a set whose ids have a gap "
-                               "in them", name, l->metal_index, l->member_count,
-                l->members[i].name, l->members[i].id);
-            ralloc_free(mem_ctx);
-            return -1;
-         }
          if (seen & (1ull << l->members[i].id)) {
             say(why, why_size, "two members of the argument buffer %s declares at Metal "
                                "buffer index %u are both id %u", name, l->metal_index,
@@ -527,9 +516,14 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
             return -1;
          }
          seen |= 1ull << l->members[i].id;
+         if (l->members[i].id > max_id)
+            max_id = l->members[i].id;
       }
-      if (l->encoded_length == 0)
-         l->encoded_length = 8 * l->member_count;
+      if (l->member_count > 0) {
+         unsigned min_len = 8 * (max_id + 1);
+         if (l->encoded_length < min_len)
+            l->encoded_length = min_len;
+      }
    }
 
    if (count)

@@ -118,8 +118,8 @@ rwa_texture_combine_rgb2p(struct rwa_texture *y, struct rwa_texture *uv,
                      : format == 543 ? "MTLPixelFormatRGB10_420_2P" : "MTLPixelFormatRGB10_422_2P";
    t->storage_owner = y;
    t->chroma = uv;
-   y->references++;
-   uv->references++;
+   __atomic_fetch_add(&y->references, 1u, __ATOMIC_RELAXED);
+   __atomic_fetch_add(&uv->references, 1u, __ATOMIC_RELAXED);
    return t;
 }
 

@@ -8,11 +8,9 @@
  * A region of a texture, as Gallium wants it, and everything that will not fit in one
  * refused.
  *
- * Two conventions meet here and only one of them is the obvious one: a slice of a 2D
- * array or a face of a cube goes in box.z, and a slice of a 1D ARRAY goes in box.y.
- * softpipe asserts exactly that (sp_texture.c, softpipe_transfer_map), so a 1D array
- * written through z lands on the wrong slice -- and in a release build, where that
- * assertion is compiled out, it lands there quietly.
+ * In Gallium (st_cb_texture.c, freedreno_resource.c, sp_texture.c), array slices for 1D
+ * array, 2D array, and cube textures always go in box.z, while 1D and 1D array textures
+ * keep box.y = 0 and box.height = 1. Slice views offset layer by texture->first_layer.
  */
 static bool
 texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
@@ -53,16 +51,17 @@ texture_box(const struct rwa_texture *texture, unsigned level, unsigned layer,
       return false;
    }
 
+   unsigned abs_layer = texture->first_layer + layer;
    *box = (struct pipe_box){ .x = o[0], .width = s[0] };
    if (!rows) {
-      box->y = layer;
+      box->y = 0;
       box->height = 1;
-      box->z = 0;
+      box->z = abs_layer;
       box->depth = 1;
    } else {
       box->y = o[1];
       box->height = s[1];
-      box->z = volume ? o[2] : layer;
+      box->z = volume ? o[2] : abs_layer;
       box->depth = volume ? s[2] : 1;
    }
    return true;

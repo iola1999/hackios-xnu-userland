@@ -363,6 +363,8 @@ mount_writable(void)
 	/* Clear cached camera source backings so mounted V57 changes take effect on every boot. */
 	(void)unlink("/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist");
 	(void)unlink("/private/var/root/Library/Preferences/com.apple.cameracapture.volatile.plist");
+	/* Clear cached MobileGestalt plist so loader DeviceTree properties take effect on every boot. */
+	(void)unlink("/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist");
 	launchservices_rebuild_once();
 
 	/*

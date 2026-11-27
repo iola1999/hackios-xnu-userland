@@ -78,10 +78,21 @@ descriptor_kind_key(const struct air_md *desc)
  * to record for a member that is not one.
  */
 static bool
+is_struct_padding_field(const struct air_type *t)
+{
+   if (!t)
+      return false;
+   if (t->kind == AIR_TYPE_INT && t->bits == 8)
+      return true;
+   return t->kind == AIR_TYPE_ARRAY && t->elem &&
+          t->elem->kind == AIR_TYPE_INT && t->elem->bits == 8;
+}
+
+static bool
 argbuf_members_rec(struct air_ctx *c, const struct air_md *sti, const struct air_type *st,
                    uint64_t base_off, unsigned base_id, struct air_argbuf *ab)
 {
-   unsigned field = 0;
+   unsigned field = 0, st_field = 0;
    for (unsigned i = 0; i < sti->num_ops; field++) {
       uint64_t off = 0, msize = 0, flag = 0, sub_id = 0;
       const char *first = md_str(sti, i);
@@ -100,17 +111,22 @@ argbuf_members_rec(struct air_ctx *c, const struct air_md *sti, const struct air
          }
          const struct air_type *mt = NULL;
          if (st) {
-            if (field >= st->num_members)
+            while (st_field < st->num_members &&
+                   air_struct_member_offset(c->m, st, st_field) < off &&
+                   is_struct_padding_field(st->members[st_field]))
+               st_field++;
+            if (st_field >= st->num_members)
                return air_error(c, "interface: the argument buffer %s declares more members "
                                    "than the %u its struct type has",
                                 ab->name ? ab->name : "unnamed", st->num_members);
-            mt = st->members[field];
-            uint64_t tyoff = air_struct_member_offset(c->m, st, field);
+            mt = st->members[st_field];
+            uint64_t tyoff = air_struct_member_offset(c->m, st, st_field);
             uint64_t tysize = air_type_alloc_size(c->m, mt);
             if (mt->kind != AIR_TYPE_STRUCT || tyoff != off || tysize != msize)
                return air_error(c, "interface: nested struct member %s of the argument buffer %s "
                                    "does not match the module's struct layout",
                                 mname, ab->name ? ab->name : "unnamed");
+            st_field++;
          } else {
             char *sub_sname = ralloc_asprintf(c->mem_ctx, "struct.%s", mtype);
             mt = named_struct(c->m, sub_sname);
@@ -152,12 +168,16 @@ argbuf_members_rec(struct air_ctx *c, const struct air_md *sti, const struct air
 
       const struct air_type *mt = NULL;
       if (st) {
-         if (field >= st->num_members)
+         while (st_field < st->num_members &&
+                air_struct_member_offset(c->m, st, st_field) < off &&
+                is_struct_padding_field(st->members[st_field]))
+            st_field++;
+         if (st_field >= st->num_members)
             return air_error(c, "interface: the argument buffer %s declares more members "
                                 "than the %u its struct type has",
                              ab->name ? ab->name : "unnamed", st->num_members);
-         mt = st->members[field];
-         uint64_t tyoff = air_struct_member_offset(c->m, st, field);
+         mt = st->members[st_field];
+         uint64_t tyoff = air_struct_member_offset(c->m, st, st_field);
          uint64_t tysize = air_type_alloc_size(c->m, mt);
          if (tyoff != off || tysize != msize)
             return air_error(c, "interface: member %s of the argument buffer %s is %u bytes "
@@ -165,6 +185,7 @@ argbuf_members_rec(struct air_ctx *c, const struct air_md *sti, const struct air
                                 "there at %u", mname, ab->name ? ab->name : "unnamed",
                              (unsigned)msize, (unsigned)off, (unsigned)tysize,
                              (unsigned)tyoff);
+         st_field++;
       }
 
       int mli = md_key(desc, "air.location_index");
@@ -281,10 +302,14 @@ argbuf_members_rec(struct air_ctx *c, const struct air_md *sti, const struct air
       ab->num_members = n + 1;
    }
 
-   if (st && field != st->num_members)
-      return air_error(c, "interface: the argument buffer %s declares %u members and its "
-                          "struct type has %u", ab->name ? ab->name : "unnamed", field,
-                       st->num_members);
+   if (st) {
+      while (st_field < st->num_members && is_struct_padding_field(st->members[st_field]))
+         st_field++;
+      if (st_field != st->num_members)
+         return air_error(c, "interface: the argument buffer %s declares %u members and its "
+                             "struct type has %u", ab->name ? ab->name : "unnamed", field,
+                          st->num_members);
+   }
    return true;
 }
 

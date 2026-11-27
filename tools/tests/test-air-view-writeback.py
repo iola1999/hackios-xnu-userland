@@ -48,19 +48,28 @@ PRODUCTION_LOCK
 #define PIPE_SWIZZLE_W 3
 #define PIPE_SWIZZLE_0 4
 #define PIPE_SWIZZLE_1 5
+enum pipe_texture_target { PIPE_TEXTURE_1D = 1, PIPE_TEXTURE_2D = 2, PIPE_TEXTURE_3D = 3, PIPE_TEXTURE_CUBE = 4, PIPE_TEXTURE_1D_ARRAY = 6, PIPE_TEXTURE_2D_ARRAY = 7, PIPE_TEXTURE_CUBE_ARRAY = 8 };
+#define RWA_TYPE_1D 0
+#define RWA_TYPE_1D_ARRAY 1
 #define RWA_TYPE_2D 2
+#define RWA_TYPE_2D_ARRAY 3
+#define RWA_TYPE_2D_MULTISAMPLE 4
+#define RWA_TYPE_CUBE 5
+#define RWA_TYPE_CUBE_ARRAY 6
+#define RWA_TYPE_3D 7
+#define RWA_TYPE_2D_MS_ARRAY 8
 #define RWA_PURGEABLE_NON_VOLATILE 2u
 #define RWA_PURGEABLE_VOLATILE 3u
 #define u_minify(v,l) (((v) >> (l)) ? ((v) >> (l)) : 1)
 enum pipe_format { PIPE_FORMAT_NONE, PIPE_FORMAT_RGBA8, PIPE_FORMAT_RGBA8_SRGB };
 struct pipe_resource { unsigned height0, width0, last_level, bind, target, nr_samples, refs; enum pipe_format format; unsigned char bytes[256]; };
-struct pipe_sampler_view { struct { struct { unsigned first_level, last_level; } tex; } u; unsigned swizzle_r, swizzle_g, swizzle_b, swizzle_a; int refs; };
+struct pipe_sampler_view { enum pipe_texture_target target; struct { struct { unsigned first_level, last_level, first_layer, last_layer; } tex; } u; unsigned swizzle_r, swizzle_g, swizzle_b, swizzle_a; int refs; };
 struct pipe_context { struct pipe_sampler_view *(*create_sampler_view)(struct pipe_context *, struct pipe_resource *, const struct pipe_sampler_view *); };
 struct rwa_texture_shape { unsigned pixel_format,type,width,height,depth,array_length,mip_levels,sample_count,usage; };
 struct rwa_pixel_format { enum pipe_format pipe; const char *name; };
 struct pipe_screen { bool (*is_format_supported)(struct pipe_screen *,enum pipe_format,unsigned,unsigned,unsigned,unsigned); };
 struct rwa_device { struct pipe_screen *screen; struct pipe_context *pipe; struct rwa_buffer_texture *buffer_textures; unsigned written_buffer_textures, buffer_textures_count; };
-struct rwa_buffer { struct rwa_device *device; void *map,*mirror; size_t size; bool mirror_hashed; };
+struct rwa_buffer { unsigned references; struct rwa_device *device; void *map,*mirror; size_t size; bool mirror_hashed; };
 '''
 pre = r'''
 static unsigned releases;
@@ -81,11 +90,18 @@ static struct pipe_sampler_view *make_sv(struct pipe_context *c,struct pipe_reso
 static bool rgb2p_prepare_sample(struct rwa_texture *t,char *why,size_t n) { (void)t;(void)why;(void)n;return true; }
 static void argbuf_scrub(struct rwa_device *d,void *b,struct rwa_texture *t,void *s) { (void)d;(void)b;(void)t;(void)s; }
 static void state_texture_gone(struct rwa_device *d,struct pipe_resource *p) { (void)d;(void)p; }
+static bool fb_bound_match_locked(const struct rwa_device *d,const struct pipe_resource *p) { (void)d;(void)p;return false; }
+static void rwa_deferred_drain_locked(struct rwa_device *d) { (void)d; }
+static void rwa_deferred_defer_texture(struct rwa_device *d,struct pipe_resource *p,struct pipe_sampler_view *v) { (void)d;(void)p;(void)v; }
 static void buffer_mirror_pull(struct rwa_buffer *b) { (void)b; }
 static bool texture_require_backing(struct rwa_texture *t, const char *what, char *why, size_t n) { (void)t;(void)what;(void)why;(void)n; return true; }
 static int buffer_texture_sync_aliases(struct rwa_texture *t, char *why, size_t n) { (void)t;(void)why;(void)n; return 0; }
 static struct { unsigned unchanged,uploads,refreshes; } upload_count;
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+#endif
 void rwa_texture_destroy(struct rwa_texture *t);
+static void rwa_buffer_destroy(struct rwa_buffer *b) { (void)b; }
 '''
 io = r'''
 static int rwa_texture_read(struct rwa_texture *t,unsigned level,unsigned slice,const unsigned *origin,const unsigned *size,void *bytes,size_t row,char *why,size_t n) { (void)level;(void)slice;(void)origin;(void)size;(void)why;(void)n;for(unsigned y=0;y<t->shape.height;y++)memcpy((char *)bytes+y*row,t->res->bytes+y*t->shape.width*4,t->shape.width*4);return 0; }
@@ -97,11 +113,11 @@ static struct rwa_texture *root_texture(struct rwa_device *device,struct rwa_buf
     INIT_REFERENCE
     t->device=device;t->res=calloc(1,sizeof(*t->res));t->res->refs=1;t->res->width0=4;t->res->height0=4;t->res->bind=5;t->res->format=PIPE_FORMAT_RGBA8;
     t->shape=(struct rwa_texture_shape){.pixel_format=70,.type=2,.width=4,.height=4,.mip_levels=1,.sample_count=1,.usage=7};t->format_name="rgba8";t->shader_read=true;t->shader_write=true;t->layers=1;
-    struct rwa_buffer_texture *b=calloc(1,sizeof(*b));b->texture=t;b->source=buffer;b->row_bytes=24;b->next=device->buffer_textures;device->buffer_textures=b;t->backing=b;return t;
+    struct rwa_buffer_texture *b=calloc(1,sizeof(*b));b->texture=t;b->source=buffer;b->row_bytes=24;b->refs=1;b->next=device->buffer_textures;device->buffer_textures=b;t->backing=b;return t;
 }
 int main(int argc,char **argv) {
     assert(argc==2);char why[256]={0};struct pipe_screen screen={supported};struct pipe_context pctx={make_sv};struct rwa_device d={.screen=&screen,.pipe=&pctx};
-    unsigned char bytes[96];memset(bytes,0x33,sizeof(bytes));struct rwa_buffer buffer={.device=&d,.map=bytes,.size=sizeof(bytes)};
+    unsigned char bytes[96];memset(bytes,0x33,sizeof(bytes));struct rwa_buffer buffer={.references=1,.device=&d,.map=bytes,.size=sizeof(bytes)};
     struct rwa_texture *root=root_texture(&d,&buffer);
     if(!strcmp(argv[1],"swizzle_propagation")) {
         buffer_textures_forget(&buffer);
@@ -150,9 +166,9 @@ int main(int argc,char **argv) {
 
 def build(label, texts):
     alltext='\n'.join(texts)
-    structs=structure(alltext,'rwa_texture')+structure(alltext,'rwa_buffer_texture')
-    body='\n'.join(function(alltext,n) for n in ['buffer_texture_clear_written','rgb2p_format','texture_format','texture_levels','texture_written'])
-    later='\n'.join(function(alltext,n) for n in ['buffer_texture_bytes','rows_hash','buffer_texture_download','rwa_texture_view','rwa_texture_set_swizzle','buffer_textures_forget','rwa_buffer_textures_writeback','texture_ensure_sampler_view','rwa_texture_destroy'])
+    structs=structure(alltext,'rwa_texture')+structure(alltext,'rwa_buffer_texture')+structure(alltext,'rwa_btex_pin')
+    body='\n'.join(function(alltext,n) for n in ['buffer_texture_clear_written_locked','buffer_texture_clear_written','rgb2p_format','texture_format','texture_levels','texture_written'])
+    later='\n'.join(function(alltext,n) for n in ['buffer_texture_bytes','rows_hash','buffer_texture_download','pipe_target_from_rwa_type','rwa_texture_view','rwa_texture_set_swizzle','rwa_try_retain_u','buffer_textures_collect','buffer_textures_release','buffer_textures_forget','rwa_buffer_textures_writeback','texture_ensure_sampler_view','rwa_texture_destroy'])
     init='t->references = 1;' if 'unsigned references;' in structs else ''
     lock_start = alltext.index('static pthread_mutex_t rwa_lock =')
     lock_end = alltext.index('#include \"nir.h\"', lock_start)
@@ -173,7 +189,7 @@ results = build('production', texts)
 assert all(x == 0 for x in results)
 mutations = {
     'lost_writeback_owner': ('   if (t->storage_owner)\n      t = t->storage_owner;\n', ''),
-    'missing_owner_retain': ('   view->storage_owner->references++;', ''),
+    'missing_owner_retain': ('   __atomic_fetch_add(&view->storage_owner->references, 1u, __ATOMIC_RELAXED);', ''),
     'missing_owner_release': ('   rwa_texture_destroy(owner);', '   (void)owner;'),
     'nested_owner_not_original': ('texture->storage_owner ? texture->storage_owner : texture', 'texture'),
     'lost_zero_swizzle_flag': ('   if (t->swizzled) {', '   if (t->swizzle_r || t->swizzle_g || t->swizzle_b || t->swizzle_a) {'),

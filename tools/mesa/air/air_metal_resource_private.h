@@ -23,6 +23,13 @@ struct rwa_yuv_key {
 
 struct rwa_vertex_cso_entry;
 
+struct rwa_deferred_item {
+   struct rwa_deferred_item *next;
+   struct pipe_transfer *xfer;
+   struct pipe_resource *res;
+   struct pipe_sampler_view *view;
+};
+
 struct rwa_device {
    struct pipe_screen *screen;
    struct pipe_context *pipe;
@@ -85,6 +92,9 @@ struct rwa_device {
 
    void *rgb2p_csos[4][3];
    uint64_t submit_seq;
+   struct rwa_deferred_item *deferred_head;
+   struct pipe_resource *fb_bound_res[PIPE_MAX_COLOR_BUFS + 1];
+   unsigned fb_bound_count;
    struct rwa_bound_state bound;
 };
 
@@ -98,6 +108,8 @@ struct rwa_buffer_texture {
    struct rwa_buffer *source;
    size_t offset;
    unsigned row_bytes;
+   unsigned refs;
+   bool unlinked;
    /* The texture holds bytes the buffer does not have yet: the GPU or the processor wrote
     * the texture since the last copy between them (texture_written). */
    bool written;
@@ -151,6 +163,7 @@ struct rwa_argbuf_encoding {
 };
 
 struct rwa_buffer {
+   unsigned references;
    struct rwa_device *device;
    struct pipe_resource *res;
    struct pipe_transfer *xfer;
@@ -211,6 +224,8 @@ struct rwa_texture {
    /* The run of the resource's levels a view covers; num_levels is 0 for a texture that
     * made its own resource. Read through texture_levels(). */
    unsigned first_level, num_levels;
+   /* First array slice/face of the resource this view covers (0 for non-sliced textures). */
+   unsigned first_layer;
 
    /* Channel swizzle for sampler views (applied when swizzled is true). */
    bool swizzled;
@@ -223,12 +238,19 @@ struct rwa_texture {
 };
 
 static inline void
-buffer_texture_clear_written(struct rwa_device *device, struct rwa_buffer_texture *backing)
+buffer_texture_clear_written_locked(struct rwa_device *device, struct rwa_buffer_texture *backing)
 {
    if (backing && backing->written) {
       backing->written = false;
       __atomic_fetch_sub(&device->written_buffer_textures, 1u, __ATOMIC_RELEASE);
    }
+}
+
+static inline void
+buffer_texture_clear_written(struct rwa_device *device, struct rwa_buffer_texture *backing)
+{
+   RWA_BTEX_LOCKED;
+   buffer_texture_clear_written_locked(device, backing);
 }
 
 /* Writes through a view update the original texture's buffer writeback record.
@@ -243,9 +265,12 @@ texture_written(struct rwa_texture *t)
    if (t->storage_owner)
       t = t->storage_owner;
    t->write_seq++;
-   if (t->backing && !t->backing->written) {
-      t->backing->written = true;
-      __atomic_fetch_add(&t->device->written_buffer_textures, 1u, __ATOMIC_RELEASE);
+   if (__atomic_load_n(&t->backing, __ATOMIC_ACQUIRE) != NULL) {
+      RWA_BTEX_LOCKED;
+      if (t->backing && !t->backing->unlinked && !t->backing->written) {
+         t->backing->written = true;
+         __atomic_fetch_add(&t->device->written_buffer_textures, 1u, __ATOMIC_RELEASE);
+      }
    }
 }
 

@@ -31,6 +31,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <os/lock.h>
+#include <pthread.h>
 #include <unistd.h>
 
 extern const void *_dyld_get_shared_cache_range(size_t *);
@@ -103,28 +104,155 @@ lock_screen_manager(void)
 }
 
 /* 1: locked, an unlock was asked for; 0: not locked; -1: no lock screen manager to ask. */
-static int sb26_wallpaper_suspended;
+static int sb26_wallpaper_suspended = -1;
 static int sb26_suspend_token = NOTIFY_TOKEN_INVALID;
+static uint64_t sb26_suspend_gen;
+
+#define SB26_WALLPAPER_SUSPEND_DELAY_MS 1500
+
+static int
+sb26_cover_sheet_is_presented(void)
+{
+    Class cspm_cls = objc_getClass("SBCoverSheetPresentationManager");
+    SEL shared_sel = sel_registerName("sharedInstanceIfExists");
+    if (!cspm_cls || !class_getClassMethod(cspm_cls, shared_sel)) return -1;
+    id cspm = ((id (*)(Class, SEL))objc_msgSend)(cspm_cls, shared_sel);
+    if (!cspm) return -1;
+    SEL presented_sel = sel_registerName("isPresented");
+    if (!class_respondsToSelector(object_getClass(cspm), presented_sel)) return -1;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(cspm, presented_sel) ? 1 : 0;
+}
+
+static void
+sb26_set_wallpaper_suspended(int suspend, const char *reason)
+{
+    if (sb26_wallpaper_suspended == suspend) return;
+    sb26_wallpaper_suspended = suspend;
+    if (sb26_suspend_token == NOTIFY_TOKEN_INVALID &&
+        notify_register_check("com.annibale.wallpaper.suspend", &sb26_suspend_token) != NOTIFY_STATUS_OK) {
+        sb26_suspend_token = NOTIFY_TOKEN_INVALID;
+    }
+    if (sb26_suspend_token != NOTIFY_TOKEN_INVALID) {
+        notify_set_state(sb26_suspend_token, suspend ? 1 : 0);
+    }
+    notify_post(suspend ? "com.annibale.wallpaper.suspend" : "com.annibale.wallpaper.resume");
+    fprintf(stderr, "sb26: wallpaper %s (%s)\n", suspend ? "suspended" : "resumed", reason);
+}
+
+static void
+sb26_resume_wallpaper(const char *reason)
+{
+    sb26_suspend_gen++;
+    sb26_set_wallpaper_suspended(0, reason);
+}
+
+static void
+sb26_schedule_wallpaper_suspend(const char *reason)
+{
+    uint64_t gen = ++sb26_suspend_gen;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)SB26_WALLPAPER_SUSPEND_DELAY_MS * NSEC_PER_MSEC),
+        dispatch_get_main_queue(), ^{
+        if (gen != sb26_suspend_gen) return;
+        if (sb26_cover_sheet_is_presented() == 1) return;
+        sb26_set_wallpaper_suspended(1, reason);
+    });
+}
 
 static void
 sb26_on_unlocked(void)
 {
-    if (!sb26_wallpaper_suspended) {
-        sb26_wallpaper_suspended = 1;
-        if (sb26_suspend_token == NOTIFY_TOKEN_INVALID &&
-            notify_register_check("com.annibale.wallpaper.suspend", &sb26_suspend_token) != NOTIFY_STATUS_OK) {
-            sb26_suspend_token = NOTIFY_TOKEN_INVALID;
-        }
-        if (sb26_suspend_token != NOTIFY_TOKEN_INVALID) {
-            notify_set_state(sb26_suspend_token, 1);
-        }
-        notify_post("com.annibale.wallpaper.suspend");
+    sb26_schedule_wallpaper_suspend("unlock");
+}
+
+typedef void (^sb26_notif_block_t)(id note);
+
+static void
+sb26_observe_notification(const char *name, sb26_notif_block_t block)
+{
+    Class nc_cls = objc_getClass("NSNotificationCenter");
+    if (!nc_cls) return;
+    id center = ((id (*)(Class, SEL))objc_msgSend)(nc_cls, sel_registerName("defaultCenter"));
+    if (!center) return;
+    CFStringRef cf_name = CFStringCreateWithCString(kCFAllocatorDefault, name, kCFStringEncodingUTF8);
+    if (!cf_name) return;
+    (void)((id (*)(id, SEL, id, id, id, sb26_notif_block_t))objc_msgSend)(
+        center,
+        sel_registerName("addObserverForName:object:queue:usingBlock:"),
+        (id)cf_name, nil, nil, block);
+    CFRelease(cf_name);
+}
+
+/*
+ * Keep MercuryPosterExtension synchronized with CoverSheet / LockScreen visibility:
+ * resume synchronously when CoverSheet or LockScreen is about to present so the live
+ * wallpaper renders Notification Center / Lock Screen instead of staying frozen on black,
+ * and suspend after dismissal settles to avoid idle GPU work on Home Screen.
+ */
+static void
+sb26_install_wallpaper_lifecycle(void)
+{
+    static int installed;
+    if (installed) return;
+    installed = 1;
+
+    static const char *const present_names[] = {
+        "SBCoverSheetWillPresentNotification",
+        "SBLockScreenUIWillPresentNotification",
+    };
+    static const char *const dismiss_names[] = {
+        "SBCoverSheetDidDismissNotification",
+        "SBLockScreenUIDidDismissNotification",
+    };
+
+    for (unsigned i = 0; i < sizeof(present_names) / sizeof(present_names[0]); i++) {
+        const char *reason = present_names[i];
+        sb26_observe_notification(reason, ^(id note) {
+            (void)note;
+            if (pthread_main_np()) {
+                sb26_resume_wallpaper(reason);
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    sb26_resume_wallpaper(reason);
+                });
+            }
+        });
     }
+    for (unsigned i = 0; i < sizeof(dismiss_names) / sizeof(dismiss_names[0]); i++) {
+        const char *reason = dismiss_names[i];
+        sb26_observe_notification(reason, ^(id note) {
+            (void)note;
+            if (pthread_main_np()) {
+                sb26_schedule_wallpaper_suspend(reason);
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    sb26_schedule_wallpaper_suspend(reason);
+                });
+            }
+        });
+    }
+    fprintf(stderr, "sb26: wallpaper lifecycle observers installed\n");
+}
+
+static void
+sb26_reset_idle_timer(const char *reason)
+{
+    Class cls = objc_getClass("SBIdleTimerGlobalCoordinator");
+    SEL shared = sel_registerName("sharedInstanceIfExists");
+    if (!cls || !class_getClassMethod(cls, shared)) return;
+    id coord = ((id (*)(Class, SEL))objc_msgSend)(cls, shared);
+    if (!coord) return;
+    SEL reset_sel = sel_registerName("resetIdleTimerForReason:");
+    if (!class_respondsToSelector(object_getClass(coord), reset_sel)) return;
+    CFStringRef cf_reason = CFStringCreateWithCString(kCFAllocatorDefault, reason, kCFStringEncodingUTF8);
+    if (!cf_reason) return;
+    ((void (*)(id, SEL, id))objc_msgSend)(coord, reset_sel, (id)cf_reason);
+    CFRelease(cf_reason);
 }
 
 static void
 wake_screen_for_unlock(void)
 {
+    sb26_reset_idle_timer("annibale-boot-unlock");
     Class bl_cls = objc_getClass("SBBacklightController");
     if (!bl_cls) return;
     SEL shared = sel_registerName("sharedInstanceIfExists");
@@ -278,6 +406,7 @@ static void
 boot_unlock(void *context)
 {
     uintptr_t attempt = (uintptr_t)context + 1;
+    sb26_reset_idle_timer("annibale-boot-unlock");
     int state = unlock_once("boot");
     if (state >= 1) boot_unlock_seen_locked = 1;
     if (state == 2 || (state == 0 && boot_unlock_seen_locked)) {
@@ -312,6 +441,8 @@ sb26_boot_arg_present(const char *wanted)
 static void
 install_unlock(void)
 {
+    sb26_install_wallpaper_lifecycle();
+
     int token;
     notify_register_dispatch("com.annibale.unlock", &token, dispatch_get_main_queue(), ^(int t) {
         (void)t;

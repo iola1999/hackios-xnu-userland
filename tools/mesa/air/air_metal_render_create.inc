@@ -523,6 +523,68 @@ _Static_assert(sizeof(struct rwa_stitch_node) == sizeof(struct air_stitch_node) 
                  offsetof(struct air_linked_function, output),
               "rwa_linked_function and air_linked_function differ");
 
+static bool
+render_create_gallium_states(struct rwa_device *device, struct rwa_render *render,
+                             nir_shader *fs_prep, nir_shader *vs_prep,
+                             const void *vertex_bitcode, size_t vertex_size,
+                             const char *vertex_entry, unsigned fetched,
+                             const struct pipe_blend_state *blend,
+                             unsigned zs_format, unsigned samples,
+                             char *why, size_t why_size)
+{
+   render->fs_cso = create_stage_cso(device, fs_prep, MESA_SHADER_FRAGMENT, why, why_size);
+   if (!render->fs_cso) {
+      ralloc_free(vs_prep);
+      return false;
+   }
+   if (!render->vs_cso) {
+      render->vs_cso = create_stage_cso(device, vs_prep, MESA_SHADER_VERTEX, why, why_size);
+      if (!render->vs_cso)
+         return false;
+      if (!render->generated_vertex && vertex_bitcode) {
+         render->cached_vcso_entry = rwa_vertex_cso_insert(device, vertex_bitcode, vertex_size,
+                                                           vertex_entry, render->vs_cso,
+                                                           &render->vinfo, render->vert_slots,
+                                                           render->vert_compare_sampler, fetched);
+      }
+   }
+
+   render->blend = device->pipe->create_blend_state(device->pipe, blend);
+   render->dsa = device->pipe->create_depth_stencil_alpha_state(device->pipe,
+      &(struct pipe_depth_stencil_alpha_state){ 0 });
+   render->rast = device->pipe->create_rasterizer_state(device->pipe,
+      &(struct pipe_rasterizer_state){
+         .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+         .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+         .clip_plane_enable = BITFIELD_MASK(render->vinfo.clip_distances),
+         .multisample = samples > 1, .line_width = 1.0f });
+   render->rast_scissor = device->pipe->create_rasterizer_state(device->pipe,
+      &(struct pipe_rasterizer_state){
+         .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
+         .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
+         .clip_plane_enable = BITFIELD_MASK(render->vinfo.clip_distances),
+         .multisample = samples > 1, .line_width = 1.0f, .scissor = 1 });
+   if (!render->blend || !render->dsa || !render->rast || !render->rast_scissor) {
+      say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
+      return false;
+   }
+
+   render->velem = render->vstate.count
+      ? device->pipe->create_vertex_elements_state(device->pipe, render->vstate.count,
+                                                   render->vstate.element)
+      : device->pipe->create_vertex_elements_state(device->pipe, 1,
+           &(struct pipe_vertex_element){
+              .src_offset = 0, .src_stride = 16, .vertex_buffer_index = 0,
+              .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT });
+   render->vbuf = rwa_quad_vbuf_ref(device, rwa_quad_verts, sizeof(rwa_quad_verts));
+   if (!render->velem || !render->vbuf) {
+      say(why, why_size, "%s would not make the quad a draw covers the attachment with",
+          rwa_device_name(device));
+      return false;
+   }
+   return true;
+}
+
 struct rwa_render *
 rwa_render_create_linked(struct rwa_device *device,
                          const void *vertex_bitcode, size_t vertex_size,
@@ -632,7 +694,12 @@ rwa_render_create_linked(struct rwa_device *device,
       }
       unsigned q = samples > 1 ? samples : 0;
       bool supported;
-      { RWA_LOCKED; supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_DEPTH_STENCIL); }
+      if (device->software) {
+         RWA_LOCKED;
+         supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_DEPTH_STENCIL);
+      } else {
+         supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_DEPTH_STENCIL);
+      }
       if (!supported) {
          char ms[48] = "";
          if (q)
@@ -672,7 +739,12 @@ rwa_render_create_linked(struct rwa_device *device,
       }
       unsigned q = samples > 1 ? samples : 0;
       bool supported;
-      { RWA_LOCKED; supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_RENDER_TARGET); }
+      if (device->software) {
+         RWA_LOCKED;
+         supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_RENDER_TARGET);
+      } else {
+         supported = device->screen->is_format_supported(device->screen, fmt->pipe, PIPE_TEXTURE_2D, q, q, PIPE_BIND_RENDER_TARGET);
+      }
       if (!supported) {
          char ms[48] = "";
          if (q)
@@ -779,19 +851,16 @@ rwa_render_create_linked(struct rwa_device *device,
          say(why, why_size, "%zu bytes is not a vertex shader module", vertex_size);
          goto fail;
       }
-      struct rwa_vertex_cso_entry *vcso_cached;
-      {
-         RWA_LOCKED;
-         vcso_cached = rwa_vertex_cso_lookup(device, vertex_bitcode, vertex_size, vertex_entry);
-         if (vcso_cached) {
-            render->cached_vcso_entry = vcso_cached;
-            render->vs_cso = vcso_cached->vs_cso;
-            render->vinfo = vcso_cached->vinfo;
-            memcpy(render->vert_slots, vcso_cached->vert_slots, sizeof(render->vert_slots));
-            memcpy(render->vert_compare_sampler, vcso_cached->vert_compare_sampler,
-                   sizeof(render->vert_compare_sampler));
-            fetched = vcso_cached->fetched_count;
-         }
+      struct rwa_vertex_cso_entry *vcso_cached =
+         rwa_vertex_cso_lookup(device, vertex_bitcode, vertex_size, vertex_entry);
+      if (vcso_cached) {
+         render->cached_vcso_entry = vcso_cached;
+         render->vs_cso = vcso_cached->vs_cso;
+         render->vinfo = vcso_cached->vinfo;
+         memcpy(render->vert_slots, vcso_cached->vert_slots, sizeof(render->vert_slots));
+         memcpy(render->vert_compare_sampler, vcso_cached->vert_compare_sampler,
+                sizeof(render->vert_compare_sampler));
+         fetched = vcso_cached->fetched_count;
       }
       if (!vcso_cached) {
          struct air_constant_value *vfc;
@@ -878,8 +947,8 @@ rwa_render_create_linked(struct rwa_device *device,
       ralloc_free(fs_prep); ralloc_free(vs_prep);
       goto fail;
    }
-   {
-   RWA_LOCKED;
+   /* CPU reflection/blend validation stays lock-free; hardware CSO creation takes cso_create_lock
+    * instead of rwa_lock so background prewarm cannot block rwa_render_draw or dealloc. */
    if (fetched) {
       const char *vn = render->vinfo.entry_point ? render->vinfo.entry_point : "the vertex shader";
       if (!build_vertex_state(&render->vinfo, shape, vn, device->screen, &render->vstate, why, why_size)) {
@@ -887,47 +956,16 @@ rwa_render_create_linked(struct rwa_device *device,
          goto fail;
       }
    }
-   render->fs_cso = create_stage_cso(device, fs_prep, MESA_SHADER_FRAGMENT, why, why_size);
-   if (!render->fs_cso) {
-      ralloc_free(vs_prep);
+   if (!blend_tables_are_shaped_right(why, why_size)) {
+      ralloc_free(fs_prep); ralloc_free(vs_prep);
       goto fail;
    }
-   if (!render->vs_cso) {
-      render->vs_cso = create_stage_cso(device, vs_prep, MESA_SHADER_VERTEX, why, why_size);
-      if (!render->vs_cso)
-         goto fail;
-      if (!render->generated_vertex && vertex_bitcode) {
-         render->cached_vcso_entry = rwa_vertex_cso_insert(device, vertex_bitcode, vertex_size,
-                                                            vertex_entry, render->vs_cso,
-                                                            &render->vinfo, render->vert_slots,
-                                                            render->vert_compare_sampler, fetched);
-      }
-   }
-
-   /*
-    * THE BLEND STATE, which until now was the fixed one air_run draws with -- colormask
-    * RGBA on render target 0 governing them all, blending off, every draw opaque. That
-    * is still exactly what a shape with `color_blend_count` 0 produces, which is every
-    * draw of the corpus and every one of air_metal_test's own initialisers; what is new
-    * is that a shape which CARRIES Metal's blend state gets Metal's blend state, mapped
-    * by the three tables above.
-    *
-    * It is worth saying what the old state did on the phone, because it was not a
-    * refusal: CoreAnimation composites with premultiplied alpha, so a label layer whose
-    * background is transparent black was drawn as OPAQUE BLACK -- every icon label in a
-    * black box and the Search pill a black rectangle (docs/air.md section 5 has the
-    * measurement and userland/rc.jobs.blend the greps, and the photograph is the test).
-    *
-    * The tables' own shape is checked first, here rather than at a draw, so that a row
-    * edited by hand cannot reach a picture: the one-minus pairing, the identity of the
-    * operations and the reversal of the mask nibble are all decidable in this file.
-    */
-   if (!blend_tables_are_shaped_right(why, why_size))
-      goto fail;
    struct pipe_blend_state blend;
    if (!blend_state_from_metal(shape, device->screen, &blend, &out.blend_enabled_mask,
-                               &out.color_write_masks, why, why_size))
+                               &out.color_write_masks, why, why_size)) {
+      ralloc_free(fs_prep); ralloc_free(vs_prep);
       goto fail;
+   }
    if (!fragment_bitcode) {
       blend.independent_blend_enable = true;
       for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
@@ -937,116 +975,7 @@ rwa_render_create_linked(struct rwa_device *device,
       out.blend_enabled_mask = 0;
       out.color_write_masks = 0;
    }
-   render->blend = device->pipe->create_blend_state(device->pipe, &blend);
-   /* The pipeline's own depth/stencil state, and it is the ZEROED one on purpose: it is
-    * what a draw gets when the caller passes no rwa_depth_stencil, which is Metal's
-    * state before an application has set one. depth_enabled 0 is "no test", not
-    * "PIPE_FUNC_NEVER", and the difference matters -- the zeroed struct's depth_func is
-    * NEVER, so a driver reading it with the test enabled would discard every fragment.
-    * Every draw this library has ever made used this state, there having been no depth
-    * attachment to test against.
-    */
-   render->dsa = device->pipe->create_depth_stencil_alpha_state(device->pipe,
-      &(struct pipe_depth_stencil_alpha_state){ 0 });
-   /*
-    * clip_halfz, because Metal's NDC z runs from 0 at the near plane to 1 at the far
-    * one where Gallium's default is OpenGL's [-1, 1]. It is what decides what a window
-    * depth IS: under halfz the viewport above puts clip z = 0 at znear, which is what
-    * rwa_draw's depth_range promises, and the generated vertex stage's quad has clip
-    * z = 0.
-    *
-    * It is set only for a pipeline that HAS a depth attachment, and that is a deliberate
-    * containment rather than a conviction. Metal's convention is Metal's whether a pass
-    * tests depth or not, and a pipeline without a depth attachment is observably
-    * identical either way -- the viewport transform is the same code, so a fragment's
-    * [[position]].z is the same number, and the only thing halfz changes is which
-    * primitives the clipper keeps. But that one thing is a risk I cannot measure from
-    * here: 253 of Apple's fragment shaders are compared pixel for pixel on the Adreno
-    * through this exact rasterizer state, and their quad sits at clip z = 0, which under
-    * halfz is exactly ON the near plane rather than in the middle of the range. If a6xx
-    * clipped a primitive on that boundary, every one of those draws would stop drawing.
-    * So the proven path keeps the state it was proven with, and the new one gets the
-    * convention it needs; if the depth draw comes back having drawn nothing at all, this
-    * boundary is the first thing to look at (docs/metal.md 10.30).
-    */
-   /*
-    * `multisample` follows the pass's sample count. freedreno reads it only in
-    * fd6_rasterizer.cc, to pick RECTANGULAR over BRESENHAM lines; sample coverage comes
-    * from the attachments (util_framebuffer_get_num_samples, emit_msaa). `line_width` is
-    * 1 because a Metal line is one pixel wide: at 0 fd6 writes a line half width of 0 and
-    * MTLPrimitiveTypeLine covers no pixel. Core Animation draws a stroked CAShapeLayer as
-    * lines (TcmaA2LlnXhf), and with width 0 the strokes were missing (kernel-12377-cmd33-bo5).
-    */
-   render->rast = device->pipe->create_rasterizer_state(device->pipe,
-      &(struct pipe_rasterizer_state){
-         .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
-         .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .clip_plane_enable = BITFIELD_MASK(render->vinfo.clip_distances),
-         .multisample = samples > 1, .line_width = 1.0f });
-   /* The same state with the clip rectangle turned on. Scissor enable is part of this
-    * state and not a call of its own in Gallium, and the rectangle itself is encoder
-    * state, so a draw that carries one binds this copy and sets the rectangle beside it.
-    */
-   render->rast_scissor = device->pipe->create_rasterizer_state(device->pipe,
-      &(struct pipe_rasterizer_state){
-         .cull_face = PIPE_FACE_NONE, .half_pixel_center = 1, .bottom_edge_rule = 1,
-         .depth_clip_near = 1, .depth_clip_far = 1, .clip_halfz = zs_format != 0,
-         .clip_plane_enable = BITFIELD_MASK(render->vinfo.clip_distances),
-         .multisample = samples > 1, .line_width = 1.0f, .scissor = 1 });
-   if (!render->blend || !render->dsa || !render->rast || !render->rast_scissor) {
-      say(why, why_size, "%s would not make the fixed render state", rwa_device_name(device));
-      goto fail;
-   }
 
-   /*
-    * The quad and its one vec4 attribute, built for BOTH paths -- and the "both" is the
-    * whole point, paid for on the device.
-    *
-    * A supplied vertex shader reads no attributes (refused above if it did), so it has
-    * no use for a vertex buffer, and binding none looks like the tidy thing to do. It is
-    * not: freedreno dereferences the bound vertex-element state with no NULL check at
-    * all. fd6_emit_3d_state's FD6_GROUP_VTXSTATE case is
-    *
-    *     state = fd6_vertex_stateobj(ctx->vtx.vtx)->stateobj;
-    *
-    * and `stateobj` sits at offset 0x208 of that struct -- pipe[32] is 0x180,
-    * strides[32] takes it to 0x200, num_elements to 0x204 and the pointer aligns to
-    * 0x208. Binding NULL therefore faults at exactly 0x208, which is where every draw
-    * with a supplied vertex shader died on the Adreno while the generated stage drew
-    * correctly. softpipe tolerates it, so no test on this machine could have caught it.
-    *
-    * So both paths now take the same vertex state, the one the generated stage has
-    * already drawn with on the device: the shader module is then the only thing that
-    * differs between a proven draw and a new one. An attribute the vertex shader never
-    * declares is simply never fetched into a register -- ir3 emits fetches for the
-    * inputs the shader has -- which is the ordinary case of a GL program with more
-    * arrays enabled than it reads.
-    */
-   /*
-    * ... and a stage that FETCHES ATTRIBUTES gets the elements the descriptor describes
-    * instead, in driver_location order, which is what build_vertex_state above is for.
-    * The quad is still made: a function-constant-gated attribute the descriptor leaves
-    * unconfigured is fetched from it at stride 0 rather than from an empty VFD slot,
-    * and the generated stage and every attribute-less vertex module still draw with it.
-    */
-   render->velem = render->vstate.count
-      ? device->pipe->create_vertex_elements_state(device->pipe, render->vstate.count,
-                                                   render->vstate.element)
-      : device->pipe->create_vertex_elements_state(device->pipe, 1,
-           &(struct pipe_vertex_element){
-              .src_offset = 0, .src_stride = 16, .vertex_buffer_index = 0,
-              .src_format = PIPE_FORMAT_R32G32B32A32_FLOAT });
-   render->vbuf = rwa_quad_vbuf_ref(device, rwa_quad_verts, sizeof(rwa_quad_verts));
-   if (!render->velem || !render->vbuf) {
-      say(why, why_size, "%s would not make the quad a draw covers the attachment with",
-          rwa_device_name(device));
-      goto fail;
-   }
-
-   /* What the layout became, for a driver that has to fill the stream slots and for a
-    * caller that wants to compare the mapping with the shader's own interface rather
-    * than trust it (air_metal.h).
-    */
    out.vertex_attribute_count = render->vstate.count;
    for (unsigned i = 0; i < render->vstate.count &&
                         i < ARRAY_SIZE(out.vertex_attribute_index); i++)
@@ -1054,21 +983,16 @@ rwa_render_create_linked(struct rwa_device *device,
    out.vertex_streams = render->vstate.stream_count;
    out.vertex_stream_mask = render->vstate.stream_mask;
 
-   /* And which buffer indices of each stage are ARGUMENT BUFFERS. Metal's one table per
-    * stage now holds three things -- a stream, an argument and a set -- and a driver
-    * that could not tell them apart would hand a set's buffer to a shader expecting a
-    * constant block. A set at an index the vertex descriptor also fetches from is
-    * refused below for the same reason an argument at one is.
-    */
    const char *fn = render->finfo.entry_point ? render->finfo.entry_point
                                              : "the fragment function";
    const char *vn = render->vinfo.entry_point ? render->vinfo.entry_point
                                               : "the vertex function";
-   if (argbuf_mask_of(&render->finfo, fn, &out.fragment_argbuf_mask, why, why_size) != 0)
+   if (argbuf_mask_of(&render->finfo, fn, &out.fragment_argbuf_mask, why, why_size) != 0 ||
+       (!render->generated_vertex &&
+        argbuf_mask_of(&render->vinfo, vn, &out.vertex_argbuf_mask, why, why_size) != 0)) {
+      ralloc_free(fs_prep); ralloc_free(vs_prep);
       goto fail;
-   if (!render->generated_vertex &&
-       argbuf_mask_of(&render->vinfo, vn, &out.vertex_argbuf_mask, why, why_size) != 0)
-      goto fail;
+   }
    if (out.vertex_argbuf_mask & out.vertex_stream_mask) {
       unsigned both = out.vertex_argbuf_mask & out.vertex_stream_mask;
 
@@ -1076,13 +1000,30 @@ rwa_render_create_linked(struct rwa_device *device,
                          "and %s declares an argument buffer there: Metal has one table "
                          "behind -setVertexBuffer:offset:atIndex: and an index is either "
                          "a stream or a set", ffs(both) - 1, vn);
+      ralloc_free(fs_prep); ralloc_free(vs_prep);
       goto fail;
    }
+
+   bool cso_ok;
+   if (device->software) {
+      RWA_LOCKED;
+      cso_ok = render_create_gallium_states(device, render, fs_prep, vs_prep,
+                                            vertex_bitcode, vertex_size, vertex_entry,
+                                            fetched, &blend, zs_format, samples,
+                                            why, why_size);
+   } else {
+      RWA_CSO_CREATE_LOCKED;
+      cso_ok = render_create_gallium_states(device, render, fs_prep, vs_prep,
+                                            vertex_bitcode, vertex_size, vertex_entry,
+                                            fetched, &blend, zs_format, samples,
+                                            why, why_size);
+   }
+   if (!cso_ok)
+      goto fail;
 
    if (info)
       *info = out;
    return render;
-   }
 
 fail:
    rwa_render_destroy(render);

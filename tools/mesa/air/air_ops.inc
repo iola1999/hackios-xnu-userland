@@ -11,6 +11,12 @@
  * the pipeline binds, so both are readable; a pipeline that bound neither
  * would read a descriptor it did not set up.
  */
+static bool
+is_null_ptr_val(const struct air_val *v)
+{
+   return v && v->kind == AIR_VAL_PTR && v->ptr.class == AIR_PTR_NONE;
+}
+
 static nir_def *
 load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type *t,
                     unsigned align)
@@ -21,8 +27,16 @@ load_through_choice(struct air_ctx *c, struct air_val *v, const struct air_type 
       air_error(c, "instruction: a load through something that is not a pointer");
       return NULL;
    }
-   nir_def *a = load_through_choice(c, v->elems[0], t, align);
-   nir_def *b = load_through_choice(c, v->elems[1], t, align);
+   bool a_null = is_null_ptr_val(v->elems[0]);
+   bool b_null = is_null_ptr_val(v->elems[1]);
+   if (a_null && b_null)
+      return air_load_ptr(c, v->elems[0]->ptr, t, align);
+   unsigned comps = air_nir_components(t);
+   unsigned bits = air_nir_bit_size(c, t);
+   nir_def *a = a_null ? nir_imm_zero(&c->b, comps, bits)
+                       : load_through_choice(c, v->elems[0], t, align);
+   nir_def *b = b_null ? nir_imm_zero(&c->b, comps, bits)
+                       : load_through_choice(c, v->elems[1], t, align);
    if (!a || !b)
       return NULL;
    air_note(c, "a pointer chosen at run time (`select` between two buffers): both sides "

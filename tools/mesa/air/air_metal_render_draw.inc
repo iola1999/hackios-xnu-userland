@@ -130,6 +130,7 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
 {
    RWA_LOCKED;
    struct rwa_device *device = render->device;
+   rwa_deferred_drain_locked(device);
    struct pipe_context *pipe = device->pipe;
    uint64_t began = draw_mark(), mark;
    /* Taken before anything else so that one draw longer than a frame can be reported with its
@@ -489,13 +490,15 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    for (unsigned i = 0; i < draw->color_count; i++) {
       if (!draw->color[i])
          continue;
-      pipe_surface_init(pipe, &surf[i], draw->color[i]->res, draw->color[i]->first_level, 0);
+      pipe_surface_init(pipe, &surf[i], draw->color[i]->res, draw->color[i]->first_level,
+                        draw->color[i]->first_layer);
       texture_written(draw->color[i]);
       surf[i].format = texture_format(draw->color[i]);
       fb.cbufs[i] = surf[i];
    }
    if (draw->depth) {
-      pipe_surface_init(pipe, &zsurf, draw->depth->res, draw->depth->first_level, 0);
+      pipe_surface_init(pipe, &zsurf, draw->depth->res, draw->depth->first_level,
+                        draw->depth->first_layer);
       texture_written(draw->depth);
       zsurf.format = draw->depth->res->format;
       fb.zsbuf = zsurf;
@@ -546,6 +549,14 @@ rwa_render_draw(struct rwa_render *render, const struct rwa_draw *draw,
    state_stencil_ref(device, (struct pipe_stencil_ref){
       .ref_value = { (uint8_t)(draw->stencil_reference[0] & 0xff),
                      (uint8_t)(draw->stencil_reference[1] & 0xff) } });
+   {
+      struct pipe_blend_color bc = { { 0.0f, 0.0f, 0.0f, 0.0f } };
+      if (draw->blend_color != NULL) {
+         for (unsigned i = 0; i < 4; i++)
+            bc.color[i] = draw->blend_color[i];
+      }
+      pipe->set_blend_color(pipe, &bc);
+   }
    /* The clip rectangle, in the same pixels and from the same corner as Metal's: Gallium's
     * scissor is minx/miny/maxx/maxy from the attachment's top left, with maxx and maxy
     * exclusive. Scissor enable is part of the rasterizer state, so it is turned on with the

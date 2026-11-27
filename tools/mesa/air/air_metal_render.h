@@ -731,6 +731,8 @@ struct rwa_draw {
 	 * memory; the picture is the same with it ignored.
 	 */
 	unsigned discard;
+	/* { r, g, b, a } of -setBlendColorRed:green:blue:alpha:, or NULL for {0, 0, 0, 0}. */
+	const float *blend_color;
 };
 
 int rwa_render_clear(struct rwa_device *, const struct rwa_draw *, char *, size_t);
@@ -759,5 +761,7 @@ struct rwa_texture *rwa_texture_view(struct rwa_texture *texture, unsigned mtl_f
 				     unsigned first_level, unsigned num_levels,
 				     char *why, size_t why_size);
 void rwa_texture_set_swizzle(struct rwa_texture *texture, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+void rwa_texture_set_view_slices(struct rwa_texture *texture, unsigned mtl_type,
+				 unsigned first_slice, unsigned num_slices);
 
 #endif /* AIR_METAL_RENDER_H */

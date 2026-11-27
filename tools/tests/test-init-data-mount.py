@@ -25,7 +25,7 @@ PRELUDE = r'''
 #define RB_HALT 8
 #define reboot fake_reboot
 static int mount_error, checks, failures, skeleton_reads, restores, processes, rc_runs, halts;
-static int var_apfs, apfs_mounts, ramfs_mounts, raw_open;
+static int var_apfs, apfs_mounts, ramfs_mounts, raw_open, cam_vol_unlinks, mg_cache_unlinks;
 static unsigned long long var_bytes = 104ULL << 30;
 static int unexpected(void) { assert(!"unexpected host filesystem/process operation"); return -1; }
 static int fake_mount(const char *type, const char *path, int flags, void *data) {
@@ -57,11 +57,20 @@ static int fake_chmod(const char *path, int mode) {
     assert(!strcmp(path, "/dev/console") && mode == 0666); return 0;
 }
 static int fake_unlink(const char *path) {
-    assert(!strcmp(path, "/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist") ||
-           !strcmp(path, "/private/var/root/Library/Preferences/com.apple.cameracapture.volatile.plist"));
+    if (!strcmp(path, "/private/var/mobile/Library/Preferences/com.apple.cameracapture.volatile.plist") ||
+        !strcmp(path, "/private/var/root/Library/Preferences/com.apple.cameracapture.volatile.plist")) {
+        cam_vol_unlinks++;
+        return 0;
+    }
+    if (!strcmp(path, "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist")) {
+        mg_cache_unlinks++;
+        return 0;
+    }
+    assert(!"unexpected unlink path");
     return 0;
 }
 static void check(int ok, const char *what) { (void)what; checks++; failures += !ok; }
+static void launchservices_rebuild_once(void) {}
 static const char *in_image(const char *path) { return path; }
 static ssize_t read_whole(const char *path, char *buf, size_t size) {
     assert(!strcmp(path, "/etc/var.skel") && size >= 103);
@@ -117,6 +126,7 @@ static void test_processes(void) { processes++; }
 static void test_dynamic(void) {}
 static void test_devices(void) {}
 static void test_time(void) {}
+static void bind_weights(void) {}
 static void configure_inject(void) {}
 static void configure_vnodes(void) {}
 static void run_rc(const char *path) { assert(!strcmp(path, "/etc/rc")); rc_runs++; }
@@ -130,16 +140,18 @@ int main(void) {
     var_apfs = 1;
     for (unsigned i = 0; i < sizeof(errors)/sizeof(errors[0]); i++) {
         mount_error = errors[i]; checks = failures = skeleton_reads = restores = processes = rc_runs = halts = 0;
-        apfs_mounts = ramfs_mounts = 0;
+        apfs_mounts = ramfs_mounts = cam_vol_unlinks = mg_cache_unlinks = 0;
         int result = startup();
         assert(halts == 1 && !raw_open);
         assert(apfs_mounts == 1 && ramfs_mounts == 0);
         if (mount_error) {
             assert(result == 1 && failures == 1);
             assert(!skeleton_reads && !restores && !processes && !rc_runs);
+            assert(!cam_vol_unlinks && !mg_cache_unlinks);
         } else {
             assert(result == 0 && failures == 0);
             assert(skeleton_reads == 1 && restores == 1 && processes == 1 && rc_runs == 1);
+            assert(cam_vol_unlinks == 2 && mg_cache_unlinks == 1);
         }
     }
     /* 2. darwin_var present and NOT APFS (legacy ANNFS001 or unformatted): refuses ramfs and halts */
@@ -154,10 +166,11 @@ int main(void) {
     /* 3. Memory-only boot without darwin_var or root_apfs: mounts pure in-memory ramfs */
     var_bytes = 0; var_apfs = 0; mount_error = 0;
     checks = failures = skeleton_reads = restores = processes = rc_runs = halts = 0;
-    apfs_mounts = ramfs_mounts = 0;
+    apfs_mounts = ramfs_mounts = cam_vol_unlinks = mg_cache_unlinks = 0;
     assert(startup() == 0 && halts == 1 && !raw_open);
     assert(ramfs_mounts == 1 && apfs_mounts == 0 && failures == 0);
     assert(skeleton_reads == 1 && restores == 1 && processes == 1 && rc_runs == 1);
+    assert(cam_vol_unlinks == 2 && mg_cache_unlinks == 1);
 
     /* 4. Flash-root boot (root_apfs=) with missing darwin_var: refuses volatile ramfs and halts */
     kernel_bootargs = "debug=0x10e init_selftest=1 root_apfs=ufs_darwin";

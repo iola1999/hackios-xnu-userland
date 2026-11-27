@@ -37,6 +37,7 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
 {
    RWA_LOCKED;
    struct rwa_device *device = compute->device;
+   rwa_deferred_drain_locked(device);
    struct pipe_context *pipe = device->pipe;
    const char *name = compute->info.entry_point ? compute->info.entry_point : "the shader";
 

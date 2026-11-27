@@ -57,7 +57,7 @@ colour_temperature(const struct isp *isp)
  */
 enum { AF_WATCH, AF_STEADY, AF_SEARCH, AF_SETTLE };
 #define AF_NEAR         16              /* (off the stop at 0) */
-#define AF_FAR          768             /* (its module file's actuator region goes to 700) */
+#define AF_FAR          700             /* (matches the module file's calibrated actuator region bound) */
 
 #define AF_LONG_MOVE    100             /* lens positions: a move this long takes a frame more to settle */
 

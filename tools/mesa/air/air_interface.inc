@@ -5,6 +5,7 @@
 /* AIR's names for what NIR calls system values */
 enum air_sysval {
    AIR_SV_VERTEX_ID, AIR_SV_INSTANCE_ID, AIR_SV_BASE_VERTEX, AIR_SV_BASE_INSTANCE,
+   AIR_SV_AMPLIFICATION_ID,
    AIR_SV_FRONT_FACING, AIR_SV_SAMPLE_ID, AIR_SV_SAMPLE_MASK_IN, AIR_SV_POINT_COORD,
    AIR_SV_THREAD_POS_GRID, AIR_SV_THREAD_POS_TG, AIR_SV_TG_POS_GRID,
    AIR_SV_THREADS_PER_TG, AIR_SV_TGS_PER_GRID, AIR_SV_THREAD_INDEX_TG,
@@ -17,6 +18,7 @@ static const struct { const char *key; enum air_sysval sv; } sysvals[] = {
    { "air.instance_id", AIR_SV_INSTANCE_ID },
    { "air.base_vertex", AIR_SV_BASE_VERTEX },
    { "air.base_instance", AIR_SV_BASE_INSTANCE },
+   { "air.amplification_id", AIR_SV_AMPLIFICATION_ID },
    { "air.front_facing", AIR_SV_FRONT_FACING },
    { "air.sample_id", AIR_SV_SAMPLE_ID },
    { "air.sample_mask_in", AIR_SV_SAMPLE_MASK_IN },
@@ -47,6 +49,8 @@ load_sysval(struct air_ctx *c, enum air_sysval sv)
       return nir_iadd(&c->b, nir_load_instance_id(&c->b), nir_load_base_instance(&c->b));
    case AIR_SV_BASE_VERTEX: return nir_load_first_vertex(&c->b);
    case AIR_SV_BASE_INSTANCE: return nir_load_base_instance(&c->b);
+   /* Single-view rendering (maxVertexAmplificationCount == 1): amplification_id is 0. */
+   case AIR_SV_AMPLIFICATION_ID: return nir_imm_int(&c->b, 0);
    case AIR_SV_FRONT_FACING: return nir_load_front_face(&c->b, 1);
    case AIR_SV_SAMPLE_ID: return nir_load_sample_id(&c->b);
    case AIR_SV_SAMPLE_MASK_IN: return nir_load_sample_mask_in(&c->b);

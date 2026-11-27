@@ -39,6 +39,7 @@ int
 rwa_render_clear(struct rwa_device *device, const struct rwa_draw *draw, char *why, size_t why_size)
 {
    RWA_LOCKED;
+   rwa_deferred_drain_locked(device);
    if (!device || !draw || draw->color_count > PIPE_MAX_COLOR_BUFS ||
        (draw->color_count && !draw->color)) {
       say(why, why_size, "invalid clear pass");
@@ -86,7 +87,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_draw *draw, char *w
       struct rwa_texture *t = i == draw->color_count ? draw->depth : draw->color[i];
       if (!t) continue;
       struct pipe_surface *surf = i == draw->color_count ? &fb.zsbuf : &fb.cbufs[i];
-      pipe_surface_init(pipe, surf, t->res, t->first_level, 0);
+      pipe_surface_init(pipe, surf, t->res, t->first_level, t->first_layer);
       surf->format = i == draw->color_count ? t->res->format : texture_format(t);
    }
    state_framebuffer(device, &fb);

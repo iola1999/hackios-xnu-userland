@@ -132,6 +132,7 @@ buffer_import_handle(struct rwa_device *device, const struct winsys_handle *whan
       free(buffer);
       return NULL;
    }
+   buffer->references = 1;
    buffer->device = device;
    buffer->size = size;
    return buffer;
@@ -411,10 +412,14 @@ rwa_texture_from_buffer(struct rwa_device *device, const struct rwa_texture_shap
    backing->source = source;
    backing->offset = offset;
    backing->row_bytes = row_bytes;
-   backing->next = device->buffer_textures;
-   device->buffer_textures = backing;
-   texture->backing = backing;
-   __atomic_fetch_add(&device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
+   backing->refs = 1;
+   {
+      RWA_BTEX_LOCKED;
+      backing->next = device->buffer_textures;
+      device->buffer_textures = backing;
+      __atomic_store_n(&texture->backing, backing, __ATOMIC_RELEASE);
+      __atomic_fetch_add(&device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
+   }
 
    buffer_mirror_pull(source);
    if (buffer_texture_upload(backing, why, why_size) != 0) {
@@ -477,7 +482,7 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
    view->device = texture->device;
    view->references = 1;
    view->storage_owner = texture->storage_owner ? texture->storage_owner : texture;
-   view->storage_owner->references++;
+   __atomic_fetch_add(&view->storage_owner->references, 1u, __ATOMIC_RELAXED);
    /* Active child views prevent independent reclamation of the owner's BO. */
    if (view->storage_owner->purgeable_state == RWA_PURGEABLE_VOLATILE)
       view->storage_owner->purgeable_state = RWA_PURGEABLE_NON_VOLATILE;
@@ -493,6 +498,7 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
    view->shape.mip_levels = num_levels;
    view->first_level = texture->first_level + first_level;
    view->num_levels = num_levels;
+   view->first_layer = texture->first_layer;
    view->format_name = fmt->name;
    view->layers = texture->layers;
    view->shader_read = texture->shader_read;
@@ -516,8 +522,160 @@ rwa_texture_set_swizzle(struct rwa_texture *texture, uint8_t r, uint8_t g, uint8
    texture->swizzle_g = g;
    texture->swizzle_b = b;
    texture->swizzle_a = a;
-   if (texture->view)
-      pipe_sampler_view_reference(&texture->view, NULL);
+   if (texture->view) {
+      if (texture->device && pthread_mutex_trylock(&rwa_lock) == 0) {
+         rwa_deferred_drain_locked(texture->device);
+         pipe_sampler_view_reference(&texture->view, NULL);
+         pthread_mutex_unlock(&rwa_lock);
+      } else {
+         rwa_deferred_defer_texture(texture->device, NULL, texture->view);
+         texture->view = NULL;
+      }
+   }
+}
+
+static enum pipe_texture_target
+pipe_target_from_rwa_type(unsigned type, enum pipe_texture_target fallback)
+{
+   switch (type) {
+   case RWA_TYPE_1D:             return PIPE_TEXTURE_1D;
+   case RWA_TYPE_1D_ARRAY:       return PIPE_TEXTURE_1D_ARRAY;
+   case RWA_TYPE_2D:             return PIPE_TEXTURE_2D;
+   case RWA_TYPE_2D_ARRAY:       return PIPE_TEXTURE_2D_ARRAY;
+   case RWA_TYPE_2D_MULTISAMPLE: return PIPE_TEXTURE_2D;
+   case RWA_TYPE_CUBE:           return PIPE_TEXTURE_CUBE;
+   case RWA_TYPE_CUBE_ARRAY:     return PIPE_TEXTURE_CUBE_ARRAY;
+   case RWA_TYPE_3D:             return PIPE_TEXTURE_3D;
+   default:                      return fallback;
+   }
+}
+
+void
+rwa_texture_set_view_slices(struct rwa_texture *texture, unsigned mtl_type,
+                            unsigned first_slice, unsigned num_slices)
+{
+   if (!texture || !texture->res || mtl_type == RWA_TYPE_3D)
+      return;
+   unsigned max_layers = texture->res->array_size ? texture->res->array_size : 1u;
+   unsigned base = texture->first_layer + first_slice;
+   if (base >= max_layers)
+      return;
+   unsigned count = num_slices ? num_slices : 1u;
+   if (base + count > max_layers)
+      count = max_layers - base;
+   texture->shape.type = mtl_type;
+   texture->first_layer = base;
+   texture->layers = count;
+   if (mtl_type == RWA_TYPE_1D_ARRAY || mtl_type == RWA_TYPE_2D_ARRAY)
+      texture->shape.array_length = count;
+   else if (mtl_type == RWA_TYPE_CUBE_ARRAY)
+      texture->shape.array_length = MAX2(count / 6u, 1u);
+   else
+      texture->shape.array_length = 1u;
+   if (texture->view) {
+      if (texture->device && pthread_mutex_trylock(&rwa_lock) == 0) {
+         rwa_deferred_drain_locked(texture->device);
+         pipe_sampler_view_reference(&texture->view, NULL);
+         pthread_mutex_unlock(&rwa_lock);
+      } else {
+         rwa_deferred_defer_texture(texture->device, NULL, texture->view);
+         texture->view = NULL;
+      }
+   }
+}
+
+static bool
+rwa_try_retain_u(unsigned *refs)
+{
+   unsigned c = __atomic_load_n(refs, __ATOMIC_RELAXED);
+   while (c != 0) {
+      if (__atomic_compare_exchange_n(refs, &c, c + 1u, true,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+         return true;
+   }
+   return false;
+}
+
+struct rwa_btex_pin {
+   struct rwa_buffer_texture *b;
+   struct rwa_texture *tex;
+   struct rwa_buffer *src;
+};
+
+static unsigned
+buffer_textures_collect(struct rwa_device *device, const struct rwa_buffer *source_filter,
+                        bool written_only, struct rwa_btex_pin *stack, unsigned stack_cap,
+                        struct rwa_btex_pin **out)
+{
+   *out = stack;
+   if (!device)
+      return 0;
+   unsigned count = 0, cap = stack_cap;
+   struct rwa_btex_pin *arr = stack;
+   struct rwa_texture *drop_tex[16];
+   struct rwa_buffer *drop_src[16];
+   unsigned ndrop_tex = 0, ndrop_src = 0;
+   {
+      RWA_BTEX_LOCKED;
+      for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
+         if (b->unlinked || !b->source || !b->texture)
+            continue;
+         if (source_filter && b->source != source_filter)
+            continue;
+         if (written_only && !b->written)
+            continue;
+         if (!rwa_try_retain_u(&b->texture->references))
+            continue;
+         if (!rwa_try_retain_u(&b->source->references)) {
+            if (ndrop_tex < ARRAY_SIZE(drop_tex))
+               drop_tex[ndrop_tex++] = b->texture;
+            else
+               __atomic_fetch_sub(&b->texture->references, 1u, __ATOMIC_ACQ_REL);
+            continue;
+         }
+         if (count == cap) {
+            unsigned ncap = cap * 2;
+            struct rwa_btex_pin *grown = arr == stack ? malloc(ncap * sizeof(*grown))
+                                                      : realloc(arr, ncap * sizeof(*grown));
+            if (!grown) {
+               if (ndrop_tex < ARRAY_SIZE(drop_tex))
+                  drop_tex[ndrop_tex++] = b->texture;
+               if (ndrop_src < ARRAY_SIZE(drop_src))
+                  drop_src[ndrop_src++] = b->source;
+               break;
+            }
+            if (arr == stack)
+               memcpy(grown, stack, count * sizeof(*grown));
+            arr = grown;
+            cap = ncap;
+         }
+         b->refs++;
+         arr[count++] = (struct rwa_btex_pin){ .b = b, .tex = b->texture, .src = b->source };
+      }
+   }
+   for (unsigned i = 0; i < ndrop_tex; i++)
+      rwa_texture_destroy(drop_tex[i]);
+   for (unsigned i = 0; i < ndrop_src; i++)
+      rwa_buffer_destroy(drop_src[i]);
+   *out = arr;
+   return count;
+}
+
+static void
+buffer_textures_release(struct rwa_btex_pin *arr, unsigned count, struct rwa_btex_pin *stack)
+{
+   for (unsigned i = 0; i < count; i++) {
+      {
+         RWA_BTEX_LOCKED;
+         struct rwa_buffer_texture *b = arr[i].b;
+         if (--b->refs == 0 && b->unlinked)
+            free(b);
+      }
+      rwa_texture_destroy(arr[i].tex);
+      rwa_buffer_destroy(arr[i].src);
+   }
+   if (arr != stack)
+      free(arr);
 }
 
 /* The textures laid over this buffer keep a borrowed pointer to it and read its `map` and
@@ -530,6 +688,7 @@ rwa_texture_set_swizzle(struct rwa_texture *texture, uint8_t r, uint8_t g, uint8
 static void
 buffer_textures_forget(struct rwa_buffer *buffer)
 {
+   RWA_BTEX_LOCKED;
    struct rwa_buffer_texture **at = &buffer->device->buffer_textures;
 
    while (*at) {
@@ -540,12 +699,16 @@ buffer_textures_forget(struct rwa_buffer *buffer)
          continue;
       }
       backing->source = NULL;
+      backing->unlinked = true;
       *at = backing->next;
       if (backing->texture)
-         backing->texture->backing = NULL;
-      buffer_texture_clear_written(buffer->device, backing);
+         __atomic_store_n(&backing->texture->backing, NULL, __ATOMIC_RELEASE);
+      buffer_texture_clear_written_locked(buffer->device, backing);
       __atomic_fetch_sub(&buffer->device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
-      free(backing);
+      if (backing->refs <= 1)
+         free(backing);
+      else
+         backing->refs--;
    }
 }
 
@@ -579,19 +742,26 @@ buffer_textures_alias(const struct rwa_buffer_texture *a, const struct rwa_buffe
 static int
 buffer_texture_sync_aliases(struct rwa_texture *t, char *why, size_t why_size)
 {
-   if (!t || !t->backing || !t->backing->source ||
-       __atomic_load_n(&t->device->written_buffer_textures, __ATOMIC_ACQUIRE) == 0)
+   if (!t || __atomic_load_n(&t->device->written_buffer_textures, __ATOMIC_ACQUIRE) == 0)
       return 0;
-   struct rwa_buffer_texture *target = t->backing;
+   struct rwa_buffer_texture *target = __atomic_load_n(&t->backing, __ATOMIC_ACQUIRE);
+   if (!target || !target->source)
+      return 0;
+   struct rwa_btex_pin stack[16], *pins = NULL;
+   unsigned n = buffer_textures_collect(t->device, NULL, true, stack, ARRAY_SIZE(stack), &pins);
    bool synced = false;
-   for (struct rwa_buffer_texture *b = t->device->buffer_textures; b; b = b->next) {
+   int rc = 0;
+   for (unsigned i = 0; i < n; i++) {
+      struct rwa_buffer_texture *b = pins[i].b;
       if (b->written && buffer_textures_alias(b, target)) {
-         if (buffer_texture_download(b, why, why_size) != 0)
-            return -1;
+         if (buffer_texture_download(b, why, why_size) != 0) {
+            rc = -1;
+            break;
+         }
          synced = true;
       }
    }
-   if (synced) {
+   if (rc == 0 && synced) {
       struct rwa_buffer *src = target->source;
       uint64_t h = 0;
       if (src->mirror && src->map && mirror_read(src->mirror, src->size, &h, src->map)) {
@@ -599,9 +769,10 @@ buffer_texture_sync_aliases(struct rwa_texture *t, char *why, size_t why_size)
          src->mirror_hashed = true;
       }
       if (buffer_texture_upload(target, why, why_size) != 0)
-         return -1;
+         rc = -1;
    }
-   return 0;
+   buffer_textures_release(pins, n, stack);
+   return rc;
 }
 
 void
@@ -612,27 +783,30 @@ rwa_buffer_textures_refresh(struct rwa_device *device)
    RWA_LOCKED;
    if (__atomic_load_n(&device->buffer_textures_count, __ATOMIC_RELAXED) == 0)
       return;
+   struct rwa_btex_pin stack[32], *pins = NULL;
+   unsigned n = buffer_textures_collect(device, NULL, false, stack, ARRAY_SIZE(stack), &pins);
    /* Pass 1: flush all GPU-written wrappers to their buffers/mirrors before any alias uploads. */
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
+   for (unsigned i = 0; i < n; i++) {
       char why[256] = { 0 };
-      if (b->source && b->written)
-         (void)buffer_texture_download(b, why, sizeof(why));
+      if (pins[i].b->source && pins[i].b->written)
+         (void)buffer_texture_download(pins[i].b, why, sizeof(why));
    }
    /* Pass 2: pull updated mirrors and upload non-written wrappers. */
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
-      if (b->source)
-         buffer_mirror_pull(b->source);
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
+   for (unsigned i = 0; i < n; i++)
+      if (pins[i].b->source)
+         buffer_mirror_pull(pins[i].b->source);
+   for (unsigned i = 0; i < n; i++) {
       char why[256] = { 0 };
-      if (!b->source || b->written)
+      if (!pins[i].b->source || pins[i].b->written)
          continue;
-      (void)buffer_texture_upload(b, why, sizeof(why));
+      (void)buffer_texture_upload(pins[i].b, why, sizeof(why));
    }
-   if (device->buffer_textures && ++upload_count.refreshes == 1024) {
+   if (n && ++upload_count.refreshes == 1024) {
       printf("rwa buffer textures: %u refreshes: %u uploads, %u unchanged\n",
              upload_count.refreshes, upload_count.uploads, upload_count.unchanged);
       memset(&upload_count, 0, sizeof(upload_count));
    }
+   buffer_textures_release(pins, n, stack);
 }
 
 void
@@ -643,12 +817,15 @@ rwa_buffer_textures_writeback(struct rwa_device *device)
    RWA_LOCKED;
    if (__atomic_load_n(&device->written_buffer_textures, __ATOMIC_RELAXED) == 0)
       return;
-   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
+   struct rwa_btex_pin stack[32], *pins = NULL;
+   unsigned n = buffer_textures_collect(device, NULL, true, stack, ARRAY_SIZE(stack), &pins);
+   for (unsigned i = 0; i < n; i++) {
       char why[256] = { 0 };
 
-      if (b->source && b->written)
-         (void)buffer_texture_download(b, why, sizeof(why));
+      if (pins[i].b->source && pins[i].b->written)
+         (void)buffer_texture_download(pins[i].b, why, sizeof(why));
    }
+   buffer_textures_release(pins, n, stack);
 }
 
 static bool
@@ -668,6 +845,13 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
    struct pipe_resource *sampled = rgb2p ? t->rgb2p_sample : t->res;
    enum pipe_format format = rgb2p ? sampled->format : texture_format(t);
    u_sampler_view_default_template(&tmpl, sampled, format);
+   if (!rgb2p) {
+      tmpl.target = pipe_target_from_rwa_type(t->shape.type, sampled->target);
+      if (tmpl.target != PIPE_TEXTURE_3D && t->layers > 0) {
+         tmpl.u.tex.first_layer = t->first_layer;
+         tmpl.u.tex.last_layer = t->first_layer + t->layers - 1;
+      }
+   }
    tmpl.u.tex.first_level = t->first_level;
    tmpl.u.tex.last_level = t->first_level + texture_levels(t) - 1;
    if (t->swizzled) {
@@ -690,28 +874,52 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
 void
 rwa_texture_destroy(struct rwa_texture *texture)
 {
-   RWA_LOCKED;
-   if (!texture || --texture->references != 0)
+   if (!texture || __atomic_sub_fetch(&texture->references, 1u, __ATOMIC_ACQ_REL) != 0)
       return;
-   if (texture->backing) {
-      struct rwa_buffer_texture **at = &texture->device->buffer_textures;
-
-      while (*at && *at != texture->backing)
-         at = &(*at)->next;
-      if (*at) {
-         *at = texture->backing->next;
-         buffer_texture_clear_written(texture->device, texture->backing);
-         __atomic_fetch_sub(&texture->device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
-         free(texture->backing);
+   struct rwa_device *device = texture->device;
+   if (__atomic_load_n(&texture->backing, __ATOMIC_ACQUIRE) != NULL) {
+      RWA_BTEX_LOCKED;
+      struct rwa_buffer_texture *backing = texture->backing;
+      if (backing) {
+         struct rwa_buffer_texture **at = &device->buffer_textures;
+         while (*at && *at != backing)
+            at = &(*at)->next;
+         if (*at) {
+            *at = backing->next;
+            __atomic_fetch_sub(&device->buffer_textures_count, 1u, __ATOMIC_RELEASE);
+         }
+         backing->source = NULL;
+         backing->unlinked = true;
+         buffer_texture_clear_written_locked(device, backing);
+         if (backing->refs <= 1)
+            free(backing);
+         else
+            backing->refs--;
+         __atomic_store_n(&texture->backing, NULL, __ATOMIC_RELEASE);
       }
-      texture->backing = NULL;
    }
-   argbuf_scrub(texture->device, NULL, texture, NULL);
-   if (texture->res)
-      state_texture_gone(texture->device, texture->res);
-   /* Released, not destroyed: a draw may have left the view bound (air_metal_state.inc),
-    * and the context's reference then keeps it until it is unbound. */
-   pipe_sampler_view_release_ptr(&texture->view);
+   argbuf_scrub(device, NULL, texture, NULL);
+   if (device && (texture->res || texture->view)) {
+      bool need_pipe = texture->view != NULL;
+      if (!need_pipe && texture->res) {
+         RWA_DEFERRED_LOCKED;
+         need_pipe = fb_bound_match_locked(device, texture->res);
+      }
+      if (need_pipe) {
+         if (pthread_mutex_trylock(&rwa_lock) == 0) {
+            rwa_deferred_drain_locked(device);
+            if (texture->res)
+               state_texture_gone(device, texture->res);
+            /* Released, not destroyed: a draw may have left the view bound (air_metal_state.inc),
+             * and the context's reference then keeps it until it is unbound. */
+            pipe_sampler_view_release_ptr(&texture->view);
+            pthread_mutex_unlock(&rwa_lock);
+         } else {
+            rwa_deferred_defer_texture(device, texture->res, texture->view);
+            texture->view = NULL;
+         }
+      }
+   }
    pipe_resource_reference(&texture->rgb2p_sample, NULL);
    pipe_resource_reference(&texture->res, NULL);
    struct rwa_texture *owner = texture->storage_owner;
