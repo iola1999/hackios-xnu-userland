@@ -148,6 +148,8 @@ TARGETS = [
     {"name": "metal_props", "type": "exe", "sources": ["src/tests/metal_props.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "IOKit"]},
     {"name": "shm_test", "type": "exe", "sources": ["src/tests/shm_test.c"], "flags": ["-O1"]},
     {"name": "apfs_mmap_test", "type": "exe", "sources": ["src/tests/apfs_mmap_test.c"], "flags": ["-O1"]},
+    {"name": "dpw_test", "type": "exe", "sources": ["src/tests/dpw_test.c"], "flags": ["-O1", "-Wall", "-Wextra", "-Werror"]},
+    {"name": "fhw_test", "type": "exe", "sources": ["src/tests/fhw_test.m"], "flags": ["-O1", "-fobjc-arc", "-Wall", "-Wextra", "-Werror", "-framework", "Foundation"]},
     {"name": "vol_ls", "type": "exe", "sources": ["src/apps/vol_ls.c"], "flags": ["-O1"]},
     {"name": "snap_test", "type": "exe", "sources": ["src/tests/snap_test.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "CoreGraphics", "-framework", "ImageIO"]},
     {"name": "font_test", "type": "exe", "sources": ["src/tests/font_test.c"], "flags": ["-O1", "-framework", "CoreFoundation", "-framework", "CoreGraphics", "-framework", "CoreText"]},

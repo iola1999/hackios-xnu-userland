@@ -557,7 +557,6 @@ struct rwa_texture *
 rwa_texture_create(struct rwa_device *device, const struct rwa_texture_shape *shape,
                    char *why, size_t why_size)
 {
-   RWA_LOCKED;
    return texture_of_shape(device, shape, NULL, why, why_size);
 }
 
@@ -566,7 +565,6 @@ rwa_texture_from_surface(struct rwa_device *device, const struct rwa_texture_sha
                          int surface_id, unsigned offset, unsigned row_bytes, char *why,
                          size_t why_size)
 {
-   RWA_LOCKED;
    /*
     * A surface ID of zero is not a surface. IOSurfaceGetID answers 0 for one that was
     * never made shareable, and the kernel's table has nothing at 0 either, so this would

@@ -262,6 +262,8 @@ texture_start_zeroed(struct rwa_device *device, struct rwa_texture *texture)
    if (!(res->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL)) ||
        res->nr_samples > 1 || !device->pipe->clear_texture)
       return texture;
+   /* Only device->pipe->clear_texture touches the shared Gallium context. */
+   RWA_LOCKED;
    for (unsigned level = 0; level <= res->last_level; level++) {
       struct pipe_box box;
 

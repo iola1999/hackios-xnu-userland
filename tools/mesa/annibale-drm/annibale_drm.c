@@ -222,11 +222,13 @@ alloc_refused(unsigned number, const void *data, size_t size, kern_return_t resu
 /*
  * Calls per selector and the microseconds they took, one line every 4 s while there are calls: in
  * an animation the render thread spends most of its time in these round trips (thread dumps of
- * kernel-12377-cmd37-bo12). Slots 0xf0 and 0xf1 are the maps and unmaps of buffer memory. Counted
- * without a lock: two threads may lose a count between them, which a rate does not notice.
+ * kernel-12377-cmd37-bo12). Slots 0xf0 and 0xf1 are the maps and unmaps of buffer memory.
+ * Serialized by tally_lock so concurrent texture/buffer allocations accumulate cleanly; printf
+ * runs outside the lock over a stack snapshot.
  */
 static struct { uint32_t calls; uint64_t us; } tally[256];
 static uint64_t tally_since;
+static pthread_mutex_t tally_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t
 now_us(void)
@@ -240,28 +242,39 @@ now_us(void)
 static void
 tally_add(unsigned slot, uint64_t ended, uint64_t us)
 {
+	struct { uint32_t calls; uint64_t us; } snapshot[256];
+	uint64_t elapsed_ms = 0;
+	bool emit = false;
 	char line[1024];
 	int n;
 
+	pthread_mutex_lock(&tally_lock);
 	tally[slot & 0xff].calls++;
 	tally[slot & 0xff].us += us;
 	if (tally_since == 0) {
 		tally_since = ended;
 	}
-	if (ended - tally_since < 4000000u) {
+	if (ended - tally_since >= 4000000u) {
+		memcpy(snapshot, tally, sizeof(snapshot));
+		elapsed_ms = (ended - tally_since) / 1000u;
+		memset(tally, 0, sizeof(tally));
+		tally_since = ended;
+		emit = true;
+	}
+	pthread_mutex_unlock(&tally_lock);
+
+	if (!emit) {
 		return;
 	}
 	n = snprintf(line, sizeof(line), "annibaledrm[%d]: calls in %llu ms, selector:calls/us", (int)getpid(),
-	    (unsigned long long)((ended - tally_since) / 1000u));
+	    (unsigned long long)elapsed_ms);
 	for (unsigned i = 0; i < 256 && n < (int)sizeof(line) - 32; i++) {
-		if (tally[i].calls != 0) {
-			n += snprintf(line + n, sizeof(line) - (size_t)n, " %#x:%u/%llu", i, tally[i].calls,
-			    (unsigned long long)tally[i].us);
+		if (snapshot[i].calls != 0) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %#x:%u/%llu", i, snapshot[i].calls,
+			    (unsigned long long)snapshot[i].us);
 		}
 	}
 	printf("%s\n", line);
-	memset(tally, 0, sizeof(tally));
-	tally_since = ended;
 }
 
 static int

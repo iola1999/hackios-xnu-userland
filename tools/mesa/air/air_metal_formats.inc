@@ -190,17 +190,24 @@ format_is_depth_stencil(enum pipe_format f)
  * is what to set if they ever need taking out of the picture; nothing else is a knob
  * here.
  *
- * Read once, because a texture is created per frame and getenv is not free.
+ * Read once via pthread_once so concurrent texture allocation calls share one result
+ * without racing on initialization.
  */
+static bool packed16_value;
+static pthread_once_t packed16_once = PTHREAD_ONCE_INIT;
+
+static void
+packed16_init(void)
+{
+   const char *v = getenv("RWA_PACKED16");
+   packed16_value = !(v && *v == '0');
+}
+
 static bool
 packed16_served(void)
 {
-   static int on = -1;
-   if (on < 0) {
-      const char *v = getenv("RWA_PACKED16");
-      on = !(v && *v == '0');
-   }
-   return on != 0;
+   pthread_once(&packed16_once, packed16_init);
+   return packed16_value;
 }
 
 static const struct rwa_pixel_format *
