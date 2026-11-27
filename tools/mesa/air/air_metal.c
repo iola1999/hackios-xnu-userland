@@ -971,7 +971,9 @@ rwa_buffer_create(struct rwa_device *device, size_t size, char *why, size_t why_
     *
     * PIPE_USAGE_STAGING: memory the processor uses as much as the GPU, as a Metal buffer is.
     * PIPE_BIND_SHARED from a page up: a buffer object of its own, not a slice of freedreno's
-    * heap, so a texture can be laid over it by its handle (buffer_texture_alias).
+    * heap, so a texture can be laid over it by its handle (buffer_texture_alias). In this
+    * port the bit is only the promise that such an export may happen; the bo becomes
+    * uncacheable when a handle is actually exported, not here.
     */
    buffer->res = pipe_buffer_create(device->screen,
                                     PIPE_BIND_SHADER_BUFFER | PIPE_BIND_CONSTANT_BUFFER |

@@ -43,6 +43,8 @@
     - 探针：`fd_submit_suballoc_ring_bo` 装槽前若读出 sink 标志，打印 `fd suballoc sink install`（ring、flags、pid、tid）与帧链，每进程 16 行上限；0029 修复后预期零命中。0026 canary/magic、0027 hist 与槽位不变量、0028 duplicate-take 补偿及归属探针保持不变。
     - 验证：主机 harness 在 0028 场景之外覆盖写入 SINK 残留的复用元素与 init 失败上游对齐，构建与反汇编核查见顶层工作区 `out/goal-1124/batch7/0029-implementation.md`。
 
+30. `0030-fd-shared-potential-cacheable.patch`：把 `FD_BO_SHARED` 的「以后可能导出」与已经导入或导出的实际共享拆开。新增内部 `_FD_BO_EXPORTED`，仅在 `fd_bo_get_name`、`fd_bo_handle`、`fd_bo_dmabuf` 或导入路径设置；cache 准入、userspace fence 状态、cpuPrep 隐式同步和提交合并判断改按实际导出位。未导出的 shareable bo 仍不进 heap（保留以后按句柄给 buffer 叠加纹理的能力），但可以进 bo cache；一旦导出立即走 NO_CACHE 与 bo_flush 的保守路径。契约分析、正确性核对与 arm64e 编译验证见顶层工作区 `out/goal-1124/batch9/shared-bypass-fix.md`。
+
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，修改的文件互不重叠。应用这一层补丁后的源码树，加上 `tools/mesa/annibale-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只执行到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 
 `smoke-osmesa.c` / `smoke-osmesa-es.c` 是构建后冒烟测试，在 macOS 主机上编译运行，见顶层 `docs/analysis/mesa-rebase-2026-10.md` 第 3 节。

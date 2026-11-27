@@ -1,0 +1,134 @@
+Keep merely shareable buffer objects in the bo cache.
+
+FD_BO_SHARED is created as a hint that a bo may be exported later
+(freedreno_drmif.h says exactly that), but the msm cache and fence paths treated
+it as proof that the bo already had consumers outside the userspace fence
+tracking. In this port AIR sets PIPE_BIND_SHARED on every page-sized-or-larger
+MTLBuffer because any such buffer can later have a linear texture laid over it;
+the result was that nearly every ordinary Metal buffer was born uncacheable and
+took a complete kernel gemNew/gemClose cycle.
+
+Split the two states. FD_BO_SHARED remains the allocation-time shareability
+hint: it still prevents heap suballocation, because a suballocated bo has no
+handle of its own to export. The new internal _FD_BO_EXPORTED bit is set only
+when the bo is imported or when fd_bo_get_name(), fd_bo_handle() or
+fd_bo_dmabuf() actually exports it. Cache admission, userspace-fence state,
+implicit-sync decisions and the read-only prefault exception key off the
+actual-exported bit. An unexported shareable bo therefore keeps complete
+userspace fence tracking and can be reused through the normal cache; once any
+handle is exported the old conservative path applies immediately, including
+NO_CACHE and bo_flush() in the export helpers.
+
+diff --git a/src/freedreno/drm/freedreno_drmif.h b/src/freedreno/drm/freedreno_drmif.h
+--- a/src/freedreno/drm/freedreno_drmif.h
++++ b/src/freedreno/drm/freedreno_drmif.h
+@@ -123,12 +123,18 @@
+ #define FD_BO_GPUREADONLY         BITSET_BIT(1)
+ #define FD_BO_NOMAP               BITSET_BIT(2) /* Hint that the bo will not be mmap'd */
+ 
+-/* Hint that the bo will be exported/shared: */
++/* Hint that the bo may be exported/shared, forcing a standalone allocation: */
+ #define FD_BO_SHARED              BITSET_BIT(4)
+ #define FD_BO_SCANOUT             BITSET_BIT(5)
+ 
+ /* internal bo flags: */
+ #define _FD_BO_NOSYNC             BITSET_BIT(7) /* Avoid userspace fencing on control buffers */
++
++/* The bo really has been imported or exported, so userspace fences no longer
++ * describe every consumer. FD_BO_SHARED only says that this may still happen;
++ * by itself it must not disable cache reuse or fence tracking.
++ */
++#define _FD_BO_EXPORTED           BITSET_BIT(12)
+ 
+ /* Additional flags hinting usage, only used for tracing.  Buffers without
+  * one of these flags set will be presumed to be driver internal.
+diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -113,7 +113,7 @@
+       return NULL;
+    }
+ 
+-   bo->alloc_flags |= FD_BO_SHARED;
++   bo->alloc_flags |= FD_BO_SHARED | _FD_BO_EXPORTED;
+ 
+    /* add ourself into the handle table: */
+    _mesa_hash_table_insert(dev->handle_table, &bo->handle, bo);
+@@ -560,7 +560,7 @@
+       set_name(bo, req.name);
+       simple_mtx_unlock(&table_lock);
+       bo->bo_reuse = NO_CACHE;
+-      bo->alloc_flags |= FD_BO_SHARED;
++      bo->alloc_flags |= FD_BO_SHARED | _FD_BO_EXPORTED;
+       bo_flush(bo);
+    }
+ 
+@@ -575,7 +575,7 @@
+    if (suballoc_bo(bo))
+       return 0;
+    bo->bo_reuse = NO_CACHE;
+-   bo->alloc_flags |= FD_BO_SHARED;
++   bo->alloc_flags |= FD_BO_SHARED | _FD_BO_EXPORTED;
+    bo_flush(bo);
+    return bo->handle;
+ }
+@@ -608,7 +608,7 @@
+    }
+ 
+    bo->bo_reuse = NO_CACHE;
+-   bo->alloc_flags |= FD_BO_SHARED;
++   bo->alloc_flags |= FD_BO_SHARED | _FD_BO_EXPORTED;
+    bo_flush(bo);
+ 
+    return ret;
+@@ -681,7 +681,7 @@
+    /* An imported bo can be memory the caller mapped read-only (kAnnibaleMemory with
+     * MSM_BO_GPU_READONLY), whose mapping here is read-only too: it is only read. */
+    for (unsigned off = 0; off < bo->size; off += page) {
+-      if (bo->alloc_flags & FD_BO_SHARED)
++      if (bo->alloc_flags & _FD_BO_EXPORTED)
+          (void)bytes[off];
+       else
+          bytes[off] = bytes[off];   /* read then write the same byte: the write is what faults it in */
+@@ -811,7 +811,7 @@
+    /* None shared buffers will not have any external usage (ie. fences
+     * that we are not aware of) so nothing more to do.
+     */
+-   if (!(bo->alloc_flags & FD_BO_SHARED))
++   if (!(bo->alloc_flags & _FD_BO_EXPORTED))
+       return 0;
+ 
+    /* If buffer is shared, but we are using explicit sync, no need to
+@@ -934,7 +934,7 @@
+     * The pipe's control buffer is specifically nosync to avoid recursive
+     * lock problems here.
+     */
+-   if (bo->alloc_flags & (FD_BO_SHARED | _FD_BO_NOSYNC))
++   if (bo->alloc_flags & (_FD_BO_EXPORTED | _FD_BO_NOSYNC))
+       return FD_BO_STATE_UNKNOWN;
+ 
+    /* Speculatively check, if we already know we're idle, no need to acquire
+diff --git a/src/freedreno/drm/freedreno_bo_cache.c b/src/freedreno/drm/freedreno_bo_cache.c
+--- a/src/freedreno/drm/freedreno_bo_cache.c
++++ b/src/freedreno/drm/freedreno_bo_cache.c
+@@ -278,7 +278,7 @@
+ int
+ fd_bo_cache_free(struct fd_bo_cache *cache, struct fd_bo *bo)
+ {
+-   if (bo->alloc_flags & (FD_BO_SHARED | _FD_BO_NOSYNC))
++   if (bo->alloc_flags & (_FD_BO_EXPORTED | _FD_BO_NOSYNC))
+       return -1;
+ 
+    struct fd_bo_bucket *bucket = get_bucket(cache, bo->size);
+diff --git a/src/freedreno/drm/freedreno_ringbuffer_sp.c b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+--- a/src/freedreno/drm/freedreno_ringbuffer_sp.c
++++ b/src/freedreno/drm/freedreno_ringbuffer_sp.c
+@@ -332,7 +332,7 @@
+    simple_mtx_lock(&fence_lock);
+    for (unsigned i = 0; i < fd_submit->nr_bos; i++) {
+       fd_bo_add_fence(fd_submit->bos[i], out_fence);
+-      has_shared |= fd_submit->bos[i]->alloc_flags & FD_BO_SHARED;
++      has_shared |= fd_submit->bos[i]->alloc_flags & _FD_BO_EXPORTED;
+    }
+    for (unsigned i = 0; i < fd_submit->nr_suballoc_bos; i++) {
+       fd_bo_add_fence(fd_submit->suballoc_bos[i], out_fence);
