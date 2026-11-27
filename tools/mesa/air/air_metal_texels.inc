@@ -125,6 +125,8 @@ rwa_texture_write(struct rwa_texture *texture, unsigned level, unsigned layer,
       say(why, why_size, "combined RGB2P writes require both planes");
       return -1;
    }
+   if (!texture_require_backing(texture, "texture write", why, why_size))
+      return -1;
    /* A depth or stencil texture is refused here and read through rwa_depth_read, and
     * the two go together on purpose: a texel of Depth32Float_Stencil8 holds two values
     * of two kinds, so a call whose only argument is "bytes" cannot say which of them
@@ -216,6 +218,8 @@ rwa_texture_read(struct rwa_texture *texture, unsigned level, unsigned layer,
       say(why, why_size, "combined RGB2P reads require both planes");
       return -1;
    }
+   if (!texture_require_backing(texture, "texture read", why, why_size))
+      return -1;
    if (format_is_depth_stencil(texture->res->format)) {
       say(why, why_size, "reading texels out of a %s texture: it has %s, and the one answer "
                          "this call can give would be whichever aspect the caller did not "
@@ -293,6 +297,8 @@ rwa_depth_read(struct rwa_texture *texture, unsigned level, unsigned layer,
                uint8_t *stencil, char *why, size_t why_size)
 {
    RWA_LOCKED;
+   if (!texture_require_backing(texture, "depth read", why, why_size))
+      return -1;
    struct pipe_context *pipe = texture->device->pipe;
    enum pipe_format format = texture->res->format;
    struct pipe_box box;
@@ -394,12 +400,14 @@ rwa_texture_thumbnail(struct rwa_texture *texture, unsigned w, unsigned h, uint8
    /* A combined YCbCr texture (rwa_texture_combine_yuv) is sampled through its luma plane. */
    if (texture && texture->chroma && texture->storage_owner)
       texture = texture->storage_owner;
-   enum pipe_format format = texture ? texture_format(texture) : PIPE_FORMAT_NONE;
+   if (!texture || !texture->res || !rgba || !w || !h)
+      return -1;
+   enum pipe_format format = texture_format(texture);
    unsigned level = 0;
    char why[64];
 
-   bool depth = texture && format_is_depth_stencil(texture->res->format);
-   if (!texture || !rgba || !w || !h || (depth && !format_has_depth(texture->res->format)) ||
+   bool depth = format_is_depth_stencil(texture->res->format);
+   if ((depth && !format_has_depth(texture->res->format)) ||
        texture->res->nr_samples > 1 || util_format_is_compressed(format) ||
        !resource_level(texture, &level, why, sizeof(why)))
       return -1;

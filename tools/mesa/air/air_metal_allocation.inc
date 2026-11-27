@@ -541,6 +541,9 @@ texture_of_shape(struct rwa_device *device, const struct rwa_texture_shape *shap
       return texture;
    }
 
+   texture->res_templ = templ;
+   texture->has_res_templ = true;
+   texture->purgeable_state = RWA_PURGEABLE_NON_VOLATILE;
    texture->res = device->screen->resource_create(device->screen, &templ);
    if (!texture->res) {
       say(why, why_size, "the GPU driver would not allocate a %ux%ux%u %s of %s. After a few "

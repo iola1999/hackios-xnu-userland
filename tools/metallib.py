@@ -20,8 +20,22 @@ TYPES = {0: 'vertex', 1: 'fragment', 2: 'kernel', 3: 'unqualified', 4: 'visible'
          5: 'extern', 6: 'intersection'}
 
 
+def unwrap_fat_metallib(b):
+    """Return the first MTLB slice from a 0xCAFEBABE fat metallib, or the raw bytes."""
+    if len(b) >= 8 and b[:4] == b'\xca\xfe\xba\xbe':
+        count = struct.unpack_from('>I', b, 4)[0]
+        if 0 < count <= 64 and 8 + count * 20 <= len(b):
+            for i in range(count):
+                _, _, off, sz, _ = struct.unpack_from('>IIIII', b, 8 + i * 20)
+                if off + sz <= len(b) and b[off:off + 4] == b'MTLB':
+                    return b[off:off + sz], 'fat'
+        return b, 'fat-no-mtlb'
+    return b, 'raw'
+
+
 def parse(path):
-    b = open(path, 'rb').read()
+    raw = open(path, 'rb').read()
+    b, _ = unwrap_fat_metallib(raw)
     assert b[:4] == b'MTLB', 'not a metallib: %r' % b[:4]
     (ver_maj, ver_min) = struct.unpack_from('<HH', b, 4)
     total = struct.unpack_from('<Q', b, 0x10)[0]

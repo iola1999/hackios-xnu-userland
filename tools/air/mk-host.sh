@@ -36,7 +36,9 @@ cd "$B"
 # column comes from and where its Adreno instructions are read, so a host ir3 that differs from the
 # device's would make both of those say something about a compiler nothing runs. The other patches
 # in tools/mesa are for the Darwin cross build and are deliberately left out.
-PATCHES=$(cat "$ROOT"/tools/mesa/air*.patch "$ROOT"/tools/mesa/ir3-*.patch | sha256sum | cut -d' ' -f1)
+HOST_PATCHES=$(LC_ALL=C; export LC_ALL; ls "$ROOT"/tools/mesa/air*.patch "$ROOT"/tools/mesa/ir3-*.patch \
+	"$ROOT"/tools/mesa/rebase-25/air-*.patch "$ROOT"/tools/mesa/rebase-25/ir3-*.patch)
+PATCHES=$(cat $HOST_PATCHES | sha256sum | cut -d' ' -f1)
 if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]; then
 	if [ ! -f mesa-$VERSION.tar.xz ]; then
 		# the cross build may already have fetched it
@@ -50,8 +52,8 @@ if [ ! -d "$SRC" ] || [ "$(cat "$SRC/.air-patches" 2>/dev/null)" != "$PATCHES" ]
 	echo "$SHA256  mesa-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf "$SRC" build
 	tar xJf mesa-$VERSION.tar.xz
-	for p in "$ROOT"/tools/mesa/air-*.patch "$ROOT"/tools/mesa/ir3-*.patch; do
-		patch -s --no-backup-if-mismatch -d "$SRC" -p1 < "$p"
+	for p in $HOST_PATCHES; do
+		patch -s --fuzz=0 --batch --no-backup-if-mismatch -d "$SRC" -p1 < "$p"
 	done
 
 	# glibc 2.43 and later declare C11's once_flag and call_once in <stdlib.h>,

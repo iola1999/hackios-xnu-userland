@@ -1,0 +1,66 @@
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc mesa-26.2.5/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc
+--- a/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc	2026-10-23 14:36:12
++++ b/src/gallium/drivers/freedreno/a6xx/fd6_draw.cc	2026-10-23 14:12:27
+@@ -488,6 +488,27 @@
+        DRAW == DRAW_INDIRECT_OP_INDIRECT_COUNT)
+       ctx->batch->barrier |= FD6_WAIT_FOR_ME;
+ 
++   /* Darwin on annibale: a draw that reads the framebuffer reads it through
++    * UCHE.  Among primitives drawn with FLUSH_PER_OVERLAP the hardware sees
++    * to it that they read what the ones before them wrote, but it knows
++    * nothing of what was drawn before that mode was on: the first triangle
++    * to read the framebuffer after a draw that did not, read (with GMEM)
++    * pixels of another tile.  Seen on a642l with CoreAnimation, which draws
++    * a label's shadow that way over icons drawn the ordinary way: the first
++    * triangle of each such quad was wrong, the second right.  A CCU colour
++    * flush before the draw mends it, and so does a UCHE invalidate alone;
++    * the first such draw gets both, as a framebuffer barrier would give.
++    * On a8xx (a830, annibale) the read also goes through CCHE: with only
++    * those two, the first triangle still showed pixels of the other GMEM
++    * bin, until CCHE was invalidated as well.
++    */
++   if (unlikely(emit.fs->fb_read) && !ctx->batch->prev_draw_read_fb) {
++      ctx->batch->barrier |= FD6_FLUSH_CCU_COLOR | FD6_INVALIDATE_CACHE;
++      if (CHIP >= A8XX)
++         ctx->batch->barrier |= FD6_INVALIDATE_CCHE;
++   }
++   ctx->batch->prev_draw_read_fb = emit.fs->fb_read;
++
+    fd6_barrier_flush<CHIP>(cs, ctx->batch);
+ 
+    if (is_indirect(DRAW)) {
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/gallium/drivers/freedreno/meson.build mesa-26.2.5/src/gallium/drivers/freedreno/meson.build
+--- a/src/gallium/drivers/freedreno/meson.build	2026-10-23 14:36:12
++++ b/src/gallium/drivers/freedreno/meson.build	2026-10-23 14:21:51
+@@ -301,7 +301,7 @@
+ air_run = executable(
+   'air_run',
+   files('../../../compiler/air/air_run.c'),
+-  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
++  include_directories : [inc_include, inc_src, include_directories('../../../mesa/glapi'), inc_mesa, inc_gallium,
+                          inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
+                          include_directories('../../drivers')],
+   dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_freedreno,
+@@ -328,7 +328,7 @@
+ libannibaleair = shared_library(
+   'annibaleair',
+   files('../../../compiler/air/air_metal.c'),
+-  include_directories : [inc_include, inc_src, inc_mapi, inc_mesa, inc_gallium,
++  include_directories : [inc_include, inc_src, include_directories('../../../mesa/glapi'), inc_mesa, inc_gallium,
+                          inc_gallium_aux, inc_gallium_winsys_sw, inc_gallium_winsys,
+                          include_directories('../../drivers')],
+   dependencies : [dep_m, idep_air, idep_mesautil, driver_softpipe, driver_freedreno,
+diff -ruN -x *.rej -x *.orig -x Oops* -x __pycache__ -x air -x annibale-drm -x ci ref-26.2.5/mesa-26.2.5/src/util/meson.build mesa-26.2.5/src/util/meson.build
+--- a/src/util/meson.build	2026-10-14 23:12:24
++++ b/src/util/meson.build	2026-10-23 14:20:33
+@@ -314,7 +314,9 @@
+   idep_mesautilformat,
+ ]
+ 
+-if dep_libdrm.found()
++# Darwin on annibale: the freedreno stand-in for libdrm (src/annibale-drm) has no syncobj, and
++# nothing in the gallium path asks for the DRM sync provider -- only turnip's virtio KMD does.
++if dep_libdrm.found() and host_machine.system() != 'darwin'
+   files_mesa_util += files('u_sync_provider.c', 'u_sync_provider.h')
+   deps_for_libmesa_util += dep_libdrm
+ endif

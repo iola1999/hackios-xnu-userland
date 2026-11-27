@@ -5,6 +5,30 @@
  * Metal SIMD-group and quad-group operations, included by air_intrinsics.c.
  */
 
+/* Mesa 26.2.5 ir3 does not normalize 1-bit subgroup shuffle/broadcast results from
+ * inactive source lanes (upstream 9b0a38ca). Widen 1-bit booleans to 32-bit before
+ * shuffling and mask bit 0 afterward so nir_opt_algebraic preserves the normalization.
+ */
+static nir_def *
+air_simd_shuffle(nir_builder *b, nir_def *val, nir_def *lane)
+{
+   if (val->bit_size == 1) {
+      nir_def *wide = nir_shuffle(b, nir_b2i32(b, val), lane);
+      return nir_ine_imm(b, nir_iand_imm(b, wide, 1), 0);
+   }
+   return nir_shuffle(b, val, lane);
+}
+
+static nir_def *
+air_quad_broadcast(nir_builder *b, nir_def *val, nir_def *lane)
+{
+   if (val->bit_size == 1) {
+      nir_def *wide = nir_quad_broadcast(b, nir_b2i32(b, val), lane);
+      return nir_ine_imm(b, nir_iand_imm(b, wide, 1), 0);
+   }
+   return nir_quad_broadcast(b, val, lane);
+}
+
 static nir_def *
 quad_reduce_pair(nir_builder *b, const char *op, bool is_float, bool is_signed,
                  nir_def *x, nir_def *y)
@@ -175,7 +199,7 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       air_note(c, "air.%s takes its lane number in the SIMD group this "
                   "implementation has, which is not Metal's 32 lanes", n->part[0]);
       air_set(c, &in->base,
-              air_val_ssa(c, nir_shuffle(&c->b, a0, nir_u2u32(&c->b, lane))));
+              air_val_ssa(c, air_simd_shuffle(&c->b, a0, nir_u2u32(&c->b, lane))));
       return true;
    }
 
@@ -190,7 +214,7 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
                           !strcmp(op, "simd_shuffle_up")   ? nir_isub(&c->b, id, d) :
                                                              nir_ixor(&c->b, id, d);
       air_note(c, "air.%s shifts across the hardware SIMD group", n->part[0]);
-      air_set(c, &in->base, air_val_ssa(c, nir_shuffle(&c->b, a0, src_lane)));
+      air_set(c, &in->base, air_val_ssa(c, air_simd_shuffle(&c->b, a0, src_lane)));
       return true;
    }
 
@@ -210,13 +234,13 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
       nir_def *res;
       if (!strcmp(op, "simd_shuffle_and_fill_down")) {
          nir_def *in_data = nir_ult(&c->b, nir_iadd(&c->b, sub, d), m);
-         nir_def *v_data = nir_shuffle(&c->b, a0, nir_iadd(&c->b, id, d));
-         nir_def *v_fill = nir_shuffle(&c->b, fill, nir_isub(&c->b, nir_iadd(&c->b, id, d), m));
+         nir_def *v_data = air_simd_shuffle(&c->b, a0, nir_iadd(&c->b, id, d));
+         nir_def *v_fill = air_simd_shuffle(&c->b, fill, nir_isub(&c->b, nir_iadd(&c->b, id, d), m));
          res = nir_bcsel(&c->b, in_data, v_data, v_fill);
       } else {
          nir_def *in_data = nir_uge(&c->b, sub, d);
-         nir_def *v_data = nir_shuffle(&c->b, a0, nir_isub(&c->b, id, d));
-         nir_def *v_fill = nir_shuffle(&c->b, fill, nir_isub(&c->b, nir_iadd(&c->b, id, m), d));
+         nir_def *v_data = air_simd_shuffle(&c->b, a0, nir_isub(&c->b, id, d));
+         nir_def *v_fill = air_simd_shuffle(&c->b, fill, nir_isub(&c->b, nir_iadd(&c->b, id, m), d));
          res = nir_bcsel(&c->b, in_data, v_data, v_fill);
       }
       air_set(c, &in->base, air_val_ssa(c, res));
@@ -229,13 +253,13 @@ simd_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n,
          return false;
       nir_def *lane32 = nir_iand_imm(&c->b, nir_u2u32(&c->b, lane), 3);
       if (nir_src_is_const(nir_src_for_ssa(lane32))) {
-         air_set(c, &in->base, air_val_ssa(c, nir_quad_broadcast(&c->b, a0, lane32)));
+         air_set(c, &in->base, air_val_ssa(c, air_quad_broadcast(&c->b, a0, lane32)));
          return true;
       }
-      nir_def *q0 = nir_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 0));
-      nir_def *q1 = nir_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 1));
-      nir_def *q2 = nir_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 2));
-      nir_def *q3 = nir_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 3));
+      nir_def *q0 = air_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 0));
+      nir_def *q1 = air_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 1));
+      nir_def *q2 = air_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 2));
+      nir_def *q3 = air_quad_broadcast(&c->b, a0, nir_imm_int(&c->b, 3));
       nir_def *r01 = nir_bcsel(&c->b, nir_ieq_imm(&c->b, lane32, 0), q0, q1);
       nir_def *r23 = nir_bcsel(&c->b, nir_ieq_imm(&c->b, lane32, 2), q2, q3);
       air_set(c, &in->base,

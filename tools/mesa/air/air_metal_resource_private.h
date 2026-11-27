@@ -215,6 +215,11 @@ struct rwa_texture {
    /* Channel swizzle for sampler views (applied when swizzled is true). */
    bool swizzled;
    uint8_t swizzle_r, swizzle_g, swizzle_b, swizzle_a;
+
+   /* Purgeable state and saved template for Empty -> NonVolatile BO rebuild. */
+   struct pipe_resource res_templ;
+   unsigned purgeable_state;
+   bool has_res_templ;
 };
 
 static inline void

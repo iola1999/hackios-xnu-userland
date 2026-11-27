@@ -437,6 +437,8 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
       say(why, why_size, "combined NV12 texture views are unsupported");
       return NULL;
    }
+   if (!texture_require_backing(texture, "texture view", why, why_size))
+      return NULL;
    if (num_levels == 0 || first_level + num_levels > texture_levels(texture)) {
       say(why, why_size, "a view of levels %u+%u of a %s with %u", first_level, num_levels,
           texture->format_name, texture_levels(texture));
@@ -476,6 +478,9 @@ rwa_texture_view(struct rwa_texture *texture, unsigned mtl_format, unsigned firs
    view->references = 1;
    view->storage_owner = texture->storage_owner ? texture->storage_owner : texture;
    view->storage_owner->references++;
+   /* Active child views prevent independent reclamation of the owner's BO. */
+   if (view->storage_owner->purgeable_state == RWA_PURGEABLE_VOLATILE)
+      view->storage_owner->purgeable_state = RWA_PURGEABLE_NON_VOLATILE;
    pipe_resource_reference(&view->res, res);
    view->shape = texture->shape;
    view->shape.pixel_format = mtl_format;
@@ -544,6 +549,61 @@ buffer_textures_forget(struct rwa_buffer *buffer)
    }
 }
 
+static size_t
+buffer_texture_span(const struct rwa_buffer_texture *b)
+{
+   return (size_t)b->row_bytes * b->texture->res->height0;
+}
+
+static bool
+buffer_textures_alias(const struct rwa_buffer_texture *a, const struct rwa_buffer_texture *b)
+{
+   if (!a || !b || a == b || !a->source || !b->source)
+      return false;
+   size_t sa = buffer_texture_span(a), sb = buffer_texture_span(b);
+   if (sa == 0 || sb == 0)
+      return false;
+   if (a->source == b->source)
+      return a->offset < b->offset + sb && b->offset < a->offset + sa;
+   if (a->source->mirror && b->source->mirror) {
+      uintptr_t a0 = (uintptr_t)a->source->mirror + a->offset;
+      uintptr_t b0 = (uintptr_t)b->source->mirror + b->offset;
+      return a0 < b0 + sb && b0 < a0 + sa;
+   }
+   return false;
+}
+
+/* Flush any written copy-wrapper texture that aliases t's backing memory (same buffer or
+ * overlapping IOSurface mirror) before the GPU reads or partially overwrites t within the
+ * same command buffer. Read-only paths exit immediately on written_buffer_textures == 0. */
+static int
+buffer_texture_sync_aliases(struct rwa_texture *t, char *why, size_t why_size)
+{
+   if (!t || !t->backing || !t->backing->source ||
+       __atomic_load_n(&t->device->written_buffer_textures, __ATOMIC_ACQUIRE) == 0)
+      return 0;
+   struct rwa_buffer_texture *target = t->backing;
+   bool synced = false;
+   for (struct rwa_buffer_texture *b = t->device->buffer_textures; b; b = b->next) {
+      if (b->written && buffer_textures_alias(b, target)) {
+         if (buffer_texture_download(b, why, why_size) != 0)
+            return -1;
+         synced = true;
+      }
+   }
+   if (synced) {
+      struct rwa_buffer *src = target->source;
+      uint64_t h = 0;
+      if (src->mirror && src->map && mirror_read(src->mirror, src->size, &h, src->map)) {
+         src->mirror_hash = h;
+         src->mirror_hashed = true;
+      }
+      if (buffer_texture_upload(target, why, why_size) != 0)
+         return -1;
+   }
+   return 0;
+}
+
 void
 rwa_buffer_textures_refresh(struct rwa_device *device)
 {
@@ -552,27 +612,21 @@ rwa_buffer_textures_refresh(struct rwa_device *device)
    RWA_LOCKED;
    if (__atomic_load_n(&device->buffer_textures_count, __ATOMIC_RELAXED) == 0)
       return;
+   /* Pass 1: flush all GPU-written wrappers to their buffers/mirrors before any alias uploads. */
+   for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
+      char why[256] = { 0 };
+      if (b->source && b->written)
+         (void)buffer_texture_download(b, why, sizeof(why));
+   }
+   /* Pass 2: pull updated mirrors and upload non-written wrappers. */
    for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next)
       if (b->source)
          buffer_mirror_pull(b->source);
    for (struct rwa_buffer_texture *b = device->buffer_textures; b; b = b->next) {
       char why[256] = { 0 };
-
-      /* Backstop for the removal in rwa_buffer_destroy, not a replacement for it: an entry
-       * whose source was unlinked elsewhere is skipped rather than read.
-       */
-      if (!b->source)
+      if (!b->source || b->written)
          continue;
-
-      /* A refresh that fails is not reported to a caller that is not making this call; the
-       * draw that reads the texture reports what the bytes are, and the copy that failed
-       * said why once when the texture was made. A written texture holds the newer bytes,
-       * so they go to the buffer rather than being overwritten from it.
-       */
-      if (b->written)
-         (void)buffer_texture_download(b, why, sizeof(why));
-      else
-         (void)buffer_texture_upload(b, why, sizeof(why));
+      (void)buffer_texture_upload(b, why, sizeof(why));
    }
    if (device->buffer_textures && ++upload_count.refreshes == 1024) {
       printf("rwa buffer textures: %u refreshes: %u uploads, %u unchanged\n",
@@ -603,6 +657,10 @@ texture_ensure_sampler_view(struct rwa_device *device, struct pipe_context *pipe
                             char *why, size_t why_size)
 {
    bool rgb2p = rgb2p_format(t->shape.pixel_format) && t->chroma;
+   if (!rgb2p && !texture_require_backing(t, "sampler view", why, why_size))
+      return false;
+   if (buffer_texture_sync_aliases(t, why, why_size) != 0)
+      return false;
    if (rgb2p && !rgb2p_prepare_sample(t, why, why_size)) return false;
    if (t->view)
       return true;
@@ -649,7 +707,8 @@ rwa_texture_destroy(struct rwa_texture *texture)
       texture->backing = NULL;
    }
    argbuf_scrub(texture->device, NULL, texture, NULL);
-   state_texture_gone(texture->device, texture->res);
+   if (texture->res)
+      state_texture_gone(texture->device, texture->res);
    /* Released, not destroyed: a draw may have left the view bound (air_metal_state.inc),
     * and the context's reference then keeps it until it is unbound. */
    pipe_sampler_view_release_ptr(&texture->view);

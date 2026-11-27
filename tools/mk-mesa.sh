@@ -105,8 +105,11 @@ cd "$B"
 # The sources are the archive's with tools/mesa/*.patch on top. When the patches change, a tree that was
 # patched with the earlier ones is of no use (and builds without a word into a library that does not match
 # the rest): the sources are taken from the archive again and everything is built anew, about a minute.
-REBASE_PATCHES=""
-if [ "$REBASE" = 26 ]; then REBASE_PATCHES="$ROOT"/tools/mesa/rebase-26/*.patch; fi
+if [ "$REBASE" = 26 ]; then
+	REBASE_PATCHES="$ROOT"/tools/mesa/rebase-26/*.patch
+else
+	REBASE_PATCHES="$ROOT"/tools/mesa/rebase-25/*.patch
+fi
 # LC_ALL=C inside the substitution, before the globs expand: a shell sorts a glob in the locale's
 # collation, the same 23 October trap the stamp hashed around -- only here it decides
 # .annibale-patches, and a host/container disagreement costs an unpack and re-patch of the tree.
@@ -119,25 +122,20 @@ if [ ! -d mesa-$VERSION ] || [ "$(cat mesa-$VERSION/.annibale-patches 2>/dev/nul
 	# No reject may survive from an earlier application: with one in the tree, "did this run add a
 	# reject" has no answer, and an old one reads as a capability that went missing (28 October).
 	find mesa-$VERSION \( -name '*.rej' -o -name '*.orig' \) -delete
-	# On 26.x some hunks of the old patches fail or skip, which is expected: 0003-restore-* re-establishes
-	# what they carried (tools/mesa/rebase-26/README.md). Only there, so a 25.0.7 build still stops on a
-	# patch that no longer fits.
-	# --batch, and the output kept: without it patch asks "File to patch:" and reads the closed stdin as
-	# "skip the hunk", so a patch that no longer fits leaves neither a nonzero status nor a line anyone
-	# reads; the prompt and "malformed patch" in this log are its only trace.
+	# Both 25.0.7 (`rebase-25/`) and 26.2.5 (`rebase-26/`) apply strictly with `--fuzz=0`: zero
+	# rejects, zero skips, and zero fuzz. `--batch` prevents `patch` from prompting on stdin.
 	PATCHLOG=patch.log
 	: > "$PATCHLOG"
-	for p in "$ROOT"/tools/mesa/*.patch; do patch -s --batch --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p" >> "$PATCHLOG" 2>&1 || [ "$REBASE" = 26 ]; done
-	if [ "$REBASE" = 26 ]; then for p in "$ROOT"/tools/mesa/rebase-26/*.patch; do patch -s --batch --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p" >> "$PATCHLOG" 2>&1; done; fi
-	# What the loop above dropped, said out loud once: 26.x is allowed to drop the old hunks, every other
-	# version is not, and a build that dropped one on those is the case this check exists for.
+	for p in "$ROOT"/tools/mesa/*.patch $REBASE_PATCHES; do
+		patch -s --fuzz=0 --batch --no-backup-if-mismatch -d mesa-$VERSION -p1 < "$p" >> "$PATCHLOG" 2>&1
+	done
 	REJECTS=$(find mesa-$VERSION -name '*.rej' | LC_ALL=C sort)
-	DROPPED=$(grep -cE 'File to patch:|malformed patch' "$PATCHLOG" || true)
+	DROPPED=$(grep -cE 'File to patch:|malformed patch|fuzz' "$PATCHLOG" || true)
 	if [ -n "$REJECTS" ] || [ "$DROPPED" != 0 ]; then
-		echo "mk-mesa.sh: $(printf '%s\n' "$REJECTS" | grep -c . || true) reject file(s), $DROPPED skip(s):" >&2
+		echo "mk-mesa.sh: $(printf '%s\n' "$REJECTS" | grep -c . || true) reject file(s), $DROPPED skip/fuzz line(s):" >&2
 		printf '%s\n' "$REJECTS" | grep . >&2 || true
-		grep -nE 'File to patch:|malformed patch' "$PATCHLOG" >&2 || true
-		[ "$REBASE" = 26 ] || exit 1
+		grep -nE 'File to patch:|malformed patch|fuzz' "$PATCHLOG" >&2 || true
+		exit 1
 	fi
 	echo "$PATCHES" > mesa-$VERSION/.annibale-patches
 	# The log goes next to the artifacts: what a round's manifest records has to be readable from
@@ -291,12 +289,7 @@ grep -qx glDrawArrays out/exported-gl.txt || { echo "mk-mesa.sh: exported-gl.txt
 glxml=mesa-$VERSION/src/mapi/glapi/registry/gl.xml
 [ -f "$glxml" ] || glxml=mesa-$VERSION/src/mesa/glapi/glapi/registry/gl.xml
 cp "$glxml" out/gl.xml
-# what fell off the tolerant 26.x patching: `|| [ "$REBASE" = 26 ]` above lets a hunk fail or skip,
-# and the only trace is a .rej in the unpacked tree, which the next rm -rf buries. Collected here
-# so the drift is a file read beside the library instead of an argument nobody kept -- recorded,
-# never fatal, because 26.x is expected to carry some (tools/mesa/rebase-26/README.md). Only the
-# suffixes GNU patch itself writes: an earlier form also collected *.frag and caught two of
-# Mesa's own shader files (src/tool/gamma, src/vulkan/overlay-layer) for it.
+# Record any unexpected leftovers beside the library (expected empty under --fuzz=0).
 { echo "# mesa-$VERSION, patches $PATCHES"
 	find mesa-$VERSION \( -name '*.rej' -o -name '*.orig' \) -type f -print | LC_ALL=C sort
 } > out/patch-survey.txt

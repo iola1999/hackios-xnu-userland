@@ -1,0 +1,206 @@
+diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
+index e887ec5..0c47d4b 100644
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -260,9 +260,15 @@ restart:
+    if (bo)
+       goto out_unlock;
+ 
++#ifdef __APPLE__
++   /* (what comes in here is an IOSurface, and the "file descriptor" its ID) */
++   struct annibale_drm_surface surface = { .surface = fd };
++   size = annibale_drm_surface(dev->fd, &surface) ? 0 : surface.size;
++#else
+    /* lseek() to get bo size */
+    size = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_CUR);
++#endif
+ 
+    bo = import_bo_from_handle(dev, size, handle);
+ 
+@@ -489,7 +495,11 @@ fd_bo_fini_common(struct fd_bo *bo)
+    fd_bo_fini_fences(bo);
+ 
+    if (bo->map)
++#ifdef __APPLE__
++      annibale_drm_unmap(bo->dev->fd, bo->handle, bo->map);
++#else
+       os_munmap(bo->map, bo->size);
++#endif
+ 
+    if (handle) {
+       simple_mtx_lock(&table_lock);
+@@ -633,8 +643,48 @@ fd_bo_map_os_mmap(struct fd_bo *bo)
+    if (ret) {
+       return NULL;
+    }
++#ifdef __APPLE__
++   /* no mmap() on a device here: the kernel's driver maps the buffer (src/annibale-drm) */
++   return annibale_drm_map(bo->dev->fd, bo->handle, bo->size);
++#else
+    return os_mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   bo->dev->fd, offset);
++#endif
++}
++
++/* The kernel maps a buffer on the first touch of each page, and on this device that fault costs
++ * milliseconds: 196 of them against 824 ms of wall clock in one draw's state emission, with 128 us of
++ * CPU, is the measurement this exists for. Touching one byte per page once, at the first map, moves
++ * that cost to a place where it is one line instead of a stall inside a draw. */
++static void
++fd_bo_prefault(struct fd_bo *bo)
++{
++   uint64_t began, took;
++   unsigned long page = (unsigned long)sysconf(_SC_PAGESIZE);
++   volatile uint8_t *bytes = bo->map;
++
++   if (bo->prefaulted || bo->map == NULL || bo->size == 0)
++      return;
++   bo->prefaulted = true;
++   if (page == 0)
++      page = 4096;
++
++   began = os_time_get_nano() / 1000;
++   /* An imported bo can be memory the caller mapped read-only (kAnnibaleMemory with
++    * MSM_BO_GPU_READONLY), whose mapping here is read-only too: it is only read. */
++   for (unsigned off = 0; off < bo->size; off += page) {
++      if (bo->alloc_flags & FD_BO_SHARED)
++         (void)bytes[off];
++      else
++         bytes[off] = bytes[off];   /* read then write the same byte: the write is what faults it in */
++   }
++   took = os_time_get_nano() / 1000 - began;
++
++   if (took >= 5000) {
++      printf("fd bo prefault slow: %p %u bytes %llu us\n", (void *)bo, bo->size,
++             (unsigned long long)took);
++      fflush(stdout);
++   }
+ }
+ 
+ /* For internal use only, does not check FD_BO_NOMAP: */
+@@ -649,6 +699,7 @@ __fd_bo_map(struct fd_bo *bo)
+       }
+    }
+ 
++   fd_bo_prefault(bo);
+    return bo->map;
+ }
+ 
+@@ -694,24 +745,6 @@ fd_bo_prefer_upload(struct fd_bo *bo, unsigned len)
+    return false;
+ }
+ 
+-/* The one call on the draw path that waits inside the kernel with a timeout: kMsmGemCpuPrep via
+- * fd_fence_wait below, and flush_streamout reaches it through the same map. It is timed in real
+- * microseconds (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us), with this
+- * thread's CPU time beside it: a wait asleep in the ioctl shows a wall of hundreds of milliseconds
+- * against a cpu of tens of microseconds, and that difference is the whole point of the line. */
+-static uint64_t
+-bo_prep_cpu_us(void)
+-{
+-   mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+-   struct thread_basic_info info;
+-
+-   if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
+-                   (thread_info_t)&info, &count) != KERN_SUCCESS)
+-      return 0;
+-   return ((uint64_t)info.user_time.seconds + (uint64_t)info.system_time.seconds) * 1000000 +
+-          (uint64_t)info.user_time.microseconds + (uint64_t)info.system_time.microseconds;
+-}
+-
+ /* a bit odd to take the pipe as an arg, but it's a, umm, quirk of kgsl.. */
+ static int
+ fd_bo_cpu_prep_body(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+@@ -782,11 +815,13 @@ fd_bo_cpu_prep_body(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+    return bo->funcs->cpu_prep(bo, pipe, op);
+ }
+ 
++/* The one call on the draw path that waits inside the kernel with a timeout: kMsmGemCpuPrep via
++ * fd_fence_wait, and flush_streamout reaches it through the same map. Timed in real microseconds
++ * (os_time_get_nano, not fd_perf_us, whose unit on this device is 52.083 us). */
+ int
+ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+ {
+    uint64_t began = os_time_get_nano() / 1000;
+-   uint64_t cpu_began = bo_prep_cpu_us();
+    int rc = fd_bo_cpu_prep_body(bo, pipe, op);
+    uint64_t took = os_time_get_nano() / 1000 - began;
+ 
+@@ -794,9 +829,8 @@ fd_bo_cpu_prep(struct fd_bo *bo, struct fd_pipe *pipe, uint32_t op)
+     * otherwise print one. `ver` is the BO handle, the nearest thing this struct has to a version
+     * (it carries no seqno). */
+    if (took >= 1000) {
+-      printf("fd bo prep slow: bo %p flags %u %llu us (cpu %llu) ver %u\n", (void *)bo, op,
+-             (unsigned long long)took, (unsigned long long)(bo_prep_cpu_us() - cpu_began),
+-             bo->handle);
++      printf("fd bo prep slow: bo %p flags %u %llu us ver %u\n", (void *)bo, op,
++             (unsigned long long)took, bo->handle);
+       fflush(stdout);
+    }
+    return rc;
+diff --git a/src/freedreno/drm/freedreno_drmif.h b/src/freedreno/drm/freedreno_drmif.h
+index ecb84aa..cdc401a 100644
+--- a/src/freedreno/drm/freedreno_drmif.h
++++ b/src/freedreno/drm/freedreno_drmif.h
+@@ -214,6 +214,7 @@ struct fd_bo {
+    int32_t refcnt;
+    uint32_t reloc_flags; /* flags like FD_RELOC_DUMP to use for relocs to this BO */
+    uint32_t alloc_flags; /* flags that control allocation/mapping, ie. FD_BO_x */
++   bool prefaulted;      /* the pages were touched once at first map (see __fd_bo_map) */
+    uint64_t iova;
+    void *map;
+    const struct fd_bo_funcs *funcs;
+diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
+index ee7b54e..9afd0b8 100644
+--- a/src/gallium/drivers/freedreno/freedreno_resource.c
++++ b/src/gallium/drivers/freedreno/freedreno_resource.c
+@@ -1527,7 +1527,12 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
+    rsc->b.is_shared = true;
+ 
+    struct fd_bo *bo = fd_screen_bo_from_handle(pscreen, handle);
++   static unsigned said;
++
+    if (!bo) {
++      if (said++ < 16)
++         printf("fd import: no bo for handle %u (type %u), %ux%u format %u\n", handle->handle,
++                handle->type, tmpl->width0, tmpl->height0, tmpl->format);
+       if (FD_DBG(LAYOUT))
+          mesa_loge("handle import failed for: %" PRSC_FMT, PRSC_ARGS(tmpl));
+       goto fail;
+@@ -1540,12 +1545,19 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
+    if (tmpl->target == PIPE_BUFFER) {
+       fdl_layout_buffer(&rsc->layout, tmpl->width0);
+    } else if (!screen->layout_resource_for_handle(rsc, handle)) {
++      if (said++ < 16)
++         printf("fd import: layout refused %ux%u format %u, stride %u offset %u, bo %u bytes\n",
++                tmpl->width0, tmpl->height0, tmpl->format, handle->stride, handle->offset,
++                fd_bo_size(bo));
+       if (FD_DBG(LAYOUT))
+          mesa_loge("layout failed for: %" PRSC_FMT, PRSC_ARGS(tmpl));
+       goto fail;
+    }
+ 
+    if (rsc->layout.pitch0 != handle->stride) {
++      if (said++ < 16)
++         printf("fd import: pitch %u for stride %u, %ux%u format %u\n", rsc->layout.pitch0,
++                handle->stride, tmpl->width0, tmpl->height0, tmpl->format);
+       if (FD_DBG(LAYOUT))
+          mesa_loge("invalid pitch (%u vs %u) for: %" PRSC_FMT, rsc->layout.pitch0,
+                    handle->stride, PRSC_ARGS(tmpl));
+diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
+index 87d9241..cd2b6bb 100644
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -860,7 +860,10 @@ fd_screen_bo_from_handle(struct pipe_screen *pscreen,
+    if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+       bo = fd_bo_from_name(screen->dev, whandle->handle);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+-      bo = fd_bo_from_handle(screen->dev, whandle->handle, 0);
++      /* HackiOS: AIR imports a buffer over the caller's memory (kAnnibaleMemory) by its handle and
++       * passes its size here. With 0 the bo has no size, and every texture laid over that buffer
++       * fails the layout's size check. */
++      bo = fd_bo_from_handle(screen->dev, whandle->handle, whandle->size);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+       bo = fd_bo_from_dmabuf(screen->dev, whandle->handle);
+    } else {

@@ -845,7 +845,7 @@
     }
  }
  
-@@ -119,6 +121,9 @@
+@@ -119,5 +121,8 @@
  
     /* mark the result available: */
     struct fd_batch *batch = fd_context_batch(ctx);
@@ -853,8 +853,7 @@
 +      return;
 +
     struct fd_ringbuffer *ring = fd_batch_get_tile_epilogue(batch);
-    if (!ring)
-       return;
+    struct fd_resource *rsc = fd_resource(aq->prsc);
 @@ -193,6 +198,8 @@
     struct fd_acc_query *aq = fd_acc_query(q);
     const struct fd_acc_sample_provider *p = aq->provider;

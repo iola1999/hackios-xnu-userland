@@ -62,12 +62,13 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-AIR2NIR = os.environ.get(
-    "AIR2NIR", os.path.join(ROOT, "build/mesa-host/build/src/compiler/air/air2nir"))
-IR3 = os.environ.get(
-    "IR3", os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler"))
-CHIP_ID = os.environ.get("AIR_CHIP_ID", "0x007506030500")
+import air_env
+
+ROOT = air_env.ROOT
+AIR2NIR = air_env.air2nir_path()
+IR3 = air_env.ir3_path()
+LLVM_AS = air_env.llvm_as_path()
+CHIP_ID = air_env.DEFAULT_CHIP_ID
 IOS = os.environ.get("IOS", os.path.join(ROOT, "ios26"))
 QUARTZCORE = os.path.join(
     IOS, "rootfs/System/Library/Frameworks/QuartzCore.framework/default.metallib")
@@ -305,7 +306,7 @@ def assemble(ll, work, n):
     bc = os.path.join(work, "v%d.bc" % n)
     with open(src, "w") as f:
         f.write(ll)
-    q = subprocess.run(["llvm-as", "-o", bc, src], capture_output=True)
+    q = subprocess.run([LLVM_AS, "-o", bc, src], capture_output=True)
     if q.returncode != 0:
         return None, "llvm-as: " + q.stderr.decode().strip().splitlines()[0]
     return bc, None
@@ -474,7 +475,16 @@ DECL = {
 
 def real_modules(verbose):
     """Returns (checked, failures) over QuartzCore's [[stage_in]] vertex shaders."""
-    q = subprocess.run([AIR2NIR, "--list", QUARTZCORE], capture_output=True)
+    with tempfile.TemporaryDirectory(prefix="vattrcheck-qc.") as td:
+        qc_path, _ = air_env.materialize_metallib(QUARTZCORE, td, "quartzcore")
+        if not qc_path:
+            print("     %s contains no MTLB slice" % QUARTZCORE)
+            return 0, 1
+        return _check_real_metallib(qc_path, verbose)
+
+
+def _check_real_metallib(qc_path, verbose):
+    q = subprocess.run([AIR2NIR, "--list", qc_path], capture_output=True)
     if q.returncode != 0:
         print("     %s" % q.stderr.decode().strip())
         return 0, 1
@@ -484,7 +494,7 @@ def real_modules(verbose):
     checked = fails = 0
     attributes = unused = 0
     for name in names:
-        ll = subprocess.run([AIR2NIR, "--ll", QUARTZCORE, name],
+        ll = subprocess.run([AIR2NIR, "--ll", qc_path, name],
                             capture_output=True).stdout.decode()
         apple = []
         for line in ll.splitlines():
@@ -507,7 +517,7 @@ def real_modules(verbose):
         attributes += len(apple)
         unused += sum(1 for a in apple if a["unused"])
 
-        info, err = interface(QUARTZCORE, name)
+        info, err = interface(qc_path, name)
         if err:
             print("FAIL %-32s --interface: %s" % (name, err.splitlines()[-1][:70]))
             fails += 1

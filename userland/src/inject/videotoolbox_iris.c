@@ -180,6 +180,7 @@ struct iris_vt_decoder {
 	uint32_t session_id;
 	uint32_t width;
 	uint32_t height;
+	uint8_t bit_depth;
 	uint8_t nal_len_size;
 	bool sent_params;
 	bool ioctl_error_reported;
@@ -531,14 +532,22 @@ iris_codec_config(CMFormatDescriptionRef format, uint32_t codec)
 }
 
 static bool
-iris_hevc_depth_supported(CFDataRef config)
+iris_hevc_bit_depth(CFDataRef config, uint8_t *out_depth)
 {
 	/* hvcC v1 stores bitDepthLumaMinus8 and bitDepthChromaMinus8 in the low
-	 * three bits of bytes 17 and 18. Main 10 can also carry 8-bit samples.
-	 * Without a configuration record, the Iris stream-settings check decides. */
+	 * three bits of bytes 17 and 18. Allow 8-bit (0/0) and Main 10 (2/2);
+	 * without a configuration record, default to 8-bit and let Iris PSC decide. */
+	*out_depth = 8u;
 	if (config == NULL || CFDataGetLength(config) < 23) return true;
 	const uint8_t *p = CFDataGetBytePtr(config);
-	return p[0] != 1 || ((p[17] | p[18]) & 7u) == 0;
+	if (p[0] != 1) return true;
+	uint8_t luma = p[17] & 7u, chroma = p[18] & 7u;
+	if (luma == 0u && chroma == 0u) return true;
+	if (luma == 2u && chroma == 2u) {
+		*out_depth = 10u;
+		return true;
+	}
+	return false;
 }
 
 static OSStatus
@@ -554,7 +563,8 @@ iris_configure_session_Locked(struct iris_vt_decoder *dec, VTDecoderSessionRef s
 	}
 
 	CFDataRef cfg = iris_codec_config(format_desc, dec->iris_codec);
-	if (dec->iris_codec == IRIS_CODEC_HEVC && !iris_hevc_depth_supported(cfg)) {
+	uint8_t bit_depth = 8u;
+	if (dec->iris_codec == IRIS_CODEC_HEVC && !iris_hevc_bit_depth(cfg, &bit_depth)) {
 		return kVTVideoDecoderUnsupportedDataFormatErr;
 	}
 
@@ -604,11 +614,14 @@ iris_configure_session_Locked(struct iris_vt_decoder *dec, VTDecoderSessionRef s
 	dec->session_id = sp.session_id;
 	dec->width = (uint32_t)dims.width;
 	dec->height = (uint32_t)dims.height;
+	dec->bit_depth = bit_depth;
 	dec->sent_params = false;
 	dec->session = session;
 	dec->ioctl_error_reported = false;
 
-	int32_t fmt_val = (int32_t)kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+	int32_t fmt_val = (bit_depth == 10u) ?
+	    (int32_t)kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange :
+	    (int32_t)kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
 	int32_t w_val = dims.width;
 	int32_t h_val = dims.height;
 	CFNumberRef cf_fmt = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &fmt_val);
@@ -664,8 +677,13 @@ iris_vt_can_accept_format(CFTypeRef decoder, CMFormatDescriptionRef new_format)
 	if (dec == NULL || new_format == NULL) {
 		return false;
 	}
-	if (CMFormatDescriptionGetMediaSubType(new_format) != dec->codec ||
-	    (dec->iris_codec == IRIS_CODEC_HEVC && !iris_hevc_depth_supported(iris_codec_config(new_format, dec->iris_codec)))) {
+	if (CMFormatDescriptionGetMediaSubType(new_format) != dec->codec) {
+		return false;
+	}
+	uint8_t new_depth = 8u;
+	if (dec->iris_codec == IRIS_CODEC_HEVC &&
+	    (!iris_hevc_bit_depth(iris_codec_config(new_format, dec->iris_codec), &new_depth) ||
+	    new_depth != dec->bit_depth)) {
 		return false;
 	}
 	CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions((CMVideoFormatDescriptionRef)new_format);

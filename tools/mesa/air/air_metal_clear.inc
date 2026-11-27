@@ -66,6 +66,7 @@ rwa_render_clear(struct rwa_device *device, const struct rwa_draw *draw, char *w
          say(why, why_size, "clear attachment belongs to another device");
          return -1;
       }
+      if (!texture_require_backing(t, "clear attachment", why, why_size)) return -1;
       unsigned samples = t->res->nr_samples ? t->res->nr_samples : 1;
       if (!attachment_shape_fits(t, samples, "clear attachment", why, why_size)) return -1;
       unsigned bind = i == draw->color_count ? PIPE_BIND_DEPTH_STENCIL : PIPE_BIND_RENDER_TARGET;

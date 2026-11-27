@@ -25,10 +25,13 @@
 
 mesa_from_stamp() {
 	{ { find "$1"/tools/mesa -maxdepth 1 -type f -name '*.patch' -print
-			# the rebase layer only belongs on 26.x, never on the 25.0.7 default -- and as an `if`,
-			# not as `[ ... ] && find`: under mk-mesa's `set -e` the latter ended the pipeline's
-			# subshell on a 25.x run, hashing a list missing everything after the guard.
-			if [ "$3" = 26 ]; then find "$1"/tools/mesa/rebase-26 -maxdepth 1 -type f -name '*.patch' -print; fi
+			# Each supported Mesa baseline keeps its own non-overlapping patch layer (`rebase-25`
+			# vs `rebase-26`), and as an `if` rather than `[ ... ] && find` under `set -e`.
+			if [ "$3" = 26 ]; then
+				find "$1"/tools/mesa/rebase-26 -maxdepth 1 -type f -name '*.patch' -print
+			else
+				find "$1"/tools/mesa/rebase-25 -maxdepth 1 -type f -name '*.patch' -print
+			fi
 			find "$1"/tools/mesa/annibale-drm -maxdepth 1 -type f -print; } |
 			LC_ALL=C sort | xargs cat
 		echo "mesa-$2 REBASE=$3"; } | sha256sum

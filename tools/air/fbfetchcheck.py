@@ -63,12 +63,13 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-AIR2NIR = os.environ.get(
-    "AIR2NIR", os.path.join(ROOT, "build/mesa-host/build/src/compiler/air/air2nir"))
-IR3 = os.environ.get(
-    "IR3", os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler"))
-CHIP_ID = os.environ.get("AIR_CHIP_ID", "0x007506030500")
+import air_env
+
+ROOT = air_env.ROOT
+AIR2NIR = air_env.air2nir_path()
+IR3 = air_env.ir3_path()
+LLVM_AS = air_env.llvm_as_path()
+CHIP_ID = air_env.DEFAULT_CHIP_ID
 
 SKELETON = """source_filename = "fbf"
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
@@ -199,7 +200,7 @@ def build(ll, work, n):
     src = os.path.join(work, "fbf%d.ll" % n)
     with open(src, "w") as f:
         f.write(ll)
-    q = subprocess.run(["llvm-as", "-o", bc, src], capture_output=True)
+    q = subprocess.run([LLVM_AS, "-o", bc, src], capture_output=True)
     if q.returncode != 0:
         return None, "llvm-as: " + q.stderr.decode().strip().splitlines()[0]
     return bc, None

@@ -51,6 +51,7 @@ usage: discardcheck.py [-v]                  the shape, here
        discardcheck.py --check DIR RUN.LOG   judge what the phone printed
 """
 
+import argparse
 import json
 import os
 import re
@@ -58,16 +59,15 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-AIR2NIR = os.environ.get(
-    "AIR2NIR", os.path.join(ROOT, "build/mesa-host/build/src/compiler/air/air2nir"))
-AIR_RUN = os.environ.get(
-    "AIR_RUN",
-    os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/air_run"))
-IR3 = os.environ.get(
-    "IR3", os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler"))
-# the POCO X5 Pro's Adreno 7c+ Gen 3 (A635), as corpus.py names it
-CHIP_ID = os.environ.get("AIR_CHIP_ID", "0x007506030500")
+import air_env
+
+ROOT = air_env.ROOT
+CHIP_ID = air_env.DEFAULT_CHIP_ID
+resolve_chip_id = air_env.resolve_chip_id
+AIR2NIR = air_env.air2nir_path()
+AIR_RUN = air_env.air_run_path()
+IR3 = air_env.ir3_path()
+LLVM_AS = air_env.llvm_as_path()
 
 HEAD = """source_filename = "dc"
 target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:16:32"
@@ -174,7 +174,7 @@ def assemble(src, path):
     ll = path + ".ll"
     with open(ll, "w") as f:
         f.write(src)
-    q = subprocess.run(["llvm-as", "-o", path, ll], capture_output=True)
+    q = subprocess.run([LLVM_AS, "-o", path, ll], capture_output=True)
     if q.returncode:
         return "llvm-as: " + q.stderr.decode().strip().splitlines()[0]
     return None
@@ -196,81 +196,86 @@ def numbers_after(text, marker="came back as"):
     return out
 
 
-def shape(verbose):
+def shape(verbose, chip_id=CHIP_ID):
     """Everything about a discard that is decidable without a GPU."""
-    d = tempfile.mkdtemp(prefix="discardcheck.")
     bad = 0
-    for case in CASES:
-        bc = os.path.join(d, case["id"] + ".bc")
-        err = assemble(case["src"], bc)
-        if err:
-            print("REFUSED %-14s %s" % (case["id"], err))
-            bad += 1
-            continue
-
-        # 1. it translates
-        out = subprocess.run([AIR2NIR, "--report", bc], capture_output=True,
-                             text=True).stdout
-        if "translate=ok" not in out:
-            print("WRONG   %-14s does not translate: %s" % (case["id"], out.strip()[:120]))
-            bad += 1
-            continue
-
-        # 2. the NIR carries demote and not terminate. air2nir prints the NIR
-        #    it produced when run with no mode flag; before the rebase to 26.x
-        #    this reading came from ir3_cmdline, which printed the same NIR.
-        printed = subprocess.run([AIR2NIR, bc, case["id"]],
-                                 capture_output=True, text=True)
-        nir = printed.stdout + printed.stderr
-        has_demote = re.search(r"@demote\b", nir) is not None
-        has_terminate = re.search(r"@terminate\b", nir) is not None
-        if not has_demote or has_terminate:
-            print("WRONG   %-14s NIR has %s" % (
-                case["id"], "terminate" if has_terminate else "no demote"))
-            bad += 1
-            continue
-
-        # 3. ir3 compiled it, and what the instruction is -- on the host that
-        #    still has ir3_cmdline. 26.x has no offline compiler to ask (see
-        #    the header), so without one this line is SKIPPED and the
-        #    instruction shape is left to the phone run at the bottom.
-        if os.path.exists(IR3):
-            ir3 = subprocess.run([IR3, "--chip-id", CHIP_ID, "-v", bc, case["id"]],
-                                 capture_output=True, text=True)
-            if ir3.returncode != 0:
-                print("WRONG   %-14s ir3 refused it: %s"
-                      % (case["id"], (ir3.stderr or ir3.stdout).strip()[-120:]))
+    ir3_compiled = 0
+    ir3_skipped = 0
+    with tempfile.TemporaryDirectory(prefix="discardcheck.") as d:
+        for case in CASES:
+            bc = os.path.join(d, case["id"] + ".bc")
+            err = assemble(case["src"], bc)
+            if err:
+                print("REFUSED %-14s %s" % (case["id"], err))
                 bad += 1
                 continue
-            code = ir3.stdout + ir3.stderr
-            kills = len(re.findall(r"^\s*kill ", code, re.M))
-            demotes = len(re.findall(r"^\s*demote ", code, re.M))
-            here = "ir3 ok (%d kill, %d demote in the Adreno code)" % (kills, demotes)
-        else:
-            code = ""
-            here = "ir3 SKIPPED (no offline compiler in 26.x; the phone prints the instruction)"
 
-        # 4. air_run refuses it by name, which is also how uses_discard is
-        #    checked: the refusal reads that flag and nothing else.
-        run = subprocess.run([AIR_RUN, bc], capture_output=True, text=True)
-        text = run.stdout + run.stderr
-        refused = "discards fragments" in text
-        if not refused:
-            vals = numbers_after(text)
-            print("WRONG   %-14s air_run did not refuse it (uses_discard not set?): %s"
-                  % (case["id"], vals if vals is not None else text.strip()[-100:]))
-            bad += 1
-            continue
+            # 1. it translates
+            out = subprocess.run([AIR2NIR, "--report", bc], capture_output=True,
+                                 text=True).stdout
+            if "translate=ok" not in out:
+                print("WRONG   %-14s does not translate: %s" % (case["id"], out.strip()[:120]))
+                bad += 1
+                continue
 
-        print("shape   %-14s translates, NIR demote, %s, air_run refuses it by name"
-              % (case["id"], here))
-        if verbose:
-            for line in (nir + "\n" + code).splitlines():
-                if re.match(r"^\s*(kill|demote) ", line):
-                    print("          %s" % line.strip())
+            # 2. the NIR carries demote and not terminate. air2nir prints the NIR
+            #    it produced when run with no mode flag; before the rebase to 26.x
+            #    this reading came from ir3_cmdline, which printed the same NIR.
+            printed = subprocess.run([AIR2NIR, bc, case["id"]],
+                                     capture_output=True, text=True)
+            nir = printed.stdout + printed.stderr
+            has_demote = re.search(r"@demote\b", nir) is not None
+            has_terminate = re.search(r"@terminate\b", nir) is not None
+            if not has_demote or has_terminate:
+                print("WRONG   %-14s NIR has %s" % (
+                    case["id"], "terminate" if has_terminate else "no demote"))
+                bad += 1
+                continue
+
+            # 3. ir3 compiled it, and what the instruction is -- on the host that
+            #    still has ir3_cmdline. 26.x has no offline compiler to ask (see
+            #    the header), so without one this line is SKIPPED and the
+            #    instruction shape is left to the phone run at the bottom.
+            if os.path.exists(IR3):
+                ir3 = subprocess.run([IR3, "--chip-id", chip_id, "-v", bc, case["id"]],
+                                     capture_output=True, text=True)
+                if ir3.returncode != 0:
+                    print("WRONG   %-14s ir3 refused it: %s"
+                          % (case["id"], (ir3.stderr or ir3.stdout).strip()[-120:]))
+                    bad += 1
+                    continue
+                code = ir3.stdout + ir3.stderr
+                kills = len(re.findall(r"^\s*kill ", code, re.M))
+                demotes = len(re.findall(r"^\s*demote ", code, re.M))
+                here = "ir3 ok (%d kill, %d demote in the Adreno code)" % (kills, demotes)
+                ir3_compiled += 1
+            else:
+                code = ""
+                here = "ir3 SKIPPED (no offline compiler in 26.x; the phone prints the instruction)"
+                ir3_skipped += 1
+
+            # 4. air_run refuses it by name, which is also how uses_discard is
+            #    checked: the refusal reads that flag and nothing else.
+            run = subprocess.run([AIR_RUN, bc], capture_output=True, text=True)
+            text = run.stdout + run.stderr
+            refused = "discards fragments" in text
+            if not refused:
+                vals = numbers_after(text)
+                print("WRONG   %-14s air_run did not refuse it (uses_discard not set?): %s"
+                      % (case["id"], vals if vals is not None else text.strip()[-100:]))
+                bad += 1
+                continue
+
+            print("shape   %-14s translates, NIR demote, %s, air_run refuses it by name"
+                  % (case["id"], here))
+            if verbose:
+                for line in (nir + "\n" + code).splitlines():
+                    if re.match(r"^\s*(kill|demote) ", line):
+                        print("          %s" % line.strip())
 
     print()
-    print("discardcheck: %d of %d shapes as expected" % (len(CASES) - bad, len(CASES)))
+    print("discardcheck: %d of %d shapes as expected; ir3: %d compiled, %d SKIPPED (chip %s)"
+          % (len(CASES) - bad, len(CASES), ir3_compiled, ir3_skipped, chip_id))
     print("discardcheck: NO VALUE WAS COMPARED HERE. softpipe's TGSI interpreter has no "
           "DEMOTE case at all (tgsi_exec.c), so what a discarded fragment leaves in the "
           "framebuffer cannot be measured on this machine; `--emit` writes the two "
@@ -410,12 +415,17 @@ def check(outdir, logpath):
 
 
 def main(argv):
-    verbose = "-v" in argv
-    if "--emit" in argv:
-        return emit(argv[argv.index("--emit") + 1])
-    if "--check" in argv:
-        i = argv.index("--check")
-        return check(argv[i + 1], argv[i + 2])
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--emit")
+    ap.add_argument("--check", nargs=2)
+    ap.add_argument("--chip-id", default=CHIP_ID)
+    args, _ = ap.parse_known_args(argv)
+    chip_id = resolve_chip_id(args.chip_id)
+    if args.emit:
+        return emit(args.emit)
+    if args.check:
+        return check(args.check[0], args.check[1])
     for p, what in ((AIR2NIR, "air2nir"), (AIR_RUN, "air_run")):
         if not os.path.exists(p):
             print("discardcheck: no %s at %s (run tools/air/mk-host.sh)" % (what, p),
@@ -425,7 +435,7 @@ def main(argv):
         print("discardcheck: no offline ir3 compiler at %s: 26.x has none, so the "
               "instruction line reads SKIPPED and --emit is the judge of it" % IR3,
               file=sys.stderr)
-    return shape(verbose)
+    return shape(args.verbose, chip_id)
 
 
 if __name__ == "__main__":

@@ -29,14 +29,15 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-AIR2NIR = os.environ.get(
-    "AIR2NIR", os.path.join(ROOT, "build/mesa-host/build/src/compiler/air/air2nir"))
-IR3 = os.environ.get(
-    "IR3", os.path.join(ROOT, "build/mesa-host/build/src/gallium/drivers/freedreno/ir3_compiler"))
-# the POCO X5 Pro's Adreno 7c+ Gen 3 (A635), as freedreno names it
-CHIP_ID = os.environ.get("AIR_CHIP_ID", "0x007506030500")
+import air_env
+
+ROOT = air_env.ROOT
+CHIP_ID = air_env.DEFAULT_CHIP_ID
+resolve_chip_id = air_env.resolve_chip_id
+AIR2NIR = air_env.air2nir_path()
+IR3 = air_env.ir3_path()
 
 
 # The mains of the other tools: each one is linked into its own binary and into
@@ -88,31 +89,48 @@ def refuse_if_stale(prog, what):
         sys.exit(1)
 
 
-def read_report(paths):
+def read_report(paths, tempdir=None):
     """air2nir --report, which forks per module so one crash is one line."""
     rows = []
-    for path in paths:
-        out = subprocess.run([AIR2NIR, "--report", path], capture_output=True, text=True)
-        for line in out.stdout.splitlines():
-            if not line.startswith("module="):
+    skipped_archives = []
+    owns_temp = tempdir is None
+    if owns_temp:
+        ctx = tempfile.TemporaryDirectory(prefix="air-corpus-")
+        tempdir = ctx.__enter__()
+    else:
+        ctx = None
+    try:
+        for idx, path in enumerate(paths):
+            lib_label = os.path.join(os.path.basename(os.path.dirname(path)),
+                                     os.path.basename(path))
+            target, kind = air_env.materialize_metallib(path, tempdir, "slice_%d" % idx)
+            if target is None:
+                skipped_archives.append((lib_label, kind))
                 continue
-            row = dict(kv.split("=", 1) for kv in line.split("\t") if "=" in kv)
-            # two of the five libraries are both called default.metallib, so
-            # the label carries the bundle they are in
-            row["library"] = os.path.join(os.path.basename(os.path.dirname(path)),
-                                          os.path.basename(path))
-            row["path"] = path
-            row["calls"] = [c for c in row.get("calls", "").split(",") if c]
-            rows.append(row)
-    return rows
+            out = subprocess.run([AIR2NIR, "--report", target], capture_output=True, text=True)
+            for line in out.stdout.splitlines():
+                if not line.startswith("module="):
+                    continue
+                row = dict(kv.split("=", 1) for kv in line.split("\t") if "=" in kv)
+                # Two of the corpus libraries are called default.metallib, so keep parent dir.
+                row["library"] = lib_label
+                row["path"] = target
+                row["source_path"] = path
+                calls_raw = row.get("calls", "").split("module=")[0]
+                row["calls"] = [c for c in calls_raw.split(",") if c]
+                rows.append(row)
+    finally:
+        if ctx is not None:
+            ctx.__exit__(None, None, None)
+    return rows, skipped_archives
 
 
-def run_ir3(rows):
+def run_ir3(rows, chip_id):
     """ir3 on every module that translated, one process each."""
     for row in rows:
         if row.get("translate") != "ok":
             continue
-        out = subprocess.run([IR3, "--chip-id", CHIP_ID, row["path"], row["module"]],
+        out = subprocess.run([IR3, "--chip-id", chip_id, row["path"], row["module"]],
                              capture_output=True, text=True, timeout=300)
         if out.returncode == 0:
             row["ir3"] = "ok"
@@ -130,6 +148,8 @@ def run_ir3(rows):
 def reason(row):
     if row.get("crash"):
         return "crashed: " + row["crash"]
+    if row.get("reader") == "skip":
+        return None
     if row.get("reader") != "ok":
         return row.get("error", "reader failed")
     if row.get("translate") != "ok":
@@ -163,9 +183,12 @@ def main():
     # the list can come from a file (one path per line) instead.
     ap.add_argument("--list", help="file of library paths, one per line")
     ap.add_argument("--ir3", action="store_true", help="also compile through ir3")
+    ap.add_argument("--chip-id", default=CHIP_ID,
+                    help="Adreno chip ID or alias (default: %s / a830)" % CHIP_ID)
     ap.add_argument("--json")
     ap.add_argument("--md")
     args = ap.parse_args()
+    chip_id = resolve_chip_id(args.chip_id)
 
     libs = list(args.libs)
     if args.list:
@@ -174,36 +197,46 @@ def main():
     if not libs:
         ap.error("no libraries: give paths, or --list FILE")
 
-    rows = read_report(libs)
-    if not rows:
-        sys.exit("corpus.py: no modules; is %s built?" % AIR2NIR)
-    if args.ir3:
-        if os.path.exists(IR3):
-            refuse_if_stale(IR3, "ir3_compiler")
-            run_ir3(rows)
-        else:
-            # 26.x has no offline compiler: upstream deleted ir3_cmdline (986530d231)
-            # and left no replacement, so the table drops the column instead of
-            # aborting -- the reader and translate columns are still worth reading.
-            # The same shape as the SKIPPED line in discardcheck.py; the phone prints
-            # the instructions (docs/analysis/mesa-rebase-2026-10.md 10.3).
-            print("corpus.py: no offline ir3 compiler at %s: the ir3 column is dropped "
-                  "and the table stops at translate" % IR3, file=sys.stderr)
-            args.ir3 = False
+    with tempfile.TemporaryDirectory(prefix="air-corpus-") as tempdir:
+        rows, skipped_archives = read_report(libs, tempdir)
+        if not rows and not skipped_archives:
+            sys.exit("corpus.py: no modules; is %s built?" % AIR2NIR)
+        ir3_state = "off"
+        if args.ir3:
+            if os.path.exists(IR3):
+                refuse_if_stale(IR3, "ir3_compiler")
+                run_ir3(rows, chip_id)
+                ir3_state = "ok"
+            else:
+                # 26.x has no offline compiler: keep ir3 separate as SKIPPED rather than passed.
+                print("corpus.py: no offline ir3 compiler at %s: ir3 is SKIPPED (not counted as passed)" % IR3,
+                      file=sys.stderr)
+                ir3_state = "skipped"
 
     total = len(rows)
     stages = collections.OrderedDict()
     stages["container"] = total
     stages["reader"] = sum(1 for r in rows if r.get("reader") == "ok")
     stages["translate"] = sum(1 for r in rows if r.get("translate") == "ok")
-    if args.ir3:
+    skipped = {}
+    if ir3_state == "ok":
         stages["ir3"] = sum(1 for r in rows if r.get("ir3") == "ok")
+    elif ir3_state == "skipped":
+        stages["ir3"] = 0
+        skipped["ir3"] = stages["translate"]
+    if skipped_archives:
+        skipped["archives"] = [lbl for lbl, _ in skipped_archives]
+
+    def ir3_cell(rs):
+        if ir3_state == "ok":
+            return str(sum(1 for r in rs if r.get("ir3") == "ok"))
+        if ir3_state == "skipped":
+            return "SKIPPED (%d)" % sum(1 for r in rs if r.get("translate") == "ok")
+        return "-"
 
     by_stage = collections.Counter(r.get("stage", "?") for r in rows)
     ok_by_stage = collections.Counter(r.get("stage", "?") for r in rows
                                       if r.get("translate") == "ok")
-    ir3_by_stage = collections.Counter(r.get("stage", "?") for r in rows
-                                       if r.get("ir3") == "ok")
     reasons = collections.Counter(short_reason(reason(r)) for r in rows
                                   if reason(r) is not None)
     intrinsics = collections.Counter(c for r in rows for c in r["calls"])
@@ -213,21 +246,34 @@ def main():
     out.append("# AIR corpus report\n")
     out.append("What every module of the system's Metal libraries does when put through the\n"
                "frontend. Generated by `tools/air/corpus.py`; see docs/air.md section 5 for\n"
-               "what the stages mean. **Reaching ir3 means it compiled, not that it is\n"
-               "correct**: correctness needs the CPU reference and a run on the GPU.\n")
+               "what the stages mean. Target chip ID: `%s`. **Reaching ir3 means it compiled,\n"
+               "not that it is correct**: correctness needs the CPU reference and a run on the GPU.\n"
+               % chip_id)
     out.append("## Stages\n")
     out.append("| stage | modules | of %d |" % total)
     out.append("| --- | --- | --- |")
     for name, n in stages.items():
-        out.append("| %s | %d | %.0f%% |" % (name, n, 100.0 * n / total))
+        if name == "ir3" and ir3_state == "skipped":
+            out.append("| %s | %d | 0%% (SKIPPED: %d) |" % (name, n, skipped["ir3"]))
+        else:
+            pct = (100.0 * n / total) if total else 0.0
+            out.append("| %s | %d | %.0f%% |" % (name, n, pct))
     out.append("")
+
+    if skipped_archives:
+        out.append("## Skipped non-AIR libraries\n")
+        out.append("| library | status |")
+        out.append("| --- | --- |")
+        for lbl, kind in skipped_archives:
+            out.append("| %s | SKIPPED (%s) |" % (lbl, kind))
+        out.append("")
 
     out.append("## By stage of the shader\n")
     out.append("| what the module is | modules | translate | ir3 |")
     out.append("| --- | --- | --- | --- |")
     for st in sorted(by_stage):
-        out.append("| %s | %d | %d | %s |" % (st, by_stage[st], ok_by_stage[st],
-                                              ir3_by_stage[st] if args.ir3 else "-"))
+        rs = [r for r in rows if r.get("stage", "?") == st]
+        out.append("| %s | %d | %d | %s |" % (st, by_stage[st], ok_by_stage[st], ir3_cell(rs)))
     out.append("")
 
     # The container's TYPE tag and the module's own metadata are two
@@ -258,17 +304,18 @@ def main():
             rs = [r for r in rows if r["library"] == lib]
             out.append("| %s | %d | %d | %s |" % (
                 lib, len(rs), sum(1 for r in rs if r.get("translate") == "ok"),
-                sum(1 for r in rs if r.get("ir3") == "ok") if args.ir3 else "-"))
+                ir3_cell(rs)))
     else:
         out.append("%d libraries, %.2f modules each on average; not listed one by one.\n"
-                   % (len(libnames), float(total) / len(libnames)))
+                   % (len(libnames), (float(total) / len(libnames)) if libnames else 0.0))
     out.append("")
 
     out.append("## Modules that call no `air.*` at all\n")
+    no_pct = (100.0 * len(no_intrinsics) / total) if total else 0.0
     out.append("%d of %d (%.0f%%), of which %d translate and %s compile through ir3.\n" % (
-        len(no_intrinsics), total, 100.0 * len(no_intrinsics) / total,
+        len(no_intrinsics), total, no_pct,
         sum(1 for r in no_intrinsics if r.get("translate") == "ok"),
-        sum(1 for r in no_intrinsics if r.get("ir3") == "ok") if args.ir3 else "-"))
+        ir3_cell(no_intrinsics)))
 
     if reasons:
         out.append("## What is not handled yet, by how many modules it stops\n")
@@ -316,10 +363,18 @@ def main():
         print(text)
     if args.json:
         with open(args.json, "w") as f:
-            json.dump({"total": total, "stages": stages, "rows": rows}, f, indent=1)
+            json.dump({"chip_id": chip_id, "total": total, "stages": stages,
+                       "skipped": skipped, "rows": rows}, f, indent=1)
 
-    print("corpus.py: %s" % ", ".join("%s %d/%d" % (k, v, total) for k, v in stages.items()),
-          file=sys.stderr)
+    parts = []
+    for k, v in stages.items():
+        if k == "ir3" and ir3_state == "skipped":
+            parts.append("ir3 %d/%d (SKIPPED %d)" % (v, total, skipped["ir3"]))
+        else:
+            parts.append("%s %d/%d" % (k, v, total))
+    if skipped_archives:
+        parts.append("archives SKIPPED %d" % len(skipped_archives))
+    print("corpus.py (chip %s): %s" % (chip_id, ", ".join(parts)), file=sys.stderr)
 
 
 if __name__ == "__main__":

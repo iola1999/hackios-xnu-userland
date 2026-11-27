@@ -1,0 +1,106 @@
+diff --git a/meson.build b/meson.build
+index 5f19ef9..0e39110 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1933,7 +1933,15 @@ else
+   # dependencies (such as vk-runtime) linking to it
+   dep_libdrm = null_dep
+ endif
+-if dep_libdrm.found()
++if host_machine.system() == 'darwin' and with_gallium_freedreno
++  # No DRM on this system: freedreno's requests go to the kernel's driver through a stand-in
++  # for libdrm (src/annibale-drm, put there by Darwin on annibale's tools/mk-mesa.sh; its one
++  # source file is built with freedreno's drm layer, src/freedreno/drm).
++  dep_libdrm = declare_dependency(
++    include_directories : include_directories('src/annibale-drm'),
++    link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
++  )
++elif dep_libdrm.found()
+   pre_args += '-DHAVE_LIBDRM'
+   if with_dri_platform == 'drm' and with_dri
+     with_gallium_drisw_kms = true
+diff --git a/src/freedreno/drm/meson.build b/src/freedreno/drm/meson.build
+index d2baf58..193e0d4 100644
+--- a/src/freedreno/drm/meson.build
++++ b/src/freedreno/drm/meson.build
+@@ -46,6 +46,9 @@ libfreedreno_drm_msm_files = files(
+   'msm/msm_ringbuffer_sp.c',
+ )
+ libfreedreno_drm_files += libfreedreno_drm_msm_files
++if host_machine.system() == 'darwin'
++  libfreedreno_drm_files += files('../../annibale-drm/annibale_drm.c')
++endif
+ 
+ libfreedreno_drm_virtio_files = files(
+   'virtio/virtio_bo.c',
+diff --git a/src/freedreno/drm/msm/msm_priv.h b/src/freedreno/drm/msm/msm_priv.h
+index ea74225..9fc9e92 100644
+--- a/src/freedreno/drm/msm/msm_priv.h
++++ b/src/freedreno/drm/msm/msm_priv.h
+@@ -176,7 +176,16 @@ get_abs_timeout(struct drm_msm_timespec *tv, uint64_t ns)
+    if (ns == OS_TIMEOUT_INFINITE)
+       ns = 3600ULL * NSEC_PER_SEC; /* 1 hour timeout is almost infinite */
+ 
++#ifdef __APPLE__
++   /* The kernel's driver goes by the clock that runs on while the machine sleeps,
++    * mach_continuous_time(), which is this one. CLOCK_MONOTONIC is another on Darwin: the
++    * date less the date the system says it was started at. Where the two are not the
++    * same, a time made of the one is long past by the other, and nothing is waited for.
++    */
++   clock_gettime(CLOCK_MONOTONIC_RAW, &t);
++#else
+    clock_gettime(CLOCK_MONOTONIC, &t);
++#endif
+    tv->tv_sec = t.tv_sec + ns / NSEC_PER_SEC;
+    tv->tv_nsec = t.tv_nsec + ns % NSEC_PER_SEC;
+    if (tv->tv_nsec >= NSEC_PER_SEC) { /* handle nsec overflow */
+diff --git a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
+index 3b732d3..6d9e389 100644
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -33,6 +33,10 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+    if (ir3_shader_debug & IR3_DBG_NOCACHE)
+       return;
+ 
++#ifdef __APPLE__
++   /* no build id in a Mach-O library to tell one build's shaders from another's: no cache */
++   return;
++#else
+    const char *renderer = fd_dev_name(compiler->dev_id);
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+@@ -55,6 +59,7 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
++#endif
+ }
+ 
+ void
+diff --git a/src/freedreno/meson.build b/src/freedreno/meson.build
+index e8f01b8..a6c37f9 100644
+--- a/src/freedreno/meson.build
++++ b/src/freedreno/meson.build
+@@ -22,7 +22,7 @@ subdir('ir2')
+ subdir('ir3')
+ subdir('fdl')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm or host_machine.system() == 'darwin'
+   subdir('drm')
+ endif
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_batch.h b/src/gallium/drivers/freedreno/freedreno_batch.h
+index d2caec5..117c7a1 100644
+--- a/src/gallium/drivers/freedreno/freedreno_batch.h
++++ b/src/gallium/drivers/freedreno/freedreno_batch.h
+@@ -136,6 +136,9 @@ struct fd_batch {
+    /* Driver specific barrier/flush flags: */
+    unsigned barrier;
+ 
++   /* The last draw emitted read the framebuffer (see fd6_draw.cc): */
++   bool prev_draw_read_fb;
++
+    /* A calculated "draw cost" value for the batch, which tries to
+     * estimate the bandwidth-per-sample of all the draws according
+     * to:

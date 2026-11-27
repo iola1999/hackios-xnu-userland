@@ -219,6 +219,9 @@ do_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice,
       say(why, why_size, "combined RGB2P copies require both planes");
       return -1;
    }
+   if (!texture_require_backing(src, "texture copy source", why, why_size) ||
+       !texture_require_backing(dst, "texture copy destination", why, why_size))
+      return -1;
    if (src->res->format != dst->res->format || src->shape.pixel_format != dst->shape.pixel_format) {
       say(why, why_size, "texture copy requires identical pixel formats");
       return -1;
@@ -234,6 +237,9 @@ do_texture_copy(struct rwa_texture *src, unsigned src_level, unsigned src_slice,
       say(why, why_size, "the driver has no resource copy operation");
       return -1;
    }
+   if (buffer_texture_sync_aliases(src, why, why_size) != 0 ||
+       buffer_texture_sync_aliases(dst, why, why_size) != 0)
+      return -1;
    bool overlap = src->res == dst->res && src_level == dst_level && src_slice == dst_slice &&
                   from.x < to.x + to.width && to.x < from.x + from.width &&
                   from.y < to.y + to.height && to.y < from.y + from.height;
