@@ -72,6 +72,7 @@ power(int on)
 static CFTypeRef mwsj_assoc;            /* WiFiDeviceClientAssociateAsync */
 static CFTypeRef mwsj_device;           /* devices[0] */
 static char mwsj_ssid[33];              /* the network to join */
+static char mwsj_pass[65];              /* WPA passphrase or 64-hex PMK */
 static int mwsj_sent;
 
 static void
@@ -117,9 +118,19 @@ mwsj_scan_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
 		    RTLD_NOW);
 		int (*disassoc)(CFTypeRef) = mw2 ? dlsym(mw2, "WiFiDeviceClientDisassociate") : NULL;
 		int (*cancel)(CFTypeRef) = mw2 ? dlsym(mw2, "WiFiDeviceClientAssociateCancel") : NULL;
-		int (*assoc)(CFTypeRef, CFTypeRef, CFDictionaryRef, void *) = (void *)mwsj_assoc;
+		int (*set_pass)(CFTypeRef, CFStringRef) = mw2 ? dlsym(mw2, "WiFiNetworkSetPassword") : NULL;
+		/* MobileWiFi ABI: WiFiDeviceClientAssociateAsync(device, network, callback, context) */
+		int (*assoc)(CFTypeRef, CFTypeRef, void *, void *) = (void *)mwsj_assoc;
 
 		mwsj_sent = 1;
+		if (set_pass != NULL && mwsj_pass[0] != '\0') {
+			CFStringRef secret = CFStringCreateWithCString(kCFAllocatorDefault, mwsj_pass,
+			    kCFStringEncodingUTF8);
+			if (secret != NULL) {
+				set_pass(picked, secret);
+				CFRelease(secret);
+			}
+		}
 		/* an earlier AssociateAsync that never completed can leave a stale
 		   in-flight command in front of this one: cancel, then disassociate
 		   (the kernel's standing rejoin leaves wifid "currently associated",
@@ -134,7 +145,7 @@ mwsj_scan_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
 			fprintf(stderr, "a80211_test: WiFiDeviceClientDisassociate -> %d\n", d);
 			CFRunLoopRunInMode(kCFRunLoopDefaultMode, 3, false);
 		}
-		int error = assoc(mwsj_device, picked, NULL, mwsj_assoc_cb);
+		int error = assoc(mwsj_device, picked, mwsj_assoc_cb, NULL);
 		fprintf(stderr, "a80211_test: WiFiDeviceClientAssociateAsync(scan-result %p) -> %d\n",
 		    picked, error);
 	} else if (picked == NULL) {
@@ -180,6 +191,7 @@ mwscanjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t *passphrase,
 			pass[i * 2 + 1] = hex[pmk[i] & 15];
 		}
 	}
+	memcpy(mwsj_pass, pass, sizeof(mwsj_pass));
 	CFTypeRef client = client_create(kCFAllocatorDefault, 0);
 	/* the client's XPC replies ride this runloop; without scheduling, async
 	   callbacks (scan results, association events) never reach us */

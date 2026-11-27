@@ -1,0 +1,256 @@
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -19,6 +19,115 @@
+ simple_mtx_t table_lock = SIMPLE_MTX_INITIALIZER;
+ simple_mtx_t fence_lock = SIMPLE_MTX_INITIALIZER;
+ 
++#ifdef __APPLE__
++static struct {
++   uint64_t since_ns;
++   uint32_t def_heap;
++   uint32_t ring_heap;
++   uint32_t bo_hit;
++   uint32_t bo_miss;
++   uint32_t ring_hit;
++   uint32_t ring_miss;
++   uint32_t expired;
++   uint32_t evicted;
++   uint32_t made;
++   uint32_t fl_204;
++   uint32_t fl_110;
++   uint32_t fl_4;
++   uint32_t fl_402;
++   uint32_t fl_other;
++} fd_bo_stats;
++static pthread_mutex_t fd_bo_stats_mtx = PTHREAD_MUTEX_INITIALIZER;
++
++void
++fd_bo_stats_note(enum fd_bo_stat_kind kind, uint32_t value)
++{
++   switch (kind) {
++   case FD_BO_STAT_DEFAULT_HEAP:
++      p_atomic_add(&fd_bo_stats.def_heap, value);
++      break;
++   case FD_BO_STAT_RING_HEAP:
++      p_atomic_add(&fd_bo_stats.ring_heap, value);
++      break;
++   case FD_BO_STAT_BO_CACHE_HIT:
++      p_atomic_add(&fd_bo_stats.bo_hit, value);
++      break;
++   case FD_BO_STAT_BO_CACHE_MISS:
++      p_atomic_add(&fd_bo_stats.bo_miss, value);
++      break;
++   case FD_BO_STAT_RING_CACHE_HIT:
++      p_atomic_add(&fd_bo_stats.ring_hit, value);
++      break;
++   case FD_BO_STAT_RING_CACHE_MISS:
++      p_atomic_add(&fd_bo_stats.ring_miss, value);
++      break;
++   case FD_BO_STAT_EXPIRED:
++      p_atomic_add(&fd_bo_stats.expired, value);
++      break;
++   case FD_BO_STAT_EVICTED:
++      p_atomic_add(&fd_bo_stats.evicted, value);
++      break;
++   case FD_BO_STAT_MADE:
++      p_atomic_inc(&fd_bo_stats.made);
++      if (value == (FD_BO_NOMAP | FD_BO_HINT_IMAGE))
++         p_atomic_inc(&fd_bo_stats.fl_204);
++      else if (value == (FD_BO_SHARED | FD_BO_HINT_BUFFER))
++         p_atomic_inc(&fd_bo_stats.fl_110);
++      else if (value == FD_BO_NOMAP)
++         p_atomic_inc(&fd_bo_stats.fl_4);
++      else if (value == (FD_BO_GPUREADONLY | FD_BO_HINT_COMMAND))
++         p_atomic_inc(&fd_bo_stats.fl_402);
++      else
++         p_atomic_inc(&fd_bo_stats.fl_other);
++      break;
++   }
++
++   uint64_t now = os_time_get_nano();
++   uint64_t since = READ_ONCE(fd_bo_stats.since_ns);
++   if (since == 0) {
++      if (pthread_mutex_trylock(&fd_bo_stats_mtx) == 0) {
++         if (fd_bo_stats.since_ns == 0)
++            fd_bo_stats.since_ns = now;
++         pthread_mutex_unlock(&fd_bo_stats_mtx);
++      }
++      return;
++   }
++   if (now - since < 5000000000ull)
++      return;
++   if (pthread_mutex_trylock(&fd_bo_stats_mtx) != 0)
++      return;
++   since = fd_bo_stats.since_ns;
++   if (now - since >= 5000000000ull) {
++      uint32_t def_heap = p_atomic_xchg(&fd_bo_stats.def_heap, 0);
++      uint32_t ring_heap = p_atomic_xchg(&fd_bo_stats.ring_heap, 0);
++      uint32_t bo_hit = p_atomic_xchg(&fd_bo_stats.bo_hit, 0);
++      uint32_t bo_miss = p_atomic_xchg(&fd_bo_stats.bo_miss, 0);
++      uint32_t ring_hit = p_atomic_xchg(&fd_bo_stats.ring_hit, 0);
++      uint32_t ring_miss = p_atomic_xchg(&fd_bo_stats.ring_miss, 0);
++      uint32_t expired = p_atomic_xchg(&fd_bo_stats.expired, 0);
++      uint32_t evicted = p_atomic_xchg(&fd_bo_stats.evicted, 0);
++      uint32_t made = p_atomic_xchg(&fd_bo_stats.made, 0);
++      uint32_t fl_204 = p_atomic_xchg(&fd_bo_stats.fl_204, 0);
++      uint32_t fl_110 = p_atomic_xchg(&fd_bo_stats.fl_110, 0);
++      uint32_t fl_4 = p_atomic_xchg(&fd_bo_stats.fl_4, 0);
++      uint32_t fl_402 = p_atomic_xchg(&fd_bo_stats.fl_402, 0);
++      uint32_t fl_other = p_atomic_xchg(&fd_bo_stats.fl_other, 0);
++      fd_bo_stats.since_ns = now;
++      if (def_heap || ring_heap || bo_hit || bo_miss || ring_hit || ring_miss ||
++          expired || evicted || made) {
++         printf("fd bo stats[%d]: %llu ms def_heap=%u ring_heap=%u bo_hit=%u bo_miss=%u "
++                "ring_hit=%u ring_miss=%u made=%u (0x204=%u 0x110=%u 0x4=%u 0x402=%u other=%u) "
++                "exp=%u evict=%u\n",
++                (int)getpid(), (unsigned long long)((now - since) / 1000000ull),
++                def_heap, ring_heap, bo_hit, bo_miss, ring_hit, ring_miss,
++                made, fl_204, fl_110, fl_4, fl_402, fl_other, expired, evicted);
++         fflush(stdout);
++      }
++   }
++   pthread_mutex_unlock(&fd_bo_stats_mtx);
++}
++#endif
++
+ /* set buffer name, and add to table, call w/ table_lock held: */
+ static void
+ set_name(struct fd_bo *bo, uint32_t name)
+@@ -127,20 +236,37 @@
+ {
+    struct fd_bo *bo = NULL;
+ 
++   /* demote cached-coherent to WC before heap matching when unsupported */
++   if ((flags & FD_BO_CACHED_COHERENT) && !dev->has_cached_coherent)
++      flags &= ~FD_BO_CACHED_COHERENT;
++
+    if (size < FD_BO_HEAP_BLOCK_SIZE) {
+       uint32_t alloc_flags = flags & ~_FD_BO_HINTS;
+-      if ((alloc_flags == 0) && dev->default_heap)
++      uint32_t ring_alloc_flags = RING_FLAGS & ~_FD_BO_HINTS;
++
++      if (!dev->has_cached_coherent)
++         ring_alloc_flags &= ~FD_BO_CACHED_COHERENT;
++
++      if (((alloc_flags == 0) ||
++           ((alloc_flags == FD_BO_NOMAP) && !(flags & FD_BO_HINT_IMAGE))) &&
++          dev->default_heap) {
+          bo = fd_bo_heap_alloc(dev->default_heap, size, flags);
+-      else if ((flags == RING_FLAGS) && dev->ring_heap)
++         if (bo) {
++            fd_bo_stats_note(FD_BO_STAT_DEFAULT_HEAP, 1);
++            return bo;
++         }
++      } else if ((alloc_flags == ring_alloc_flags) &&
++                 ((flags & FD_BO_HINT_COMMAND) ||
++                  !(flags & (_FD_BO_HINTS & ~FD_BO_HINT_BUFFER))) &&
++                 dev->ring_heap) {
+          bo = fd_bo_heap_alloc(dev->ring_heap, size, flags);
+-      if (bo)
+-         return bo;
++         if (bo) {
++            fd_bo_stats_note(FD_BO_STAT_RING_HEAP, 1);
++            return bo;
++         }
++      }
+    }
+ 
+-   /* demote cached-coherent to WC if not supported: */
+-   if ((flags & FD_BO_CACHED_COHERENT) && !dev->has_cached_coherent)
+-      flags &= ~FD_BO_CACHED_COHERENT;
+-
+    bo = fd_bo_cache_alloc(cache, &size, flags);
+    if (bo)
+       return bo;
+@@ -175,6 +301,7 @@
+ 
+    bo->alloc_flags = flags;
+ 
++   fd_bo_stats_note(FD_BO_STAT_MADE, flags);
+    fd_alloc_log(bo, FD_ALLOC_NONE, FD_ALLOC_ACTIVE);
+ 
+    return bo;
+--- a/src/freedreno/drm/freedreno_bo_heap.c
++++ b/src/freedreno/drm/freedreno_bo_heap.c
+@@ -187,9 +187,8 @@
+ {
+    simple_mtx_lock(&heap->lock);
+    foreach_bo_safe (bo, &heap->freelist) {
+-      /* It might be nice if we could keep freelist sorted by fence # */
+       if (idle && !sa_idle(bo))
+-         break;
++         continue;
+       sa_release(bo);
+    }
+    simple_mtx_unlock(&heap->lock);
+@@ -198,14 +197,19 @@
+ struct fd_bo *
+ fd_bo_heap_alloc(struct fd_bo_heap *heap, uint32_t size, uint32_t flags)
+ {
++   uint32_t align_bytes =
++      (flags & FD_BO_NOMAP) ? MAX2(SUBALLOC_ALIGNMENT, 256u) : SUBALLOC_ALIGNMENT;
++
+    heap_clean(heap, true);
+ 
+    /* util_vma does not like zero byte allocations, which we get, for
+     * ex, with the initial query buffer allocation on pre-a5xx:
+     */
+-   size = MAX2(size, SUBALLOC_ALIGNMENT);
++   size = MAX2(size, align_bytes);
+ 
+-   size = align(size, SUBALLOC_ALIGNMENT);
++   size = align(size, align_bytes);
++   if (size > FD_BO_HEAP_BLOCK_SIZE)
++      return NULL;
+ 
+    simple_mtx_lock(&heap->lock);
+    /* Allocate larger buffers from the bottom, and smaller buffers from top
+@@ -214,7 +218,7 @@
+     * (The 8k threshold is just a random guess, but seems to work ok)
+     */
+    heap->heap.alloc_high = (size <= 8 * 1024);
+-   uint64_t offset = util_vma_heap_alloc(&heap->heap, size, SUBALLOC_ALIGNMENT);
++   uint64_t offset = util_vma_heap_alloc(&heap->heap, size, align_bytes);
+    if (!offset) {
+       simple_mtx_unlock(&heap->lock);
+       return NULL;
+@@ -262,6 +266,7 @@
+    bo->funcs = &heap_bo_funcs;
+    bo->handle = 1; /* dummy handle to make fd_bo_init_common() happy */
+    bo->alloc_flags = flags;
++   bo->prefaulted = true; /* backing heap block is already mapped and prefaulted */
+ 
+    /* Pre-initialize mmap ptr, to avoid trying to os_mmap() */
+    bo->map = block_map + block_offset(s);
+--- a/src/freedreno/drm/freedreno_priv.h
++++ b/src/freedreno/drm/freedreno_priv.h
+@@ -468,6 +468,29 @@
+ 
+ struct fd_bo *fd_bo_new_ring(struct fd_device *dev, uint32_t size);
+ 
++enum fd_bo_stat_kind {
++   FD_BO_STAT_DEFAULT_HEAP,
++   FD_BO_STAT_RING_HEAP,
++   FD_BO_STAT_BO_CACHE_HIT,
++   FD_BO_STAT_BO_CACHE_MISS,
++   FD_BO_STAT_RING_CACHE_HIT,
++   FD_BO_STAT_RING_CACHE_MISS,
++   FD_BO_STAT_EXPIRED,
++   FD_BO_STAT_EVICTED,
++   FD_BO_STAT_MADE,
++};
++
++#ifdef __APPLE__
++void fd_bo_stats_note(enum fd_bo_stat_kind kind, uint32_t value);
++#else
++static inline void
++fd_bo_stats_note(enum fd_bo_stat_kind kind, uint32_t value)
++{
++   (void)kind;
++   (void)value;
++}
++#endif
++
+ uint32_t fd_handle_from_dmabuf_drm(struct fd_device *dev, int fd);
+ struct fd_bo *fd_bo_from_dmabuf_drm(struct fd_device *dev, int fd);
+ void fd_bo_close_handle_drm(struct fd_bo *bo);

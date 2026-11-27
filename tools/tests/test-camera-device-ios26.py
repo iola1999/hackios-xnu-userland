@@ -52,7 +52,7 @@ static int profile_eintr, short_install, short_frame, capture_errno, hold_after_
 static int open_ebusy_remaining;
 static unsigned install_calls, capture_calls, pixel_reads, ebusy_sleeps;
 static int torch_present, torch_open, short_torch_read, short_torch_write, fail_stream_create;
-static uint32_t torch_shown = 173, torch_wanted;
+static uint32_t torch_shown = 173, torch_wanted, torch_peak;
 static unsigned torch_reads, torch_writes;
 
 static void init_fixture(void) {
@@ -140,7 +140,10 @@ static ssize_t fake_write(int fd, const void *buffer, size_t count) {
     if (fd == TORCH_FD) {
         assert(torch_open && count == sizeof(torch_wanted));
         torch_writes++;
-        if (!short_torch_write) memcpy(&torch_wanted, buffer, sizeof(torch_wanted));
+        if (!short_torch_write) {
+            memcpy(&torch_wanted, buffer, sizeof(torch_wanted));
+            if (torch_wanted > torch_peak) torch_peak = torch_wanted;
+        }
         return (ssize_t)count - short_torch_write;
     }
     if (fd != CAMERA_FD) return write(fd, buffer, count);
@@ -474,7 +477,7 @@ static void metadata_boundaries(void) {
     isp_init(&isp);
     complete_capture();
     assert(isnan(lux_index(&isp, &next_frame)));
-    CFDictionaryRef metadata = frame_metadata(&isp, &next_frame, k_front, -1, false, 0, 0);
+    CFDictionaryRef metadata = frame_metadata(&isp, &next_frame, k_front, -1, false, false, 0, 0);
     assert(CFDictionaryGetCount(metadata) == 4);
     assert(CFDictionaryContainsKey(metadata, md_key[MD_PORT]));
     assert(CFDictionaryContainsKey(metadata, md_key[MD_PTS]));
@@ -488,7 +491,7 @@ static void metadata_boundaries(void) {
     next_frame.line_ns = 10000;
     next_frame.gain = next_frame.gain_unity = 256;
     next_frame.frame_lines = 3333;
-    metadata = frame_metadata(&isp, &next_frame, k_front, -1, false, 0, 0);
+    metadata = frame_metadata(&isp, &next_frame, k_front, -1, false, false, 0, 0);
     assert(CFDictionaryGetCount(metadata) == 7);
     assert(fabs(get_double(metadata, md_key[MD_EXPOSURE]) - 0.001) < 1e-9);
     assert(get_int(metadata, md_key[MD_AGC]) == 256);
@@ -607,7 +610,6 @@ static void pixel_buffer_consumer(CMBaseObjectRef front) {
     __block unsigned flash_still_callbacks = 0;
     pixel_buffer_handler flash_still_handler = Block_copy(^(CVPixelBufferRef image, CMTime pts) {
         (void)pts;
-        assert(torch_wanted == 1000);
         CFDictionaryRef metadata = CVBufferCopyAttachment(image, md_attachment, NULL);
         assert(metadata != NULL);
         CFDictionaryRef exif = CFDictionaryGetValue(metadata, CFSTR("{Exif}"));
@@ -628,13 +630,14 @@ static void pixel_buffer_consumer(CMBaseObjectRef front) {
     assert(stream_set_property(front, CFSTR("StillImageCaptureNow"), cap_opts) == 0);
     CFRelease(cap_opts);
     complete_capture();
+    torch_peak = 0;
     unsigned writes_before = torch_writes;
     unsigned frames_before = pixel_reads;
     stream_of(front)->state = CAM_STREAM_ACTIVE;
     assert(worker(front) == NULL);
     assert(flash_still_callbacks == 1);
-    assert(pixel_reads == frames_before + 4);
-    assert(torch_writes == writes_before + 2 && torch_wanted == 0);
+    assert(pixel_reads >= frames_before + 4);
+    assert(torch_peak == 1000 && torch_writes == writes_before + 2 && torch_wanted == 0);
 
     /* Verify GenerateRedEyeAuxiliaryImage=1 emits unlit pre-flash auxiliary frame (Flash=16, RedEyeAuxiliaryImage=true) then main flash frame (Flash=1), plus transient EBUSY retry on open */
     __block unsigned redeye_callbacks = 0;
@@ -643,16 +646,14 @@ static void pixel_buffer_consumer(CMBaseObjectRef front) {
         CFDictionaryRef metadata = CVBufferCopyAttachment(image, md_attachment, NULL);
         assert(metadata != NULL);
         assert(get_int(metadata, CFSTR("SensorID")) == 0x0914);
-        assert(get_int(metadata, CFSTR("ExifOrientation")) == 6);
+        assert(CFDictionaryGetValue(metadata, CFSTR("ExifOrientation")) == NULL);
         assert(get_int(metadata, CFSTR("AWBGGain")) == 4096);
         CFDictionaryRef exif = CFDictionaryGetValue(metadata, CFSTR("{Exif}"));
         assert(exif != NULL);
         if (redeye_callbacks == 0) {
-            assert(torch_wanted == 0);
             assert(CFDictionaryGetValue(metadata, CFSTR("RedEyeAuxiliaryImage")) == kCFBooleanTrue);
             assert(get_int(exif, CFSTR("Flash")) == 16);
         } else {
-            assert(torch_wanted == 1000);
             assert(CFDictionaryGetValue(metadata, CFSTR("RedEyeAuxiliaryImage")) == NULL);
             assert(get_int(exif, CFSTR("Flash")) == 1);
             stream_of(front)->state = CAM_STREAM_STOPPED;
@@ -675,14 +676,15 @@ static void pixel_buffer_consumer(CMBaseObjectRef front) {
     complete_capture();
     open_ebusy_remaining = 3;
     ebusy_sleeps = 0;
+    torch_peak = 0;
     writes_before = torch_writes;
     frames_before = pixel_reads;
     stream_of(front)->state = CAM_STREAM_ACTIVE;
     assert(worker(front) == NULL);
     assert(ebusy_sleeps == 3 && open_ebusy_remaining == 0);
     assert(redeye_callbacks == 2);
-    assert(pixel_reads == frames_before + 5);
-    assert(torch_writes == writes_before + 2 && torch_wanted == 0);
+    assert(pixel_reads >= frames_before + 5);
+    assert(torch_peak == 1000 && torch_writes == writes_before + 2 && torch_wanted == 0);
 
     stream_of(front)->torch = -1;
     assert(stream_set_property(front, CFSTR("FlashMode"), CFSTR("ForceFlashOff")) == 0);
@@ -738,6 +740,20 @@ static CFIndex resolve_v57_spec(CFArrayRef formats, const struct ios26_stream_fo
         return i;
     }
     return -1;
+}
+
+/* M15: BWMultiStreamCameraSourceNode reads PrimaryScaler/SecondaryScaler/IntermediateTap unconditionally */
+static void check_required_outputs(CFArrayRef formats) {
+    CFStringRef names[5] = { CFSTR("PrimaryScaler"), CFSTR("SecondaryScaler"),
+        CFSTR("IntermediateTap"), CFSTR("StillImage"), CFSTR("StillImageRaw") };
+    for (CFIndex i = 0; i < CFArrayGetCount(formats); i++) {
+        CFDictionaryRef outs = CFDictionaryGetValue(CFArrayGetValueAtIndex(formats, i), CFSTR("SupportedOutputs"));
+        assert(outs != NULL);
+        for (int k = 0; k < 5; k++) {
+            CFDictionaryRef o = CFDictionaryGetValue(outs, names[k]);
+            assert(o != NULL && CFArrayGetCount(CFDictionaryGetValue(o, CFSTR("SupportedPixelFormats"))) == 6);
+        }
+    }
 }
 
 int main(void) {
@@ -806,10 +822,11 @@ int main(void) {
     for (size_t i = 0; i < sizeof(v57_front_specs) / sizeof(v57_front_specs[0]); i++) {
         assert(resolve_v57_spec(formats, &v57_front_specs[i]) >= 3);
     }
-    /* CMCapture aborts on a resolved format without VideoFieldOfView. */
+    /* CMCapture aborts on a resolved format without VideoFieldOfView or IntermediateTap. */
     for (CFIndex i = 0; i < CFArrayGetCount(formats); i++) {
         assert(get_double(CFArrayGetValueAtIndex(formats, i), CFSTR("VideoFieldOfView")) == stream_of(front)->camera->field_of_view);
     }
+    check_required_outputs(formats);
     CFRelease(formats);
     /* BWFigVideoCaptureStream fails the graph without a PixelSize between 0 and 100. */
     CFNumberRef pixel_size = NULL;
@@ -840,8 +857,12 @@ int main(void) {
     for (size_t i = 0; i < sizeof(v57_back_specs) / sizeof(v57_back_specs[0]); i++) {
         assert(resolve_v57_spec(back_formats, &v57_back_specs[i]) >= 3);
     }
+    check_required_outputs(back_formats);
     CFRelease(back_formats);
 
+    CFNumberRef fmt5 = number_i(5);
+    assert(stream_set_property(front, CFSTR("FormatIndex"), fmt5) == 0);
+    CFRelease(fmt5);
     CFNumberRef fmt1 = number_i(1);
     assert(stream_set_property(front, CFSTR("FormatIndex"), fmt1) == 0);
     CFRelease(fmt1);

@@ -891,6 +891,7 @@ iris_vt_finish_delayed_frames(CFTypeRef decoder)
 	pthread_mutex_lock(&dec->lock);
 	OSStatus status = noErr;
 	if (dec->fd >= 0 && dec->session_id != 0 && dec->session != NULL) {
+		bool drain_completed = false;
 		for (uint32_t step = 0; step < IRIS_VT_PENDING_MAX; step++) {
 			if (!iris_pending_any(dec)) {
 				/* VT can finish repeatedly between samples without resetting the decoder. */
@@ -903,14 +904,20 @@ iris_vt_finish_delayed_frames(CFTypeRef decoder)
 			bool emitted = false;
 			status = iris_run_decode_step_Locked(dec, NULL, NULL, 0, 0, IRIS_FRAME_DRAIN, &emitted);
 			if (status != noErr || !emitted) {
+				if (status == noErr && !emitted) {
+					drain_completed = true;
+				}
 				break;
 			}
 		}
-		uint32_t sid = dec->session_id;
-		if (iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid) != 0 && status == noErr)
-			status = kVTVideoDecoderMalfunctionErr;
+		if (!drain_completed) {
+			uint32_t sid = dec->session_id;
+			if (iris_sys_ioctl(dec->fd, IRIS_IOC_FLUSH_SESSION, &sid) != 0 && status == noErr)
+				status = kVTVideoDecoderMalfunctionErr;
+		}
 		if (iris_pending_any(dec) && status == noErr) status = kVTVideoDecoderMalfunctionErr;
 		iris_pending_abort_all(dec, status);
+		dec->sent_params = false;
 	}
 	pthread_mutex_unlock(&dec->lock);
 	return status;
