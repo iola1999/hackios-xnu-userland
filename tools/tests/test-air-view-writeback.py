@@ -49,6 +49,8 @@ PRODUCTION_LOCK
 #define PIPE_SWIZZLE_0 4
 #define PIPE_SWIZZLE_1 5
 #define RWA_TYPE_2D 2
+#define RWA_PURGEABLE_NON_VOLATILE 2u
+#define RWA_PURGEABLE_VOLATILE 3u
 #define u_minify(v,l) (((v) >> (l)) ? ((v) >> (l)) : 1)
 enum pipe_format { PIPE_FORMAT_NONE, PIPE_FORMAT_RGBA8, PIPE_FORMAT_RGBA8_SRGB };
 struct pipe_resource { unsigned height0, width0, last_level, bind, target, nr_samples, refs; enum pipe_format format; unsigned char bytes[256]; };
@@ -80,6 +82,8 @@ static bool rgb2p_prepare_sample(struct rwa_texture *t,char *why,size_t n) { (vo
 static void argbuf_scrub(struct rwa_device *d,void *b,struct rwa_texture *t,void *s) { (void)d;(void)b;(void)t;(void)s; }
 static void state_texture_gone(struct rwa_device *d,struct pipe_resource *p) { (void)d;(void)p; }
 static void buffer_mirror_pull(struct rwa_buffer *b) { (void)b; }
+static bool texture_require_backing(struct rwa_texture *t, const char *what, char *why, size_t n) { (void)t;(void)what;(void)why;(void)n; return true; }
+static int buffer_texture_sync_aliases(struct rwa_texture *t, char *why, size_t n) { (void)t;(void)why;(void)n; return 0; }
 static struct { unsigned unchanged,uploads,refreshes; } upload_count;
 void rwa_texture_destroy(struct rwa_texture *t);
 '''

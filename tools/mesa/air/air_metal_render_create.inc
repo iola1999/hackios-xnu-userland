@@ -720,9 +720,9 @@ rwa_render_create_linked(struct rwa_device *device,
          .linked = (const struct air_linked_function *)fragment_linked,
          .num_linked = num_fragment_linked,
       };
-      fs = air_to_nir(render->mem_ctx, fragment_bitcode, fragment_size,
-                      fragment_entry, &fopts, device->nir_options, &render->finfo,
-                      &error);
+      fs = rwa_air_to_nir_cached(render->mem_ctx, fragment_bitcode, fragment_size,
+                                 fragment_entry, &fopts, device->nir_options,
+                                 device->software, &render->finfo, &error);
       if (!fs) {
          /* The stage is named because the sentence is all a boot log carries: air_to_nir's
           * own error says which construct it declined and where, and nothing in it says
@@ -798,8 +798,8 @@ rwa_render_create_linked(struct rwa_device *device,
          unsigned num_vfc =
             air_module_function_constants(render->mem_ctx, vertex_bitcode, vertex_size, &vfc);
          const struct air_to_nir_options vopts = { .constants = vfc, .num_constants = num_vfc };
-         vs = air_to_nir(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
-                         device->nir_options, &render->vinfo, &error);
+         vs = rwa_air_to_nir_cached(render->mem_ctx, vertex_bitcode, vertex_size, vertex_entry, &vopts,
+                                    device->nir_options, device->software, &render->vinfo, &error);
          if (!vs) {
             say(why, why_size, "the vertex module: %s",
                 error ? error : "could not be translated");

@@ -740,6 +740,7 @@ rwa_texture_generate_mipmaps(struct rwa_texture *texture, char *why, size_t why_
 #include "air_metal_rgb2p.inc"
 #include "air_metal_yuv.inc"
 #include "air_metal_bicubic.inc"
+#include "air_metal_nircache.inc"
 #include "air_metal_compute.inc"
 
 #include "air_metal_bind.inc"

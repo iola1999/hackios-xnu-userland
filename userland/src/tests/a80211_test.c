@@ -78,7 +78,8 @@ static int mwsj_sent;
 static void
 mwsj_assoc_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
 {
-	fprintf(stderr, "a80211_test: assoc callback: %p %p %p %p\n", client, a2, a3, a4);
+	fprintf(stderr, "a80211_test: assoc callback: %p %p %p %p (err=%d)\n",
+	    client, a2, a3, a4, (int)(intptr_t)a4);
 	if (a2 != NULL) {
 		show("assoc a2", a2);
 	}
@@ -127,7 +128,8 @@ mwsj_scan_cb(CFTypeRef client, CFTypeRef a2, CFTypeRef a3, CFTypeRef a4)
 			CFStringRef secret = CFStringCreateWithCString(kCFAllocatorDefault, mwsj_pass,
 			    kCFStringEncodingUTF8);
 			if (secret != NULL) {
-				set_pass(picked, secret);
+				int pw_ok = set_pass(picked, secret);
+				fprintf(stderr, "a80211_test: WiFiNetworkSetPassword(picked) -> %d\n", pw_ok);
 				CFRelease(secret);
 			}
 		}
@@ -217,6 +219,7 @@ mwscanjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t *passphrase,
 			fprintf(stderr, "a80211_test: WiFiNetworkSetPassword -> %d\n",
 			    net_pass(net, secret));
 		}
+		CFRelease(secret);
 	}
 	if (net != NULL) {
 		fprintf(stderr, "a80211_test: WiFiManagerClientAddNetwork -> %d\n",
@@ -245,13 +248,16 @@ mwscanjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t *passphrase,
 struct cwf_job {
 	const uint8_t *ssid;
 	unsigned ssid_len;
+	const uint8_t *passphrase;
+	unsigned passphrase_length;
 	const uint8_t *pmk;
 };
 
 static void *cwf_run(void *arg);
 
 static int
-cwjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t pmk[32])
+cwjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t *passphrase,
+    unsigned passphrase_length, const uint8_t pmk[32])
 {
 	void *objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_NOW);
 	void *cw = dlopen("/System/Library/PrivateFrameworks/CoreWiFi.framework/CoreWiFi", RTLD_NOW);
@@ -264,6 +270,8 @@ cwjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t pmk[32])
 	}
 	job.ssid = ssid;
 	job.ssid_len = ssid_len;
+	job.passphrase = passphrase;
+	job.passphrase_length = passphrase_length;
 	job.pmk = pmk;
 	/* the CoreWiFi XPC answers ride a runloop the way MobileWiFi's do, so the
 	   calls go on a worker while this thread pumps the default loop */
@@ -292,31 +300,41 @@ cwf_sel(const char *name)
 static void
 cwf_assoc(void *picked)
 {
-	void *ap = MSG0(MSG0(((void *(*)(const char *))cwf_getclass)("CWFAssocParameters"), "alloc"),
-	    "init");
+	void *cls = ((void *(*)(const char *))cwf_getclass)("CWFAssocParameters");
+	void *alloced = cls ? MSG0(cls, "alloc") : NULL;
+	void *ap = NULL;
 
+	if (alloced != NULL) {
+		if ((long)MSG1(alloced, "respondsToSelector:", cwf_sel("initWithScanResult:"))) {
+			ap = MSG1(alloced, "initWithScanResult:", picked);
+		} else {
+			ap = MSG0(alloced, "init");
+			if (ap != NULL && (long)MSG1(ap, "respondsToSelector:", cwf_sel("setScanResult:"))) {
+				MSG1(ap, "setScanResult:", picked);
+			}
+		}
+	}
 	if (ap == NULL) {
 		fprintf(stderr, "a80211_test: cwjoin: no CWFAssocParameters\n");
 		return;
 	}
-	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("initWithScanResult:"))) {
-		ap = MSG1(ap, "initWithScanResult:", picked);
-	} else if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setScanResult:"))) {
-		MSG1(ap, "setScanResult:", picked);
-	}
-	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setPassword:"))) {
-		MSG1(ap, "setPassword:", CFStringCreateWithCString(kCFAllocatorDefault, cwf_pass,
-		    kCFStringEncodingUTF8));
+	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setPassword:")) && cwf_pass[0] != '\0') {
+		CFStringRef pw = CFStringCreateWithCString(kCFAllocatorDefault, cwf_pass,
+		    kCFStringEncodingUTF8);
+		if (pw != NULL) {
+			MSG1(ap, "setPassword:", pw);
+			CFRelease(pw);
+		}
 	}
 	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setUserInitiated:"))) {
-		MSG1(ap, "setUserInitiated:", 1);
+		MSG1(ap, "setUserInitiated:", (void *)(uintptr_t)1);
 	}
-	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setRememberedNetwork:"))) {
-		MSG1(ap, "setRememberedNetwork:", 1);
+	if ((long)MSG1(ap, "respondsToSelector:", cwf_sel("setRememberUponSuccessfulAssociation:"))) {
+		MSG1(ap, "setRememberUponSuccessfulAssociation:", (void *)(uintptr_t)1);
 	}
-	MSG2(cwf_iface, "associateWithParameters:reply:", ap, ^(void *result, void *err) {
-		fprintf(stderr, "a80211_test: cwjoin: associate reply result %p err %p\n", result, err);
-		show("cwjoin assoc result", result);
+	/* CoreWiFi associateWithParameters:reply: block ABI: void (^)(NSError *err) */
+	MSG2(cwf_iface, "associateWithParameters:reply:", ap, ^(void *err) {
+		fprintf(stderr, "a80211_test: cwjoin: associate reply err %p\n", err);
 		if (err != NULL) {
 			show("cwjoin assoc error", MSG0(err, "localizedDescription"));
 		}
@@ -324,12 +342,12 @@ cwf_assoc(void *picked)
 }
 
 static void
-cwf_scan_reply(void *results, void *err)
+cwf_scan_reply(void *err, void *results)
 {
 	void *arr, *picked = NULL;
 	unsigned long count;
 
-	fprintf(stderr, "a80211_test: cwjoin: scan reply %p err %p\n", results, err);
+	fprintf(stderr, "a80211_test: cwjoin: scan reply err %p results %p\n", err, results);
 	if (err != NULL) {
 		show("cwjoin scan error", MSG0(err, "localizedDescription"));
 	}
@@ -342,14 +360,19 @@ cwf_scan_reply(void *results, void *err)
 	fprintf(stderr, "a80211_test: cwjoin: %lu scan results\n", count);
 	for (unsigned long i = 0; i < count; i++) {
 		void *item = MSG1(arr, "objectAtIndex:", i);
-		void *nm = MSG0(item, "ssid");
+		void *nm = MSG0(item, "networkName");
 		char got[64] = { 0 };
 
-		if (nm == NULL) {
-			nm = MSG0(item, "networkName");
-		}
-		if (nm != NULL) {
+		if (nm != NULL && CFGetTypeID((CFTypeRef)nm) == CFStringGetTypeID()) {
 			CFStringGetCString((CFStringRef)nm, got, sizeof(got), kCFStringEncodingUTF8);
+		} else {
+			void *raw_ssid = MSG0(item, "SSID");
+			if (raw_ssid != NULL && CFGetTypeID((CFTypeRef)raw_ssid) == CFDataGetTypeID()) {
+				CFIndex n = CFDataGetLength((CFDataRef)raw_ssid);
+				if (n > 0 && n < (CFIndex)sizeof(got)) {
+					memcpy(got, CFDataGetBytePtr((CFDataRef)raw_ssid), (size_t)n);
+				}
+			}
 		}
 		fprintf(stderr, "a80211_test: cwjoin: result %lu ssid '%s' %p\n", i, got, item);
 		if (picked == NULL && strcmp(got, cwf_name) == 0) {
@@ -373,10 +396,17 @@ cwf_run(void *arg)
 	cwf_regname = dlsym(objc, "sel_registerName");
 	cwf_msg = dlsym(objc, "objc_msgSend");
 	cwf_getclass = dlsym(objc, "objc_getClass");
+	memset(cwf_name, 0, sizeof(cwf_name));
+	memset(cwf_pass, 0, sizeof(cwf_pass));
 	memcpy(cwf_name, job->ssid, job->ssid_len < 32 ? job->ssid_len : 32);
-	for (unsigned i = 0; i < 32; i++) {
-		cwf_pass[i * 2] = hex[job->pmk[i] >> 4];
-		cwf_pass[i * 2 + 1] = hex[job->pmk[i] & 15];
+	if (job->passphrase_length != 0) {
+		memcpy(cwf_pass, job->passphrase,
+		    job->passphrase_length < 64 ? job->passphrase_length : 64);
+	} else {
+		for (unsigned i = 0; i < 32; i++) {
+			cwf_pass[i * 2] = hex[job->pmk[i] >> 4];
+			cwf_pass[i * 2 + 1] = hex[job->pmk[i] & 15];
+		}
 	}
 	cwf_iface = MSG0(((void *(*)(const char *))cwf_getclass)("CWFInterface"), "alloc");
 	if ((long)MSG1(cwf_iface, "respondsToSelector:", cwf_sel("initWithInterfaceName:"))) {
@@ -388,24 +418,24 @@ cwf_run(void *arg)
 	if (cwf_iface == NULL) {
 		return NULL;
 	}
+	if ((long)MSG1(cwf_iface, "respondsToSelector:", cwf_sel("activate"))) {
+		MSG0(cwf_iface, "activate");
+		fprintf(stderr, "a80211_test: cwjoin: activated CWFInterface\n");
+	}
 	void *sp = MSG0(MSG0(((void *(*)(const char *))cwf_getclass)("CWFScanParameters"), "alloc"),
 	    "init");
-	CFStringRef want = CFStringCreateWithCString(kCFAllocatorDefault, cwf_name,
-	    kCFStringEncodingUTF8);
 
-	if (sp != NULL) {
-		if ((long)MSG1(sp, "respondsToSelector:", cwf_sel("setNetworkName:"))) {
-			MSG1(sp, "setNetworkName:", want);
-		}
-		if ((long)MSG1(sp, "respondsToSelector:", cwf_sel("setSsid:"))) {
-			MSG1(sp, "setSsid:", want);
-		}
-		if ((long)MSG1(sp, "respondsToSelector:", cwf_sel("setSSID:"))) {
+	if (sp != NULL && (long)MSG1(sp, "respondsToSelector:", cwf_sel("setSSID:"))) {
+		unsigned n = job->ssid_len < 32 ? job->ssid_len : 32;
+		CFDataRef want = CFDataCreate(kCFAllocatorDefault, job->ssid, (CFIndex)n);
+		if (want != NULL) {
 			MSG1(sp, "setSSID:", want);
+			CFRelease(want);
 		}
 	}
-	MSG2(cwf_iface, "performScanWithParameters:reply:", sp, ^(void *results, void *err) {
-		cwf_scan_reply(results, err);
+	/* CoreWiFi performScanWithParameters:reply: block ABI: void (^)(NSError *err, NSArray *results) */
+	MSG2(cwf_iface, "performScanWithParameters:reply:", sp, ^(void *err, void *results) {
+		cwf_scan_reply(err, results);
 	});
 	fprintf(stderr, "a80211_test: cwjoin: scan request sent\n");
 	return NULL;
@@ -574,7 +604,8 @@ main(int argc, char **argv)
 			    saved.passphrase_length, saved.pmk);
 		}
 		if (strcmp(argv[1], "cwjoin") == 0) {
-			return cwjoin(saved.ssid, saved.ssid_length, saved.pmk);
+			return cwjoin(saved.ssid, saved.ssid_length, saved.passphrase,
+			    saved.passphrase_length, saved.pmk);
 		}
 		if (strcmp(argv[1], "ajoin") == 0) {
 			/* the join wifid is asked to issue is a plain Apple80211Set 20:

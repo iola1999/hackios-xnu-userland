@@ -85,9 +85,7 @@ runs, applies it.
 diff --git a/src/gallium/drivers/freedreno/freedreno_resource.c b/src/gallium/drivers/freedreno/freedreno_resource.c
 --- a/src/gallium/drivers/freedreno/freedreno_resource.c
 +++ b/src/gallium/drivers/freedreno/freedreno_resource.c
-@@ -353,8 +353,26 @@
-    struct pipe_resource *prsc = &rsc->b.b;
-    struct fd_screen *screen = fd_screen(pctx->screen);
+@@ -355,6 +355,24 @@
     struct fd_batch *batch;
     bool fallback = false;
  

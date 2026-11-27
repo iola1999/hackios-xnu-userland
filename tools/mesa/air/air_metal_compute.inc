@@ -43,8 +43,8 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
       .kernel = (const struct air_stitched_kernel *)kernel,
    };
    const char *error;
-   compute->nir = air_to_nir(compute->mem_ctx, bitcode, size, entry, &options,
-                             device->nir_options, &compute->info, &error);
+   compute->nir = rwa_air_to_nir_cached(compute->mem_ctx, bitcode, size, entry, &options,
+                                        device->nir_options, device->software, &compute->info, &error);
    if (!compute->nir) {
       /* The sentence the translator wrote, which is the one that matters: it begins
        * with its own category (reader, stage, interface, instruction, intrinsic) and
