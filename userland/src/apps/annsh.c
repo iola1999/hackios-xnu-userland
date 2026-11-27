@@ -46,6 +46,7 @@
  *                              the binary pushes and so may be staged through the inbox)
  *   mkdir [-p] PATH            mkdir(2), with -p each missing parent too
  *   chmod MODE PATH            chmod(2), MODE in octal
+ *   bg PROGRAM [ARG...]        posix_spawnp without waiting; prints "bg pid=PID" and reaps on exit
  * Anything else is a program: posix_spawnp with stdout and stderr read back, killed after
  * ANNSH_LIMIT_SECONDS.
  */
@@ -824,6 +825,45 @@ do_dump(const char *which)
 	return for_named("dump", which, do_dump_pid);
 }
 
+#define ANNSH_MAX_BG             32
+static pid_t bg_pids[ANNSH_MAX_BG];
+static int bg_count;
+
+static void
+reap_bg(void)
+{
+	int keep = 0;
+
+	for (int i = 0; i < bg_count; i++) {
+		int st = 0;
+		pid_t r = waitpid(bg_pids[i], &st, WNOHANG);
+		if (r == 0)
+			bg_pids[keep++] = bg_pids[i];
+	}
+	bg_count = keep;
+}
+
+static int
+do_bg(char **argv)
+{
+	pid_t pid = 0;
+	int err;
+
+	reap_bg();
+	if (bg_count >= ANNSH_MAX_BG) {
+		out("bg: too many background processes (%d)", ANNSH_MAX_BG);
+		return 1;
+	}
+	err = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+	if (err != 0) {
+		out("bg %s: %s", argv[0], strerror(err));
+		return 127;
+	}
+	bg_pids[bg_count++] = pid;
+	out("bg pid=%d", (int)pid);
+	return 0;
+}
+
 static int
 run(char *text)
 {
@@ -918,6 +958,13 @@ run(char *text)
 		}
 		return 0;
 	}
+	if (strcmp(argv[0], "bg") == 0) {
+		if (argc < 2) {
+			out("bg: usage: bg PROGRAM [ARG...]");
+			return 2;
+		}
+		return do_bg(argv + 1);
+	}
 	return do_spawn(argv);
 }
 
@@ -942,6 +989,7 @@ main(void)
 		int status;
 
 		usleep(ANNSH_POLL_US);
+		reap_bg();
 		size = sizeof(value) - 1;
 		if (sysctlbyname("kern.annibale.cmd", value, &size, NULL, 0) != 0)
 			continue;

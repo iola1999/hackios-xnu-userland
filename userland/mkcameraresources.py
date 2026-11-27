@@ -20,6 +20,11 @@ frames only, and the capture graph or photo coordinator fails when the resources
   making BWVideoDepthConfiguration return nil and BWGraph raise on a nil BWVideoDepthNode.
 - ZeroShutterLagSupported, IrisSupported, IrisVideoStabilizationSupported: ZSL time-machine waits on
   ISP motion metadata and Live Photo preroll waits on BWIrisStagingNode before firing the still shutter.
+- smartCameraSupported, LensSmudgeDetectionSupported, geometricDistortionCorrection,
+  geometricDistortionCorrectionForSmartCropEnabled, IntelligentDistortionCorrectionSupported:
+  SmartCamera, SmudgeNet, and PhotonicEngine IDC (0->15) load H18-only E5 bundles
+  (smartcam_5_2_0, smudgenet-v1, personsemantics-preview-lowfps) through BWE5InferenceProvider,
+  failing at m:263 (-31710) and cascading to -16808 without an Apple H18 ANE.
 """
 
 import argparse
@@ -42,6 +47,9 @@ ISP_FEATURES = (
     "StudioLightingSupported",
     "StudioAndContourPreviewRenderingSupported", "StagePreviewRenderingSupported",
     "ZeroShutterLagSupported", "IrisSupported", "IrisVideoStabilizationSupported",
+    "smartCameraSupported", "LensSmudgeDetectionSupported",
+    "geometricDistortionCorrection", "geometricDistortionCorrectionForSmartCropEnabled",
+    "IntelligentDistortionCorrectionSupported",
 )
 OMITTED_KEYS = (
     "stillImageDepthDataType", "SupportedDepthDataFormats",

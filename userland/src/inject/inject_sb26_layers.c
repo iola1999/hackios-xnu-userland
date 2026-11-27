@@ -1156,7 +1156,8 @@ install_poster_dump(void)
     const char *prog = getprogname();
     if (!prog || (strcmp(prog, "MercuryPosterExtension") &&
         strcmp(prog, "WidgetRenderer_Default") &&
-        strcmp(prog, "SharingUIService"))) return;
+        strcmp(prog, "SharingUIService") &&
+        strcmp(prog, "Weather"))) return;
     to_say = 1;
     sb26_install_layer_dump();
     out("sb26 layers: dump installed in %s\n", prog);

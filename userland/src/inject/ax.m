@@ -1,6 +1,7 @@
 /*
- * libannibale-ax.dylib: what an application shows, by name and place, for driving the phone from the
- * host without guessing coordinates (tools/k90auto/ui.py).
+ * libannibale-ax.dylib (tools/k90auto/package.py AX): what an application shows, by name and place,
+ * for driving the phone from the host without guessing coordinates (tools/k90auto/ui.py).
+ * Build-time split from libannibale-statusbar.dylib (statusbar26.m) so release images strip ax.
  *
  * On the darwin notification com.annibale.ax every process this library is in writes
  * /tmp/ax-NAME.txt on its main thread, unless it is an application in the background:

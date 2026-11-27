@@ -1,8 +1,8 @@
 /*
- * Part of libannibale-ax.dylib (tools/k90auto/package.py AX): the status bar's time and battery on
- * 23G90's iPhone 17 canvas (1206x2622, 402 points) placed 12 points closer to the screen edges than
- * iOS places them. Each process lays out its own status bar, so only the processes the library is
- * inserted into get the new place.
+ * libannibale-statusbar.dylib (tools/k90auto/package.py STATUSBAR): the status bar's time and
+ * battery on 23G90's iPhone 17 canvas (1206x2622, 402 points) placed 12 points closer to the
+ * screen edges than iOS places them. Each process lays out its own status bar, so only the
+ * processes the library is inserted into get the new place.
  *
  * On that canvas iOS lays the status bar out for the Dynamic Island. The time is centred in the
  * region from the left edge + 17 points to the island - 8, the battery in the region from the

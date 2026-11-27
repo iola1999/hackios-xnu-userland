@@ -486,6 +486,8 @@ worker(void *context)
 			}
 		}
 		bool gave_still = false;
+		struct still_job *pending_stills[OUTPUTS];
+		unsigned pending_still_count = 0;
 		uint64_t render_from = mach_absolute_time();
 
 		for (int i = 0; s->state == CAM_STREAM_ACTIVE && i < OUTPUTS; i++) {
@@ -508,8 +510,11 @@ worker(void *context)
 				continue;
 			}
 			if (still) {
-				still_enqueue(s, out, &isp, buffer, (uint32_t)bytes, metadata);
-				gave_still = true;
+				struct still_job *j = still_prepare(s, out, &isp, (uint32_t)bytes, metadata);
+				if (j != NULL) {
+					pending_stills[pending_still_count++] = j;
+					gave_still = true;
+				}
 			} else {
 				deliver(s, out, &isp, f, raw, metadata);
 			}
@@ -531,6 +536,9 @@ worker(void *context)
 			}
 		}
 		pthread_mutex_unlock(&s->lock);
+		for (unsigned k = 0; k < pending_still_count; k++) {
+			still_dispatch(s, pending_stills[k], buffer);
+		}
 		if (metadata != NULL) {
 			CFRelease(metadata);
 		}
@@ -564,6 +572,9 @@ worker(void *context)
 	 */
 	if (s->still_queue != NULL) {
 		dispatch_sync(s->still_queue, ^{});
+	}
+	if (s->still_deliver_queue != NULL) {
+		dispatch_sync(s->still_deliver_queue, ^{});
 	}
 	free(buffer);
 	isp_destroy(&isp);

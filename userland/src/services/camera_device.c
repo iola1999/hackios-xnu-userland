@@ -446,6 +446,13 @@ struct af_search {
 	bool            peak_prediction;
 };
 
+#define STILL_POOL_SLOTS 3
+struct still_slot {
+	uint8_t *buf;
+	uint32_t cap;
+	bool     busy;
+};
+
 struct stream {
 	CFArrayRef      formats;
 	CFDictionaryRef supported;
@@ -475,7 +482,9 @@ struct stream {
 	struct output   out[OUTPUTS];
 	pthread_mutex_t lock;
 	pthread_t       worker;
-	dispatch_queue_t still_queue;     /* the photographs' renders, off the worker (still_enqueue/still_run) */
+	dispatch_queue_t still_queue;     /* the photographs' renders, off the worker (still_prepare/still_run) */
+	dispatch_queue_t still_deliver_queue; /* serial PixelBufferHandler delivery, decoupled from demosaic */
+	struct still_slot still_pool[STILL_POOL_SLOTS];
 	volatile int    state;
 	bool            worker_started;
 	int             torch;

@@ -367,6 +367,11 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 		sink = open(ANNIBALE_AUDIO_DEVICE, O_WRONLY);
 	}
 	say("annibale: audio: the speaker is with the HAL (%s: %s)\n", ANNIBALE_AUDIO_DEVICE, sink < 0 ? strerror(errno) : "open");
+	if (sink >= 0) {
+		pthread_mutex_lock(&lock);
+		volume_to_kernel();
+		pthread_mutex_unlock(&lock);
+	}
 	return 0;
 }
 
@@ -412,6 +417,12 @@ struct value {
 		AudioStreamRangedDescription ranged;
 	} u;
 };
+
+static inline bool
+speaker_output_scope(UInt32 scope)
+{
+	return scope == kAudioObjectPropertyScopeOutput || scope == kAudioObjectPropertyScopeGlobal;
+}
 
 static struct value
 property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32 qualifier_size, const void *qualifier)
@@ -578,24 +589,24 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			break;
 		case kAudioDevicePropertyVolumeScalar:
 		case PROP_VIRTUAL_MASTER_VOL:
-			if (d->object == OBJECT_SPEAKER) {
+			if (d->object == OBJECT_SPEAKER && speaker_output_scope(scope)) {
 				FLOAT(volume);
 			}
 			break;
 		case kAudioDevicePropertyVolumeDecibels:
-			if (d->object == OBJECT_SPEAKER) {
+			if (d->object == OBJECT_SPEAKER && speaker_output_scope(scope)) {
 				FLOAT(scalar_to_db(volume));
 			}
 			break;
 		case kAudioDevicePropertyVolumeRangeDecibels:
-			if (d->object == OBJECT_SPEAKER) {
+			if (d->object == OBJECT_SPEAKER && speaker_output_scope(scope)) {
 				v.u.range.mMinimum = -VOLUME_RANGE_DB;
 				v.u.range.mMaximum = 0;
 				v.size = sizeof(AudioValueRange);
 			}
 			break;
 		case kAudioDevicePropertyMute:
-			if (d->object == OBJECT_SPEAKER) {
+			if (d->object == OBJECT_SPEAKER && speaker_output_scope(scope)) {
 				WORD(speaker_muted);
 			}
 			break;
@@ -759,7 +770,8 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 		*settable = false;
 	} else if (object == d->object) {
 		*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate ||
-		    (d->object == OBJECT_SPEAKER && (address->mSelector == kAudioDevicePropertyVolumeScalar ||
+		    (d->object == OBJECT_SPEAKER && speaker_output_scope(address->mScope) &&
+		    (address->mSelector == kAudioDevicePropertyVolumeScalar ||
 		    address->mSelector == PROP_VIRTUAL_MASTER_VOL ||
 		    address->mSelector == kAudioDevicePropertyVolumeDecibels ||
 		    address->mSelector == kAudioDevicePropertyMute)) ||
@@ -857,11 +869,21 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		volume_to_kernel();
 		pthread_mutex_unlock(&lock);
 		if (host != NULL) {
+			AudioObjectPropertyAddress dev_changed[3] = {
+				{ kAudioDevicePropertyVolumeScalar, kAudioObjectPropertyScopeOutput, 0 },
+				{ PROP_VIRTUAL_MASTER_VOL, kAudioObjectPropertyScopeOutput, 0 },
+				{ kAudioDevicePropertyVolumeDecibels, kAudioObjectPropertyScopeOutput, 0 },
+			};
 			host->PropertiesChanged(host, OBJECT_SPEAKER_VOLUME, 2, changed);
+			host->PropertiesChanged(host, OBJECT_SPEAKER, 3, dev_changed);
 		}
 		return 0;
 	}
 	if (object == OBJECT_SPEAKER && address->mSelector == kAudioDevicePropertyMute) {
+		AudioObjectPropertyAddress mute_changed = {
+			kAudioDevicePropertyMute, kAudioObjectPropertyScopeOutput, 0
+		};
+
 		if (size != sizeof(UInt32)) {
 			return kAudioHardwareBadPropertySizeError;
 		}
@@ -869,6 +891,9 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 		speaker_muted = *(const UInt32 *)data != 0 ? 1u : 0u;
 		volume_to_kernel();
 		pthread_mutex_unlock(&lock);
+		if (host != NULL) {
+			host->PropertiesChanged(host, OBJECT_SPEAKER, 1, &mute_changed);
+		}
 		return 0;
 	}
 	if (object == OBJECT_CODEC_SOURCE ||

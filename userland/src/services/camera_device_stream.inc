@@ -528,13 +528,27 @@ struct still_job {
 	struct isp      isp;            /* this frame's state; the tuning pointer is borrowed, not used */
 	struct shot_env env;            /* the frame's, for the photograph's own metadata */
 	uint32_t        pf, width, height;
+	uint32_t        frame_bytes;
+	int             slot_idx;       /* index into s->still_pool, or -1 once released */
+	CMTime          pts;
 	uint64_t        enqueued;       /* when it went on the queue (mach_absolute_time): the wait before it renders */
-	uint8_t         frame[];        /* the frame and the RAW picture after it, copied */
 };
+
+static void
+still_release_slot(struct stream *s, int *slot_idx)
+{
+	if (*slot_idx >= 0 && *slot_idx < STILL_POOL_SLOTS) {
+		pthread_mutex_lock(&s->lock);
+		s->still_pool[*slot_idx].busy = false;
+		pthread_mutex_unlock(&s->lock);
+		*slot_idx = -1;
+	}
+}
 
 static void
 still_free(struct still_job *j)
 {
+	still_release_slot(j->s, &j->slot_idx);
 	CVPixelBufferRelease(j->pb);
 	if (j->handler != NULL) {
 		CFRelease(j->handler);
@@ -546,12 +560,10 @@ still_free(struct still_job *j)
 }
 
 static void
-still_run(void *context)
+still_deliver(void *context)
 {
 	struct still_job *j = context;
 	struct stream *s = j->s;
-	const struct annibale_camera_frame *f = (const void *)j->frame;
-	const uint8_t *raw = j->frame + f->header_bytes;
 	static mach_timebase_info_data_t tb;
 	bool live;
 
@@ -561,26 +573,10 @@ still_run(void *context)
 	pthread_mutex_lock(&s->lock);
 	live = s->state == CAM_STREAM_ACTIVE;
 	pthread_mutex_unlock(&s->lock);
-	/*
-	 * A stopped stream drops the photographs queued but not begun; one already rendering finishes
-	 * and gives its buffer, as a frame mid-deliver() does. The handlers outlive the queue: the
-	 * worker's exit waits for what is queued before join returns.
-	 */
-	if (live) {
-		say("the %s's photograph of frame %llu begins rendering after %.0f ms in the queue", j->out->name, f->sequence,
-		    (double)(mach_absolute_time() - j->enqueued) * tb.numer / tb.denom / 1e6);
-		render_picture(j->out, j->pb, j->pf, j->width, j->height, &j->isp, f, raw, true);
-		CVBufferSetAttachments(j->pb, colour_attachments(), kCVAttachmentMode_ShouldPropagate);
-		attach_metadata(s, j->out, j->pb, j->metadata, &j->isp, &j->env);
-		pthread_mutex_lock(&s->lock);
-		live = s->state == CAM_STREAM_ACTIVE;
-		pthread_mutex_unlock(&s->lock);
-	}
-	if (live) {
-		CMTime pts = CMClockMakeHostTimeFromSystemUnits(f->time);
+	if (live && j->handler != NULL) {
 		uint64_t hand = mach_absolute_time();
 
-		((pixel_buffer_handler)j->handler)(j->pb, pts);
+		((pixel_buffer_handler)j->handler)(j->pb, j->pts);
 		double handler_ms = (double)(mach_absolute_time() - hand) * tb.numer / tb.denom / 1e6;
 
 		if (j->out->delivered++ == 0) {
@@ -595,27 +591,94 @@ still_run(void *context)
 	still_free(j);
 }
 
-/*
- * A still output's frame is spent here only for the copying (~6 MB of RAW, single-digit ms); the
- * render waits its turn on the queue. Called under s->lock, as the output loop around it is.
- */
 static void
-still_enqueue(struct stream *s, struct output *out, const struct isp *isp, const uint8_t *frame,
-    uint32_t frame_bytes, CFDictionaryRef metadata)
+still_run(void *context)
+{
+	struct still_job *j = context;
+	struct stream *s = j->s;
+	const uint8_t *frame = s->still_pool[j->slot_idx].buf;
+	const struct annibale_camera_frame *f = (const void *)frame;
+	const uint8_t *raw = frame + f->header_bytes;
+	static mach_timebase_info_data_t tb;
+	bool live;
+
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	pthread_mutex_lock(&s->lock);
+	live = s->state == CAM_STREAM_ACTIVE;
+	pthread_mutex_unlock(&s->lock);
+	/*
+	 * A stopped stream drops the photographs queued but not begun; one already rendering finishes
+	 * and hands its rendered buffer to still_deliver_queue. The RAW pool slot is returned as soon
+	 * as demosaic finishes so bursts reuse it while CMCapture encodes the previous photograph.
+	 */
+	if (live) {
+		j->pts = CMClockMakeHostTimeFromSystemUnits(f->time);
+		say("the %s's photograph of frame %llu begins rendering after %.0f ms in the queue", j->out->name, f->sequence,
+		    (double)(mach_absolute_time() - j->enqueued) * tb.numer / tb.denom / 1e6);
+		render_picture(j->out, j->pb, j->pf, j->width, j->height, &j->isp, f, raw, true);
+		CVBufferSetAttachments(j->pb, colour_attachments(), kCVAttachmentMode_ShouldPropagate);
+		attach_metadata(s, j->out, j->pb, j->metadata, &j->isp, &j->env);
+	}
+	still_release_slot(s, &j->slot_idx);
+	if (live) {
+		pthread_mutex_lock(&s->lock);
+		live = s->state == CAM_STREAM_ACTIVE;
+		pthread_mutex_unlock(&s->lock);
+	}
+	if (live && s->still_deliver_queue != NULL) {
+		dispatch_async_f(s->still_deliver_queue, j, still_deliver);
+		return;
+	}
+	if (live) {
+		still_deliver(j);
+		return;
+	}
+	still_free(j);
+}
+
+/*
+ * Reserve a RAW ring-pool slot and snapshot metadata under s->lock; the ~6 MB RAW copy and queue
+ * dispatch happen after s->lock is released so preview/control callers never stall on memcpy.
+ */
+static struct still_job *
+still_prepare(struct stream *s, struct output *out, const struct isp *isp, uint32_t frame_bytes,
+    CFDictionaryRef metadata)
 {
 	uint32_t pf, width, height;
-	CVPixelBufferRef pb = picture_buffer(out, &pf, &width, &height);
-	struct still_job *j;
+	int slot_idx = -1;
 
-	if (pb == NULL) {
-		return;
+	for (int i = 0; i < STILL_POOL_SLOTS; i++) {
+		if (!s->still_pool[i].busy) {
+			slot_idx = i;
+			break;
+		}
 	}
-	j = malloc(sizeof(*j) + frame_bytes);
+	if (slot_idx < 0) {
+		say("%s: all %d still RAW slots busy: photograph skipped", out->name, STILL_POOL_SLOTS);
+		return NULL;
+	}
+	if (s->still_pool[slot_idx].cap < frame_bytes) {
+		uint8_t *nb = realloc(s->still_pool[slot_idx].buf, frame_bytes);
+		if (nb == NULL) {
+			say("%s: no room for the photograph's frame: skipped", out->name);
+			return NULL;
+		}
+		s->still_pool[slot_idx].buf = nb;
+		s->still_pool[slot_idx].cap = frame_bytes;
+	}
+	CVPixelBufferRef pb = picture_buffer(out, &pf, &width, &height);
+	if (pb == NULL) {
+		return NULL;
+	}
+	struct still_job *j = calloc(1, sizeof(*j));
 	if (j == NULL) {
 		CVPixelBufferRelease(pb);
-		say("%s: no room for the photograph's frame: skipped", out->name);
-		return;
+		say("%s: no room for the photograph's job: skipped", out->name);
+		return NULL;
 	}
+	s->still_pool[slot_idx].busy = true;
 	j->s = s;
 	j->out = out;
 	j->handler = out->handler != NULL ? (void *)CFRetain(out->handler) : NULL;
@@ -628,12 +691,20 @@ still_enqueue(struct stream *s, struct output *out, const struct isp *isp, const
 	j->pf = pf;
 	j->width = width;
 	j->height = height;
-	memcpy(j->frame, frame, frame_bytes);
+	j->frame_bytes = frame_bytes;
+	j->slot_idx = slot_idx;
+	return j;
+}
+
+static void
+still_dispatch(struct stream *s, struct still_job *j, const uint8_t *frame)
+{
+	memcpy(s->still_pool[j->slot_idx].buf, frame, j->frame_bytes);
 	j->enqueued = mach_absolute_time();
 	if (s->still_queue != NULL) {
 		dispatch_async_f(s->still_queue, j, still_run);
 	} else {
-		say("%s: the stills' queue is not there: the photograph is skipped", out->name);
+		say("%s: the stills' queue is not there: the photograph is skipped", j->out->name);
 		still_free(j);
 	}
 }
@@ -816,6 +887,12 @@ stream_finalize(CMBaseObjectRef o)
 	if (s->still_queue != NULL) {
 		dispatch_release(s->still_queue);
 	}
+	if (s->still_deliver_queue != NULL) {
+		dispatch_release(s->still_deliver_queue);
+	}
+	for (int i = 0; i < STILL_POOL_SLOTS; i++) {
+		free(s->still_pool[i].buf);
+	}
 	if (s->torch >= 0) {
 		close(s->torch);
 	}
@@ -849,7 +926,10 @@ stream_create(CFAllocatorRef allocator, const struct camera *camera, CFStringRef
 	memset(s, 0, sizeof(*s));
 	pthread_mutex_init(&s->lock, NULL);
 	pthread_mutex_init(&s->metadata_lock, NULL);
-	s->still_queue = dispatch_queue_create("annibale-camera-still", NULL);
+	dispatch_queue_attr_t still_attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
+	    QOS_CLASS_USER_INITIATED, 0);
+	s->still_queue = dispatch_queue_create("annibale-camera-still", still_attr);
+	s->still_deliver_queue = dispatch_queue_create("annibale-camera-still-deliver", still_attr);
 	s->torch = torch_fd;
 	s->zoom = 1;
 	s->exposure_bias = s->said_bias = 256;

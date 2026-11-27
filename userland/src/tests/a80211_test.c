@@ -268,6 +268,18 @@ cwjoin(const uint8_t *ssid, unsigned ssid_len, const uint8_t *passphrase,
 	if (cw == NULL || objc == NULL) {
 		return 1;
 	}
+	typedef int (*bs_lu_fn)(unsigned int, const char *, unsigned int *);
+	typedef int (*bs_lu2_fn)(unsigned int, const char *, unsigned int *, int, uint64_t);
+	unsigned int *bp = dlsym(RTLD_DEFAULT, "bootstrap_port");
+	bs_lu_fn lu = dlsym(RTLD_DEFAULT, "bootstrap_look_up");
+	bs_lu2_fn lu2 = dlsym(RTLD_DEFAULT, "bootstrap_look_up2");
+	if (bp != NULL && lu != NULL && lu2 != NULL) {
+		unsigned int p0 = 0, p8 = 0;
+		int k0 = lu(*bp, "com.apple.private.corewifi-xpc", &p0);
+		int k8 = lu2(*bp, "com.apple.private.corewifi-xpc", &p8, 0, 8u);
+		fprintf(stderr, "a80211_test: cwjoin: corewifi-xpc plain=%#x(p=%#x) flags8=%#x(p=%#x)\n",
+		    k0, p0, k8, p8);
+	}
 	job.ssid = ssid;
 	job.ssid_len = ssid_len;
 	job.passphrase = passphrase;
@@ -296,6 +308,16 @@ cwf_sel(const char *name)
 #define MSG1(o, s, a) ((void *(*)(void *, void *, void *))cwf_msg)((o), cwf_sel(s), (void *)(a))
 #define MSG2(o, s, a, b) \
 	((void *(*)(void *, void *, void *, void *))cwf_msg)((o), cwf_sel(s), (void *)(a), (void *)(b))
+
+static void
+cwf_show_err(const char *tag, void *err)
+{
+	long code = (long)MSG0(err, "code");
+	fprintf(stderr, "a80211_test: %s: code=%ld\n", tag, code);
+	show(tag, MSG0(err, "domain"));
+	show(tag, MSG0(err, "localizedDescription"));
+	show(tag, MSG0(err, "debugDescription"));
+}
 
 static void
 cwf_assoc(void *picked)
@@ -336,7 +358,7 @@ cwf_assoc(void *picked)
 	MSG2(cwf_iface, "associateWithParameters:reply:", ap, ^(void *err) {
 		fprintf(stderr, "a80211_test: cwjoin: associate reply err %p\n", err);
 		if (err != NULL) {
-			show("cwjoin assoc error", MSG0(err, "localizedDescription"));
+			cwf_show_err("cwjoin assoc error", err);
 		}
 	});
 }
@@ -349,7 +371,7 @@ cwf_scan_reply(void *err, void *results)
 
 	fprintf(stderr, "a80211_test: cwjoin: scan reply err %p results %p\n", err, results);
 	if (err != NULL) {
-		show("cwjoin scan error", MSG0(err, "localizedDescription"));
+		cwf_show_err("cwjoin scan error", err);
 	}
 	if (results == NULL) {
 		return;
