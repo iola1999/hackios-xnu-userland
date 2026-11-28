@@ -808,8 +808,12 @@ main(int argc, char **argv)
 		return 0;
 	}
 	if (argc >= 2 && strcmp(argv[1], "leave") == 0) {
-		printf("a80211_test: set disassociate(22) -> %d\n", a80211_set(handle, 22, NULL, NULL, 0));
-		return 0;
+		error = a80211_set(handle, 22, NULL, NULL, 0);
+		printf("a80211_test: set disassociate(22) -> %d\n", error);
+		if (a80211_close != NULL) {
+			a80211_close(handle);
+		}
+		return error != 0;
 	}
 	if (argc >= 2 && strcmp(argv[1], "scan") == 0) {
 		int (*scan)(void *, CFArrayRef *, CFDictionaryRef) = dlsym(io, "Apple80211Scan");
