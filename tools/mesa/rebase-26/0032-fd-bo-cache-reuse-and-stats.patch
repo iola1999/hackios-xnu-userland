@@ -1,0 +1,100 @@
+--- a/src/freedreno/drm/freedreno_bo_cache.c
++++ b/src/freedreno/drm/freedreno_bo_cache.c
+@@ -30,6 +30,12 @@
+       }                                                         \
+    } while (0)
+ 
++static inline bool
++is_ring_cache(const struct fd_bo_cache *cache)
++{
++   return cache->name && strcmp(cache->name, "ring") == 0;
++}
++
+ static void
+ bo_remove_from_bucket(struct fd_bo_bucket *bucket, struct fd_bo *bo)
+ {
+@@ -104,7 +110,11 @@
+ void
+ fd_bo_cache_init(struct fd_bo_cache *cache, int coarse, const char *name)
+ {
++#ifdef __APPLE__
++   unsigned long size, cache_max_size = 128 * 1024 * 1024;
++#else
+    unsigned long size, cache_max_size = 64 * 1024 * 1024;
++#endif
+ 
+    cache->name = name;
+    simple_mtx_init(&cache->lock, mtx_plain);
+@@ -154,9 +164,15 @@
+       while (!list_is_empty(&bucket->list)) {
+          bo = first_bo(&bucket->list);
+ 
++#ifdef __APPLE__
++         /* keep things in cache for at least 3 seconds: */
++         if (time && ((time - bo->free_time) <= 3))
++            break;
++#else
+          /* keep things in cache for at least 1 second: */
+          if (time && ((time - bo->free_time) <= 1))
+             break;
++#endif
+ 
+          if (cnt == 0) {
+             BO_CACHE_LOG(cache, "cache cleanup");
+@@ -177,6 +193,8 @@
+    fd_bo_del_list_nocache(&freelist);
+ 
+    if (cnt > 0) {
++      if (time != 0)
++         fd_bo_stats_note(FD_BO_STAT_EXPIRED, (uint32_t)cnt);
+       BO_CACHE_LOG(cache, "cache cleaned %u BOs", cnt);
+       dump_cache_stats(cache);
+    }
+@@ -216,7 +234,7 @@
+     */
+    foreach_bo (entry, &bucket->list) {
+       if (fd_bo_state(entry) != FD_BO_STATE_IDLE) {
+-         break;
++         continue;
+       }
+       if (entry->alloc_flags == flags) {
+          bo = entry;
+@@ -260,12 +278,18 @@
+          p_atomic_set(&bo->refcnt, 1);
+          bo->reloc_flags = FD_RELOC_FLAGS_INIT;
+          BO_CACHE_INC(bucket, hits);
++         fd_bo_stats_note(is_ring_cache(cache) ? FD_BO_STAT_RING_CACHE_HIT
++                                               : FD_BO_STAT_BO_CACHE_HIT,
++                          1);
+          fd_alloc_log(bo, FD_ALLOC_CACHE, FD_ALLOC_ACTIVE);
+          return bo;
+       }
+       BO_CACHE_INC(bucket, misses);
+    }
+ 
++   fd_bo_stats_note(is_ring_cache(cache) ? FD_BO_STAT_RING_CACHE_MISS
++                                         : FD_BO_STAT_BO_CACHE_MISS,
++                    1);
+    fd_bo_del_list_nocache(&freelist);
+ 
+    BO_CACHE_LOG(cache, "miss on size=%u, flags=0x%x, bucket=%u", *size, flags,
+@@ -278,8 +302,11 @@
+ int
+ fd_bo_cache_free(struct fd_bo_cache *cache, struct fd_bo *bo)
+ {
+-   if (bo->alloc_flags & (_FD_BO_EXPORTED | _FD_BO_NOSYNC))
++   if (bo->alloc_flags & (_FD_BO_EXPORTED | _FD_BO_NOSYNC)) {
++      if (bo->alloc_flags & _FD_BO_EXPORTED)
++         fd_bo_stats_note(FD_BO_STAT_EVICTED, 1);
+       return -1;
++   }
+ 
+    struct fd_bo_bucket *bucket = get_bucket(cache, bo->size);
+ 
+@@ -305,5 +332,6 @@
+       return 0;
+    }
+ 
++   fd_bo_stats_note(FD_BO_STAT_EVICTED, 1);
+    return -1;
+ }

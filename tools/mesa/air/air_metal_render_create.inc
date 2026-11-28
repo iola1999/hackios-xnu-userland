@@ -34,6 +34,14 @@ make_stage_cso(struct rwa_device *device, nir_shader *nir, const struct air_shad
  * the colour side and refuses to read back an attachment nothing stored to.
  */
 static bool
+is_frag_depth_store_deref(const nir_deref_instr *d)
+{
+   return d && d->deref_type == nir_deref_type_var &&
+          d->var->data.mode == nir_var_shader_out &&
+          d->var->data.location == FRAG_RESULT_DEPTH;
+}
+
+static bool
 fragment_writes_depth(nir_shader *fs)
 {
    nir_foreach_function_impl(impl, fs) {
@@ -45,8 +53,7 @@ fragment_writes_depth(nir_shader *fs)
             if (in->intrinsic != nir_intrinsic_store_deref)
                continue;
             nir_deref_instr *d = nir_src_as_deref(in->src[0]);
-            if (d && d->deref_type == nir_deref_type_var &&
-                d->var->data.location == FRAG_RESULT_DEPTH)
+            if (is_frag_depth_store_deref(d))
                return true;
          }
       }
@@ -73,8 +80,7 @@ drop_frag_depth_stores(nir_shader *fs)
             if (in->intrinsic != nir_intrinsic_store_deref)
                continue;
             nir_deref_instr *d = nir_src_as_deref(in->src[0]);
-            if (d && d->deref_type == nir_deref_type_var &&
-                d->var->data.location == FRAG_RESULT_DEPTH) {
+            if (is_frag_depth_store_deref(d)) {
                nir_instr_remove(instr);
                dropped = true;
             }

@@ -50,6 +50,9 @@
 31. `0031-fd-heap-and-cache-reuse.patch`：批 11 切片 B（`ring_heap` 与 `default_heap` 接纳扩展、`heap_clean` 跳过忙条目及 `fd bo stats` 汇总；`freedreno_bo_cache.c` 与 `tools/mesa/air/` 均保持 `0030` 基线）。
     - `bo_new()` 在判定 heap 前剥除 `!dev->has_cached_coherent` 下的 `FD_BO_CACHED_COHERENT`，将 GPU 只读小描述符（`0x402`/`0x403`/`0x2`/`0x3`）纳入 `ring_heap`，并将非图像 `FD_BO_NOMAP`（`0x4`，`256` 字节对齐，置 `prefaulted = true`）纳入 `default_heap`。
     - `heap_clean()` 遇忙 `sa_bo` 改为 `continue` 跳过；`freedreno_bo.c` 附带 5 秒活跃窗 `fd bo stats` 汇总。设计与二分范围见顶层工作区 `out/goal-1124/batch9/mesa-0031-design.md`。
+32. `0032-fd-bo-cache-reuse-and-stats.patch`：批 27 `b5r83` 切片（`freedreno_bo_cache.c` 忙节点跳过复用、Mac/iOS 缓存上限与保留窗口调整、以及 `fd bo stats` 缓存统计接入）。
+    - `find_in_bucket()` 遇到 `fd_bo_state(entry) != FD_BO_STATE_IDLE` 时改为 `continue`，仅摘除已复用的空闲 BO 并保持剩余节点 `free_time` 递增顺序；`fd_bo_cache_init()` 与 `fd_bo_cache_cleanup()` 在 `__APPLE__` 下分别将 `cache_max_size` 提至 `128 MiB`、保留窗口扩至 `<= 3s`。
+    - 在 `fd_bo_cache_alloc()`、`fd_bo_cache_cleanup()`（`time != 0`）与 `fd_bo_cache_free()` 驱逐路径接入 `fd_bo_stats_note()`，按 `cache->name` 区分 `bo_cache` 与 `ring_cache`。
 
 `rebase-26/` 下的补丁按文件名顺序应用。两个 `0004` 开头的补丁分别来自 Turnip 与 A830 两条工作，修改的文件互不重叠。应用这一层补丁后的源码树，加上 `tools/mesa/annibale-drm` 与 `tools/mesa/air`，就是真机 AIR 库的构建源；`PREPARE=1 VERSION=26.2.5 SHA256=… REBASE=26 tools/mk-mesa.sh` 只执行到这一步，arm64e 构建见顶层 `tools/k90auto/setup-mesa-arm64e.py`。
 

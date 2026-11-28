@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host ASan+UBSan lifecycle and mutation tests for Mesa 0031 heap/cache changes."""
+"""Host ASan+UBSan lifecycle and mutation tests for Mesa 0031/0032 heap/cache changes."""
 
 import argparse
 import os
@@ -24,6 +24,7 @@ HARNESS_C = r"""
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "freedreno_drmif.h"
 #include "freedreno_priv.h"
@@ -183,9 +184,9 @@ static void reset_counters(void) {
 int main(void) {
     struct fd_device *dev = make_test_device();
     struct fd_pipe_control ctrl = { .fence = 0 };
-    struct fd_pipe pipe = { .dev = dev, .refcnt = 10, .control = &ctrl };
-    struct fd_fence f_busy = { .refcnt = 10, .pipe = &pipe, .ufence = 5 };
-    struct fd_fence f_idle = { .refcnt = 10, .pipe = &pipe, .ufence = 1 };
+    struct fd_pipe fake_pipe = { .dev = dev, .refcnt = 10, .control = &ctrl };
+    struct fd_fence f_busy = { .refcnt = 10, .pipe = &fake_pipe, .ufence = 5 };
+    struct fd_fence f_idle = { .refcnt = 10, .pipe = &fake_pipe, .ufence = 1 };
 
     /* 1. ring_heap accepts 0x402 (tex_desc/samp_desc), 0x2 (zero_desc), 0x3 (bindless) when !has_cached_coherent */
     g_fake_sec = 100;
@@ -262,21 +263,118 @@ int main(void) {
     for (int i = 0; i < 32; i++)
         fd_bo_del(again[i]);
 
-    /* 5. bo_cache stays at 0030 baseline (expires >1 s idle on next free cleanup; busy head stops find_in_bucket) */
+    /* 5. 0032 bo_cache: <=3 s stays cached & reusable after cleanup, >3 s expires; busy head skipped; >112 MiB bucket; stats */
     g_fake_sec = 200;
     fd_bo_cache_cleanup(&dev->bo_cache, 0);
     reset_counters();
     struct fd_bo *c0 = fd_bo_new(dev, 65536, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "c0");
     fd_bo_del(c0);
     assert(g_backend_close_calls == 0);
-    g_fake_sec = 202; /* >1 s in 0030 bo_cache; next fd_bo_del runs cleanup and expires c0 */
-    struct fd_bo *trig = fd_bo_new(dev, 16384, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "trig");
+    g_fake_sec = 203; /* <=3 s in 0032 bo_cache: cleanup on trig0 free must NOT expire c0 */
+    struct fd_bo *trig0 = fd_bo_new(dev, 16384, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "trig0");
+    fd_bo_del(trig0);
+    assert(g_backend_close_calls == 0);
+    reset_counters();
+    struct fd_bo *c0_reuse = fd_bo_new(dev, 65536, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "c0_reuse");
+    assert(c0_reuse == c0 && g_backend_new_calls == 0 && g_backend_close_calls == 0);
+    fd_bo_del(c0_reuse);
+    g_fake_sec = 207; /* >3 s since 203: next fd_bo_del runs cleanup and expires c0_reuse + trig0 */
+    struct fd_bo *trig = fd_bo_new(dev, 32768, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "trig");
     fd_bo_del(trig);
-    assert(g_backend_close_calls == 1);
+    assert(g_backend_close_calls == 2);
     reset_counters();
     struct fd_bo *c1 = fd_bo_new(dev, 65536, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "c1");
     assert(c1 != c0 && g_backend_new_calls == 1);
     fd_bo_del(c1);
+
+    /* 5b. find_in_bucket skips busy head and reuses trailing idle BO in the same bucket */
+    ctrl.fence = 2; /* f_idle(1) is IDLE, f_busy(5) is BUSY */
+    fd_bo_cache_cleanup(&dev->bo_cache, 0);
+    reset_counters();
+    struct fd_bo *b_busy = fd_bo_new(dev, 28u << 20, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "b_busy");
+    struct fd_bo *b_idle = fd_bo_new(dev, 28u << 20, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "b_idle");
+    simple_mtx_lock(&fence_lock);
+    fd_bo_add_fence(b_busy, &f_busy);
+    fd_bo_add_fence(b_idle, &f_idle);
+    simple_mtx_unlock(&fence_lock);
+    fd_bo_del(b_busy);
+    fd_bo_del(b_idle);
+    reset_counters();
+    struct fd_bo *b_reused = fd_bo_new(dev, 28u << 20, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "b_reused");
+    assert(b_reused == b_idle && g_backend_new_calls == 0);
+    fd_bo_del(b_reused);
+
+    /* 5c. 128 MiB cache_max_size keeps and reuses >112 MiB (128 MiB) BO */
+    reset_counters();
+    struct fd_bo *b128 = fd_bo_new(dev, 128u << 20, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "b128");
+    fd_bo_del(b128);
+    reset_counters();
+    struct fd_bo *b128_reuse = fd_bo_new(dev, 128u << 20, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "b128_reuse");
+    assert(b128_reuse == b128 && g_backend_new_calls == 0);
+    fd_bo_del(b128_reuse);
+
+    /* 5d. Verify bo_cache vs ring_cache, expired, and evicted stats via fd bo stats window flush */
+    g_fake_sec = 300;
+    fd_bo_cache_cleanup(&dev->bo_cache, 0);
+    fd_bo_cache_cleanup(&dev->ring_cache, 0);
+    struct fd_bo *rst = fd_bo_new(dev, 65536, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "rst");
+    fd_bo_del(rst);
+    fd_bo_cache_cleanup(&dev->bo_cache, 0);
+
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    int pfd[2];
+    assert(pipe(pfd) == 0);
+    assert(dup2(pfd[1], STDOUT_FILENO) >= 0);
+    close(pfd[1]);
+
+    struct fd_bo *sb0 = fd_bo_new(dev, 65536, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "sb0"); /* bo_miss #1 */
+    fd_bo_del(sb0);
+    struct fd_bo *sb1 = fd_bo_new(dev, 65536, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "sb1"); /* bo_hit #1 */
+    assert(sb1 == sb0);
+    fd_bo_del(sb1);
+    struct fd_bo *sr0 = fd_bo_new_ring(dev, FD_BO_HEAP_BLOCK_SIZE); /* ring_miss #1 */
+    fd_bo_del(sr0);
+    struct fd_bo *sr1 = fd_bo_new_ring(dev, FD_BO_HEAP_BLOCK_SIZE); /* ring_hit #1 */
+    assert(sr1 == sr0);
+    fd_bo_del(sr1);
+    g_fake_sec = 304; /* expires sb1 (>3 s) on cleanup */
+    struct fd_bo *sb2 = fd_bo_new(dev, 16384, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "sb2"); /* bo_miss #2 */
+    fd_bo_del(sb2);
+    g_fake_sec = 310; /* triggers stats flush + oversize (>224 MiB) eviction */
+    struct fd_bo *over = fd_bo_new(dev, 240u << 20, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "over"); /* bo_miss #3, evict #1 */
+    fd_bo_del(over);
+    g_fake_sec = 316; /* flushes evict #1 into stats */
+    struct fd_bo *sb3 = fd_bo_new(dev, 32768, FD_BO_NOMAP | FD_BO_HINT_IMAGE, "sb3"); /* bo_miss #4 */
+    fd_bo_del(sb3);
+
+    fflush(stdout);
+    assert(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+    close(saved_stdout);
+    char stats_buf[4096];
+    ssize_t nread = read(pfd[0], stats_buf, sizeof(stats_buf) - 1);
+    assert(nread > 0);
+    stats_buf[nread] = '\0';
+    close(pfd[0]);
+    unsigned sum_bo_hit = 0, sum_bo_miss = 0, sum_ring_hit = 0, sum_ring_miss = 0, sum_exp = 0, sum_evict = 0;
+    for (char *line = stats_buf; line && *line; ) {
+        char *next = strchr(line, '\n');
+        if (next) *next = '\0';
+        unsigned bh, bm, rh, rm, ex, ev;
+        if (sscanf(line, "fd bo stats[%*d]: %*u ms def_heap=%*u ring_heap=%*u bo_hit=%u bo_miss=%u ring_hit=%u ring_miss=%u made=%*u (0x204=%*u 0x110=%*u 0x4=%*u 0x402=%*u other=%*u) exp=%u evict=%u",
+                   &bh, &bm, &rh, &rm, &ex, &ev) == 6) {
+            sum_bo_hit += bh;
+            sum_bo_miss += bm;
+            sum_ring_hit += rh;
+            sum_ring_miss += rm;
+            sum_exp += ex;
+            sum_evict += ev;
+        }
+        line = next ? next + 1 : NULL;
+    }
+    assert(sum_bo_hit == 1 && sum_bo_miss == 4);
+    assert(sum_ring_hit == 1 && sum_ring_miss == 1);
+    assert(sum_exp == 1 && sum_evict == 1);
 
     destroy_test_device(dev);
     printf("test-fd-bo-cache-reuse: ALL PASS\n");
@@ -345,8 +443,10 @@ def run_build(mesa_dir: Path, build_dir: Path, overrides: dict[str, tuple[str, s
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mutations", action="store_true")
+    ap.add_argument("--mesa-dir", type=Path, default=MESA)
+    ap.add_argument("--build-dir", type=Path, default=BUILD)
     args = ap.parse_args()
-    rc = run_build(MESA, BUILD)
+    rc = run_build(args.mesa_dir, args.build_dir)
     if rc != 0:
         raise SystemExit(f"production check failed with rc={rc}")
     if args.mutations:
@@ -356,11 +456,17 @@ def main() -> int:
             "default_heap_skip_nomap": ("freedreno_bo.c", ("((alloc_flags == FD_BO_NOMAP) && !(flags & FD_BO_HINT_IMAGE))", "0")),
             "nomap_align_64": ("freedreno_bo_heap.c", ("(flags & FD_BO_NOMAP) ? MAX2(SUBALLOC_ALIGNMENT, 256u) : SUBALLOC_ALIGNMENT;", "SUBALLOC_ALIGNMENT;")),
             "heap_clean_break": ("freedreno_bo_heap.c", ("if (idle && !sa_idle(bo))\n         continue;", "if (idle && !sa_idle(bo))\n         break;")),
+            "find_in_bucket_break": ("freedreno_bo_cache.c", ("if (fd_bo_state(entry) != FD_BO_STATE_IDLE) {\n         continue;\n      }", "if (fd_bo_state(entry) != FD_BO_STATE_IDLE) {\n         break;\n      }")),
+            "cache_max_size_64m": ("freedreno_bo_cache.c", ("unsigned long size, cache_max_size = 128 * 1024 * 1024;", "unsigned long size, cache_max_size = 64 * 1024 * 1024;")),
+            "cache_expire_1s": ("freedreno_bo_cache.c", ("if (time && ((time - bo->free_time) <= 3))", "if (time && ((time - bo->free_time) <= 1))")),
+            "stats_ring_vs_bo": ("freedreno_bo_cache.c", ("is_ring_cache(cache) ? FD_BO_STAT_RING_CACHE_HIT", "0 ? FD_BO_STAT_RING_CACHE_HIT")),
+            "stats_expired_missing": ("freedreno_bo_cache.c", ("fd_bo_stats_note(FD_BO_STAT_EXPIRED, (uint32_t)cnt);", "")),
+            "stats_evicted_missing": ("freedreno_bo_cache.c", ("fd_bo_stats_note(FD_BO_STAT_EVICTED, 1);\n   return -1;\n}", "return -1;\n}")),
         }
         for name, (fn, repl) in mutations.items():
-            mrc = run_build(MESA, BUILD, {fn: repl})
+            mrc = run_build(args.mesa_dir, args.build_dir, {fn: repl})
             assert mrc != 0, f"mutation {name} escaped"
-        print(f"Mesa 0031 Slice B heap mutations detected: {len(mutations)}")
+        print(f"Mesa 0031/0032 heap and cache mutations detected: {len(mutations)}")
     return 0
 
 

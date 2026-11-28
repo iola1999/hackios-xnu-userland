@@ -633,6 +633,128 @@ run_depth(const char *path, const char *func, const char *colorspec, const char 
    return ok ? 0 : 1;
 }
 
+static bool
+check_no_depth_case(struct rwa_device *device, struct metallib *lib, const char *func,
+                    const float want[4], const char *label)
+{
+   char name[256];
+   const uint8_t *bitcode = NULL;
+   size_t bitcode_size = 0;
+   if (!find_function(lib, func, name, sizeof(name), &bitcode, &bitcode_size))
+      return false;
+
+   char why[WHY] = "";
+   struct rwa_render_shape shape = {
+      .color_count = 1,
+      .color_format = { MTL_RGBA32_FLOAT },
+      .sample_count = 1,
+      .depth_format = 0,
+      .stencil_format = 0,
+   };
+   struct rwa_render_info info = { 0 };
+   struct rwa_render *render =
+      rwa_render_create(device, NULL, 0, NULL, bitcode, bitcode_size, func, &shape, &info,
+                        why, sizeof(why));
+   if (!render) {
+      printf("air_metal_test: %s (%s): rwa_render_create: %s\n", label, name, why);
+      return false;
+   }
+   if (info.fragment_writes_depth != 0) {
+      printf("air_metal_test: %s (%s): fragment_writes_depth=%u, expected 0\n",
+             label, name, info.fragment_writes_depth);
+      rwa_render_destroy(render);
+      return false;
+   }
+
+   const struct rwa_texture_shape ts = {
+      .pixel_format = MTL_RGBA32_FLOAT, .type = MTL_TEXTURE_TYPE_2D,
+      .width = TEX, .height = TEX, .depth = 1, .array_length = 1, .mip_levels = 1,
+      .sample_count = 1,
+      .usage = MTL_USAGE_SHADER_READ | 4 /* MTLTextureUsageRenderTarget */,
+   };
+   struct rwa_texture *color = rwa_texture_create(device, &ts, why, sizeof(why));
+   if (!color) {
+      printf("air_metal_test: %s: rwa_texture_create: %s\n", label, why);
+      rwa_render_destroy(render);
+      return false;
+   }
+
+   struct rwa_buffer *buffers[4] = { 0 };
+   unsigned nbuf = info.fragment_buffers < COUNT_OF(buffers) ? info.fragment_buffers
+                                                             : (unsigned)COUNT_OF(buffers);
+   for (unsigned i = 0; i < nbuf; i++) {
+      buffers[i] = rwa_buffer_create(device, 64, why, sizeof(why));
+      if (!buffers[i]) {
+         printf("air_metal_test: %s: rwa_buffer_create(%u): %s\n", label, i, why);
+         for (unsigned j = 0; j < i; j++)
+            rwa_buffer_destroy(buffers[j]);
+         rwa_texture_destroy(color);
+         rwa_render_destroy(render);
+         return false;
+      }
+      memset(rwa_buffer_map(buffers[i]), 0, 64);
+   }
+
+   const float clear_zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+   const struct rwa_draw draw = {
+      .color = &color, .color_count = 1,
+      .clear_color = clear_zero,
+      .fragment = { .buffers = buffers, .buffer_count = nbuf },
+      .primitive = 4, .vertex_start = 0, .vertex_count = 4,
+   };
+   bool ok = true;
+   if (rwa_render_draw(render, &draw, why, sizeof(why)) != 0) {
+      printf("air_metal_test: %s: rwa_render_draw: %s\n", label, why);
+      ok = false;
+   }
+   float got[4] = { 0 };
+   const unsigned origin[3] = { 0, 0, 0 };
+   const unsigned one[3] = { 1, 1, 1 };
+   if (ok && rwa_texture_read(color, 0, 0, origin, one, got, 0, why, sizeof(why)) != 0) {
+      printf("air_metal_test: %s: rwa_texture_read: %s\n", label, why);
+      ok = false;
+   }
+   if (ok) {
+      printf("air_metal_test: %s (%s): fragment_writes_depth=%u pixel=(%.4f, %.4f, %.4f, %.4f)\n",
+             label, name, info.fragment_writes_depth,
+             (double)got[0], (double)got[1], (double)got[2], (double)got[3]);
+      for (unsigned c = 0; c < 4; c++) {
+         float d = got[c] - want[c];
+         if (!(got[c] == got[c]) || (d < 0.0f ? -d : d) > 1e-3f) {
+            printf("air_metal_test: %s: channel %u mismatch got=%.6f want=%.6f\n",
+                   label, c, (double)got[c], (double)want[c]);
+            ok = false;
+         }
+      }
+   }
+   for (unsigned i = 0; i < nbuf; i++)
+      rwa_buffer_destroy(buffers[i]);
+   rwa_texture_destroy(color);
+   rwa_render_destroy(render);
+   return ok;
+}
+
+static int
+run_depth_store_filter(const char *path, const char *temp_func, const char *depth_func)
+{
+   struct metallib lib = { 0 };
+   if (!load_metallib(path, &lib))
+      return 1;
+   setenv("RWA_SOFTWARE", "1", 0);
+   char why[WHY] = "";
+   struct rwa_device *device = rwa_device_open(why, sizeof(why));
+   if (!device) {
+      printf("air_metal_test: rwa_device_open: %s\n", why);
+      return 1;
+   }
+   const float want_temp[4] = { 0.25f, 0.5f, 0.75f, 1.0f };
+   const float want_depth[4] = { 0.5f, 0.25f, 0.75f, 1.0f };
+   bool ok = check_no_depth_case(device, &lib, temp_func, want_temp, "function_temp_preserved");
+   ok &= check_no_depth_case(device, &lib, depth_func, want_depth, "depth_store_dropped");
+   rwa_device_close(device);
+   return ok ? 0 : 1;
+}
+
 /*
  * --draw-ms: a multisample texture, filled the only way anything can fill one, and read
  * by the shader that declared it.

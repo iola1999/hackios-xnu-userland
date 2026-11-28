@@ -634,6 +634,15 @@ main(int argc, char **argv)
                        argc > 5 ? argv[5] : NULL);
    }
 
+   if (argc >= 2 && !strcmp(argv[1], "--depth-store-filter")) {
+      if (argc < 5) {
+         fprintf(stderr, "usage: air_metal_test --depth-store-filter FILE.metallib "
+                         "TEMP_FUNC DEPTH_FUNC\n");
+         return 2;
+      }
+      return run_depth_store_filter(argv[2], argv[3], argv[4]);
+   }
+
    /* --draw-ms is the draw whose TEXTURE is multisample, which takes two passes and not
     * one: nothing puts a known texel in a multisample texture from the processor, so the
     * first pass renders the fill into it and the second is the shader under test reading
