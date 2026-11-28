@@ -1,4 +1,5 @@
 /* Exposure/AF/tuning helpers and capture worker loop, included into camera_device_stream.inc. */
+#include "camera_pdaf.inc"
 
 /*
  * The scene's light as the cameras' tuning measures it (Qualcomm's lux index, higher is darker): about
@@ -77,6 +78,10 @@ struct af {
 	unsigned        lag;            /* frames not yet taken where the lens was told to go */
 	unsigned        skip;           /* frames taken there to pass over before measuring */
 	uint64_t        began;          /* when the search began (mach_absolute_time) */
+	struct pdaf_cal pdaf;
+	bool            pdaf_mode;      /* current AF_SEARCH is driven by PDAF direct jump */
+	unsigned        pdaf_iter;
+	unsigned        pdaf_defocus;
 };
 
 static void
@@ -142,7 +147,8 @@ af_peak(const struct af *af)
 }
 
 static void
-af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const uint8_t *raw, const float window[4], bool locked)
+af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const uint8_t *raw,
+    const uint8_t *pd_raw, const float window[4], bool locked)
 {
 	float level, sharpness;
 	unsigned needed = f->gain >= 16 * f->gain_unity ? 2 : 1;      /* (in the dark, two frames to a measurement) */
@@ -173,8 +179,23 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 	level = af->sum_level / af->measured;
 	af->sum_sharpness = af->sum_level = 0;
 	af->measured = 0;
+	struct pdaf_result pd;
+	bool pd_ok = af->pdaf.valid && pd_raw != NULL &&
+	    pdaf_measure(&af->pdaf, f, pd_raw, window, af->at, &pd);
 	switch (af->state) {
 	case AF_WATCH:
+		if (!locked && pd_ok && fabsf(pd.delta_dac) >= PDAF_DEFOCUS_TRIGGER_DAC) {
+			if (++af->pdaf_defocus >= 5u) {
+				af->pdaf_defocus = 0;
+				af->state = AF_STEADY;
+				af->steady = 0;
+				af->last_sharpness = sharpness;
+				af->last_level = level;
+				return;
+			}
+		} else {
+			af->pdaf_defocus = 0;
+		}
 		if (locked || (af->sharpness > 0 && sharpness > af->sharpness * 0.6f && level > af->level * 0.7f &&
 		    level < af->level * 1.4f)) {
 			af->unlike = 0;
@@ -200,9 +221,46 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 			return;
 		}
 		af->now = false;
+		if (pd_ok) {
+			af->pdaf_mode = true;
+			af->pdaf_iter = 0;
+			af->state = AF_SEARCH;
+			af->steps = 0;
+			af->best = 0;
+			af->pos[0] = pd.target_dac;
+			af->sharp[0] = sharpness;
+			af->began = mach_absolute_time();
+			say("focus: pdaf start at %u -> %u (disp %.2f px, dcc %.2f, conf %u)",
+			    af->at, pd.target_dac, pd.disparity, pd.dcc, pd.confidence);
+			af_go(device, af, pd.target_dac);
+			return;
+		}
+		af->pdaf_mode = false;
 		af_search(device, af);
 		return;
 	case AF_SEARCH: {
+		if (af->pdaf_mode) {
+			if (!pd_ok) {
+				af->pdaf_mode = false;
+				af_search(device, af);
+				return;
+			}
+			say("focus: pdaf iter %u at %u -> %u (disp %.2f px, delta %.1f, conf %u)",
+			    af->pdaf_iter, af->at, pd.target_dac, pd.disparity, pd.delta_dac, pd.confidence);
+			af->best = 0;
+			af->pos[0] = pd.target_dac;
+			af->sharp[0] = sharpness;
+			if (fabsf(pd.delta_dac) <= PDAF_CONVERGE_DAC || af->pdaf_iter >= PDAF_MAX_ITERS) {
+				af->state = AF_SETTLE;
+				if (fabsf(pd.delta_dac) > 4.0f && pd.target_dac != af->at) {
+					af_go(device, af, pd.target_dac);
+				}
+				return;
+			}
+			af->pdaf_iter++;
+			af_go(device, af, pd.target_dac);
+			return;
+		}
 		const struct af_search *p = &af->search;
 
 		say("focus: searched %u: sharpness %.4f level %.1f frame %llu", af->at, sharpness, level, f->sequence);
@@ -228,6 +286,8 @@ af_frame(int device, struct af *af, const struct annibale_camera_frame *f, const
 			mach_timebase_info(&tb);
 		}
 		af->state = AF_WATCH;
+		af->pdaf_mode = false;
+		af->pdaf_defocus = 0;
 		af->sharpness = sharpness;
 		af->level = level;
 		af->unlike = 0;
@@ -306,13 +366,16 @@ worker(void *context)
 		s->state = CAM_STREAM_FAULTED;
 		return NULL;
 	}
-	bytes = sizeof(struct annibale_camera_frame) + (size_t)profile.stride * profile.height;
+	size_t main_bytes = sizeof(struct annibale_camera_frame) + (size_t)profile.stride * profile.height;
+	size_t pd_alloc = (profile.sensor == 1u && profile.mode == 24u) ? PDAF_MAX_BYTES : 0u;
+	bytes = main_bytes + pd_alloc;
 	buffer = malloc(bytes);
 	if (buffer == NULL) {
 		close(device);
 		s->state = CAM_STREAM_FAULTED;
 		return NULL;
 	}
+	bool eeprom_loaded = false;
 	unsigned consecutive_failures = 0;
 	/* the pace over the last 300 frames: how long between frames at most, how long each took here */
 	mach_timebase_info_data_t tb;
@@ -380,6 +443,13 @@ worker(void *context)
 			pace_from = now;
 		}
 		const uint8_t *raw = buffer + f->header_bytes;
+		const uint8_t *pd_raw = ((f->pd_flags & ANNIBALE_CAM_PD_VALID) != 0 &&
+		    f->pd_bytes >= PDAF_MAX_BYTES && pd_alloc >= PDAF_MAX_BYTES) ?
+		    (buffer + main_bytes) : NULL;
+		if (!eeprom_loaded && profile.sensor == 1u) {
+			eeprom_loaded = true;
+			pdaf_load_eeprom(device, &af.pdaf);
+		}
 		struct annibale_camera_command c;
 
 		uint64_t mark[5];
@@ -430,7 +500,7 @@ worker(void *context)
 			af.state = AF_STEADY;
 			af.now = true;
 		}
-		af_frame(device, &af, f, raw, af_win, af_locked);
+		af_frame(device, &af, f, raw, pd_raw, af_win, af_locked);
 		mark[3] = mach_absolute_time();
 		s->frames++;
 
@@ -510,7 +580,7 @@ worker(void *context)
 				continue;
 			}
 			if (still) {
-				struct still_job *j = still_prepare(s, out, &isp, (uint32_t)bytes, metadata);
+				struct still_job *j = still_prepare(s, out, &isp, (uint32_t)main_bytes, metadata);
 				if (j != NULL) {
 					pending_stills[pending_still_count++] = j;
 					gave_still = true;

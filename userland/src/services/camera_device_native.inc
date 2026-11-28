@@ -94,6 +94,38 @@ fail:
 	return -1;
 }
 
+/* Read cached rear camera EEPROM via paged CAMIOC_G_EEPROM ioctl. Returns bytes copied (0 on unavailable). */
+static size_t
+camera_native_read_eeprom(int device, uint8_t *out, size_t max_bytes)
+{
+	if (device < 0 || out == NULL || max_bytes == 0) {
+		return 0;
+	}
+	size_t offset = 0, total = max_bytes;
+	while (offset < total) {
+		struct annibale_camera_eeprom req;
+		memset(&req, 0, sizeof(req));
+		req.offset = (uint32_t)offset;
+		size_t want = total - offset;
+		req.length = (uint32_t)(want > ANNIBALE_CAM_EEPROM_CHUNK ? ANNIBALE_CAM_EEPROM_CHUNK : want);
+		if (ioctl(device, CAMIOC_G_EEPROM, &req) != 0) {
+			return 0;
+		}
+		if ((req.flags & ANNIBALE_CAM_EEPROM_FLAG_VALID) == 0 || req.total_bytes == 0) {
+			return 0;
+		}
+		if (req.total_bytes < total) {
+			total = req.total_bytes;
+		}
+		if (req.length == 0 || req.length > ANNIBALE_CAM_EEPROM_CHUNK || offset + req.length > max_bytes) {
+			break;
+		}
+		memcpy(out + offset, req.data, req.length);
+		offset += req.length;
+	}
+	return offset;
+}
+
 /* A failed or HELD capture ends the worker; pixels are read only from a frame the kernel says is whole. */
 static ssize_t
 camera_native_frame(int device, const struct annibale_camera_profile *profile, void *buffer, size_t bytes,
@@ -107,14 +139,15 @@ camera_native_frame(int device, const struct annibale_camera_profile *profile, v
 		errno = capture->error != 0 ? (int)capture->error : EIO;
 		return -1;
 	}
+	size_t main_total = sizeof(struct annibale_camera_frame) + (size_t)capture->bytes;
 	if (capture->width != profile->width || capture->height != profile->height ||
 	    capture->stride != profile->stride || capture->bytes != (uint64_t)profile->stride * profile->height ||
-	    bytes != sizeof(struct annibale_camera_frame) + (size_t)capture->bytes) {
+	    bytes < main_total) {
 		errno = EIO;
 		return -1;
 	}
 	ssize_t n = read(device, buffer, bytes);
-	if (n != (ssize_t)bytes) {
+	if (n < (ssize_t)main_total) {
 		if (n >= 0) errno = EIO;
 		return -1;
 	}
@@ -124,6 +157,15 @@ camera_native_frame(int device, const struct annibale_camera_profile *profile, v
 	    frame->stride != profile->stride || frame->format != 1 || frame->bayer != profile->bayer ||
 	    frame->sensor != profile->sensor || frame->black > 1023 ||
 	    frame->sequence != capture->sequence || frame->time != capture->time) {
+		errno = EIO;
+		return -1;
+	}
+	size_t expected = main_total;
+	if ((frame->pd_flags & ANNIBALE_CAM_PD_VALID) != 0 && frame->pd_bytes > 0) {
+		size_t avail = bytes - main_total;
+		expected += frame->pd_bytes < avail ? frame->pd_bytes : avail;
+	}
+	if ((size_t)n != expected) {
 		errno = EIO;
 		return -1;
 	}
