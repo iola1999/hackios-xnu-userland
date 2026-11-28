@@ -54,6 +54,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreFoundation/CFPlugInCOM.h>
 #include <CoreAudioTypes/CoreAudioTypes.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -73,6 +74,9 @@ typedef UInt32 AudioObjectID;
 typedef struct {
 	UInt32 mSelector, mScope, mElement;
 } AudioObjectPropertyAddress;
+typedef struct {
+	UInt32 mSelector, mPropertyDataType, mQualifierDataType;
+} AudioServerPlugInCustomPropertyInfo;
 typedef struct {
 	AudioStreamBasicDescription mFormat;
 	AudioValueRange mSampleRateRange;
@@ -222,7 +226,8 @@ static struct device devices[] = {
 	{ .object = OBJECT_SPEAKER, .uid = CFSTR("Speaker"), .output = OBJECT_SPEAKER_OUTPUT, .input = OBJECT_SPEAKER_INPUT,
 	  .output_channels = ANNIBALE_AUDIO_CHANNELS, .input_channels = 2 },
 	{ .object = OBJECT_HAWKING, .uid = CFSTR("Hawking"), .input = OBJECT_HAWKING_INPUT, .input_channels = 1 },
-	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("Actuator"), .output = OBJECT_ACTUATOR_OUTPUT, .output_channels = 2 },
+	{ .object = OBJECT_ACTUATOR, .uid = CFSTR("VirtualAudioDevice_Actuator"), .output = OBJECT_ACTUATOR_OUTPUT,
+	  .output_channels = 2 },
 	{ .object = OBJECT_CODEC, .uid = CFSTR("Codec"), .input = OBJECT_CODEC_INPUT, .input_channels = 1 },
 };
 #define DEVICES                 (sizeof(devices) / sizeof(devices[0]))
@@ -354,6 +359,8 @@ release(__unused void *driver)
 	return 1;
 }
 
+static void actuator_start_hal_id_resolver(void);
+
 static OSStatus
 initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef the_host)
 {
@@ -372,6 +379,7 @@ initialize(__unused AudioServerPlugInDriverRef driver, AudioServerPlugInHostRef 
 		volume_to_kernel();
 		pthread_mutex_unlock(&lock);
 	}
+	actuator_start_hal_id_resolver();
 	return 0;
 }
 
@@ -406,15 +414,16 @@ configuration_change(__unused AudioServerPlugInDriverRef driver, __unused AudioO
 struct value {
 	UInt32 size;
 	bool empty;
-	bool string;                    /* a CFString: whoever is given it gets a reference of their own */
+	bool cf;                        /* a CF object: whoever is given it gets a reference of their own */
 	union {
 		UInt32 words[4];
 		Float64 number;
 		Float32 decimal;
-		CFStringRef string;
+		CFTypeRef cf;
 		AudioValueRange range;
 		AudioStreamBasicDescription format;
 		AudioStreamRangedDescription ranged;
+		AudioServerPlugInCustomPropertyInfo custom[4];
 	} u;
 };
 
@@ -423,6 +432,8 @@ speaker_output_scope(UInt32 scope)
 {
 	return scope == kAudioObjectPropertyScopeOutput || scope == kAudioObjectPropertyScopeGlobal;
 }
+
+#include "audio_plugin_actuator.inc"
 
 static struct value
 property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32 qualifier_size, const void *qualifier)
@@ -434,7 +445,7 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 	memset(&v, 0, sizeof(v));
 #define WORD(x)         (v.u.words[0] = (x), v.size = sizeof(UInt32))
 #define LIST(x)         (v.u.words[v.size / sizeof(UInt32)] = (x), v.size += sizeof(UInt32))
-#define STRING(x)       (v.u.string = (x), v.string = true, v.size = sizeof(CFStringRef))
+#define STRING(x)       (v.u.cf = (x), v.cf = true, v.size = sizeof(CFStringRef))
 #define FLOAT(x)        (v.u.decimal = (x), v.size = sizeof(Float32))
 	if (object == OBJECT_SPEAKER_VOLUME) {
 		switch (selector) {
@@ -667,6 +678,9 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(TIMESTAMP_PERIOD);
 			break;
 		}
+		if (v.size == 0 && !v.empty && d->object == OBJECT_ACTUATOR) {
+			(void)actuator_device_property(address, &v);
+		}
 	} else {
 		switch (selector) {
 		case kAudioStreamPropertyIsActive:
@@ -695,6 +709,9 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			v.u.ranged.mSampleRateRange.mMinimum = v.u.ranged.mSampleRateRange.mMaximum = ANNIBALE_AUDIO_RATE;
 			v.size = sizeof(AudioStreamRangedDescription);
 			break;
+		}
+		if (v.size == 0 && !v.empty && object == OBJECT_ACTUATOR_OUTPUT) {
+			(void)actuator_stream_property(address, &v);
 		}
 	}
 #undef WORD
@@ -769,13 +786,15 @@ is_property_settable(AudioServerPlugInDriverRef driver, AudioObjectID object, pi
 	} else if (object == OBJECT_PLUGIN) {
 		*settable = false;
 	} else if (object == d->object) {
-		*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate ||
-		    (d->object == OBJECT_SPEAKER && speaker_output_scope(address->mScope) &&
-		    (address->mSelector == kAudioDevicePropertyVolumeScalar ||
-		    address->mSelector == PROP_VIRTUAL_MASTER_VOL ||
-		    address->mSelector == kAudioDevicePropertyVolumeDecibels ||
-		    address->mSelector == kAudioDevicePropertyMute)) ||
-		    (d->object == OBJECT_CODEC && address->mSelector == kAudioDevicePropertyDataSource);
+		if (!actuator_is_property_settable(object, address, settable)) {
+			*settable = address->mSelector == kAudioDevicePropertyNominalSampleRate ||
+			    (d->object == OBJECT_SPEAKER && speaker_output_scope(address->mScope) &&
+			    (address->mSelector == kAudioDevicePropertyVolumeScalar ||
+			    address->mSelector == PROP_VIRTUAL_MASTER_VOL ||
+			    address->mSelector == kAudioDevicePropertyVolumeDecibels ||
+			    address->mSelector == kAudioDevicePropertyMute)) ||
+			    (d->object == OBJECT_CODEC && address->mSelector == kAudioDevicePropertyDataSource);
+		}
 	} else {
 		*settable = address->mSelector == kAudioStreamPropertyIsActive ||
 		    address->mSelector == kAudioStreamPropertyVirtualFormat || address->mSelector == kAudioStreamPropertyPhysicalFormat;
@@ -817,19 +836,20 @@ get_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
 	}
 	pthread_mutex_lock(&lock);
 	v = property(object, address, qualifier_size, qualifier);
-	pthread_mutex_unlock(&lock);
 	if (v.size > room) {
 		/* a list may be asked for in part; anything else must fit */
 		if (address->mSelector != kAudioObjectPropertyOwnedObjects && address->mSelector != kAudioDevicePropertyStreams &&
 		    address->mSelector != kAudioPlugInPropertyDeviceList) {
+			pthread_mutex_unlock(&lock);
 			return kAudioHardwareBadPropertySizeError;
 		}
 		v.size = room - room % sizeof(UInt32);
 	}
 	memcpy(data, &v.u, v.size);
-	if (v.string) {
-		CFRetain(v.u.string);
+	if (v.cf) {
+		CFRetain(v.u.cf);
 	}
+	pthread_mutex_unlock(&lock);
 	*size = v.size;
 	return 0;
 }
@@ -840,12 +860,19 @@ set_property_data(AudioServerPlugInDriverRef driver, AudioObjectID object, pid_t
     const void *data)
 {
 	Boolean settable = false;
+	bool actuator_handled = false;
 
 	if (address == NULL || data == NULL || is_property_settable(driver, object, client, address, &settable) != 0) {
 		return kAudioHardwareUnknownPropertyError;
 	}
 	if (!settable) {
 		return kAudioHardwareIllegalOperationError;
+	}
+	{
+		OSStatus actuator_status = actuator_set_property_data(object, address, size, data, &actuator_handled);
+		if (actuator_handled) {
+			return actuator_status;
+		}
 	}
 	if (object == OBJECT_SPEAKER_VOLUME ||
 	    (object == OBJECT_SPEAKER && (address->mSelector == kAudioDevicePropertyVolumeScalar ||
@@ -1090,41 +1117,6 @@ begin_end_io_operation(__unused AudioServerPlugInDriverRef driver, __unused Audi
     __unused UInt32 operation, __unused UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle)
 {
 	return 0;
-}
-
-/*
- * What iOS plays on the actuator -- the haptics: the system's feedbacks and the ringer's vibration,
- * CoreHaptics' patterns, UIKit's feedbacks, as waveforms of one channel -- goes to the kernel's motor
- * driver (/dev/annibale-haptic, bsd/dev/annibale/annibale_haptic.c, haptic=5), which plays Android's own
- * waveforms on the phone's motor by it. (iOS plays on this device at all only because the device
- * tree says the phone's haptics are "closed-loop": see mkidentity.py.) Said the first times, with
- * how loud.
- */
-static int haptic = -1;          /* the motor driver; -2: not there (the kernel runs without haptic=5) */
-static unsigned haptic_said;
-
-static void
-actuator_write(const int16_t *samples, UInt32 frames)
-{
-	int peak = 0;
-
-	for (UInt32 i = 0; i < frames; i++) {
-		int v = samples[i] < 0 ? -samples[i] : samples[i];
-
-		peak = v > peak ? v : peak;
-	}
-	if (haptic == -1) {
-		int fd = open("/dev/annibale-haptic", O_WRONLY | O_NONBLOCK);
-		haptic = fd >= 0 ? fd : (errno == ENOENT ? -2 : -1);
-	}
-	if (haptic >= 0) {
-		(void)write(haptic, samples, (size_t)frames * 2);
-	}
-	if (peak > 0 && haptic_said < 12) {
-		haptic_said++;
-		say("annibale: audio: the actuator plays: %u frames, peak %d of 32768%s\n", (unsigned)frames, peak,
-		    haptic >= 0 ? "" : " (no /dev/annibale-haptic: not felt)");
-	}
 }
 
 static OSStatus

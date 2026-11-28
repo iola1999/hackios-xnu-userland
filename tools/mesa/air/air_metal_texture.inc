@@ -84,8 +84,9 @@ rwa_buffer_set_mirror(struct rwa_buffer *buffer, void *mirror)
  * request 0x7c, which drmIoctl passes on by the request's low byte), and the buffer object is
  * imported by its handle: the GPU reads what the caller writes, and no batch reads, hashes or
  * copies the memory first. A texture over such a buffer can be laid over it (buffer_texture_alias).
- * map is the kernel's second mapping of the same pages, still there after the caller unmaps its
- * own. NULL when the kernel refuses (no gpu_coherent=1, memory not in whole 4 KB pages).
+ * map reuses the caller's bytes directly with xfer == NULL (skipping a redundant kernel CPU
+ * mapping); the caller keeps the allocation live until the buffer is destroyed. NULL when the
+ * kernel refuses (no gpu_coherent=1, memory not in whole 4 KB pages).
  */
 #include <errno.h>
 #include <sys/ioccom.h>
@@ -102,8 +103,8 @@ struct rwa_buffer *rwa_buffer_from_surface(struct rwa_device *device, int surfac
 
 static struct rwa_buffer *
 buffer_import_handle(struct rwa_device *device, const struct winsys_handle *whandle,
-                     size_t size, bool close_kms_on_fail, const char *what, char *why,
-                     size_t why_size)
+                     size_t size, void *host_bytes, bool close_kms_on_fail,
+                     const char *what, char *why, size_t why_size)
 {
    struct pipe_resource templ = {
       .target = PIPE_BUFFER, .format = PIPE_FORMAT_R8_UNORM, .usage = PIPE_USAGE_STAGING,
@@ -117,9 +118,15 @@ buffer_import_handle(struct rwa_device *device, const struct winsys_handle *whan
       buffer->res = device->screen->resource_from_handle(device->screen, &templ,
                                                          (struct winsys_handle *)whandle,
                                                          PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
-   if (buffer && buffer->res)
-      buffer->map = pipe_buffer_map(device->pipe, buffer->res, PIPE_MAP_READ | PIPE_MAP_WRITE,
-                                    &buffer->xfer);
+   if (buffer && buffer->res) {
+      if (host_bytes) {
+         buffer->map = host_bytes;
+         buffer->xfer = NULL;
+      } else {
+         buffer->map = pipe_buffer_map(device->pipe, buffer->res,
+                                       PIPE_MAP_READ | PIPE_MAP_WRITE, &buffer->xfer);
+      }
+   }
    if (!buffer || !buffer->map) {
       say(why, why_size, "%s over %zu bytes could not be %s", what, size,
           buffer && buffer->res ? "mapped" : "imported");
@@ -151,7 +158,7 @@ rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char
       say(why, why_size, "this device imports no memory");
       return NULL;
    }
-   if (size == 0 || size > UINT32_MAX || ((uintptr_t)bytes | size) % 4096 != 0) {
+   if (!bytes || size == 0 || size > UINT32_MAX || ((uintptr_t)bytes | size) % 4096 != 0) {
       say(why, why_size, "%zu bytes at %p are not whole 4 KB pages", size, bytes);
       return NULL;
    }
@@ -175,7 +182,7 @@ rwa_buffer_from_memory(struct rwa_device *device, void *bytes, size_t size, char
    whandle.handle = request.handle;
    char what[64];
    snprintf(what, sizeof(what), "buffer %u at %p", request.handle, bytes);
-   return buffer_import_handle(device, &whandle, size, true, what, why, why_size);
+   return buffer_import_handle(device, &whandle, size, bytes, true, what, why, why_size);
 }
 
 struct rwa_buffer *
@@ -202,7 +209,7 @@ rwa_buffer_from_surface(struct rwa_device *device, int surface_id, size_t size, 
    };
    char what[64];
    snprintf(what, sizeof(what), "IOSurface %d", surface_id);
-   return buffer_import_handle(device, &whandle, size, false, what, why, why_size);
+   return buffer_import_handle(device, &whandle, size, NULL, false, what, why, why_size);
 }
 
 /* Where the texture's rows lie in the buffer, or NULL when they do not fit in it. */
