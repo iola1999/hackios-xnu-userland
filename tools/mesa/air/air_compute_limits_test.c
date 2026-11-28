@@ -1,7 +1,7 @@
 /* Exercise the production compute lifecycle with instrumented Gallium callbacks.
  * Real software execution is validated separately with the same built library. */
 #include "air_metal.c"
-static unsigned created, deleted, reported = 768;
+static unsigned created, deleted, reported = 768, reported_fixed = 0;
 static bool fixed;
 static void *test_create(struct pipe_context *pipe, const struct pipe_compute_state *state)
 {
@@ -17,8 +17,14 @@ static void test_delete(struct pipe_context *pipe, void *state)
 static void test_bind(struct pipe_context *pipe, void *state) { (void)pipe; (void)state; }
 static void test_info(struct pipe_context *pipe, void *state, struct pipe_compute_state_object_info *info)
 {
-   (void)pipe; (void)state;
-   info->max_threads=reported;info->preferred_simd_size=128;
+   (void)pipe;
+   bool is_fixed = !((nir_shader *)state)->info.workgroup_size_variable;
+   info->max_threads = (is_fixed && reported_fixed) ? reported_fixed : reported;
+   info->preferred_simd_size = 128;
+}
+static void test_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *grid)
+{
+   (void)pipe; (void)grid;
 }
 #define CHECK(x) do {if(!(x)){fprintf(stderr,"contract:%d %s: %s\n",__LINE__,#x,why);return 1;}}while(0)
 int main(int argc,char **argv)
@@ -32,7 +38,8 @@ int main(int argc,char **argv)
    __typeof__(pipe->delete_compute_state) del=pipe->delete_compute_state;
    __typeof__(pipe->bind_compute_state) bind=pipe->bind_compute_state;
    __typeof__(pipe->get_compute_state_info) info=pipe->get_compute_state_info;
-   pipe->create_compute_state=test_create;pipe->delete_compute_state=test_delete;pipe->bind_compute_state=test_bind;pipe->get_compute_state_info=test_info;
+   __typeof__(pipe->launch_grid) launch=pipe->launch_grid;
+   pipe->create_compute_state=test_create;pipe->delete_compute_state=test_delete;pipe->bind_compute_state=test_bind;pipe->get_compute_state_info=test_info;pipe->launch_grid=test_launch_grid;
    d->software=false;d->max_threads_per_group=1024;
    struct rwa_compute_info caps={0};
    struct rwa_compute *c=rwa_compute_create(d,bc,size,argv[2],&caps,why,sizeof(why));CHECK(c);
@@ -41,8 +48,23 @@ int main(int argc,char **argv)
    void *cso=c->cso;CHECK(compute_state_for(c,a,why,sizeof(why))==cso);CHECK(compute_state_for(c,b,why,sizeof(why))==cso);CHECK(created==1);
    CHECK(rwa_dispatch(c,NULL,grid,over,why,sizeof(why))!=0 && strstr(why,"at most 768"));CHECK(created==1);
    rwa_compute_destroy(c);CHECK(deleted==1);
-   reported=0;c=rwa_compute_create(d,bc,size,argv[2],&caps,why,sizeof(why));CHECK(!c && created==2 && deleted==2);
-   reported=2048;c=rwa_compute_create(d,bc,size,argv[2],&caps,why,sizeof(why));CHECK(c&&caps.max_threads_per_group==1024);rwa_compute_destroy(c);CHECK(deleted==3);
-   pipe->create_compute_state=create;pipe->delete_compute_state=del;pipe->bind_compute_state=bind;pipe->get_compute_state_info=info;d->software=true;rwa_device_close(d);free(bc);
-   puts("PASS production create/info/cache/dispatch guard/destroy: 768 cap, variant reuse, zero cap refusal, device min; pipe callbacks instrumented");return 0;
+   /* Split fixed-workgroup CSO: variable CSO reports 256, fixed 18x18x1 (324) CSO fits at 512
+    * and must not be rejected by the stale variable caps.max_threads_per_group (256). */
+   reported=256;reported_fixed=512;
+   c=rwa_compute_create(d,bc,size,argv[2],&caps,why,sizeof(why));CHECK(c && caps.max_threads_per_group==256);
+   unsigned g18[3]={18,18,1};
+   struct rwa_grid_split sp={.group_offset={0,0,0},.whole_groups={74,56,1}};
+   CHECK(rwa_dispatch_split(c,NULL,NULL,0,grid,g18,0,NULL,&sp,false,why,sizeof(why))==0);
+   unsigned after_split=created;
+   CHECK(rwa_dispatch_split(c,NULL,NULL,0,grid,g18,0,NULL,&sp,false,why,sizeof(why))==0 && created==after_split);
+   /* A split CSO whose compiled fixed limit is still below 324 must still be rejected. */
+   reported_fixed=256;
+   struct rwa_grid_split sp2={.group_offset={37,0,0},.whole_groups={74,56,1}};
+   CHECK(rwa_dispatch_split(c,NULL,NULL,0,grid,g18,0,NULL,&sp2,false,why,sizeof(why))!=0 && strstr(why,"at most 256"));
+   rwa_compute_destroy(c);
+   reported_fixed=0;
+   reported=0;c=rwa_compute_create(d,bc,size,argv[2],&caps,why,sizeof(why));CHECK(!c);
+   reported=2048;c=rwa_compute_create(d,bc,size,argv[2],&caps,why,sizeof(why));CHECK(c&&caps.max_threads_per_group==1024);rwa_compute_destroy(c);
+   pipe->create_compute_state=create;pipe->delete_compute_state=del;pipe->bind_compute_state=bind;pipe->get_compute_state_info=info;pipe->launch_grid=launch;d->software=true;rwa_device_close(d);free(bc);
+   puts("PASS production create/info/cache/dispatch guard/split-fixed/destroy");return 0;
 }

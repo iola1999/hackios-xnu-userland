@@ -449,7 +449,12 @@ cwf_run(void *arg)
 
 	if (sp != NULL && (long)MSG1(sp, "respondsToSelector:", cwf_sel("setSSID:"))) {
 		unsigned n = job->ssid_len < 32 ? job->ssid_len : 32;
-		CFDataRef want = CFDataCreate(kCFAllocatorDefault, job->ssid, (CFIndex)n);
+		CFStringRef want = CFStringCreateWithBytes(kCFAllocatorDefault, job->ssid,
+		    (CFIndex)n, kCFStringEncodingUTF8, false);
+		if (want == NULL) {
+			want = CFStringCreateWithBytes(kCFAllocatorDefault, job->ssid,
+			    (CFIndex)n, kCFStringEncodingISOLatin1, false);
+		}
 		if (want != NULL) {
 			MSG1(sp, "setSSID:", want);
 			CFRelease(want);

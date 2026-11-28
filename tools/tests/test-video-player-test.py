@@ -147,8 +147,96 @@ class VideoPlayerTest(unittest.TestCase):
             with self.subTest(input=path.name):
                 output = self.run_probe(path, status=1, label='-' + path.stem)
                 self.assertEqual(records(output, 'summary')[-1]['result'], 'fail')
-                self.assertNotEqual(records(output, 'item')[-1]['error'], '0')
+                item_err = records(output, 'item')[-1]
+                self.assertNotEqual(item_err['error'], '0')
+                self.assertEqual(item_err['error_domain'], 'AVFoundationErrorDomain')
+                self.assertIn('underlying', item_err)
+                self.assertNotEqual(item_err['underlying'], 'none')
+                self.assertIn(':', item_err['underlying'])
                 self.assertNotIn(path.name, output)
+
+    def test_error_diagnostics_and_sanitization(self):
+        harness = self.directory / 'error-diag-harness.m'
+        binary = self.directory / 'error-diag-harness'
+        harness.write_text(f'''#define main video_player_test_main
+#include "{SOURCE}"
+#undef main
+
+int main(void) {{
+    @autoreleasepool {{
+        report_error("nil_case", nil);
+        NSError *single = [NSError errorWithDomain:@"CoreMediaErrorDomain" code:-16800 userInfo:@{{
+            NSFilePathErrorKey: @"/private/secret/movie.mp4",
+            NSLocalizedDescriptionKey: @"failed at file:///private/secret/movie.mp4"
+        }}];
+        report_error("single_case", single);
+
+        NSError *leaf = [NSError errorWithDomain:NSPOSIXErrorDomain code:2 userInfo:@{{
+            NSFilePathErrorKey: @"/var/mobile/secret-leaf.mp4"
+        }}];
+        NSError *mid = [NSError errorWithDomain:NSOSStatusErrorDomain code:-12780 userInfo:@{{
+            NSUnderlyingErrorKey: leaf
+        }}];
+        NSError *top = [NSError errorWithDomain:AVFoundationErrorDomain code:-11800 userInfo:@{{
+            NSUnderlyingErrorKey: mid,
+            NSLocalizedFailureReasonErrorKey: @"secret failure reason"
+        }}];
+        report_error("chain_case", top);
+
+        NSError *m1 = [NSError errorWithDomain:@"AudioToolbox" code:-50 userInfo:nil];
+        NSError *m2 = [NSError errorWithDomain:NSOSStatusErrorDomain code:-10863 userInfo:nil];
+        NSError *multi = [NSError errorWithDomain:AVFoundationErrorDomain code:-11819 userInfo:@{{
+            NSMultipleUnderlyingErrorsKey: @[m1, m2]
+        }}];
+        report_error("multi_case", multi);
+
+        NSError *path_dom = [NSError errorWithDomain:@"/tmp/leak/path" code:1 userInfo:nil];
+        report_error("path_domain", path_dom);
+        NSError *url_dom = [NSError errorWithDomain:@"file:///etc/passwd" code:2 userInfo:nil];
+        report_error("url_domain", url_dom);
+        NSError *space_dom = [NSError errorWithDomain:@"Custom Domain:1" code:3 userInfo:nil];
+        report_error("space_domain", space_dom);
+
+        NSError *deep = [NSError errorWithDomain:@"LeafDomain" code:10 userInfo:nil];
+        for (NSInteger i = 9; i >= 1; i--) {{
+            deep = [NSError errorWithDomain:@"ChainDomain" code:i userInfo:@{{
+                NSUnderlyingErrorKey: deep
+            }}];
+        }}
+        report_error("deep_case", deep);
+    }}
+    return 0;
+}}
+''')
+        subprocess.run(['xcrun', '--sdk', 'macosx', 'clang', '-fobjc-arc', '-O1',
+                        '-Wall', '-Wextra', '-Werror', '-fsanitize=address,undefined',
+                        '-framework', 'Foundation', '-framework', 'AVFoundation',
+                        '-framework', 'CoreMedia', '-framework', 'CoreVideo',
+                        str(harness), '-o', str(binary)], check=True)
+        res = subprocess.run([str(binary)], capture_output=True, text=True, timeout=15, check=True)
+        out = res.stdout
+        self.assertNotIn('secret', out)
+        self.assertNotIn('file://', out)
+        self.assertNotIn('/tmp/leak', out)
+        self.assertNotIn('passwd', out)
+        self.assertEqual(records(out, 'nil_case')[0],
+                         {'stage': 'nil_case', 'error_domain': 'none', 'error': '0', 'underlying': 'none'})
+        self.assertEqual(records(out, 'single_case')[0],
+                         {'stage': 'single_case', 'error_domain': 'CoreMediaErrorDomain',
+                          'error': '-16800', 'underlying': 'none'})
+        self.assertEqual(records(out, 'chain_case')[0],
+                         {'stage': 'chain_case', 'error_domain': 'AVFoundationErrorDomain',
+                          'error': '-11800', 'underlying': 'NSOSStatusErrorDomain:-12780,NSPOSIXErrorDomain:2'})
+        self.assertEqual(records(out, 'multi_case')[0],
+                         {'stage': 'multi_case', 'error_domain': 'AVFoundationErrorDomain',
+                          'error': '-11819', 'underlying': 'AudioToolbox:-50,NSOSStatusErrorDomain:-10863'})
+        self.assertEqual(records(out, 'path_domain')[0]['error_domain'], 'redacted')
+        self.assertEqual(records(out, 'url_domain')[0]['error_domain'], 'redacted')
+        self.assertEqual(records(out, 'space_domain')[0]['error_domain'], 'Custom_Domain_1')
+        deep_rec = records(out, 'deep_case')[0]
+        self.assertEqual(deep_rec['error_domain'], 'ChainDomain')
+        self.assertEqual(deep_rec['error'], '1')
+        self.assertEqual(len(deep_rec['underlying'].split(',')), 8)
 
     def test_frame_report(self):
         report = self.directory / 'frames.txt'

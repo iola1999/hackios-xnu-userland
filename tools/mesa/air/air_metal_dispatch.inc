@@ -108,8 +108,10 @@ dispatch_grid(struct rwa_compute *compute, const struct rwa_bindings *bindings,
    void *cso = compute_state_for_ib(compute, group_size, &yuv, ib_dim, split, why, why_size);
    if (!cso)
       return -1;
-   /* Re-check threadgroup limit once a deferred CSO materializes with compiled register pressure. */
-   if (!device->software && compute->caps.max_threads_per_group &&
+   /* Re-check threadgroup limit for unsplit CSOs once a deferred CSO materializes with
+    * compiled register pressure. Split CSOs are always compiled fixed for group_size and
+    * already validated against si.max_threads inside compute_state_for_ib(). */
+   if (!device->software && !split && compute->caps.max_threads_per_group &&
        threads > compute->caps.max_threads_per_group) {
       say(why, why_size, "%s: %ux%ux%u is %u threads in one threadgroup and this GPU takes "
                          "at most %u", name, group_size[0], group_size[1], group_size[2],

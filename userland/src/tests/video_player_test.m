@@ -6,7 +6,8 @@
  *       1 input/player/pixel failure; 2 arguments; 124 whole-process deadline.
  * The player retains its default decoder, buffering and audio-session behavior.
  * Pixel hashes cover active NV12 bytes, excluding row padding. Logs omit paths,
- * NSError descriptions and userInfo. This probe does not present frames.
+ * URLs and free-form NSError descriptions; error records report sanitized domain,
+ * code and NSUnderlyingError chain. This probe does not present frames.
  * --report-file exclusively creates a file with every frame and a completion record.
  */
 #import <AVFoundation/AVFoundation.h>
@@ -25,6 +26,8 @@
 
 #define SUMMARY_LINE_SIZE 1024
 #define FRAME_LOG_EVERY 60
+#define ERROR_DOMAIN_SIZE 64
+#define ERROR_UNDERLYING_MAX_DEPTH 8
 
 struct summary_snapshot {
 	bool ready, playing, advanced, ended, failed, finished;
@@ -119,15 +122,73 @@ deadline_expired(int signal_number)
 }
 
 static void
+sanitize_error_domain(NSString *raw, char *out, size_t size)
+{
+	if (size == 0) return;
+	if (raw == nil || ![raw isKindOfClass:[NSString class]] || raw.length == 0) {
+		snprintf(out, size, "none");
+		return;
+	}
+	const char *utf8 = raw.UTF8String;
+	if (utf8 == NULL || utf8[0] == '\0') {
+		snprintf(out, size, "other");
+		return;
+	}
+	if (strstr(utf8, "://") != NULL || strchr(utf8, '/') != NULL || strchr(utf8, '\\') != NULL) {
+		snprintf(out, size, "redacted");
+		return;
+	}
+	size_t len = 0;
+	for (const unsigned char *p = (const unsigned char *)utf8; *p != '\0' && len + 1 < size; p++) {
+		unsigned char c = *p;
+		bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+		out[len++] = ok ? (char)c : '_';
+	}
+	out[len] = '\0';
+	if (len == 0) snprintf(out, size, "other");
+}
+
+static void
 report_error(const char *stage, NSError *error)
 {
-	const char *domain = error == nil ? "none" : "other";
-	if ([error.domain isEqualToString:AVFoundationErrorDomain]) domain = "avfoundation";
-	else if ([error.domain isEqualToString:NSOSStatusErrorDomain]) domain = "osstatus";
-	else if ([error.domain isEqualToString:NSPOSIXErrorDomain]) domain = "posix";
-	else if ([error.domain isEqualToString:NSCocoaErrorDomain]) domain = "cocoa";
-	else if ([error.domain isEqualToString:NSURLErrorDomain]) domain = "url";
-	printf("video_player_test: stage=%s error_domain=%s error=%ld\n", stage, domain, (long)error.code);
+	if (error == nil || ![error isKindOfClass:[NSError class]]) {
+		printf("video_player_test: stage=%s error_domain=none error=0 underlying=none\n", stage);
+		return;
+	}
+	char domain[ERROR_DOMAIN_SIZE];
+	sanitize_error_domain(error.domain, domain, sizeof(domain));
+	printf("video_player_test: stage=%s error_domain=%s error=%ld underlying=", stage, domain, (long)error.code);
+	unsigned printed = 0;
+	NSError *cursor = error;
+	while (cursor != nil && printed < ERROR_UNDERLYING_MAX_DEPTH) {
+		NSDictionary *info = cursor.userInfo;
+		id next = [info isKindOfClass:[NSDictionary class]] ? info[NSUnderlyingErrorKey] : nil;
+		if ([next isKindOfClass:[NSError class]]) {
+			NSError *sub = (NSError *)next;
+			char sub_domain[ERROR_DOMAIN_SIZE];
+			sanitize_error_domain(sub.domain, sub_domain, sizeof(sub_domain));
+			printf("%s%s:%ld", printed == 0 ? "" : ",", sub_domain, (long)sub.code);
+			printed++;
+			cursor = sub;
+			continue;
+		}
+		id multi = [info isKindOfClass:[NSDictionary class]] ? info[NSMultipleUnderlyingErrorsKey] : nil;
+		if ([multi isKindOfClass:[NSArray class]]) {
+			for (id entry in (NSArray *)multi) {
+				if (printed >= ERROR_UNDERLYING_MAX_DEPTH) break;
+				if (![entry isKindOfClass:[NSError class]]) continue;
+				NSError *sub = (NSError *)entry;
+				char sub_domain[ERROR_DOMAIN_SIZE];
+				sanitize_error_domain(sub.domain, sub_domain, sizeof(sub_domain));
+				printf("%s%s:%ld", printed == 0 ? "" : ",", sub_domain, (long)sub.code);
+				printed++;
+			}
+		}
+		break;
+	}
+	if (printed == 0) printf("none");
+	printf("\n");
 }
 
 static const char *

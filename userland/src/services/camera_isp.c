@@ -260,8 +260,9 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 	 */
 	drc = target / mean * (bright > 0.9 * white ? 1 : bright / (0.9 * white));
 	drc = drc < 1 ? 1 : drc > 2 ? 2 : drc;
-	if (fabs(drc - isp->drc) > 0.005 * isp->drc) {
-		tone(isp, (float)drc);
+	double next_drc = isp->drc > 0 ? isp->drc * 0.75 + drc * 0.25 : drc;
+	if (fabs(next_drc - isp->drc) > 0.01 * isp->drc) {
+		tone(isp, (float)next_drc);
 	}
 	if (isp_ae_pending(isp, f)) {
 		isp->ae_wait--;
@@ -277,7 +278,8 @@ isp_ae(struct isp *isp, const struct annibale_camera_frame *f, const struct isp_
 	if (ratio > 0.94 && ratio < 1.06) {
 		return false;
 	}
-	want = now * pow(ratio, 0.7);
+	double damp = (ratio < 0.5 || ratio > 2.0) ? 0.85 : 0.7;
+	want = now * pow(ratio, damp);
 	if (want <= fast) {
 		lines = want < 4 ? 4 : (uint32_t)want;
 		gain = f->gain_unity;
