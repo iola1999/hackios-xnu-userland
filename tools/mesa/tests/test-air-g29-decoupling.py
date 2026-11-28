@@ -78,6 +78,7 @@ def build_harness_source() -> str:
     tex_inc = (ROOT / "air_metal_texture.inc").read_text()
     vcso_inc = (ROOT / "air_metal_vertex_cache.inc").read_text()
     render_create_inc = (ROOT / "air_metal_render_create.inc").read_text()
+    compute_inc = (ROOT / "air_metal_compute.inc").read_text()
 
     # Verify the exact non-software vs software CSO lock branch exists in rwa_render_create_linked.
     rcreate_fn = extract_function(render_create_inc, r"struct rwa_render \*\nrwa_render_create_linked\(")
@@ -86,6 +87,21 @@ def build_harness_source() -> str:
         r"   bool cso_ok;\n   if \(device->software\) \{",
         r"   \} else \{\n      RWA_CSO_CREATE_LOCKED;\n      cso_ok = render_create_gallium_states\([^;]+\);\n   \}",
     )
+
+    # Verify compute_create uses RWA_CSO_CREATE_LOCKED on !software, rwa_compute_materialize
+    # compiles into locals under RWA_CSO_CREATE_LOCKED and installs under short RWA_LOCKED
+    # (deleting any duplicate CSO if dispatch raced ahead), and compute_state_for_ib deletes
+    # unbound newly-created CSOs directly.
+    ccreate_fn = extract_function(compute_inc, r"static struct rwa_compute \*\ncompute_create\(")
+    assert "if (!device->software && !deferred) {\n      RWA_CSO_CREATE_LOCKED;" in ccreate_fn
+    cmat_fn = extract_function(compute_inc, r"int\nrwa_compute_materialize\(")
+    assert "RWA_CSO_CREATE_LOCKED;" in cmat_fn
+    assert "compute_compile_variable_cso(compute, &yuv, &caps, &var_max, why, why_size);" in cmat_fn
+    assert "if (!compute->cso) {" in cmat_fn
+    assert "dup_cso = cso;" in cmat_fn
+    assert "compute->device->pipe->delete_compute_state(compute->device->pipe, dup_cso);" in cmat_fn
+    csib_fn = extract_function(compute_inc, r"static void \*\ncompute_state_for_ib\(")
+    assert "device->pipe->delete_compute_state(device->pipe, cso);" in csib_fn
 
     locks_block = extract_between(
         air_metal_c,
@@ -788,6 +804,128 @@ static void mock_bind_samplers(struct pipe_context *p, mesa_shader_stage s, unsi
 }}
 static void mock_flush(struct pipe_context *p, void *f, unsigned flags) {{ (void)p; (void)f; (void)flags; }}
 
+struct mock_compute {{
+   struct rwa_device *device;
+   void *cso;
+   unsigned variable_max;
+   unsigned max_threads;
+}};
+
+struct mat_race_arg {{
+   struct mock_compute *comp;
+   int started;
+   pthread_mutex_t mu;
+   pthread_cond_t cv;
+   unsigned out_threads;
+   int dup_deleted;
+}};
+
+static void *bg_compute_materialize_thread(void *p) {{
+   struct mat_race_arg *a = p;
+   struct mock_compute *comp = a->comp;
+   {{
+      RWA_LOCKED;
+      if (comp->cso) {{
+         a->out_threads = comp->max_threads;
+         return NULL;
+      }}
+   }}
+   void *cso = NULL;
+   unsigned var_max = 0;
+   {{
+      RWA_CSO_CREATE_LOCKED;
+      pthread_mutex_lock(&a->mu);
+      a->started = 1;
+      pthread_cond_broadcast(&a->cv);
+      pthread_mutex_unlock(&a->mu);
+      usleep(40000);
+      cso = mock_create_fixed(comp->device->pipe, NULL);
+      var_max = 256;
+   }}
+   void *dup_cso = NULL;
+   {{
+      RWA_LOCKED;
+      if (!comp->cso) {{
+         comp->cso = cso;
+         comp->variable_max = var_max;
+         comp->max_threads = var_max;
+      }} else {{
+         dup_cso = cso;
+      }}
+      a->out_threads = comp->max_threads;
+   }}
+   if (dup_cso) {{
+      mock_del_cso(comp->device->pipe, dup_cso);
+      a->dup_deleted = 1;
+   }}
+   return NULL;
+}}
+
+static void test_compute_cso_decoupled(struct rwa_device *dev) {{
+   /* 1. Slow compute CSO compile under RWA_CSO_CREATE_LOCKED must not block foreground
+    * rwa_lock draws or rwa_texture_destroy. */
+   __atomic_store_n(&g_cso_sleep_us, 60000, __ATOMIC_RELAXED);
+   g_entered_slow_fs = 0;
+   g_trylock_inside_fs = -1;
+   struct slow_cso_arg arg = {{ .dev = dev, .tag = "COMPUTE_CSO_V1" }};
+   pthread_t bg;
+   assert(pthread_create(&bg, NULL, bg_slow_cso_thread, &arg) == 0);
+
+   pthread_mutex_lock(&g_hook_mu);
+   while (!g_entered_slow_fs)
+      pthread_cond_wait(&g_hook_cv, &g_hook_mu);
+   pthread_mutex_unlock(&g_hook_mu);
+
+   double t0 = now_ms();
+   struct rwa_texture *tex = make_test_texture(dev, true, true, false, NULL);
+   rwa_texture_destroy(tex);
+   {{
+      RWA_LOCKED;
+      rwa_deferred_drain_locked(dev);
+      state_release_framebuffer(dev);
+   }}
+   double fg_ms = now_ms() - t0;
+   assert(fg_ms < 30.0);
+
+   assert(pthread_join(bg, NULL) == 0);
+   assert(g_trylock_inside_fs == 0);
+   rwa_render_destroy(arg.out);
+   __atomic_store_n(&g_cso_sleep_us, 0, __ATOMIC_RELAXED);
+
+   /* 2. Same-object race: rwa_compute_materialize() (compiling under rwa_cso_create_lock)
+    * vs concurrent rwa_dispatch() (installing comp->cso under rwa_lock). Must have zero
+    * TSan data races and cleanly delete the duplicate CSO. */
+   struct mock_compute comp = {{ .device = dev, .cso = NULL, .variable_max = 0, .max_threads = 0 }};
+   struct mat_race_arg marg = {{
+      .comp = &comp, .started = 0,
+      .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER,
+      .out_threads = 0, .dup_deleted = 0,
+   }};
+   pthread_t mat_th;
+   assert(pthread_create(&mat_th, NULL, bg_compute_materialize_thread, &marg) == 0);
+   pthread_mutex_lock(&marg.mu);
+   while (!marg.started)
+      pthread_cond_wait(&marg.cv, &marg.mu);
+   pthread_mutex_unlock(&marg.mu);
+
+   /* Foreground dispatch beats materialize while materialize is compiling. */
+   {{
+      RWA_LOCKED;
+      assert(comp.cso == NULL);
+      comp.cso = mock_create_fixed(dev->pipe, NULL);
+      comp.variable_max = 512;
+      comp.max_threads = 512;
+   }}
+   assert(pthread_join(mat_th, NULL) == 0);
+   assert(marg.dup_deleted == 1);
+   assert(marg.out_threads == 512);
+   {{
+      RWA_LOCKED;
+      mock_del_cso(dev->pipe, comp.cso);
+      comp.cso = NULL;
+   }}
+}}
+
 int main(void) {{
    struct pipe_screen scr = {{ .get_name = mock_get_name }};
    struct pipe_context pipe = {{
@@ -822,6 +960,7 @@ int main(void) {{
 
    test_non_software_decoupling(&dev);
    test_software_keeps_rwa_lock(&dev);
+   test_compute_cso_decoupled(&dev);
 
    enum {{ NTHREADS = 8 }};
    pthread_t th[NTHREADS];

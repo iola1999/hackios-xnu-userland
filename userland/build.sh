@@ -169,6 +169,7 @@ cp obj/input26-service root/bin/
 cp com.annibale.input26.plist root/LaunchDaemons/
 echo "Darwin on annibale: image built $(date '+%Y-%m-%d %H:%M')" > root/etc/motd
 python3 -c "import sys; sys.stdout.buffer.write(bytes((i*31 + (i>>8)) & 0xff for i in range(300000)))" > root/share/pattern.bin
+[ -f ../out/av-test-4s.mp4 ] && cp ../out/av-test-4s.mp4 root/share/av-test-4s.mp4
 
 for d in $EXTRA_SHARE; do
 	[ -d "$d" ] || { echo "build.sh: EXTRA_SHARE: $d is not a directory"; exit 1; }

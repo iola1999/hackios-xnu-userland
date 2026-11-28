@@ -7,6 +7,10 @@
 static void *compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
                                   const struct rwa_yuv_key *yuv, const unsigned ib_dim[2],
                                   const struct rwa_grid_split *split, char *why, size_t why_size);
+static void *compute_compile_variable_cso(struct rwa_compute *compute,
+                                          const struct rwa_yuv_key *yuv,
+                                          struct rwa_compute_info *out_caps,
+                                          unsigned *out_var_max, char *why, size_t why_size);
 
 static void *
 compute_state_for(struct rwa_compute *compute, const unsigned block[3],
@@ -166,7 +170,7 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
     * CSO that dispatch will use. Deferred pipelines compile their CSO on first
     * dispatch or materialization; softpipe always requires a fixed block at dispatch. */
    if (!device->software && !deferred) {
-      RWA_LOCKED;
+      RWA_CSO_CREATE_LOCKED;
       if (!compute_state_for(compute, NULL, &compute->yuv, why, why_size))
          goto fail;
    }
@@ -205,16 +209,58 @@ int
 rwa_compute_materialize(struct rwa_compute *compute, struct rwa_compute_info *info,
                         char *why, size_t why_size)
 {
-   RWA_LOCKED;
    if (!compute) {
       say(why, why_size, "compute materialize requires a pipeline");
       return -1;
    }
-   if (!compute->device->software && !compute->cso &&
-       !compute_state_for(compute, NULL, &compute->yuv, why, why_size))
+   if (compute->device->software) {
+      RWA_LOCKED;
+      if (info)
+         *info = compute->caps;
+      return 0;
+   }
+
+   struct rwa_yuv_key yuv;
+   struct rwa_compute_info caps;
+   {
+      RWA_LOCKED;
+      if (compute->cso) {
+         if (info)
+            *info = compute->caps;
+         return 0;
+      }
+      yuv = compute->yuv;
+      caps = compute->caps;
+   }
+
+   unsigned var_max = 0;
+   void *cso = NULL;
+   {
+      RWA_CSO_CREATE_LOCKED;
+      cso = compute_compile_variable_cso(compute, &yuv, &caps, &var_max, why, why_size);
+   }
+   if (!cso)
       return -1;
-   if (info)
-      *info = compute->caps;
+
+   void *dup_cso = NULL;
+   {
+      RWA_LOCKED;
+      if (!compute->cso) {
+         compute->cso = cso;
+         compute->cso_fixed = false;
+         compute->variable_max = var_max;
+         compute->caps = caps;
+         compute->yuv = yuv;
+         compute->cso_ib_dim[0] = 0;
+         compute->cso_ib_dim[1] = 0;
+      } else {
+         dup_cso = cso;
+      }
+      if (info)
+         *info = compute->caps;
+   }
+   if (dup_cso)
+      compute->device->pipe->delete_compute_state(compute->device->pipe, dup_cso);
    return 0;
 }
 
@@ -306,6 +352,56 @@ rwa_compute_destroy(struct rwa_compute *compute)
    free(compute->entry_copy);
    ralloc_free(compute->mem_ctx);
    free(compute);
+}
+
+/* Compile a fresh hardware variable-workgroup CSO into caller-owned locals without mutating
+ * compute->cso/caps. Safe to invoke under rwa_cso_create_lock while rwa_dispatch holds rwa_lock. */
+static void *
+compute_compile_variable_cso(struct rwa_compute *compute, const struct rwa_yuv_key *yuv,
+                             struct rwa_compute_info *out_caps, unsigned *out_var_max,
+                             char *why, size_t why_size)
+{
+   struct rwa_device *device = compute->device;
+   nir_shader *cs = nir_shader_clone(NULL, compute->nir);
+   if (!cs) {
+      say(why, why_size, "out of memory compiling the shader");
+      return NULL;
+   }
+   if (!lower_yuv(cs, yuv, why, why_size) ||
+       !lower_rgb2p_samples(cs, &compute->info, yuv, why, why_size) ||
+       !lower_half_for_backend(cs, device, &compute->info, why, why_size)) {
+      ralloc_free(cs);
+      return NULL;
+   }
+   finalize_for_gallium(cs, device->screen);
+
+   void *cso = device->pipe->create_compute_state(device->pipe,
+      &(struct pipe_compute_state){
+         .ir_type = PIPE_SHADER_IR_NIR, .prog = cs,
+         .static_shared_mem = cs->info.shared_size });
+   if (!cso) {
+      say(why, why_size, "%s would not make a compute pipeline of %s",
+          device->screen->get_name(device->screen),
+          compute->info.entry_point ? compute->info.entry_point : "the shader");
+      return NULL;
+   }
+
+   struct pipe_compute_state_object_info si = { 0 };
+   if (device->pipe->get_compute_state_info)
+      device->pipe->get_compute_state_info(device->pipe, cso, &si);
+   if (!si.max_threads) {
+      say(why, why_size, "the hardware driver did not report a compiled threadgroup limit");
+      device->pipe->delete_compute_state(device->pipe, cso);
+      return NULL;
+   }
+   if (out_var_max)
+      *out_var_max = si.max_threads;
+   if (out_caps) {
+      out_caps->max_threads_per_group = MIN2(device->max_threads_per_group, si.max_threads);
+      if (si.preferred_simd_size)
+         out_caps->thread_execution_width = si.preferred_simd_size;
+   }
+   return cso;
 }
 
 /* Hardware keeps one variable-workgroup CSO for queries and dispatch.
@@ -442,7 +538,9 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
    if (!device->software) {
       if (!si.max_threads) {
          say(why, why_size, "the hardware driver did not report a compiled threadgroup limit");
-         delete_compute_state(device, cso);
+         /* Brand-new CSO was never bound on device->pipe; delete directly without touching
+          * bound compute state (caller may hold rwa_cso_create_lock rather than rwa_lock). */
+         device->pipe->delete_compute_state(device->pipe, cso);
          return NULL;
       }
       if (fixed && threads > si.max_threads) {
@@ -450,7 +548,7 @@ compute_state_for_ib(struct rwa_compute *compute, const unsigned block[3],
                             "still takes at most %u", compute->info.entry_point ?
                             compute->info.entry_point : "the shader", block[0], block[1],
              block[2], si.max_threads);
-         delete_compute_state(device, cso);
+         device->pipe->delete_compute_state(device->pipe, cso);
          return NULL;
       }
       if (!fixed)
