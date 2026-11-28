@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "air_metal.h"
+#include "air_reflection.h"
 #include "air_clear_plan.h"
 #include "air_metal_yuv.h"
 #include "air_metal_rgb2p.h"

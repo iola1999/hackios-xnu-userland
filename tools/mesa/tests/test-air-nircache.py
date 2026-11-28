@@ -169,9 +169,16 @@ assert_refl_type_eq(const struct rwa_reflection_type *a,
    MUST(a->member_count == b->member_count);
    MUST(a->array_length == b->array_length);
    MUST(a->array_stride == b->array_stride);
+   MUST(a->texture_type == b->texture_type);
+   MUST(a->texture_data_type == b->texture_data_type);
+   MUST(a->depth_texture == b->depth_texture);
+   MUST(a->access == b->access);
+   MUST(a->constant_buffer == b->constant_buffer);
+   MUST(a->is_argument_buffer == b->is_argument_buffer);
    for (unsigned i = 0; i < a->member_count; i++) {
       assert_str_eq(a->members[i].name, b->members[i].name);
       MUST(a->members[i].offset == b->members[i].offset);
+      MUST(a->members[i].indirect_argument_index == b->members[i].indirect_argument_index);
       assert_refl_type_eq(a->members[i].type, b->members[i].type);
    }
    assert_refl_type_eq(a->element, b->element);
@@ -204,8 +211,17 @@ assert_info_eq(const struct air_shader_info *a, const struct air_shader_info *b)
       MUST(memcmp(&ra->sampler, &rb->sampler, sizeof(ra->sampler)) == 0);
       MUST(ra->raster_order_group == rb->raster_order_group);
       MUST(ra->level_base == rb->level_base && ra->level_count == rb->level_count);
-      MUST(ra->nullable == rb->nullable);
+      MUST(ra->nullable == rb->nullable && ra->unused == rb->unused);
       MUST(ra->argbuf_set == rb->argbuf_set && ra->argbuf_id == rb->argbuf_id);
+   }
+
+   MUST(a->num_argbuf_constants == b->num_argbuf_constants);
+   for (unsigned i = 0; i < a->num_argbuf_constants; i++) {
+      const struct air_argbuf_const_member *ca = &a->argbuf_constants[i];
+      const struct air_argbuf_const_member *cb = &b->argbuf_constants[i];
+      MUST(ca->argbuf_set == cb->argbuf_set && ca->argbuf_id == cb->argbuf_id);
+      MUST(ca->offset == cb->offset && ca->size == cb->size && ca->alignment == cb->alignment);
+      assert_str_eq(ca->name, cb->name);
    }
 
    MUST(a->num_varyings == b->num_varyings);

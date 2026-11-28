@@ -25,7 +25,53 @@ argbuf_find(const struct rwa_buffer *dest, size_t offset)
    return NULL;
 }
 
-/* The encoding at `offset`, made if it is not there, with room for `id`.
+#define RWA_MAX_ARGBUF_SLOTS 1024u
+
+static struct rwa_argbuf_slot *
+argbuf_slot_find(const struct rwa_argbuf_encoding *e, unsigned id)
+{
+   if (!e)
+      return NULL;
+   for (unsigned i = 0; i < e->slots; i++) {
+      if (e->slot[i].set && e->slot[i].id == id)
+         return &e->slot[i];
+   }
+   return NULL;
+}
+
+static struct rwa_argbuf_slot *
+argbuf_slot_for(struct rwa_argbuf_encoding *e, unsigned id, char *why, size_t why_size)
+{
+   struct rwa_argbuf_slot *empty = NULL;
+   for (unsigned i = 0; i < e->slots; i++) {
+      if (e->slot[i].set && e->slot[i].id == id)
+         return &e->slot[i];
+      if (!e->slot[i].set && !empty)
+         empty = &e->slot[i];
+   }
+   if (empty)
+      return empty;
+   if (e->slots >= RWA_MAX_ARGBUF_SLOTS) {
+      say(why, why_size, "argument buffer encoding exceeded %u active slots (id %u)",
+          RWA_MAX_ARGBUF_SLOTS, id);
+      return NULL;
+   }
+   unsigned want = e->slots ? e->slots * 2 : 8;
+   if (want > RWA_MAX_ARGBUF_SLOTS)
+      want = RWA_MAX_ARGBUF_SLOTS;
+   struct rwa_argbuf_slot *grown = realloc(e->slot, want * sizeof(*grown));
+   if (!grown) {
+      say(why, why_size, "out of memory recording member %u of an argument buffer", id);
+      return NULL;
+   }
+   memset(grown + e->slots, 0, (want - e->slots) * sizeof(*grown));
+   unsigned idx = e->slots;
+   e->slot = grown;
+   e->slots = want;
+   return &e->slot[idx];
+}
+
+/* The encoding at `offset`, made if it is not there.
  *
  * It is NOT cleared when it is found, and that is Metal's behaviour rather than a
  * shortcut: -setArgumentBuffer:offset: starts an encoding over a buffer whose BYTES are
@@ -34,7 +80,7 @@ argbuf_find(const struct rwa_buffer *dest, size_t offset)
  * refuse a draw Metal would have made.
  */
 static struct rwa_argbuf_encoding *
-argbuf_encoding_for(struct rwa_buffer *dest, size_t offset, unsigned id, char *why,
+argbuf_encoding_for(struct rwa_buffer *dest, size_t offset, char *why,
                     size_t why_size)
 {
    struct rwa_argbuf_encoding *e = argbuf_find(dest, offset);
@@ -56,19 +102,6 @@ argbuf_encoding_for(struct rwa_buffer *dest, size_t offset, unsigned id, char *w
          dest->device->encoded = dest;
       }
    }
-
-   if (id >= e->slots) {
-      unsigned want = (id + 8) & ~7u;
-      struct rwa_argbuf_slot *grown = realloc(e->slot, want * sizeof(*grown));
-
-      if (!grown) {
-         say(why, why_size, "out of memory recording member %u of an argument buffer", id);
-         return NULL;
-      }
-      memset(grown + e->slots, 0, (want - e->slots) * sizeof(*grown));
-      e->slot = grown;
-      e->slots = want;
-   }
    return e;
 }
 
@@ -84,25 +117,16 @@ argbuf_begin_member(struct rwa_buffer *dest, size_t dest_offset, unsigned id,
                          "-setArgumentBuffer:offset: has to name one first", what);
       return NULL;
    }
-   if (id >= RWA_MAX_ARGBUF_MEMBERS) {
-      say(why, why_size, "%s was encoded at id %u and this library records %u members of "
-                         "a set", what, id, RWA_MAX_ARGBUF_MEMBERS);
-      return NULL;
-   }
-   /* The handle Metal would write is eight bytes at dest_offset + 8 * id, and an
-    * encoding that does not fit the buffer is an application that allocated it from
-    * something other than -encodedLength. Nothing of ours would read those bytes, which
-    * is exactly why it has to be said here: this library would otherwise be the only
-    * thing in the system that did not notice.
+   /* Sparse [[id(n)]] values (such as VFX id=200..571) do not imply byte offset 8 * id;
+    * verify the destination holds at least one 8-byte handle at dest_offset.
     */
-   size_t need = dest_offset + (size_t)8 * id + 8;
-   if (need > dest->size) {
+   if (dest_offset > dest->size || dest->size - dest_offset < 8) {
       say(why, why_size, "%s was encoded at id %u of an argument buffer at offset %zu, "
-                         "which Metal would write %zu bytes into, and that buffer holds "
-                         "%zu", what, id, dest_offset, need, dest->size);
+                         "which requires at least 8 bytes, and that buffer holds %zu",
+          what, id, dest_offset, dest->size);
       return NULL;
    }
-   return argbuf_encoding_for(dest, dest_offset, id, why, why_size);
+   return argbuf_encoding_for(dest, dest_offset, why, why_size);
 }
 
 int
@@ -117,8 +141,9 @@ rwa_argbuf_encode_buffer(struct rwa_buffer *dest, size_t dest_offset, unsigned i
    if (!e)
       return -1;
    if (!buffer) {
-      if (e->slot[id].set) {
-         e->slot[id] = (struct rwa_argbuf_slot){ 0 };
+      struct rwa_argbuf_slot *sl = argbuf_slot_find(e, id);
+      if (sl) {
+         *sl = (struct rwa_argbuf_slot){ 0 };
          if (e->members > 0)
             e->members--;
       }
@@ -133,10 +158,13 @@ rwa_argbuf_encode_buffer(struct rwa_buffer *dest, size_t dest_offset, unsigned i
                          "bytes", id, offset, buffer->size);
       return -1;
    }
-   if (!e->slot[id].set)
+   struct rwa_argbuf_slot *sl = argbuf_slot_for(e, id, why, why_size);
+   if (!sl)
+      return -1;
+   if (!sl->set)
       e->members++;
-   e->slot[id] = (struct rwa_argbuf_slot){ .set = true, .kind = RWA_ARGBUF_BUFFER,
-                                           .buffer = buffer, .offset = offset };
+   *sl = (struct rwa_argbuf_slot){ .id = id, .set = true, .kind = RWA_ARGBUF_BUFFER,
+                                   .buffer = buffer, .offset = offset };
    return 0;
 }
 
@@ -151,8 +179,9 @@ rwa_argbuf_encode_texture(struct rwa_buffer *dest, size_t dest_offset, unsigned 
    if (!e)
       return -1;
    if (!texture) {
-      if (e->slot[id].set) {
-         e->slot[id] = (struct rwa_argbuf_slot){ 0 };
+      struct rwa_argbuf_slot *sl = argbuf_slot_find(e, id);
+      if (sl) {
+         *sl = (struct rwa_argbuf_slot){ 0 };
          if (e->members > 0)
             e->members--;
       }
@@ -162,10 +191,13 @@ rwa_argbuf_encode_texture(struct rwa_buffer *dest, size_t dest_offset, unsigned 
       say(why, why_size, "the texture encoded at id %u belongs to another device", id);
       return -1;
    }
-   if (!e->slot[id].set)
+   struct rwa_argbuf_slot *sl = argbuf_slot_for(e, id, why, why_size);
+   if (!sl)
+      return -1;
+   if (!sl->set)
       e->members++;
-   e->slot[id] = (struct rwa_argbuf_slot){ .set = true, .kind = RWA_ARGBUF_TEXTURE,
-                                           .texture = texture };
+   *sl = (struct rwa_argbuf_slot){ .id = id, .set = true, .kind = RWA_ARGBUF_TEXTURE,
+                                   .texture = texture };
    return 0;
 }
 
@@ -180,8 +212,9 @@ rwa_argbuf_encode_sampler(struct rwa_buffer *dest, size_t dest_offset, unsigned 
    if (!e)
       return -1;
    if (!sampler) {
-      if (e->slot[id].set) {
-         e->slot[id] = (struct rwa_argbuf_slot){ 0 };
+      struct rwa_argbuf_slot *sl = argbuf_slot_find(e, id);
+      if (sl) {
+         *sl = (struct rwa_argbuf_slot){ 0 };
          if (e->members > 0)
             e->members--;
       }
@@ -191,10 +224,13 @@ rwa_argbuf_encode_sampler(struct rwa_buffer *dest, size_t dest_offset, unsigned 
       say(why, why_size, "the sampler encoded at id %u belongs to another device", id);
       return -1;
    }
-   if (!e->slot[id].set)
+   struct rwa_argbuf_slot *sl = argbuf_slot_for(e, id, why, why_size);
+   if (!sl)
+      return -1;
+   if (!sl->set)
       e->members++;
-   e->slot[id] = (struct rwa_argbuf_slot){ .set = true, .kind = RWA_ARGBUF_SAMPLER,
-                                           .sampler = sampler };
+   *sl = (struct rwa_argbuf_slot){ .id = id, .set = true, .kind = RWA_ARGBUF_SAMPLER,
+                                   .sampler = sampler };
    return 0;
 }
 
@@ -374,6 +410,8 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
       *sampler = NULL;
    if (offset)
       *offset = 0;
+   if (r->unused)
+      return 0;
 
    /* Nothing bound at the set's own Metal index. The shader would read a descriptor out
     * of memory that is not there at all.
@@ -381,6 +419,8 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
    const struct rwa_buffer_bind *bind =
       table && r->argbuf_set < table_count ? &table[r->argbuf_set] : NULL;
    if (!bind || !bind->buffer) {
+      if (r->nullable)
+         return 0;
       say(why, why_size, "%s reads %s `%s` out of the argument buffer at Metal buffer "
                          "index %u and nothing is bound there (%u slot%s given)", name,
           kind, member, r->argbuf_set, table_count, table_count == 1 ? "" : "s");
@@ -396,6 +436,8 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
    RWA_ARGBUF_LOCKED;
    const struct rwa_argbuf_encoding *e = argbuf_find(bind->buffer, bind->offset);
    if (!e || e->members == 0) {
+      if (r->nullable)
+         return 0;
       say(why, why_size, "the buffer bound as the argument buffer at Metal buffer index "
                          "%u (offset %zu) was never filled through an MTLArgumentEncoder, "
                          "so there is no record of what %s's %s `%s` (id %u) should be. "
@@ -407,13 +449,14 @@ argbuf_member(const struct air_resource *r, const struct rwa_buffer_bind *table,
       return -1;
    }
 
-   const struct rwa_argbuf_slot *sl =
-      r->argbuf_id < e->slots ? &e->slot[r->argbuf_id] : NULL;
+   const struct rwa_argbuf_slot *sl = argbuf_slot_find(e, r->argbuf_id);
 
    /* Encoded, but not this member: Metal would have written a handle of zero there and
     * the GPU would read descriptor zero of the device, which is some other resource.
     */
    if (!sl || !sl->set) {
+      if (r->nullable)
+         return 0;
       say(why, why_size, "%s reads %s `%s` at id %u of the argument buffer at Metal "
                          "buffer index %u, and that id was never set on the encoder "
                          "(%u member%s encoded at offset %zu)", name, kind, member,

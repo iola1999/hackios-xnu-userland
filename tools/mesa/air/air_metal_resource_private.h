@@ -137,6 +137,7 @@ struct rwa_buffer_texture {
  * same answer, one frame earlier, with the resource's own number in it.
  */
 struct rwa_argbuf_slot {
+   unsigned id;                   /* Metal [[id(n)]] stored in this slot */
    bool set;                      /* this member was encoded at all */
    bool destroyed;                /* ... and the resource it named has been destroyed */
    unsigned kind;                 /* enum rwa_argbuf_kind: which call set it */

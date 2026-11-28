@@ -337,6 +337,8 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
 {
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
+      if (r->unused)
+         continue;
 
       /*
        * A MEMBER OF AN ARGUMENT BUFFER comes from the encoder's record and not from the
@@ -370,7 +372,8 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
              * it: Tungsten's fragment_main walks `const float4 *shaderP` only for sprites with
              * shader opcodes, and Photos binds nothing there for the grid. A reference argument
              * carries air.buffer_size and must be bound. */
-            if (unbound && r->kind == AIR_RESOURCE_CONSTANT_BUFFER && r->size == 0)
+            if (unbound && r->kind == AIR_RESOURCE_CONSTANT_BUFFER &&
+                (r->size == 0 || r->nullable))
                break;
             if (unbound) {
                say(why, why_size, "%s reads buffer %u and %u buffer%s bound", name,
@@ -393,6 +396,8 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
             if (buffer_offset_ok(b->device, r, b, moffset, name, what, why, why_size) != 0)
                return -1;
          }
+         if (member && !b)
+            break;
          /* `r->size` is air.buffer_size, which a member never carries: the frontend
           * adds a member's resource with a size of zero because the nested descriptor
           * has no such key (air_to_nir.c's allocate_argbuf_indices). Where it IS
@@ -419,7 +424,7 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
          }
          /* a texture the application may leave unbound, as on Metal, gets no view
           * (air_resource.nullable, air_texture_may_be_unbound) */
-         if (!member && !stored && r->nullable &&
+         if (!member && r->nullable &&
              (r->index >= bindings->texture_count || !bindings->textures[r->index]))
             break;
          if (!member && (r->index >= bindings->texture_count ||
@@ -429,6 +434,8 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
                 bindings->texture_count == 1 ? " was" : "s were");
             return -1;
          }
+         if (member && !mtexture)
+            break;
          const struct rwa_texture *t = member ? mtexture : bindings->textures[r->index];
          /* MTLTextureUsage, honoured rather than noted: Metal refuses to bind a
           * texture to a shader that writes it unless the application asked for
@@ -466,6 +473,8 @@ check_bindings(const struct air_shader_info *info, const struct rwa_slot *slots,
           * was refused.
           */
          if (member)
+            break;
+         if (r->nullable && (r->index >= bindings->sampler_count || !bindings->samplers[r->index]))
             break;
          if (r->index >= bindings->sampler_count || !bindings->samplers[r->index]) {
             say(why, why_size, "%s takes sampler %u from the API and %u sampler%s bound",
@@ -628,6 +637,8 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
 
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
+      if (r->unused)
+         continue;
       struct rwa_buffer *b = NULL;
       struct rwa_texture *t = NULL;
       struct rwa_sampler *sm = NULL;
@@ -660,7 +671,7 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             break;
          case AIR_RESOURCE_SAMPLER:
             if (!r->inline_sampler)
-               sm = bindings->samplers[r->index];
+               sm = r->index < bindings->sampler_count ? bindings->samplers[r->index] : NULL;
             break;
          default:
             break;
@@ -814,6 +825,8 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
          break;
 
       case AIR_RESOURCE_IMAGE:
+         if (!t)
+            break;
          if (!texture_require_backing(t, "image binding", why, why_size) ||
              buffer_texture_sync_aliases(t, why, why_size) != 0)
             return -1;
@@ -900,6 +913,16 @@ bind_stage(struct rwa_device *device, mesa_shader_stage stage,
             }
             samplers[r->index] = own_sampler[r->index];
          } else {
+            if (!sm) {
+               samplers[r->index] = default_sampler(device);
+               if (!samplers[r->index]) {
+                  say(why, why_size, "%s would not make a sampler at all",
+                      rwa_device_name(device));
+                  return -1;
+               }
+               num_samplers = MAX2(num_samplers, r->index + 1);
+               break;
+            }
             if (sm->cubic) {
                cubic_samplers |= 1u << r->index;
                unlowered_cubic |= 1u << r->index;

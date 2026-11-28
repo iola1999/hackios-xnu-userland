@@ -316,12 +316,18 @@ run_argbufs(const char *path, const char *only)
                 "%u members\n", name, l->metal_index, l->encoded_length, l->alignment,
                 l->member_count);
          for (unsigned m = 0; m < l->member_count; m++) {
-            static const char *const kind[] = { "buffer", "texture", "sampler" };
+            static const char *const kind[] = { "buffer", "texture", "sampler", "constant" };
 
-            printf("argbufs %s    id %u  %s  index %u%s  %s\n", name, l->members[m].id,
-                   l->members[m].kind < 3 ? kind[l->members[m].kind] : "?",
-                   l->members[m].index, l->members[m].write ? "  written" : "",
-                   l->members[m].name);
+            if (l->members[m].kind == RWA_ARGBUF_CONSTANT) {
+               printf("argbufs %s    id %u  constant  off %u  size %u  %s\n", name,
+                      l->members[m].id, l->members[m].offset, l->members[m].size,
+                      l->members[m].name);
+            } else {
+               printf("argbufs %s    id %u  %s  index %u%s  %s\n", name, l->members[m].id,
+                      l->members[m].kind < 4 ? kind[l->members[m].kind] : "?",
+                      l->members[m].index, l->members[m].write ? "  written" : "",
+                      l->members[m].name);
+            }
          }
       }
    }

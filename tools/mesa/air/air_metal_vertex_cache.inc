@@ -78,6 +78,9 @@ rwa_vertex_cso_insert(struct rwa_device *device, const void *bitcode, size_t siz
       e->vinfo = *vinfo;
       e->vinfo.notes = NULL;
       e->vinfo.num_notes = 0;
+      e->vinfo.reflection = air_reflection_clone(e->mem_ctx, vinfo->reflection);
+      e->vinfo.reflection_error = vinfo->reflection_error
+         ? ralloc_strdup(e->mem_ctx, vinfo->reflection_error) : NULL;
       if (vinfo->entry_point)
          e->vinfo.entry_point = ralloc_strdup(e->mem_ctx, vinfo->entry_point);
       if (vinfo->resources && vinfo->num_resources > 0) {

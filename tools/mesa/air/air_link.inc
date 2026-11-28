@@ -135,10 +135,12 @@ inline_linked_function(struct air_ctx *c, struct air_linked_module *lm,
    nir_block *saved_entry = c->inline_entry, *saved_exit = c->inline_exit;
    struct air_val *saved_ret = c->inline_ret;
    nir_def *saved_ret_reg = c->inline_ret_reg;
+   bool saved_in_entry_block = c->in_entry_block;
 
    c->m = lm->m;
    c->global_plan = lm->plan;
    c->fn = f;
+   c->in_entry_block = false;
    c->values = _mesa_pointer_hash_table_create(c->mem_ctx);
    c->blocks = _mesa_pointer_hash_table_create(c->mem_ctx);
    c->phi_cursors = _mesa_pointer_hash_table_create(c->mem_ctx);
@@ -158,6 +160,7 @@ inline_linked_function(struct air_ctx *c, struct air_linked_module *lm,
          c->inline_exit = saved_exit;
          c->inline_ret = saved_ret;
          c->inline_ret_reg = saved_ret_reg;
+         c->in_entry_block = saved_in_entry_block;
          air_error(c, "link: a linked function returns something other than a number "
                       "from more than one place");
          return NULL;
@@ -206,6 +209,7 @@ inline_linked_function(struct air_ctx *c, struct air_linked_module *lm,
    c->inline_exit = saved_exit;
    c->inline_ret = saved_ret;
    c->inline_ret_reg = saved_ret_reg;
+   c->in_entry_block = saved_in_entry_block;
    return ok ? result : NULL;
 }
 

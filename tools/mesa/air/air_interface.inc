@@ -495,7 +495,13 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       default:
          return air_error(c, "interface: a buffer in address space %u", (unsigned)as);
       }
-      add_resource(c, rk, index, size, read, write, param, node);
+      struct air_resource *r = add_resource(c, rk, index, size, read, write, param, node);
+      if (r && (as == 1 || as == 2)) {
+         if (md_key(node, "air.arg_unused") >= 0)
+            r->unused = true;
+         else if (md_key(node, "air.function_constant") >= 0)
+            r->nullable = true;
+      }
       c->params[param] = air_val_ptr(c, p);
       if (p.class == AIR_PTR_SHARED)
          c->dynamic_threadgroup = c->params[param];
@@ -530,9 +536,13 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
          .is_image = write,
       };
       if (md_key(node, "air.arg_unused") < 0) {
-         for (uint64_t k = 0; k < span; k++)
-            add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE, index + k, 0,
-                         sample || read, write, param, node);
+         bool fc_gated = md_key(node, "air.function_constant") >= 0;
+         for (uint64_t k = 0; k < span; k++) {
+            struct air_resource *r = add_resource(c, write ? AIR_RESOURCE_IMAGE : AIR_RESOURCE_TEXTURE,
+                                                  index + k, 0, sample || read, write, param, node);
+            if (r && fc_gated)
+               r->nullable = true;
+         }
       }
       c->params[param] = air_val_ptr(c, p);
       return true;
@@ -543,8 +553,12 @@ translate_input(struct air_ctx *c, const struct air_md *node, unsigned *next_var
       md_key_int(node, "air.location_index", &index);
       struct air_ptr p = { .class = AIR_PTR_SAMPLER, .binding = index };
       /* inactive as an unused texture is, see there */
-      if (md_key(node, "air.arg_unused") < 0)
-         add_resource(c, AIR_RESOURCE_SAMPLER, index, 0, true, false, param, node);
+      if (md_key(node, "air.arg_unused") < 0) {
+         struct air_resource *r = add_resource(c, AIR_RESOURCE_SAMPLER, index, 0, true, false,
+                                               param, node);
+         if (r && md_key(node, "air.function_constant") >= 0)
+            r->nullable = true;
+      }
       c->params[param] = air_val_ptr(c, p);
       return true;
    }

@@ -370,7 +370,7 @@ rgb2p_prepare_bindings(const struct air_shader_info *info, const struct rwa_bind
 {
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
-      if (r->kind != AIR_RESOURCE_TEXTURE)
+      if (r->unused || r->kind != AIR_RESOURCE_TEXTURE)
          continue;
       struct rwa_texture *t = NULL;
       if (r->argbuf_set != ~0u) {

@@ -340,7 +340,7 @@ translate_argument_buffer(struct air_ctx *c, const struct air_md *node, unsigned
    const char *tn = md_key_str(node, "air.arg_type_name");
 
    int li = md_key(node, "air.location_index");
-   uint64_t set_index = 0, span = 1, size = 0;
+   uint64_t set_index = 0, span = 1, size = 0, align = 0;
    if (li < 0 || !md_int(node, li + 1, &set_index))
       return air_error(c, "interface: an argument buffer (%s) with no air.location_index",
                        name ? name : "unnamed");
@@ -348,6 +348,8 @@ translate_argument_buffer(struct air_ctx *c, const struct air_md *node, unsigned
       return air_error(c, "interface: an argument buffer (%s) spanning %u buffer indices",
                        name ? name : "unnamed", (unsigned)span);
    md_key_int(node, "air.buffer_size", &size);
+   md_key_int(node, "air.arg_type_align_size", &align);
+   unsigned alignment = align > 8 ? (unsigned)align : 8u;
 
    const struct air_md *sti = md_key_node(node, "air.struct_type_info");
    if (!sti)
@@ -373,8 +375,8 @@ translate_argument_buffer(struct air_ctx *c, const struct air_md *node, unsigned
    c->argbufs = reralloc(c->mem_ctx, c->argbufs, struct air_argbuf, c->num_argbufs + 1);
    struct air_argbuf *ab = &c->argbufs[c->num_argbufs];
    *ab = (struct air_argbuf) {
-      .metal_index = (unsigned)set_index, .size = (unsigned)size, .param = param,
-      .const_ubo_index = ~0u, .name = name, .type_name = tn,
+      .metal_index = (unsigned)set_index, .size = (unsigned)size, .alignment = alignment,
+      .param = param, .const_ubo_index = ~0u, .name = name, .type_name = tn,
    };
    if (!argbuf_members(c, sti, st, ab))
       return false;
@@ -458,8 +460,21 @@ allocate_argbuf_indices(struct air_ctx *c)
       }
       for (unsigned k = 0; k < ab->num_members; k++) {
          struct air_argbuf_member *m = &ab->members[k];
-         if (m->is_constant)
+         if (m->is_constant) {
+            unsigned nc = c->info->num_argbuf_constants;
+            c->info->argbuf_constants = reralloc(c->mem_ctx, c->info->argbuf_constants,
+                                                 struct air_argbuf_const_member, nc + 1);
+            c->info->argbuf_constants[nc] = (struct air_argbuf_const_member) {
+               .argbuf_set = ab->metal_index,
+               .argbuf_id = m->metal_id,
+               .offset = (unsigned)m->offset,
+               .size = (unsigned)m->size,
+               .alignment = ab->alignment,
+               .name = m->name,
+            };
+            c->info->num_argbuf_constants = nc + 1;
             continue;
+         }
          if (m->span > 1) {
             unsigned avail = next_texture < 16 ? (16 - next_texture) : 1;
             m->slots = MIN2(m->span, avail);
@@ -514,14 +529,14 @@ static struct air_val *
 argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
             unsigned align)
 {
-   const struct air_argbuf *ab = &c->argbufs[ptr.binding];
+   struct air_argbuf *ab = &c->argbufs[ptr.binding];
    const char *abname = ab->name ? ab->name : "unnamed";
 
    uint64_t off = 0;
    if (ptr.offset) {
       if (!nir_src_is_const(nir_src_for_ssa(ptr.offset))) {
          if (type->kind == AIR_TYPE_POINTER) {
-            const struct air_argbuf_member *arr = NULL;
+            struct air_argbuf_member *arr = NULL;
             for (unsigned i = 0; i < ab->num_members; i++) {
                if (!ab->members[i].is_constant && ab->members[i].span > 1) {
                   arr = &ab->members[i];
@@ -529,6 +544,7 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
                }
             }
             if (arr && type->addrspace == arr->addrspace && arr->slots > 0) {
+               arr->used = true;
                nir_def *rel = arr->offset ? nir_iadd_imm(&c->b, ptr.offset, -(int)arr->offset)
                                           : ptr.offset;
                nir_def *elem = nir_umin_imm(&c->b, nir_ushr_imm(&c->b, rel, 3),
@@ -547,6 +563,9 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
                return air_val_ptr(c, tp);
             }
          } else if (ab->has_constants && ab->const_ubo_index != ~0u) {
+            ab->const_used = true;
+            if (c->in_entry_block)
+               ab->const_unconditional = true;
             struct air_ptr up = {
                .class = AIR_PTR_UBO, .binding = ab->const_ubo_index,
                .offset = ptr.offset, .pointee = type,
@@ -562,9 +581,9 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
       off = nir_src_as_uint(nir_src_for_ssa(ptr.offset));
    }
 
-   const struct air_argbuf_member *m = NULL;
+   struct air_argbuf_member *m = NULL;
    for (unsigned i = 0; i < ab->num_members; i++) {
-      const struct air_argbuf_member *cand = &ab->members[i];
+      struct air_argbuf_member *cand = &ab->members[i];
       if (cand->is_constant) {
          if (off >= cand->offset && off < cand->offset + cand->size) {
             m = cand;
@@ -593,6 +612,9 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
                       "argument buffer %s", m->name ? m->name : "unnamed", abname);
          return NULL;
       }
+      ab->const_used = true;
+      if (c->in_entry_block)
+         ab->const_unconditional = true;
       struct air_ptr up = {
          .class = AIR_PTR_UBO, .binding = ab->const_ubo_index,
          .offset = nir_imm_int(&c->b, off), .pointee = type,
@@ -615,6 +637,10 @@ argbuf_load(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
                 abname, m->addrspace);
       return NULL;
    }
+
+   m->used = true;
+   if (c->in_entry_block && m->span == 1)
+      m->unconditional = true;
 
    unsigned elem_idx = (unsigned)((off - m->offset) >> 3);
    if (elem_idx >= m->slots)

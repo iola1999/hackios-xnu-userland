@@ -120,6 +120,7 @@ struct air_argbuf_member {
     */
    unsigned addrspace;
    bool read, write, is_constant;
+   bool used, unconditional;
    const char *name, *type_name;
    const struct air_md *node;   /* the member's own air.indirect_argument descriptor */
 };
@@ -127,9 +128,11 @@ struct air_argbuf_member {
 struct air_argbuf {
    unsigned metal_index;   /* the SET's own Metal [[buffer(n)]] */
    unsigned size;          /* air.buffer_size */
+   unsigned alignment;     /* air.arg_type_align_size, at least 8 */
    unsigned param;         /* the entry point's parameter the set arrives as */
    unsigned const_ubo_index;
    bool has_constants;
+   bool const_used, const_unconditional;
    const char *name, *type_name;
    unsigned num_members;
    struct air_argbuf_member *members;
@@ -139,6 +142,8 @@ struct air_ctx {
    void *mem_ctx;
    const struct air_module *m;
    const struct air_function *fn;
+   const struct air_function *entry_fn;
+   bool in_entry_block;
    nir_shader *nir;
    nir_builder b;
 

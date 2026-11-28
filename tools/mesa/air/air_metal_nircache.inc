@@ -22,6 +22,7 @@
 #endif
 
 #include "air_metal_reflection.h"
+#include "air_reflection.h"
 #include "nir_serialize.h"
 #include "util/blob.h"
 #include "util/crc32.h"
@@ -29,7 +30,7 @@
 
 #define NIRC_DEFAULT_DIR   "/private/var/db/annibale-nircache"
 #define NIRC_MAGIC         0x4352494eu /* "NIRC" */
-#define NIRC_VERSION       1u
+#define NIRC_VERSION       2u
 #define NIRC_MAX_FILE_SIZE (64u << 20)
 #define NIRC_MAX_ARRAY_LEN 65536u
 #define NIRC_MAX_REFL_DEPTH 64u
@@ -113,7 +114,7 @@ nircache_hash_key(const void *bitcode, size_t size, const char *entry,
                   const struct air_to_nir_options *options, bool software,
                   char hex_out[BLAKE3_HEX_LEN])
 {
-   static const char tag[] = "annibale-nircache-v1";
+   static const char tag[] = "annibale-nircache-v3";
    struct mesa_blake3 ctx;
    _mesa_blake3_init(&ctx);
    _mesa_blake3_update(&ctx, tag, sizeof(tag));
@@ -245,9 +246,16 @@ nircache_write_refl_type(struct blob *blob, const struct rwa_reflection_type *t,
    blob_write_uint32(blob, t->member_count);
    blob_write_uint32(blob, t->array_length);
    blob_write_uint32(blob, t->array_stride);
+   blob_write_uint32(blob, t->texture_type);
+   blob_write_uint32(blob, t->texture_data_type);
+   blob_write_uint32(blob, t->depth_texture);
+   blob_write_uint32(blob, t->access);
+   blob_write_uint32(blob, t->constant_buffer);
+   blob_write_uint32(blob, t->is_argument_buffer);
    for (unsigned i = 0; i < t->member_count; i++) {
       nircache_write_str(blob, t->members[i].name);
       blob_write_uint32(blob, t->members[i].offset);
+      blob_write_uint32(blob, t->members[i].indirect_argument_index);
       if (!nircache_write_refl_type(blob, t->members[i].type, depth + 1))
          return false;
    }
@@ -277,6 +285,12 @@ nircache_read_refl_type(void *mem_ctx, struct blob_reader *blob, unsigned depth)
    t->member_count = blob_read_uint32(blob);
    t->array_length = blob_read_uint32(blob);
    t->array_stride = blob_read_uint32(blob);
+   t->texture_type = blob_read_uint32(blob);
+   t->texture_data_type = blob_read_uint32(blob);
+   t->depth_texture = blob_read_uint32(blob);
+   t->access = blob_read_uint32(blob);
+   t->constant_buffer = blob_read_uint32(blob);
+   t->is_argument_buffer = blob_read_uint32(blob);
    if (blob->overrun || t->member_count > NIRC_MAX_ARRAY_LEN) {
       blob->overrun = true;
       return NULL;
@@ -291,6 +305,7 @@ nircache_read_refl_type(void *mem_ctx, struct blob_reader *blob, unsigned depth)
       for (unsigned i = 0; i < t->member_count; i++) {
          members[i].name = nircache_read_str(t, blob);
          members[i].offset = blob_read_uint32(blob);
+         members[i].indirect_argument_index = blob_read_uint32(blob);
          members[i].type = nircache_read_refl_type(t, blob, depth + 1);
          if (blob->overrun)
             return NULL;
@@ -348,8 +363,20 @@ nircache_write_info(struct blob *blob, const struct air_shader_info *info)
       blob_write_uint32(blob, r->level_base);
       blob_write_uint32(blob, r->level_count);
       blob_write_uint8(blob, r->nullable);
+      blob_write_uint8(blob, r->unused);
       blob_write_uint32(blob, r->argbuf_set);
       blob_write_uint32(blob, r->argbuf_id);
+   }
+
+   blob_write_uint32(blob, info->num_argbuf_constants);
+   for (unsigned i = 0; i < info->num_argbuf_constants; i++) {
+      const struct air_argbuf_const_member *cm = &info->argbuf_constants[i];
+      blob_write_uint32(blob, cm->argbuf_set);
+      blob_write_uint32(blob, cm->argbuf_id);
+      blob_write_uint32(blob, cm->offset);
+      blob_write_uint32(blob, cm->size);
+      blob_write_uint32(blob, cm->alignment);
+      nircache_write_str(blob, cm->name);
    }
 
    blob_write_uint32(blob, info->num_varyings);
@@ -461,8 +488,30 @@ nircache_read_info(void *mem_ctx, struct blob_reader *blob,
          r->level_base = blob_read_uint32(blob);
          r->level_count = blob_read_uint32(blob);
          r->nullable = blob_read_uint8(blob) != 0;
+         r->unused = blob_read_uint8(blob) != 0;
          r->argbuf_set = blob_read_uint32(blob);
          r->argbuf_id = blob_read_uint32(blob);
+         if (blob->overrun)
+            return false;
+      }
+   }
+
+   info->num_argbuf_constants = blob_read_uint32(blob);
+   if (blob->overrun || info->num_argbuf_constants > NIRC_MAX_ARRAY_LEN)
+      return false;
+   if (info->num_argbuf_constants) {
+      info->argbuf_constants =
+         rzalloc_array(mem_ctx, struct air_argbuf_const_member, info->num_argbuf_constants);
+      if (!info->argbuf_constants)
+         return false;
+      for (unsigned i = 0; i < info->num_argbuf_constants; i++) {
+         struct air_argbuf_const_member *cm = &info->argbuf_constants[i];
+         cm->argbuf_set = blob_read_uint32(blob);
+         cm->argbuf_id = blob_read_uint32(blob);
+         cm->offset = blob_read_uint32(blob);
+         cm->size = blob_read_uint32(blob);
+         cm->alignment = blob_read_uint32(blob);
+         cm->name = nircache_read_str(mem_ctx, blob);
          if (blob->overrun)
             return false;
       }
@@ -738,8 +787,12 @@ rwa_air_to_nir_cached(void *mem_ctx, const void *bitcode, size_t size,
                                     file_path, sizeof(file_path));
    if (have_paths) {
       nir_shader *cached = nircache_load(mem_ctx, file_path, nir_options, info);
-      if (cached)
+      if (cached) {
+         if (!info->reflection && !info->reflection_error)
+            info->reflection = air_module_reflect(mem_ctx, bitcode, size, entry,
+                                                  &info->reflection_error);
          return cached;
+      }
    }
 
    nir_shader *nir = air_to_nir(mem_ctx, bitcode, size, entry, options,

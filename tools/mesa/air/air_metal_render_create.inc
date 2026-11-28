@@ -1093,3 +1093,35 @@ rwa_render_destroy(struct rwa_render *render)
    ralloc_free(render->mem_ctx);
    free(render);
 }
+
+int
+rwa_render_get_reflection(struct rwa_render *render,
+                          struct rwa_render_reflection *out,
+                          char *why, size_t why_size)
+{
+   if (out)
+      memset(out, 0, sizeof(*out));
+   if (!render || !out) {
+      say(why, why_size, "render reflection requires a pipeline and an output pointer");
+      return -1;
+   }
+   if (!render->generated_vertex) {
+      if (!render->vinfo.reflection) {
+         say(why, why_size, "%s", render->vinfo.reflection_error ?
+                                  render->vinfo.reflection_error :
+                                  "vertex shader reflection is unavailable");
+         return -1;
+      }
+      out->vertex = render->vinfo.reflection;
+   }
+   if (render->finfo.entry_point) {
+      if (!render->finfo.reflection) {
+         say(why, why_size, "%s", render->finfo.reflection_error ?
+                                  render->finfo.reflection_error :
+                                  "fragment shader reflection is unavailable");
+         return -1;
+      }
+      out->fragment = render->finfo.reflection;
+   }
+   return 0;
+}

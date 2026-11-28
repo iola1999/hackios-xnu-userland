@@ -166,6 +166,11 @@ struct air_resource {
     * (air_texture_may_be_unbound in air_texture.inc).
     */
    bool nullable;
+   /* An unused argument-buffer resource remains in info->resources[] so
+    * rwa_module_argbufs() still reports the full declared encoder layout,
+    * while check_bindings() and bind_stage() skip it.
+    */
+   bool unused;
 
    /* A member of an ARGUMENT BUFFER (`air.indirect_buffer`, Metal's
     * `[[id(n)]]` struct) rather than an argument of its own, and the one place
@@ -279,11 +284,22 @@ struct air_vertex_attribute {
    const char *function_constant;
 };
 
+struct air_argbuf_const_member {
+   unsigned argbuf_set;   /* the SET's own Metal [[buffer(n)]] */
+   unsigned argbuf_id;    /* Metal's [[id(n)]] */
+   unsigned offset;       /* byte offset within the argument buffer */
+   unsigned size;         /* byte size of this inline constant */
+   unsigned alignment;    /* set alignment from air.arg_type_align_size (at least 8) */
+   const char *name;      /* air.arg_name */
+};
+
 struct air_shader_info {
    mesa_shader_stage stage;     /* MESA_SHADER_NONE for an air.visible function */
    const char *entry_point;
    unsigned num_resources;
    struct air_resource *resources;
+   unsigned num_argbuf_constants;
+   struct air_argbuf_const_member *argbuf_constants;
    /* Bytes of the folded constant window (air_resource.const_win): bound once at the
     * last UBO slot when constant buffers outnumber the sixteen ir3 takes. */
    unsigned const_win_size;

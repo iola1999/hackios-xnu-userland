@@ -387,8 +387,10 @@ translate_body(struct air_ctx *c)
    for (unsigned oi = 0; oi < num_order; oi++)
       reachable[order[oi]] = true;
 
+   bool is_entrypoint = (c->fn == c->entry_fn && !c->inline_entry);
    for (unsigned oi = 0; oi < num_order; oi++) {
       unsigned bi = order[oi];
+      c->in_entry_block = is_entrypoint && (bi == 0);
       const struct air_block *blk = &f->blocks[bi];
       nir_block *nb = nir_block_of(c, blk);
       c->b.cursor = nir_after_block(nb);
@@ -521,9 +523,11 @@ translate_body(struct air_ctx *c)
          nir_goto(&c->b, c->b.impl->end_block);
          break;
       default:
+         c->in_entry_block = false;
          return air_error(c, "instruction: block %u ends with opcode %u", bi, term->op);
       }
    }
+   c->in_entry_block = false;
 
    /* the phi stores, now that every value exists */
    for (unsigned bi = 0; bi < f->num_blocks; bi++) {

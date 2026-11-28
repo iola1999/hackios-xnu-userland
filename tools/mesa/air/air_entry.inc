@@ -52,6 +52,175 @@ reads_threadgroup(nir_shader *nir)
    return false;
 }
 
+static void
+mark_unused_direct_resources(nir_shader *nir, struct air_shader_info *info)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   uint64_t ssbo_used = 0, ubo_used = 0, img_used = 0, tex_used = 0, samp_used = 0;
+   bool dynamic_ssbo = false, dynamic_ubo = false, dynamic_img = false;
+   bool dynamic_tex = false, dynamic_samp = false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_ssbo:
+            case nir_intrinsic_ssbo_atomic:
+            case nir_intrinsic_ssbo_atomic_swap:
+            case nir_intrinsic_get_ssbo_size:
+               if (!nir_src_is_const(intr->src[0])) {
+                  dynamic_ssbo = true;
+               } else {
+                  unsigned idx = nir_src_as_uint(intr->src[0]);
+                  if (idx < 64)
+                     ssbo_used |= 1ull << idx;
+               }
+               break;
+            case nir_intrinsic_store_ssbo:
+               if (!nir_src_is_const(intr->src[1])) {
+                  dynamic_ssbo = true;
+               } else {
+                  unsigned idx = nir_src_as_uint(intr->src[1]);
+                  if (idx < 64)
+                     ssbo_used |= 1ull << idx;
+               }
+               break;
+            case nir_intrinsic_load_ubo:
+               if (!nir_src_is_const(intr->src[0])) {
+                  dynamic_ubo = true;
+               } else {
+                  unsigned slot = nir_src_as_uint(intr->src[0]);
+                  if (slot < 64)
+                     ubo_used |= 1ull << slot;
+               }
+               break;
+            case nir_intrinsic_image_load:
+            case nir_intrinsic_image_store:
+            case nir_intrinsic_image_atomic:
+            case nir_intrinsic_image_atomic_swap:
+            case nir_intrinsic_image_size:
+            case nir_intrinsic_image_levels:
+            case nir_intrinsic_image_samples:
+               if (!nir_src_is_const(intr->src[0])) {
+                  dynamic_img = true;
+               } else {
+                  unsigned idx = nir_src_as_uint(intr->src[0]);
+                  if (idx < 64)
+                     img_used |= 1ull << idx;
+               }
+               break;
+            default:
+               break;
+            }
+         } else if (instr->type == nir_instr_type_tex) {
+            nir_tex_instr *tex = nir_instr_as_tex(instr);
+            if (nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >= 0)
+               dynamic_tex = true;
+            else if (tex->texture_index < 64)
+               tex_used |= 1ull << tex->texture_index;
+            if (nir_tex_instr_need_sampler(tex)) {
+               if (nir_tex_instr_src_index(tex, nir_tex_src_sampler_offset) >= 0)
+                  dynamic_samp = true;
+               else if (tex->sampler_index < 64)
+                  samp_used |= 1ull << tex->sampler_index;
+            }
+         }
+      }
+   }
+
+   bool changed = false;
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      struct air_resource *r = &info->resources[i];
+      if (r->argbuf_set != ~0u || r->unused)
+         continue;
+      switch (r->kind) {
+      case AIR_RESOURCE_DEVICE_BUFFER:
+         if (!dynamic_ssbo && r->index < 64 && !(ssbo_used & (1ull << r->index))) {
+            r->unused = true;
+            changed = true;
+         }
+         break;
+      case AIR_RESOURCE_CONSTANT_BUFFER:
+         if (!dynamic_ubo && !r->const_win && r->slot < 64 && !(ubo_used & (1ull << r->slot))) {
+            r->unused = true;
+            changed = true;
+         }
+         break;
+      case AIR_RESOURCE_TEXTURE:
+         if (!dynamic_tex && r->index < 64 && !(tex_used & (1ull << r->index))) {
+            r->unused = true;
+            changed = true;
+         }
+         break;
+      case AIR_RESOURCE_IMAGE:
+         if (!dynamic_img && r->index < 64 && !(img_used & (1ull << r->index))) {
+            bool any_level = false;
+            for (unsigned l = 0; l < r->level_count; l++) {
+               unsigned slot = r->level_base + l;
+               if (slot >= 64 || (img_used & (1ull << slot))) {
+                  any_level = true;
+                  break;
+               }
+            }
+            if (!any_level) {
+               r->unused = true;
+               changed = true;
+            }
+         }
+         break;
+      case AIR_RESOURCE_SAMPLER:
+         if (!r->inline_sampler && !dynamic_samp && r->index < 64 &&
+             !(samp_used & (1ull << r->index))) {
+            r->unused = true;
+            changed = true;
+         }
+         break;
+      default:
+         break;
+      }
+   }
+
+   if (!changed)
+      return;
+
+   nir->info.num_ubos = 0;
+   nir->info.num_ssbos = 0;
+   nir->info.num_textures = 0;
+   nir->info.num_images = 0;
+   BITSET_ZERO(nir->info.textures_used);
+   BITSET_ZERO(nir->info.images_used);
+   for (unsigned i = 0; i < info->num_resources; i++) {
+      const struct air_resource *r = &info->resources[i];
+      if (r->unused)
+         continue;
+      switch (r->kind) {
+      case AIR_RESOURCE_CONSTANT_BUFFER:
+         nir->info.num_ubos = MAX2(nir->info.num_ubos, r->slot + 1);
+         break;
+      case AIR_RESOURCE_DEVICE_BUFFER:
+         nir->info.num_ssbos = MAX2(nir->info.num_ssbos, r->index + 1);
+         break;
+      case AIR_RESOURCE_TEXTURE:
+         nir->info.num_textures = MAX2(nir->info.num_textures, r->index + 1);
+         BITSET_SET(nir->info.textures_used, r->index);
+         break;
+      case AIR_RESOURCE_IMAGE:
+         nir->info.num_images = MAX2(nir->info.num_images, r->index + 1);
+         BITSET_SET(nir->info.images_used, r->index);
+         if (r->level_count) {
+            nir->info.num_images = MAX2(nir->info.num_images,
+                                        r->level_base + r->level_count);
+            BITSET_SET_RANGE(nir->info.images_used, r->level_base,
+                             r->level_base + r->level_count - 1);
+         }
+         break;
+      default:
+         break;
+      }
+   }
+}
+
 nir_shader *
 air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_point,
            const struct air_to_nir_options *options,
@@ -130,6 +299,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       }
    }
    c.fn = fn;
+   c.entry_fn = fn;
 
    c.nir = nir_shader_create(mem_ctx, stage, nir_options);
    const char *name = kernel ? kernel->graph.name : fn->base.name;
@@ -236,6 +406,46 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
             translate_body(&c);
       }
 
+      if (!c.error[0] && c.num_argbufs) {
+         for (unsigned i = 0; i < c.info->num_resources; i++) {
+            struct air_resource *r = &c.info->resources[i];
+            if (r->argbuf_set == ~0u)
+               continue;
+            const struct air_argbuf *ab = NULL;
+            for (unsigned a = 0; a < c.num_argbufs; a++) {
+               if (c.argbufs[a].metal_index == r->argbuf_set) {
+                  ab = &c.argbufs[a];
+                  break;
+               }
+            }
+            if (!ab)
+               continue;
+            if (r->argbuf_id == ~0u) {
+               if (!ab->const_used)
+                  r->unused = true;
+               else if (!ab->const_unconditional)
+                  r->nullable = true;
+               continue;
+            }
+            const struct air_argbuf_member *m = NULL;
+            for (unsigned k = 0; k < ab->num_members; k++) {
+               const struct air_argbuf_member *cand = &ab->members[k];
+               if (!cand->is_constant &&
+                   r->argbuf_id >= cand->metal_id &&
+                   r->argbuf_id < cand->metal_id + cand->slots) {
+                  m = cand;
+                  break;
+               }
+            }
+            if (!m)
+               continue;
+            if (!m->used)
+               r->unused = true;
+            else if (!m->unconditional)
+               r->nullable = true;
+         }
+      }
+
    }
    /* freedreno gives ir3 sixteen constant buffers (freedreno_screen.c, max_const_buffers),
     * and a UBO block past them reads zeros: in kernel-12377-lens2-w75 a kernel read its
@@ -257,7 +467,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       unsigned indices[32], count = 0, top = 0;
       for (unsigned i = 0; i < c.info->num_resources; i++) {
          struct air_resource *r = &c.info->resources[i];
-         if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
+         if (r->unused || r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
             continue;
          r->slot = r->index;
          top = MAX2(top, r->index + 1);
@@ -288,7 +498,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
 
          for (unsigned i = 0; i < c.info->num_resources; i++) {
             struct air_resource *r = &c.info->resources[i];
-            if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
+            if (r->unused || r->kind != AIR_RESOURCE_CONSTANT_BUFFER)
                continue;
             AIR_UBO_RANK(r->index, r->slot);
             if (fold && r->slot >= win_slot && r->size &&
@@ -340,6 +550,8 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
     */
    for (unsigned i = 0; i < c.info->num_resources; i++) {
       const struct air_resource *r = &c.info->resources[i];
+      if (r->unused)
+         continue;
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
          c.nir->info.num_ubos = MAX2(c.nir->info.num_ubos, r->slot + 1);
@@ -410,6 +622,7 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
       NIR_PASS(_, c.nir, nir_opt_constant_folding);
       NIR_PASS(_, c.nir, nir_opt_dce);
    }
+   mark_unused_direct_resources(c.nir, c.info);
    nir_index_ssa_defs(nir_shader_get_entrypoint(c.nir));
    c.info->group_free = stage == MESA_SHADER_COMPUTE && !c.shared_size &&
                         !c.imageblock_data_size && !reads_threadgroup(c.nir);
@@ -417,9 +630,10 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
    if (info) {
       if (kernel)
          ralloc_steal(mem_ctx, info->reflection);
-      else if (stage == MESA_SHADER_COMPUTE && !wrap)
-         info->reflection = air_compute_reflection(mem_ctx, c.m, fn, in_node,
-                                                   &info->reflection_error);
+      else if ((stage == MESA_SHADER_COMPUTE || stage == MESA_SHADER_VERTEX ||
+                stage == MESA_SHADER_FRAGMENT) && !wrap)
+         info->reflection = air_stage_reflection(mem_ctx, c.m, fn, in_node,
+                                                 &info->reflection_error);
       /* The info's arrays live under mem_ctx, not under the scratch context --
        * and so must every STRING in them, which is the part this used to get
        * wrong. `air_md_string` returns a NUL-terminated copy allocated as a
@@ -443,6 +657,15 @@ air_to_nir(void *mem_ctx, const void *bitcode, size_t size, const char *entry_po
             info->resources[i].name = ralloc_strdup(mem_ctx, info->resources[i].name);
             info->resources[i].type_name =
                ralloc_strdup(mem_ctx, info->resources[i].type_name);
+         }
+      }
+      if (info->num_argbuf_constants) {
+         info->argbuf_constants = ralloc_memdup(
+            mem_ctx, info->argbuf_constants,
+            info->num_argbuf_constants * sizeof(*info->argbuf_constants));
+         for (unsigned i = 0; i < info->num_argbuf_constants; i++) {
+            info->argbuf_constants[i].name =
+               ralloc_strdup(mem_ctx, info->argbuf_constants[i].name);
          }
       }
       if (info->num_varyings) {

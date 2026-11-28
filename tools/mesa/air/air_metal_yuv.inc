@@ -54,12 +54,14 @@ yuv_key_for(const struct air_shader_info *info, const struct rwa_bindings *bindi
    unsigned used = 0;
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
+      if (r->unused)
+         continue;
       if (r->kind == AIR_RESOURCE_TEXTURE && r->index < RWA_MAX_TEXTURES)
          used |= 1u << r->index;
    }
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
-      if (r->kind != AIR_RESOURCE_TEXTURE)
+      if (r->unused || r->kind != AIR_RESOURCE_TEXTURE)
          continue;
       struct rwa_texture *t = NULL;
       if (r->argbuf_set != ~0u) {

@@ -371,6 +371,7 @@ enum rwa_argbuf_kind {
 	RWA_ARGBUF_BUFFER = 0,     /* `constant` or `device`: which it is, the shader decides */
 	RWA_ARGBUF_TEXTURE = 1,
 	RWA_ARGBUF_SAMPLER = 2,
+	RWA_ARGBUF_CONSTANT = 3,   /* inline `air.indirect_constant` bytes inside the set */
 };
 
 /*
@@ -389,6 +390,8 @@ struct rwa_argbuf_member {
 	unsigned kind;             /* enum rwa_argbuf_kind */
 	unsigned index;
 	unsigned write;            /* 1 when the shader writes this member */
+	unsigned offset;           /* byte offset for RWA_ARGBUF_CONSTANT; 0 otherwise */
+	unsigned size;             /* byte size for RWA_ARGBUF_CONSTANT; 0 otherwise */
 	char name[48];             /* air.arg_name, as Apple's compiler wrote it; "" if none */
 };
 

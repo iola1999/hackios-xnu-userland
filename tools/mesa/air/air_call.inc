@@ -496,8 +496,10 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
     * constants are built belongs to the function being translated, like the
     * values table above */
    nir_cursor saved_consts = c->const_cursor;
+   bool saved_in_entry_block = c->in_entry_block;
 
    c->fn = f;
+   c->in_entry_block = false;
    c->values = _mesa_pointer_hash_table_create(c->mem_ctx);
    c->blocks = _mesa_pointer_hash_table_create(c->mem_ctx);
    c->phi_cursors = _mesa_pointer_hash_table_create(c->mem_ctx);
@@ -584,6 +586,7 @@ translate_callee(struct air_ctx *c, const struct air_function *f,
    c->num_ret_fields = saved_num_ret_fields;
    c->inline_entry = saved_inline_entry;
    c->inline_exit = saved_inline_exit;
+   c->in_entry_block = saved_in_entry_block;
    return ok ? fn : NULL;
 }
 

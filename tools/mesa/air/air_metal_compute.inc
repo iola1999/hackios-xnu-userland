@@ -89,6 +89,8 @@ compute_create(struct rwa_device *device, const void *bitcode, size_t size,
     */
    for (unsigned i = 0; i < compute->info.num_resources; i++) {
       const struct air_resource *r = &compute->info.resources[i];
+      if (r->unused)
+         continue;
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
       case AIR_RESOURCE_DEVICE_BUFFER:

@@ -189,6 +189,8 @@ count_resources(const struct air_shader_info *info, struct rwa_slot slots[RWA_MA
 {
    for (unsigned i = 0; i < info->num_resources; i++) {
       const struct air_resource *r = &info->resources[i];
+      if (r->unused)
+         continue;
       switch (r->kind) {
       case AIR_RESOURCE_CONSTANT_BUFFER:
       case AIR_RESOURCE_DEVICE_BUFFER:
@@ -297,6 +299,8 @@ rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t size,
     */
    for (unsigned i = 0; i < info.num_resources; i++) {
       const struct air_resource *r = &info.resources[i];
+      if (r->unused)
+         continue;
       if ((r->kind == AIR_RESOURCE_TEXTURE || r->kind == AIR_RESOURCE_IMAGE) &&
           r->index >= RWA_MAX_TEXTURES) {
          say(why, why_size, "%s binds a texture at index %u, past the %u slots this "
@@ -356,6 +360,8 @@ rwa_module_textures(struct rwa_device *device, const void *bitcode, size_t size,
        */
       for (unsigned k = 0; k < info.num_resources; k++) {
          const struct air_resource *r = &info.resources[k];
+         if (r->unused)
+            continue;
          if ((r->kind != AIR_RESOURCE_TEXTURE && r->kind != AIR_RESOURCE_IMAGE) ||
              r->index != i || !r->type_name)
             continue;
@@ -481,14 +487,6 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
          ralloc_free(mem_ctx);
          return -1;
       }
-      if (r->argbuf_id >= RWA_MAX_ARGBUF_MEMBERS) {
-         say(why, why_size, "member `%s` of the argument buffer %s declares at Metal "
-                            "buffer index %u is id %u, and this library records %u "
-                            "members of a set", r->name ? r->name : "?", name,
-             r->argbuf_set, r->argbuf_id, RWA_MAX_ARGBUF_MEMBERS);
-         ralloc_free(mem_ctx);
-         return -1;
-      }
 
       struct rwa_argbuf_member *m = &l->members[l->member_count++];
       m->id = r->argbuf_id;
@@ -503,26 +501,77 @@ rwa_module_argbufs(struct rwa_device *device, const void *bitcode, size_t size,
       snprintf(m->name, sizeof(m->name), "%s", r->name ? r->name : "");
    }
 
-   for (unsigned k = 0; k < n; k++) {
-      struct rwa_argbuf_layout *l = &out[k];
-      uint64_t seen = 0;
-      unsigned max_id = 0;
-      for (unsigned i = 0; i < l->member_count; i++) {
-         if (seen & (1ull << l->members[i].id)) {
-            say(why, why_size, "two members of the argument buffer %s declares at Metal "
-                               "buffer index %u are both id %u", name, l->metal_index,
-                l->members[i].id);
+   for (unsigned i = 0; i < info.num_argbuf_constants; i++) {
+      const struct air_argbuf_const_member *cm = &info.argbuf_constants[i];
+      struct rwa_argbuf_layout *l = NULL;
+      for (unsigned k = 0; k < n; k++) {
+         if (out[k].metal_index == cm->argbuf_set) {
+            l = &out[k];
+            break;
+         }
+      }
+      if (!l) {
+         if (n >= max) {
+            say(why, why_size, "%s declares an argument buffer at Metal buffer index %u "
+                               "and there is room for %u layout%s", name, cm->argbuf_set,
+                max, max == 1 ? "" : "s");
             ralloc_free(mem_ctx);
             return -1;
          }
-         seen |= 1ull << l->members[i].id;
+         l = &out[n++];
+         memset(l, 0, sizeof(*l));
+         l->metal_index = cm->argbuf_set;
+         l->alignment = cm->alignment > 8 ? cm->alignment : 8;
+      } else if (cm->alignment > l->alignment) {
+         l->alignment = cm->alignment;
+      }
+      if (l->member_count >= RWA_MAX_ARGBUF_MEMBERS) {
+         say(why, why_size, "the argument buffer %s declares at Metal buffer index %u has "
+                            "more than the %u members this library records", name,
+             cm->argbuf_set, RWA_MAX_ARGBUF_MEMBERS);
+         ralloc_free(mem_ctx);
+         return -1;
+      }
+      struct rwa_argbuf_member *m = &l->members[l->member_count++];
+      memset(m, 0, sizeof(*m));
+      m->id = cm->argbuf_id;
+      m->kind = RWA_ARGBUF_CONSTANT;
+      m->index = ~0u;
+      m->write = 0;
+      m->offset = cm->offset;
+      m->size = cm->size;
+      snprintf(m->name, sizeof(m->name), "%s", cm->name ? cm->name : "");
+   }
+
+   for (unsigned k = 0; k < n; k++) {
+      struct rwa_argbuf_layout *l = &out[k];
+      unsigned max_id = 0;
+      for (unsigned i = 0; i < l->member_count; i++) {
+         for (unsigned j = 0; j < i; j++) {
+            if (l->members[j].id == l->members[i].id) {
+               say(why, why_size, "two members of the argument buffer %s declares at Metal "
+                                  "buffer index %u are both id %u", name, l->metal_index,
+                   l->members[i].id);
+               ralloc_free(mem_ctx);
+               return -1;
+            }
+         }
          if (l->members[i].id > max_id)
             max_id = l->members[i].id;
+         if (l->members[i].kind == RWA_ARGBUF_CONSTANT) {
+            uint64_t end = (uint64_t)l->members[i].offset + l->members[i].size;
+            if (end > l->encoded_length)
+               l->encoded_length = (unsigned)end;
+         }
       }
       if (l->member_count > 0) {
-         unsigned min_len = 8 * (max_id + 1);
-         if (l->encoded_length < min_len)
-            l->encoded_length = min_len;
+         if (l->encoded_length == 0 && max_id < RWA_MAX_ARGBUF_MEMBERS) {
+            l->encoded_length = 8 * (max_id + 1);
+         } else {
+            unsigned min_len = 8 * l->member_count;
+            if (l->encoded_length < min_len)
+               l->encoded_length = min_len;
+         }
       }
    }
 
@@ -919,7 +968,8 @@ build_vertex_state(const struct air_shader_info *vinfo,
     */
    for (unsigned i = 0; i < vinfo->num_resources; i++) {
       const struct air_resource *r = &vinfo->resources[i];
-      if (r->kind != AIR_RESOURCE_CONSTANT_BUFFER && r->kind != AIR_RESOURCE_DEVICE_BUFFER)
+      if (r->unused || r->argbuf_set != ~0u ||
+          (r->kind != AIR_RESOURCE_CONSTANT_BUFFER && r->kind != AIR_RESOURCE_DEVICE_BUFFER))
          continue;
       if (r->index < RWA_MAX_VERTEX_BUFFERS && (out->stream_mask & (1u << r->index))) {
          say(why, why_size, "buffer index %u is a vertex stream in this descriptor and "
